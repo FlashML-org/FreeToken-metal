@@ -3,9 +3,7 @@
 Port of FreeToken models/qwen3_5_moe/model.py. Divergences: the batch flows
 through forward explicitly; norms are plain RMSNorm because MLX checkpoints store
 the (1 + w) shift; each Linear takes its affine scheme from the checkpoint's
-quantization map at construction; every residual add is fused with the norm that
-consumes it, so a layer takes and returns (residual, normed) and the next layer's
-input norm is applied at the end of the previous one.
+quantization map at construction.
 """
 
 from __future__ import annotations
@@ -13,7 +11,6 @@ from __future__ import annotations
 import mlx.core as mx
 
 from ftmetal.core import Batch
-from ftmetal.kernel.norm import add_rms_norm
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.embedding import Embedding
 from ftmetal.layers.linear import Linear
@@ -94,17 +91,14 @@ class Qwen3_5DecoderLayer(BaseOP):
             config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
 
-    def forward(
-        self, residual: mx.array, normed: mx.array, next_norm: RMSNorm, batch: Batch
-    ) -> tuple[mx.array, mx.array]:
-        """normed is this layer's input norm of residual; returns the next layer's pair."""
+    def forward(self, x: mx.array, batch: Batch) -> mx.array:
+        normed = self.input_layernorm.forward(x)
         if self.is_linear:
             r = self.linear_attn.forward(normed, batch)
         else:
             r = self.self_attn.forward(normed, batch)
-        post = self.post_attention_layernorm
-        residual, normed = add_rms_norm(residual, r, post.weight, post.eps)
-        return add_rms_norm(residual, self.mlp.forward(normed), next_norm.weight, next_norm.eps)
+        h = x + r
+        return h + self.mlp.forward(self.post_attention_layernorm.forward(h))
 
 
 class Qwen3_5Model(BaseOP):
@@ -123,14 +117,10 @@ class Qwen3_5Model(BaseOP):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
 
     def forward(self, batch: Batch) -> mx.array:
-        residual = self.embed_tokens.forward(batch.input_ids)
-        normed = self.layers[0].input_layernorm.forward(residual)
-        for i, layer in enumerate(self.layers):
-            next_norm = (
-                self.layers[i + 1].input_layernorm if i + 1 < len(self.layers) else self.norm
-            )
-            residual, normed = layer.forward(residual, normed, next_norm, batch)
-        return normed
+        x = self.embed_tokens.forward(batch.input_ids)
+        for layer in self.layers:
+            x = layer.forward(x, batch)
+        return self.norm.forward(x)
 
 
 class Qwen3_5MoeForCausalLM(BaseLLMModel):
