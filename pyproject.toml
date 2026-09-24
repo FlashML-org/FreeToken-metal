@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=75"]
+requires = ["setuptools>=75", "cmake>=3.27", "nanobind==2.13.0", "mlx==0.32.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -38,6 +38,7 @@ where = ["python"]
 [tool.ruff]
 line-length = 100
 target-version = "py313"
+src = ["python", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
