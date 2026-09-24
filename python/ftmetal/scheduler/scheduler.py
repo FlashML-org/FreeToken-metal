@@ -82,14 +82,14 @@ class Scheduler:
         self.eos_token_ids = eos_token_ids
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
         self.cache_manager = CacheManager(
-            self.engine.num_pages, config.page_size, self.engine.page_table
+            self.engine.num_pages,
+            config.page_size,
+            self.engine.page_table,
+            self.engine.linear_state_pool,
         )
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
-            self.cache_manager,
-            self.table_manager,
-            self.decode_manager,
-            self.engine.linear_state_pool,
+            self.cache_manager, self.table_manager, self.decode_manager
         )
         self.finished_reqs: set[Req] = set()
         self.metrics = SchedulerMetrics()
@@ -105,6 +105,14 @@ class Scheduler:
         if sampling_params.max_tokens > max_output_len:
             sampling_params.max_tokens = max_output_len
         self.prefill_manager.add_one_req(uid, input_ids, sampling_params)
+
+    def abort_request(self, uid: int) -> None:
+        """Drop a pending or running request; a step already launched with it still runs."""
+        req = self.prefill_manager.abort_req(uid) or self.decode_manager.abort_req(uid)
+        if req is None:
+            return
+        req.aborted = True
+        self.free_req_resources(req)
 
     @property
     def runnable(self) -> bool:
@@ -180,10 +188,6 @@ class Scheduler:
         )
         batch.positions = mx.array(positions)
         batch.input_ids = table.gather_tokens(mx.array(input_flat))
-        if self.engine.linear_state_pool is not None:
-            batch.linear_slot_ids = mx.array(
-                np.array([req.linear_slot_idx for req in batch.reqs], dtype=np.int32)
-            )
         self.engine.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,
@@ -209,7 +213,7 @@ class Scheduler:
         new_finished: set[Req] = set()
         with self.cache_manager.lazy_free_region():
             for req, next_token in zip(batch.reqs, next_tokens):
-                if isinstance(req, ChunkedReq):
+                if isinstance(req, ChunkedReq) or req.aborted:
                     continue
                 if req in self.finished_reqs:
                     continue
@@ -235,9 +239,6 @@ class Scheduler:
             return
         self.cache_manager.cache_req(req, finished=True)
         self.table_manager.free(req.table_idx)
-        if req.linear_slot_idx is not None and self.engine.linear_state_pool is not None:
-            self.engine.linear_state_pool.free([req.linear_slot_idx])
-            req.linear_slot_idx = None
         req.table_idx = -1
 
 

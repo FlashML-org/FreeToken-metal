@@ -2,7 +2,7 @@
 
 Port of FreeToken scheduler/prefill.py. Divergences: no prefix cache in round 1 (the
 match always misses), no multimodal or sliding-window currencies; the GDN live slot
-is allocated and zeroed at admission.
+comes from the CacheManager at admission.
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from ftmetal.core import Batch, Req, SamplingParams
-from ftmetal.kvcache.linear_state_pool import LinearStatePool
 from ftmetal.scheduler.cache import CacheManager, div_ceil
 from ftmetal.scheduler.decode import DecodeManager
 from ftmetal.scheduler.table import TableManager
@@ -54,7 +53,6 @@ class PrefillAdder:
     reserved_size: int
     cache_manager: CacheManager
     table_manager: TableManager
-    linear_state_pool: LinearStatePool | None
 
     def kv_reservation_size(self, total_len: int, cached_len: int) -> int:
         page_size = self.cache_manager.page_size
@@ -69,14 +67,10 @@ class PrefillAdder:
         )
         if estimated_size + self.reserved_size > self.cache_manager.available_size:
             return None
-        if self.linear_state_pool is not None and self.linear_state_pool.num_free_slots < 1:
+        if not self.cache_manager.can_allocate_linear_slot:
             return None
         table_idx = self.table_manager.allocate()
-        linear_slot_idx = None
-        if self.linear_state_pool is not None:
-            linear_slot_idx = self.linear_state_pool.alloc(1)[0]
-            self.linear_state_pool.clear_slots([linear_slot_idx])
-        return cached_len, table_idx, linear_slot_idx
+        return cached_len, table_idx, self.cache_manager.allocate_linear_slot()
 
     def add_one_req(
         self,
@@ -127,7 +121,6 @@ class PrefillManager:
     cache_manager: CacheManager
     table_manager: TableManager
     decode_manager: DecodeManager
-    linear_state_pool: LinearStatePool | None
     pending_list: list[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, uid: int, input_ids: np.ndarray, sampling_params: SamplingParams) -> None:
@@ -143,7 +136,6 @@ class PrefillManager:
             reserved_size=self.decode_manager.inflight_tokens,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
-            linear_state_pool=self.linear_state_pool,
         )
         reqs: list[Req] = []
         chunked_list: list[PendingReq] = []
