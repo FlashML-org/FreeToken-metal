@@ -2,7 +2,7 @@
 
 Port of FreeToken layers/moe.py (MoELayer). Divergences: the experts live in one
 fused gate_up_proj and one down_proj bank per layer in bf16 or affine quantization;
-routing is computed by the model and handed to routed_forward. The offload subclass
+routing is computed by the model and handed to forward. The offload subclass
 arrives in round 3.
 """
 
@@ -83,10 +83,11 @@ class MoELayer(BaseOP):
             num_experts, intermediate_size, hidden_size, scheme=scheme, dtype=dtype
         )
 
-    def routed_forward(
+    def forward(
         self, hidden_states: mx.array, topk_weights: mx.array, topk_ids: mx.array
     ) -> mx.array:
-        """Expert compute for a routing decision: hidden [T, H], weights / ids [T, top_k]."""
+        """Expert compute for a routing decision (the donor's routed_forward): hidden [T, H],
+        weights / ids [T, top_k]; the model computes the routing."""
         x = mx.expand_dims(hidden_states, (-2, -3))
         do_sort = topk_ids.size >= SORT_MIN_PAIRS
         indices = topk_ids

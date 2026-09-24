@@ -79,7 +79,7 @@ class Qwen3_5MoE(BaseOP):
         topk_ids, topk_weights = router_topk(
             self.gate.forward(hidden_states), self.top_k, self.norm_topk_prob
         )
-        routed = self.experts.routed_forward(hidden_states, topk_weights, topk_ids)
+        routed = self.experts.forward(hidden_states, topk_weights, topk_ids)
         shared = self.shared_expert.forward(hidden_states)
         return sigmoid_gated_add(routed, shared, self.shared_expert_gate.forward(hidden_states))
 
