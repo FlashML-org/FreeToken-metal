@@ -85,7 +85,7 @@ class LinearMerged(Linear):
         for size in self._output_sizes[:-1]:
             offset += size
             bounds.append(offset)
-        return mx.split(self.forward(x), bounds, axis=-1)
+        return self.forward(x).split(tuple(bounds), axis=-1)
 
 
 __all__ = ["Linear", "LinearMerged"]

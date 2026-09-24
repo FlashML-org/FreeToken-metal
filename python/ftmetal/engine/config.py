@@ -17,7 +17,7 @@ import mlx.core as mx
 
 from ftmetal.layers.quantization.config import QuantConfig
 from ftmetal.models.config import ModelConfig
-from ftmetal.models.loader import read_model_config, weight_files
+from ftmetal.models.loader import config_dict, config_str_list, read_model_config, weight_files
 from ftmetal.models.register import parse_model_config
 
 # Kernel set of the full-attention backend; prefill runs on MLX SDPA under both.
@@ -52,12 +52,14 @@ class EngineConfig:
 
     @cached_property
     def architecture(self) -> str:
-        return str(self.raw_config["architectures"][0])
+        architectures = config_str_list(self.raw_config, "architectures")
+        assert architectures, "config.json names no architecture"
+        return architectures[0]
 
     @cached_property
     def model_config(self) -> ModelConfig:
         quant = QuantConfig.from_checkpoint(
-            self.raw_config.get("quantization"), checkpoint_tensor_names(self.model_path)
+            config_dict(self.raw_config, "quantization"), checkpoint_tensor_names(self.model_path)
         )
         return parse_model_config(self.architecture, self.raw_config, quant)
 

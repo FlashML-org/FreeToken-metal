@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import mlx.core as mx
 
+from ftmetal.kernel.custom import metal_kernel
+
 SIMD_WIDTH = 32
 
 ROUTER_SOURCE = """
@@ -65,7 +67,7 @@ ROUTER_SOURCE = """
     }
 """
 
-ROUTER_KERNEL = mx.fast.metal_kernel(
+ROUTER_KERNEL = metal_kernel(
     name="router_topk",
     input_names=["gates"],
     output_names=["ids", "scores"],

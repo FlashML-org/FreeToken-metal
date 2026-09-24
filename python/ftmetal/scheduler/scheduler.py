@@ -18,7 +18,7 @@ from typing import Literal, NamedTuple
 import mlx.core as mx
 import numpy as np
 
-from ftmetal.core import Batch, Req, SamplingParams
+from ftmetal.core import Batch, Req, SamplingParams, host_ints
 from ftmetal.engine.config import EngineConfig
 from ftmetal.engine.engine import Engine, ForwardOutput
 from ftmetal.engine.sample import BatchSamplingArgs
@@ -293,7 +293,7 @@ class Scheduler:
         if last_data is None:
             return
         batch = last_data.forward_input.batch
-        next_tokens = last_data.forward_output.next_tokens.tolist()
+        next_tokens = host_ints(last_data.forward_output.next_tokens)
         events: list[TokenEvent] = []
         new_finished: set[Req] = set()
         with self.cache_manager.lazy_free_region():

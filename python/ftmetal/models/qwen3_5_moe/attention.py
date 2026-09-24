@@ -10,6 +10,7 @@ from __future__ import annotations
 import mlx.core as mx
 
 from ftmetal.attention.base import AttnType
+from ftmetal.attention.full.common import FullAttnBackend
 from ftmetal.context import get_global_ctx
 from ftmetal.core import Batch
 from ftmetal.layers.activation import sigmoid_gate
@@ -65,6 +66,7 @@ class Qwen3_5Attention(BaseOP):
         )
         v = v.reshape(num_tokens, self.num_kv, self.head_dim)
         backend = get_global_ctx().attn_backends[AttnType.FULL]
+        assert isinstance(backend, FullAttnBackend)
         o = backend.forward(q, k, v, self.layer_id, batch)
         o = sigmoid_gate(o.reshape(num_tokens, self.qo_attn_dim), gate)
         return self.o_proj.forward(o)

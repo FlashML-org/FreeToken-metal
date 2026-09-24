@@ -9,7 +9,7 @@ maintenance gate or request log.
 from __future__ import annotations
 
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import aclosing
 
 from fastapi import FastAPI
@@ -84,7 +84,7 @@ def chat_message(message: Message) -> ChatMessage:
 
 async def stream_chat_completion_chunks(
     uid: int, req: ChatCompletionRequest, spec: GenSpec, frontend: FrontendManager
-) -> AsyncIterator[bytes]:
+) -> AsyncGenerator[bytes]:
     """generate_events as chat.completion.chunk server-sent events."""
     completion_id = f"chatcmpl-{uid}"
     created = int(time.time())

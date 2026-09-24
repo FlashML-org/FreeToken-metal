@@ -15,6 +15,8 @@ import math
 
 import mlx.core as mx
 
+from ftmetal.kernel.custom import metal_kernel
+
 SIMD_WIDTH = 32
 SIMDGROUPS_PER_THREADGROUP = 4
 # Apple GPUs cap threadgroup memory at 32 KiB; keep a margin for the compiler.
@@ -186,13 +188,13 @@ MERGE_SOURCE = """
     }
 """
 
-PARTIALS_KERNEL = mx.fast.metal_kernel(
+PARTIALS_KERNEL = metal_kernel(
     name="fdecode_partials",
     input_names=["q", "k_cache", "v_cache", "page_table", "seq_lens", "scale_log2e"],
     output_names=["part_acc", "part_ml"],
     source=PARTIALS_SOURCE,
 )
-MERGE_KERNEL = mx.fast.metal_kernel(
+MERGE_KERNEL = metal_kernel(
     name="fdecode_merge",
     input_names=["part_acc", "part_ml"],
     output_names=["out"],

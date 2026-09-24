@@ -17,6 +17,12 @@ class AffineScheme:
     group_size: int
 
 
+def affine_scheme(entry: dict[str, object]) -> AffineScheme:
+    bits, group_size = entry["bits"], entry["group_size"]
+    assert isinstance(bits, int) and isinstance(group_size, int), "bits and group_size are ints"
+    return AffineScheme(bits, group_size)
+
+
 @dataclass(frozen=True)
 class QuantConfig:
     default: AffineScheme | None
@@ -36,11 +42,11 @@ class QuantConfig:
         mode = quantization.get("mode", "affine")
         if mode != "affine":
             raise ValueError(f"unsupported quantization mode {mode!r}; only affine is served")
-        default = AffineScheme(int(quantization["bits"]), int(quantization["group_size"]))
+        default = affine_scheme(quantization)
         overrides: dict[str, AffineScheme] = {}
         for key, value in quantization.items():
             if isinstance(value, dict):
-                overrides[key] = AffineScheme(int(value["bits"]), int(value["group_size"]))
+                overrides[key] = affine_scheme(value)
         return cls(default=default, overrides=overrides, quantized_modules=quantized)
 
     def scheme_for(self, checkpoint_name: str) -> AffineScheme | None:

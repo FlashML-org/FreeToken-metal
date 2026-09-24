@@ -3,6 +3,8 @@
 import mlx.core as mx
 import mlx.nn as nn
 
+from ftmetal.core import host_ints
+
 
 def scatter_rows_ref(pool: mx.array, rows: mx.array, dst_ids: mx.array) -> mx.array:
     out = mx.array(pool)
@@ -42,7 +44,7 @@ def gdn_decode_step_ref(
     conv_out_pool = conv_pool
     state_out_pool = state_pool
     ys = []
-    for i, (slot, position) in enumerate(zip(slots.tolist(), positions.tolist())):
+    for i, (slot, position) in enumerate(zip(host_ints(slots), host_ints(positions))):
         ring = conv_pool[slot].astype(mx.float32)
         current = conv_in[i].astype(mx.float32)
         taps = [
@@ -103,7 +105,7 @@ def flash_decode_ref(
     group = q.shape[1] // k_cache.shape[1]
     offsets = mx.arange(page_size, dtype=mx.int32)
     outputs = []
-    for i, seq_len in enumerate(seq_lens.tolist()):
+    for i, seq_len in enumerate(host_ints(seq_lens)):
         slots = (page_table[i][:, None] * page_size + offsets).reshape(-1)[:seq_len]
         keys = mx.repeat(k_cache[slots].astype(mx.float32), group, axis=1)
         values = mx.repeat(v_cache[slots].astype(mx.float32), group, axis=1)

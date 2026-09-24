@@ -124,4 +124,13 @@ class Batch:
         return sum(req.extend_len for req in self.reqs)
 
 
-__all__ = ["Batch", "Req", "SamplingParams"]
+def host_ints(values: mx.array) -> list[int]:
+    """A 1-D integer array as Python ints (one device sync)."""
+    listed = values.tolist()
+    assert isinstance(listed, list)
+    ints = [value for value in listed if isinstance(value, int)]
+    assert len(ints) == len(listed), "host_ints needs a 1-D integer array"
+    return ints
+
+
+__all__ = ["Batch", "Req", "SamplingParams", "host_ints"]

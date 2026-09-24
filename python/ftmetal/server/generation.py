@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import queue
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import aclosing
 from dataclasses import dataclass, field
 
@@ -81,7 +81,7 @@ class FrontendManager:
             if pending is not None:
                 pending.put_nowait(reply)
 
-    async def wait_for_ack(self, uid: int) -> AsyncIterator[UserReply]:
+    async def wait_for_ack(self, uid: int) -> AsyncGenerator[UserReply]:
         """uid's replies up to the terminal one; closing the stream earlier aborts uid."""
         pending = self.ack_map[uid]
         finished = False
@@ -184,7 +184,7 @@ def submit_generation(spec: GenSpec, frontend: FrontendManager) -> int:
 
 async def generate_events(
     uid: int, spec: GenSpec, frontend: FrontendManager
-) -> AsyncIterator[GenEvent]:
+) -> AsyncGenerator[GenEvent]:
     """Reasoning and content deltas of one request, then exactly one GenDone."""
     parser = ThinkReasoningParser(force_reasoning=spec.opens_reasoning)
     prompt_tokens = 0

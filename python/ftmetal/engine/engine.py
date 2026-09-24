@@ -62,7 +62,9 @@ class Engine:
         self.weights_bytes = mx.get_active_memory() - resident_before
         logger.info(f"weights resident: {self.weights_bytes / 2**30:.2f} GiB")
 
-        budget = memory_budget_bytes(mx.device_info()["max_recommended_working_set_size"])
+        working_set = mx.device_info()["max_recommended_working_set_size"]
+        assert isinstance(working_set, int)
+        budget = memory_budget_bytes(working_set)
         linear_group = model_config.linear_attention_group()
         num_slots = linear_pool_num_slots(config.max_running_req)
         linear_state_bytes = 0

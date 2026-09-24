@@ -14,6 +14,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ftmetal.kernel._ext import _C
+from ftmetal.kernel.custom import MetalKernel, metal_kernel
 
 # Threads per simdgroup; each lane owns key_head_dim / 32 state columns.
 SIMD_WIDTH = 32
@@ -26,7 +27,7 @@ def compute_gate_decay(A_log: mx.array, a: mx.array, dt_bias: mx.array) -> mx.ar
     return mx.exp(-mx.exp(A_log.astype(mx.float32)) * nn.softplus(a + dt_bias))
 
 
-def make_gated_delta_kernel(has_mask: bool):
+def make_gated_delta_kernel(has_mask: bool) -> MetalKernel:
     mask_source = "mask[b_idx * T + t]" if has_mask else "true"
     source = f"""
         auto n = thread_position_in_grid.z;
@@ -95,7 +96,7 @@ def make_gated_delta_kernel(has_mask: bool):
     inputs = ["q", "k", "v", "g", "beta", "state_in", "T"]
     if has_mask:
         inputs.append("mask")
-    return mx.fast.metal_kernel(
+    return metal_kernel(
         name="gated_delta_step" + ("_mask" if has_mask else ""),
         input_names=inputs,
         output_names=["y", "state_out"],

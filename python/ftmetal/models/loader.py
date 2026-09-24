@@ -67,7 +67,84 @@ class WeightRules:
 
 def read_model_config(model_path: str) -> dict[str, object]:
     with open(os.path.join(model_path, "config.json"), encoding="utf-8") as f:
-        return json.load(f)
+        config = json.load(f)
+    assert isinstance(config, dict), "config.json must hold an object"
+    return config
+
+
+def config_dict(config: dict[str, object], key: str) -> dict[str, object] | None:
+    value = config.get(key)
+    if value is None:
+        return None
+    assert isinstance(value, dict), f"config {key!r} must be an object"
+    return value
+
+
+def config_optional_int(config: dict[str, object], key: str) -> int | None:
+    value = config.get(key)
+    if value is None:
+        return None
+    assert isinstance(value, int) and not isinstance(value, bool), f"config {key!r} must be an int"
+    return value
+
+
+def config_int(config: dict[str, object], key: str, default: int | None = None) -> int:
+    value = config_optional_int(config, key)
+    if value is None:
+        if default is None:
+            raise KeyError(f"config {key!r} is missing")
+        return default
+    return value
+
+
+def config_optional_float(config: dict[str, object], key: str) -> float | None:
+    value = config.get(key)
+    if value is None:
+        return None
+    assert isinstance(value, (int, float)) and not isinstance(value, bool), (
+        f"config {key!r} must be a number"
+    )
+    return float(value)
+
+
+def config_float(config: dict[str, object], key: str, default: float | None = None) -> float:
+    value = config_optional_float(config, key)
+    if value is None:
+        if default is None:
+            raise KeyError(f"config {key!r} is missing")
+        return default
+    return value
+
+
+def config_bool(config: dict[str, object], key: str, default: bool) -> bool:
+    value = config.get(key)
+    if value is None:
+        return default
+    assert isinstance(value, bool), f"config {key!r} must be a bool"
+    return value
+
+
+def config_optional_str(config: dict[str, object], key: str) -> str | None:
+    value = config.get(key)
+    if value is None:
+        return None
+    assert isinstance(value, str), f"config {key!r} must be a string"
+    return value
+
+
+def config_str(config: dict[str, object], key: str, default: str) -> str:
+    value = config_optional_str(config, key)
+    return default if value is None else value
+
+
+def config_str_list(config: dict[str, object], key: str) -> list[str] | None:
+    value = config.get(key)
+    if value is None:
+        return None
+    assert isinstance(value, list) and all(isinstance(item, str) for item in value), (
+        f"config {key!r} must be a list of strings"
+    )
+    return [str(item) for item in value]
 
 
 def weight_files(model_path: str) -> list[str]:
@@ -81,7 +158,9 @@ def load_checkpoint(model_path: str) -> dict[str, mx.array]:
     """Every tensor of the checkpoint under its checkpoint name, lazily mapped."""
     state: dict[str, mx.array] = {}
     for file in weight_files(model_path):
-        state.update(mx.load(file))
+        loaded = mx.load(file)
+        assert isinstance(loaded, dict), f"{file}: not a safetensors dictionary"
+        state.update(loaded)
     return state
 
 
@@ -144,6 +223,15 @@ __all__ = [
     "FuseRule",
     "WeightRules",
     "apply_rules",
+    "config_bool",
+    "config_dict",
+    "config_float",
+    "config_int",
+    "config_optional_float",
+    "config_optional_int",
+    "config_optional_str",
+    "config_str",
+    "config_str_list",
     "load_checkpoint",
     "load_state",
     "load_weights",

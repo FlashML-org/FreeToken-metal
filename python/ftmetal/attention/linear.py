@@ -18,8 +18,10 @@ from ftmetal.core import Batch
 class LinearAttnBackend(BaseAttnBackend):
     def prepare_metadata(self, batch: Batch) -> None:
         lens = [req.extend_len for req in batch.reqs]
-        slots = [req.linear_slot_idx for req in batch.reqs]
-        assert all(slot is not None for slot in slots), "every request needs a GDN state slot"
+        slots: list[int] = []
+        for req in batch.reqs:
+            assert req.linear_slot_idx is not None, "every request needs a GDN state slot"
+            slots.append(req.linear_slot_idx)
         cu = np.zeros(len(lens) + 1, dtype=np.int32)
         np.cumsum(lens, out=cu[1:])
         batch.attn_metadata[AttnType.LINEAR] = LinearAttnMetadata(
