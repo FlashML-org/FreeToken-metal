@@ -12,6 +12,7 @@ import mlx.core as mx
 from ftmetal.attention.base import AttnType
 from ftmetal.context import get_global_ctx
 from ftmetal.core import Batch
+from ftmetal.layers.activation import sigmoid_gate
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
 from ftmetal.layers.norm import RMSNorm
@@ -65,7 +66,7 @@ class Qwen3_5Attention(BaseOP):
         v = v.reshape(num_tokens, self.num_kv, self.head_dim)
         backend = get_global_ctx().attn_backends[AttnType.FULL]
         o = backend.forward(q, k, v, self.layer_id, batch)
-        o = o.reshape(num_tokens, self.qo_attn_dim) * mx.sigmoid(gate)
+        o = sigmoid_gate(o.reshape(num_tokens, self.qo_attn_dim), gate)
         return self.o_proj.forward(o)
 
 

@@ -1,4 +1,4 @@
-"""Gated activations over [gate | up] projections.
+"""Gated activations and gated adds as compiled elementwise leaves.
 
 Port of FreeToken layers/activation.py; only silu is served. The compiled leaf takes
 the halves separately because a shapeless compile cannot split.
@@ -24,4 +24,17 @@ def silu_and_mul(gate_up: mx.array) -> mx.array:
     return silu_mul(gate, up)
 
 
-__all__ = ["silu_and_mul", "silu_mul"]
+@partial(mx.compile, shapeless=True)
+def sigmoid_gate(x: mx.array, gate: mx.array) -> mx.array:
+    """x * sigmoid(gate), the gate broadcast over the last axis."""
+    return (x.astype(mx.float32) * mx.sigmoid(gate.astype(mx.float32))).astype(x.dtype)
+
+
+@partial(mx.compile, shapeless=True)
+def sigmoid_gated_add(base: mx.array, x: mx.array, gate: mx.array) -> mx.array:
+    """base + x * sigmoid(gate) in one launch."""
+    out = base.astype(mx.float32) + x.astype(mx.float32) * mx.sigmoid(gate.astype(mx.float32))
+    return out.astype(base.dtype)
+
+
+__all__ = ["sigmoid_gate", "sigmoid_gated_add", "silu_and_mul", "silu_mul"]

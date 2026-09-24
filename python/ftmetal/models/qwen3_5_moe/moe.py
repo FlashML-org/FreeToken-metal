@@ -10,7 +10,7 @@ from __future__ import annotations
 import mlx.core as mx
 
 from ftmetal.kernel.router import router_topk
-from ftmetal.layers.activation import silu_and_mul
+from ftmetal.layers.activation import sigmoid_gated_add, silu_and_mul
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
 from ftmetal.layers.moe import MoELayer
@@ -81,8 +81,7 @@ class Qwen3_5MoE(BaseOP):
         )
         routed = self.experts.routed_forward(hidden_states, topk_weights, topk_ids)
         shared = self.shared_expert.forward(hidden_states)
-        shared = mx.sigmoid(self.shared_expert_gate.forward(hidden_states)) * shared
-        return routed + shared
+        return sigmoid_gated_add(routed, shared, self.shared_expert_gate.forward(hidden_states))
 
 
 __all__ = ["Qwen3_5MoE", "SharedExpert"]
