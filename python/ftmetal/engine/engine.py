@@ -15,6 +15,7 @@ import mlx.core as mx
 import numpy as np
 
 from ftmetal.attention.base import AttnType, BaseAttnBackend
+from ftmetal.attention.full.metal import FullAttnMetalBackend
 from ftmetal.attention.full.mlx import FullAttnMLXBackend
 from ftmetal.attention.linear import LinearAttnBackend
 from ftmetal.context import Context, set_global_ctx
@@ -98,8 +99,11 @@ class Engine:
         width = -(-self.max_seq_len // PAGE_TABLE_ALIGN) * PAGE_TABLE_ALIGN
         self.page_table = np.zeros((config.max_running_req, width), dtype=np.int32)
 
+        full_attn_backend = {"mlx": FullAttnMLXBackend, "metal": FullAttnMetalBackend}[
+            config.attention_backend
+        ]
         self.attn_backends: dict[AttnType, BaseAttnBackend] = {
-            AttnType.FULL: FullAttnMLXBackend(
+            AttnType.FULL: full_attn_backend(
                 model_config, self.kv_cache, self.page_table, config.page_size
             )
         }
