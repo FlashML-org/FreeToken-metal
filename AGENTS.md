@@ -27,3 +27,28 @@ Before writing, modifying, or reviewing code, read and follow
 Before writing a commit message, read and follow
 [.claude/skills/commit-style/commit-style.md](.claude/skills/commit-style/commit-style.md).
 Only commit when the user asks.
+
+## Parallel work with subagents
+
+- Parallelize only when the modules are fully independent: their interface to the
+  rest of the code is already agreed and neither side needs to touch the other's
+  files. Examples that qualify: optimizing a kernel behind an interface the upper
+  layers already call; implementing two models' own parts in `models/<a>/` and
+  `models/<b>/` when neither touches shared code. Anything that changes a shared
+  interface (`layers/`, `attention/base.py`, `kvcache/`, `core.py`) is done
+  serially, by one agent.
+- Every subagent works in its own `git worktree` on its own branch; never two
+  agents in the same checkout. The parent integrates by merging or rebasing the
+  branches, resolves conflicts once, and runs the full test suite before calling
+  the work done.
+
+## Model code and shared components
+
+- Packages under `models/` never import from each other. A model's layers, weight
+  mapping and attention specifics live in its own package.
+- When a piece is genuinely shared, extract it into `layers/` (or `attention/`,
+  `kvcache/`, `kernel/`) and have every model import the shared version; do not
+  reuse across model packages by import.
+- Do not extract early. A layer whose generality is uncertain is first
+  implemented inside `models/<model>/`; it moves to `layers/` only once a second
+  model needs the same thing.
