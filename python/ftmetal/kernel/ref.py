@@ -81,3 +81,13 @@ def gdn_decode_step_ref(
             conv_out_pool, new_ring[None], mx.array([slot], dtype=mx.int32)
         )
     return conv_out_pool, state_out_pool, mx.stack(ys)
+
+
+def router_topk_ref(gates: mx.array, top_k: int, norm_topk_prob: bool) -> tuple[mx.array, mx.array]:
+    """The ops path of the router: fp32 softmax, argpartition, renormalized weights."""
+    scores = mx.softmax(gates, axis=-1, precise=True)
+    topk_ids = mx.argpartition(scores, kth=-top_k, axis=-1)[..., -top_k:]
+    topk_weights = mx.take_along_axis(scores, topk_ids, axis=-1)
+    if norm_topk_prob:
+        topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
+    return topk_ids.astype(mx.int32), topk_weights

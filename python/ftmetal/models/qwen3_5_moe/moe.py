@@ -1,13 +1,15 @@
 """Qwen3.5 sparse MoE block: softmax top-k router, routed experts, gated shared expert.
 
-Port of FreeToken models/qwen3_5_moe/moe.py. Divergences: the router runs on MLX ops
-(softmax in fp32, argpartition) and the experts are the resident MoELayer.
+Port of FreeToken models/qwen3_5_moe/moe.py. Divergences: the router is the fused
+kernel/router Metal kernel (fp32 softmax, top-k, renorm in one launch) and the
+experts are the resident MoELayer.
 """
 
 from __future__ import annotations
 
 import mlx.core as mx
 
+from ftmetal.kernel.router import router_topk
 from ftmetal.layers.activation import silu_and_mul
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
@@ -74,11 +76,9 @@ class Qwen3_5MoE(BaseOP):
         )
 
     def forward(self, hidden_states: mx.array) -> mx.array:
-        scores = mx.softmax(self.gate.forward(hidden_states), axis=-1, precise=True)
-        topk_ids = mx.argpartition(scores, kth=-self.top_k, axis=-1)[..., -self.top_k :]
-        topk_weights = mx.take_along_axis(scores, topk_ids, axis=-1)
-        if self.norm_topk_prob:
-            topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
+        topk_ids, topk_weights = router_topk(
+            self.gate.forward(hidden_states), self.top_k, self.norm_topk_prob
+        )
         routed = self.experts.routed_forward(hidden_states, topk_weights, topk_ids)
         shared = self.shared_expert.forward(hidden_states)
         shared = mx.sigmoid(self.shared_expert_gate.forward(hidden_states)) * shared
