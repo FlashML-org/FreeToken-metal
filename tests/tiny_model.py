@@ -47,12 +47,12 @@ def build_reference(seed: int) -> reference.Model:
         reference.ModelArgs(model_type="qwen3_5_moe", text_config=TINY_TEXT_CONFIG)
     )
     # Random init leaves the norm weights at one; perturb them so the parity is not trivial.
-    params = {
-        key: (value + 0.05 * mx.random.normal(value.shape))
-        if key.endswith("norm.weight")
-        else value
-        for key, value in tree_flatten(model.parameters())
-    }
+    params: dict[str, mx.array] = {}
+    for key, value in tree_flatten(model.parameters()):
+        assert isinstance(value, mx.array)
+        if key.endswith("norm.weight"):
+            value = value + 0.05 * mx.random.normal(value.shape)
+        params[key] = value
     model.load_weights(list(params.items()))
     model.set_dtype(mx.float32)
     mx.eval(model.parameters())
@@ -79,11 +79,11 @@ def reference_greedy(
     cache = model.make_cache()
     logits = model(mx.array(prompt)[None], cache=cache)
     prefill_logits = logits[0]
-    token = int(mx.argmax(logits[0, -1]).item())
+    token = int(mx.argmax(logits[0, -1]))
     tokens = [token]
     for _ in range(steps - 1):
         logits = model(mx.array([[token]]), cache=cache)
-        token = int(mx.argmax(logits[0, -1]).item())
+        token = int(mx.argmax(logits[0, -1]))
         tokens.append(token)
     return prefill_logits, tokens
 

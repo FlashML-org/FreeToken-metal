@@ -11,11 +11,17 @@ from pathlib import Path
 
 import pytest
 from jinja2 import TemplateError
-from mlx_lm.utils import load_tokenizer
+from transformers import AutoTokenizer
 
 from ftmetal.core import SamplingParams
 from ftmetal.message.frontend import UserReply
-from ftmetal.message.tokenizer import ChatMessage, DetokenizeMsg, FinishReason, TokenizeMsg
+from ftmetal.message.tokenizer import (
+    ChatMessage,
+    DetokenizeMsg,
+    FinishReason,
+    JsonValue,
+    TokenizeMsg,
+)
 from ftmetal.tokenizer import (
     DetokenizeManager,
     TokenizeManager,
@@ -61,6 +67,7 @@ def outputs(replies: list[UserReply | None]) -> list[str]:
 def test_incremental_detokenize_rebuilds_multibyte_text(tiny_model_dir: Path) -> None:
     tokenize_manager, detokenize_manager = make_managers(str(tiny_model_dir))
     eos = tokenize_manager.tokenizer.token_to_id("<|im_end|>")
+    assert eos is not None
     token_ids = tokenize_manager.tokenizer.encode(MULTILINGUAL_TEXT).ids
     replies = decode_stream(detokenize_manager, [*token_ids, eos], finish_reason="stop")
     chunks = outputs(replies)
@@ -109,6 +116,7 @@ def test_partial_stop_is_held_back_then_released(tiny_model_dir: Path) -> None:
 def test_eos_is_counted_but_not_decoded(tiny_model_dir: Path) -> None:
     tokenize_manager, detokenize_manager = make_managers(str(tiny_model_dir))
     eos = tokenize_manager.tokenizer.token_to_id("<|im_end|>")
+    assert eos is not None
     replies = decode_stream(detokenize_manager, [*tokenize_manager.tokenizer.encode("hi").ids, eos])
     assert "".join(outputs(replies)) == "hi"
     assert len(replies) == 3
@@ -127,9 +135,11 @@ def test_dropped_request_ignores_late_tokens(tiny_model_dir: Path) -> None:
 def tokenize_msg(
     messages: list[ChatMessage],
     enable_thinking: bool | None = None,
-    tools: list[dict[str, str]] | None = None,
+    tools: list[dict[str, JsonValue]] | None = None,
 ) -> TokenizeMsg:
-    kwargs = {} if enable_thinking is None else {"enable_thinking": enable_thinking}
+    kwargs: dict[str, JsonValue] = {}
+    if enable_thinking is not None:
+        kwargs["enable_thinking"] = enable_thinking
     return TokenizeMsg(
         uid=0,
         text=messages,
@@ -160,7 +170,7 @@ def test_chat_template_raises_and_renders_plain_json(tiny_model_dir: Path) -> No
     ]
     with pytest.raises(TemplateError, match="System message must be at the beginning"):
         manager.render_prompt(tokenize_msg(out_of_order))
-    tools = [{"name": "lookup", "description": "a <b> & c"}]
+    tools: list[dict[str, JsonValue]] = [{"name": "lookup", "description": "a <b> & c"}]
     prompt = manager.render_prompt(tokenize_msg([{"role": "user", "content": "hi"}], tools=tools))
     assert '"description": "a <b> & c"' in prompt
 
@@ -168,6 +178,7 @@ def test_chat_template_raises_and_renders_plain_json(tiny_model_dir: Path) -> No
 def test_checkpoint_eos_and_sampling_defaults(tiny_model_dir: Path) -> None:
     manager = TokenizeManager(str(tiny_model_dir))
     eos = manager.tokenizer.token_to_id("<|im_end|>")
+    assert eos is not None
     assert load_eos_token_ids(str(tiny_model_dir), manager.tokenizer) == {eos}
     defaults = load_sampling_defaults(str(tiny_model_dir))
     assert (defaults.temperature, defaults.top_k, defaults.top_p) == (0.6, 20, 0.95)
@@ -179,7 +190,7 @@ def test_checkpoint_eos_and_sampling_defaults(tiny_model_dir: Path) -> None:
 def test_real_tokenizer_matches_transformers() -> None:
     assert MODEL_PATH is not None
     tokenize_manager, detokenize_manager = make_managers(MODEL_PATH)
-    reference = load_tokenizer(Path(MODEL_PATH))
+    reference = AutoTokenizer.from_pretrained(MODEL_PATH)
 
     token_ids = tokenize_manager.tokenizer.encode(MULTILINGUAL_TEXT).ids
     assert token_ids == reference.encode(MULTILINGUAL_TEXT, add_special_tokens=False)

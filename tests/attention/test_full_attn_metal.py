@@ -84,7 +84,7 @@ def decode_batch(seq_lens: list[int], page_table: np.ndarray, num_pages: int) ->
 def max_row_error(out: mx.array, reference: mx.array) -> float:
     error = mx.abs(out.astype(mx.float32) - reference.astype(mx.float32)).max(axis=(1, 2))
     scale = mx.abs(reference.astype(mx.float32)).max(axis=(1, 2))
-    return (error / scale).max().item()
+    return float((error / scale).max())
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])

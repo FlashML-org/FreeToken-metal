@@ -133,4 +133,13 @@ def host_ints(values: mx.array) -> list[int]:
     return ints
 
 
-__all__ = ["Batch", "Req", "SamplingParams", "host_ints"]
+def host_floats(values: mx.array) -> list[float]:
+    """A 1-D floating array as Python floats (one device sync)."""
+    listed = values.astype(mx.float32).tolist()
+    assert isinstance(listed, list)
+    floats = [value for value in listed if isinstance(value, float)]
+    assert len(floats) == len(listed), "host_floats needs a 1-D array"
+    return floats
+
+
+__all__ = ["Batch", "Req", "SamplingParams", "host_floats", "host_ints"]

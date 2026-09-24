@@ -10,19 +10,18 @@ engines is not the bar; the bar is that the model still solves the problem.
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import sys
 import time
 from pathlib import Path
 
 import mlx.core as mx
-import numpy as np
-from mlx_lm.utils import load_tokenizer
 
 from ftmetal.core import SamplingParams
 from ftmetal.engine.config import EngineConfig
+from ftmetal.message.tokenizer import TokenizeMsg
 from ftmetal.scheduler.scheduler import Scheduler
+from ftmetal.tokenizer import TokenizeManager, load_eos_token_ids, load_sampling_defaults
 
 PROBLEM = "Find the sum of all integer bases $b>9$ for which $17_b$ is a divisor of $97_b.$"
 ANSWER = "70"
@@ -49,26 +48,31 @@ def main() -> int:
     seeds = [int(s) for s in args.seeds.split(",")]
     path = Path(args.model_path)
 
-    tok = load_tokenizer(path)
-    gen = json.load(open(path / "generation_config.json"))
-    ids = tok.apply_chat_template(
-        [{"role": "user", "content": PROBLEM}], add_generation_prompt=True, enable_thinking=True
+    tokenize_manager = TokenizeManager(str(path))
+    prompt = tokenize_manager.tokenize(
+        TokenizeMsg(
+            uid=0,
+            text=[{"role": "user", "content": PROBLEM}],
+            sampling_params=SamplingParams(),
+            chat_template_kwargs={"enable_thinking": True},
+        )
     )
+    defaults = load_sampling_defaults(str(path))
     params = SamplingParams(
-        temperature=gen["temperature"],
-        top_k=gen["top_k"],
-        top_p=gen["top_p"],
+        temperature=defaults.temperature,
+        top_k=defaults.top_k,
+        top_p=defaults.top_p,
         max_tokens=args.max_tokens,
     )
     mx.random.seed(seeds[0])
     config = EngineConfig(
         model_path=str(path),
         max_running_req=len(seeds),
-        max_seq_len_override=len(ids) + args.max_tokens + 64,
+        max_seq_len_override=len(prompt.input_ids) + args.max_tokens + 64,
     )
-    sched = Scheduler(config, set(gen["eos_token_id"]))
+    sched = Scheduler(config, load_eos_token_ids(str(path), tokenize_manager.tokenizer))
     for uid, _ in enumerate(seeds):
-        sched.add_request(uid, np.array(ids, dtype=np.int32), params)
+        sched.add_request(uid, prompt.input_ids, params)
 
     tokens: dict[int, list[int]] = {uid: [] for uid in range(len(seeds))}
     finish: dict[int, str | None] = {}
@@ -84,7 +88,9 @@ def main() -> int:
 
     ok = True
     for uid, seed in enumerate(seeds):
-        answer = final_answer(tok.decode(tokens[uid]))
+        answer = final_answer(
+            tokenize_manager.tokenizer.decode(tokens[uid], skip_special_tokens=False)
+        )
         passed = answer == ANSWER
         ok &= passed
         print(

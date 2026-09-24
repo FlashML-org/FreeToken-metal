@@ -48,7 +48,9 @@ def make_prompt(num_tokens: int, seed: int) -> str:
 
 def one_request(base_url: str, model: str, prompt: str, max_tokens: int) -> RequestResult:
     url = urlparse(base_url)
-    connection = http.client.HTTPConnection(url.hostname, url.port or 80, timeout=600.0)
+    connection = http.client.HTTPConnection(
+        url.hostname or "127.0.0.1", url.port or 80, timeout=600.0
+    )
     body = json.dumps(
         {
             "model": model,
@@ -95,7 +97,9 @@ def one_request(base_url: str, model: str, prompt: str, max_tokens: int) -> Requ
 
 def served_model(base_url: str) -> str:
     url = urlparse(base_url)
-    connection = http.client.HTTPConnection(url.hostname, url.port or 80, timeout=30.0)
+    connection = http.client.HTTPConnection(
+        url.hostname or "127.0.0.1", url.port or 80, timeout=30.0
+    )
     connection.request("GET", "/v1/models")
     response = connection.getresponse()
     models = json.loads(response.read())["data"]
