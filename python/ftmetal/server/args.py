@@ -101,7 +101,7 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
     parser.add_argument(
         "--attention-backend",
         "--attn",
-        choices=["mlx"],
+        choices=["mlx", "metal"],
         default=ServerArgs.attention_backend,
     )
     namespace = parser.parse_args(argv)
