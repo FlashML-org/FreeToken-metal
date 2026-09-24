@@ -31,7 +31,6 @@ from ftmetal.message.backend import (
     BaseBackendMsg,
     BatchBackendMsg,
     ExitMsg,
-    UserMsg,
 )
 from ftmetal.message.frontend import BaseFrontendMsg, BatchFrontendMsg, UserReply
 from ftmetal.message.tokenizer import (
@@ -43,7 +42,7 @@ from ftmetal.message.tokenizer import (
     PromptAdmittedMsg,
     TokenizeMsg,
 )
-from ftmetal.scheduler.scheduler import ForwardData, Scheduler
+from ftmetal.scheduler.scheduler import Scheduler
 from ftmetal.server.args import ServerArgs
 from ftmetal.server.generation import FrontendManager
 from ftmetal.server.openai_api import register_openai_routes
@@ -148,70 +147,13 @@ def run_scheduler(
         return
     started.set_result(None)
 
-    # Requests whose tokens may still come; they get an error if this thread dies.
-    live_uids: set[int] = set()
-    data: ForwardData | None = None
     try:
-        while True:
-            is_idle = data is None and not scheduler.runnable
-            pending = [recv_backend.get()] if is_idle else []
-            while not recv_backend.empty():
-                pending.append(recv_backend.get_nowait())
-            msgs: list[BaseBackendMsg] = []
-            for msg in pending:
-                msgs.extend(msg.data if isinstance(msg, BatchBackendMsg) else [msg])
-
-            replies: list[BaseTokenizerMsg] = []
-            for msg in msgs:
-                if isinstance(msg, ExitMsg):
-                    return
-                elif isinstance(msg, UserMsg):
-                    try:
-                        scheduler.add_request(msg.uid, msg.input_ids, msg.sampling_params)
-                    except ValueError as exc:
-                        replies.append(
-                            ErrorReplyMsg(
-                                uid=msg.uid, error=str(exc), code="context_length_exceeded"
-                            )
-                        )
-                    else:
-                        live_uids.add(msg.uid)
-                        replies.append(
-                            PromptAdmittedMsg(uid=msg.uid, prompt_tokens=len(msg.input_ids))
-                        )
-                elif isinstance(msg, AbortBackendMsg):
-                    scheduler.abort_request(msg.uid)
-                    live_uids.discard(msg.uid)
-                else:
-                    raise NotImplementedError(f"unexpected backend message {msg!r}")
-
-            data = scheduler.overlap_loop(data)
-            for event in scheduler.take_results():
-                replies.append(
-                    DetokenizeMsg(
-                        uid=event.uid,
-                        next_token=event.token,
-                        finished=event.finished,
-                        finish_reason=event.finish_reason,
-                    )
-                )
-                if event.finished:
-                    live_uids.discard(event.uid)
-            if replies:
-                send_tokenizer.put(BatchTokenizerMsg(data=replies))
-
-            steps = scheduler.metrics.steps
-            if data is None and not scheduler.runnable and steps:
-                logger.info(
-                    f"idle after {len(steps)} steps, decode "
-                    f"{scheduler.metrics.decode_tokens_per_second():.1f} tok/s"
-                )
-                steps.clear()
+        scheduler.run_forever(recv_backend, send_tokenizer)
     except Exception:
         # The thread ends here: running requests fail and new ones get a 503.
         logger.exception("the scheduler thread failed")
         failed: list[BaseTokenizerMsg] = [
-            ErrorReplyMsg(uid=uid, error="the engine failed") for uid in sorted(live_uids)
+            ErrorReplyMsg(uid=uid, error="the engine failed") for uid in sorted(scheduler.live_uids)
         ]
         send_tokenizer.put(BatchTokenizerMsg(data=failed))
 

@@ -55,6 +55,7 @@ class ScriptedScheduler(Scheduler):
         self.eos_token_id = min(eos_token_ids)
         self.metrics = SchedulerMetrics()
         self.results: list[TokenEvent] = []
+        self.live_uids: set[int] = set()
         # uid -> (tokens left, whether the last one is EOS)
         self.running: dict[int, tuple[list[int], bool]] = {}
         self.aborted: list[int] = []

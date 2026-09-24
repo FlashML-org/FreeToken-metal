@@ -3,13 +3,14 @@
 Port of FreeToken scheduler/scheduler.py. Divergences: one process and one MLX
 stream, so the launch is an async_eval of the sampled tokens plus every pool array
 and the drain is reading those tokens; requests arrive by add_request and results
-leave through send_result as TokenEvents (the message transport and run_forever
-land in round 1's server phase).
+leave through send_result as TokenEvents; run_forever is the server's scheduler
+thread body over the message queues.
 """
 
 from __future__ import annotations
 
 import logging
+import queue
 import time
 from dataclasses import dataclass, field
 from typing import Literal, NamedTuple
@@ -21,6 +22,20 @@ from ftmetal.core import Batch, Req, SamplingParams
 from ftmetal.engine.config import EngineConfig
 from ftmetal.engine.engine import Engine, ForwardOutput
 from ftmetal.engine.sample import BatchSamplingArgs
+from ftmetal.message.backend import (
+    AbortBackendMsg,
+    BaseBackendMsg,
+    BatchBackendMsg,
+    ExitMsg,
+    UserMsg,
+)
+from ftmetal.message.tokenizer import (
+    BaseTokenizerMsg,
+    BatchTokenizerMsg,
+    DetokenizeMsg,
+    ErrorReplyMsg,
+    PromptAdmittedMsg,
+)
 from ftmetal.scheduler.cache import CacheManager
 from ftmetal.scheduler.decode import DecodeManager
 from ftmetal.scheduler.prefill import ChunkedReq, PrefillManager
@@ -93,8 +108,10 @@ class Scheduler:
         )
         self.finished_reqs: set[Req] = set()
         self.metrics = SchedulerMetrics()
-        # Results not yet taken by the caller; the server phase replaces this with a queue.
+        # Results not yet taken by the caller (run_forever forwards them as messages).
         self.results: list[TokenEvent] = []
+        # Requests whose tokens may still come; reported as failed if run_forever dies.
+        self.live_uids: set[int] = set()
 
     def add_request(self, uid: int, input_ids: np.ndarray, sampling_params: SamplingParams) -> None:
         max_output_len = self.engine.max_seq_len - len(input_ids)
@@ -140,6 +157,74 @@ class Scheduler:
                 )
             )
         return ongoing_data
+
+    def run_forever(
+        self,
+        recv_backend: queue.Queue[BaseBackendMsg],
+        send_tokenizer: queue.Queue[BaseTokenizerMsg | None],
+    ) -> None:
+        """Serve backend messages until ExitMsg: admit, abort, step, and emit detokenize messages.
+
+        Blocks on the queue when idle. live_uids are the requests whose tokens may still
+        come; the caller reports them if this loop dies.
+        """
+        self.live_uids.clear()
+        data: ForwardData | None = None
+        while True:
+            is_idle = data is None and not self.runnable
+            pending = [recv_backend.get()] if is_idle else []
+            while not recv_backend.empty():
+                pending.append(recv_backend.get_nowait())
+            msgs: list[BaseBackendMsg] = []
+            for msg in pending:
+                msgs.extend(msg.data if isinstance(msg, BatchBackendMsg) else [msg])
+
+            replies: list[BaseTokenizerMsg] = []
+            for msg in msgs:
+                if isinstance(msg, ExitMsg):
+                    return
+                elif isinstance(msg, UserMsg):
+                    try:
+                        self.add_request(msg.uid, msg.input_ids, msg.sampling_params)
+                    except ValueError as exc:
+                        replies.append(
+                            ErrorReplyMsg(
+                                uid=msg.uid, error=str(exc), code="context_length_exceeded"
+                            )
+                        )
+                    else:
+                        self.live_uids.add(msg.uid)
+                        replies.append(
+                            PromptAdmittedMsg(uid=msg.uid, prompt_tokens=len(msg.input_ids))
+                        )
+                elif isinstance(msg, AbortBackendMsg):
+                    self.abort_request(msg.uid)
+                    self.live_uids.discard(msg.uid)
+                else:
+                    raise NotImplementedError(f"unexpected backend message {msg!r}")
+
+            data = self.overlap_loop(data)
+            for event in self.take_results():
+                replies.append(
+                    DetokenizeMsg(
+                        uid=event.uid,
+                        next_token=event.token,
+                        finished=event.finished,
+                        finish_reason=event.finish_reason,
+                    )
+                )
+                if event.finished:
+                    self.live_uids.discard(event.uid)
+            if replies:
+                send_tokenizer.put(BatchTokenizerMsg(data=replies))
+
+            steps = self.metrics.steps
+            if data is None and not self.runnable and steps:
+                logger.info(
+                    f"idle after {len(steps)} steps, decode "
+                    f"{self.metrics.decode_tokens_per_second():.1f} tok/s"
+                )
+                steps.clear()
 
     def send_result(self, events: list[TokenEvent]) -> None:
         self.results.extend(events)
