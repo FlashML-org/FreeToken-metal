@@ -1,10 +1,12 @@
 """Per-request recurrent state (conv + SSM) for GDN layers.
 
 Port of FreeToken kvcache/linear_state_pool.py. Divergences: one array per layer
-for the conv states [num_slots, kernel - 1, conv_dim] and the recurrent states
-[num_slots, num_v_heads, value_head_dim, key_head_dim] (the layouts the GDN kernel
-reads directly); clearing and copying slots are the in-place row primitives; no
-extra slot_states and no runtime rebuild.
+for the conv states and the recurrent states [num_slots, num_v_heads,
+value_head_dim, key_head_dim] (the layouts the GDN kernels read directly); clearing
+and copying slots are the in-place row primitives; no extra slot_states and no
+runtime rebuild. The conv state of a slot is a ring [kernel, conv_dim] of the last
+kernel conv inputs stored at position mod kernel, so the fused decode step can
+update it in the same launch that reads it (a shift register would race).
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ class LinearStatePool:
         conv_dim = 2 * group.num_key_heads * group.key_head_dim
         conv_dim += group.num_value_heads * group.value_head_dim
         self.conv_states = [
-            mx.zeros((num_slots, group.conv_kernel_dim - 1, conv_dim), dtype=dtype)
+            mx.zeros((num_slots, group.conv_kernel_dim, conv_dim), dtype=dtype)
             for _ in group.layer_ids
         ]
         self.recurrent_states = [
@@ -104,7 +106,7 @@ def linear_state_bytes_per_req(
 ) -> int:
     conv_dim = 2 * group.num_key_heads * group.key_head_dim
     conv_dim += group.num_value_heads * group.value_head_dim
-    conv_bytes = conv_dim * (group.conv_kernel_dim - 1) * dtype.size
+    conv_bytes = conv_dim * group.conv_kernel_dim * dtype.size
     rec_bytes = group.num_value_heads * group.key_head_dim * group.value_head_dim
     rec_bytes *= state_dtype.size
     return len(group.layer_ids) * (conv_bytes + rec_bytes)

@@ -1,9 +1,10 @@
 """Gated DeltaNet layer over the per-request state pool.
 
-Port of FreeToken models/qwen3_5_moe/gdn.py. Divergences: the conv is mx.conv1d over
-the slot's conv state plus this step's inputs, the recurrence is the Metal gated
-delta kernel, and both new states are scattered into the pool in place. Decode runs
-the batch in one launch; prefill runs one launch per request (varlen).
+Port of FreeToken models/qwen3_5_moe/gdn.py. Divergences: decode is one fused
+launch per layer (conv, gating, q/k norm, recurrence) that updates the conv ring and
+the recurrent state in place; prefill runs one request at a time (varlen): mx.conv1d
+over the ring's last taps plus the chunk, the Metal gated delta recurrence, and the
+new states scattered into the pool.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import mlx.nn as nn
 from ftmetal.attention.metadata import AttnType, LinearAttnMetadata
 from ftmetal.context import get_global_ctx
 from ftmetal.core import Batch
-from ftmetal.kernel.gdn import compute_gate_decay, gated_delta_recurrence
+from ftmetal.kernel.gdn import compute_gate_decay, gated_delta_recurrence, gdn_decode_step
 from ftmetal.kernel.inplace import scatter_rows
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
@@ -86,36 +87,43 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         conv_in, z = self.in_proj_qkvz.forward_split(hidden_states)
         b, a = self.in_proj_ba.forward_split(hidden_states)
         slots = metadata.cache_indices
-        n_keep = self.conv_kernel_size - 1
+        kernel = self.conv_kernel_size
 
         if batch.is_decode:
-            conv_state = pool.conv_states[li][slots]
-            conv_input = mx.concatenate([conv_state, conv_in[:, None, :]], axis=1)
-            conv_out = nn.silu(self.conv1d.forward(conv_input))
-            q, k, v, g, beta = self.recurrence_inputs(conv_out, a[:, None, :], b[:, None, :])
-            state = pool.recurrent_states[li][slots]
-            y, new_state = gated_delta_recurrence(q, k, v, g, beta, state)
-            pool.conv_states[li] = scatter_rows(pool.conv_states[li], conv_input[:, 1:], slots)
-            pool.recurrent_states[li] = scatter_rows(pool.recurrent_states[li], new_state, slots)
-            core_out = y.reshape(num_tokens, self.num_v_heads, self.head_v_dim)
+            pool.conv_states[li], pool.recurrent_states[li], core_out = gdn_decode_step(
+                pool.conv_states[li],
+                pool.recurrent_states[li],
+                conv_in,
+                self.conv1d.weight.reshape(self.conv_dim, kernel),
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                slots,
+                batch.positions,
+            )
         else:
             outputs = []
             start = 0
             for i, seq_len in enumerate(metadata.seq_lens_host):
                 slot = slots[i : i + 1]
-                conv_state = pool.conv_states[li][slot]
-                conv_input = mx.concatenate(
-                    [conv_state, conv_in[None, start : start + seq_len]], axis=1
-                )
+                first = batch.reqs[i].cached_len
+                last = first + seq_len - 1
+                ring = pool.conv_states[li][slot][0]
+                # The kernel - 1 inputs before this chunk, oldest first, by position mod kernel.
+                taps = mx.array([(first - kernel + 1 + j) % kernel for j in range(kernel - 1)])
+                chunk = conv_in[start : start + seq_len]
+                conv_input = mx.concatenate([ring[taps], chunk])[None]
                 conv_out = nn.silu(self.conv1d.forward(conv_input))
                 q, k, v, g, beta = self.recurrence_inputs(
                     conv_out, a[None, start : start + seq_len], b[None, start : start + seq_len]
                 )
                 state = pool.recurrent_states[li][slot]
                 y, new_state = gated_delta_recurrence(q, k, v, g, beta, state)
-                pool.conv_states[li] = scatter_rows(
-                    pool.conv_states[li], conv_input[:, -n_keep:], slot
-                )
+                written = min(kernel, seq_len)
+                cells = mx.array([(last - j) % kernel for j in range(written)])
+                ring[cells] = chunk[seq_len - 1 - mx.arange(written)]
+                pool.conv_states[li] = scatter_rows(pool.conv_states[li], ring[None], slot)
                 pool.recurrent_states[li] = scatter_rows(pool.recurrent_states[li], new_state, slot)
                 outputs.append(y[0])
                 start += seq_len

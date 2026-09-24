@@ -3,6 +3,7 @@
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
+#include "gdn_step.h"
 #include "rows.h"
 
 namespace nb = nanobind;
@@ -12,6 +13,7 @@ NB_MODULE(_C, m) {
   m.doc() = "ftmetal in-place pool primitives";
 
   m.def("init_library", &ftmetal::init_library, "source"_a);
+  m.def("init_gdn_step_library", &ftmetal::init_gdn_step_library, "source"_a);
 
   m.def(
       "scatter_rows",
@@ -53,4 +55,21 @@ NB_MODULE(_C, m) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       "k_cache[out_loc[i]] = k[i] and v_cache[out_loc[i]] = v[i], in place; returns (k_cache, v_cache).");
+
+  m.def(
+      "gdn_step",
+      &ftmetal::gdn_step,
+      "conv_pool"_a,
+      "state_pool"_a,
+      "conv_in"_a,
+      "conv_weight"_a,
+      "a"_a,
+      "b"_a,
+      "A_log"_a,
+      "dt_bias"_a,
+      "slots"_a,
+      "positions"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      "One GDN decode step per request in place on the pools; returns (conv_pool, state_pool, y).");
 }

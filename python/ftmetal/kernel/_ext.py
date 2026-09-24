@@ -16,5 +16,6 @@ if mx.__version__ != REQUIRED_MLX_VERSION:
 from ftmetal.kernel import _C  # noqa: E402  (import order is the loading contract)
 
 _C.init_library((METAL_DIR / "rows.metal").read_text())
+_C.init_gdn_step_library((METAL_DIR / "gdn_step.metal").read_text())
 
 __all__ = ["_C"]

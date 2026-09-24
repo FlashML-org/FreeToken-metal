@@ -1,7 +1,9 @@
-"""Gated delta rule recurrence as a Metal kernel over [B, T] sequences.
+"""Gated delta rule kernels: the [B, T] recurrence for prefill and the fused decode step.
 
-Adapted from mlx-lm's gated_delta kernel (Apple, MIT). The state is read from and
-written to fresh arrays here; the GDN layer scatters the result into the state pool.
+The recurrence is adapted from mlx-lm's gated_delta kernel (Apple, MIT); it reads and
+writes fresh state arrays and the GDN layer scatters the result into the pool. The
+decode step (gdn_decode_step, a C++ primitive) fuses conv, gating, q/k norm and the
+recurrence for one token per request and updates the pools in place.
 """
 
 from __future__ import annotations
@@ -10,6 +12,8 @@ from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn
+
+from ftmetal.kernel._ext import _C
 
 # Threads per simdgroup; each lane owns key_head_dim / 32 state columns.
 SIMD_WIDTH = 32
@@ -141,4 +145,29 @@ def gated_delta_recurrence(
     return y, state_out
 
 
-__all__ = ["compute_gate_decay", "gated_delta_recurrence"]
+def gdn_decode_step(
+    conv_pool: mx.array,
+    state_pool: mx.array,
+    conv_in: mx.array,
+    conv_weight: mx.array,
+    a: mx.array,
+    b: mx.array,
+    A_log: mx.array,
+    dt_bias: mx.array,
+    slots: mx.array,
+    positions: mx.array,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """One decode token per request, in place on the pools; returns (conv_pool, state_pool, y).
+
+    conv_pool [S, K, conv_dim] is a ring of the last K conv inputs indexed by position
+    mod K; state_pool [S, Hv, Dv, Dk] fp32; conv_in [B, conv_dim]; conv_weight
+    [conv_dim, K]; a, b [B, Hv]; A_log, dt_bias [Hv]; slots, positions int32 [B].
+    y is [B, Hv, Dv] in conv_in's dtype.
+    """
+    conv_pool, state_pool, y = _C.gdn_step(
+        conv_pool, state_pool, conv_in, conv_weight, a, b, A_log, dt_bias, slots, positions
+    )
+    return conv_pool, state_pool, y
+
+
+__all__ = ["compute_gate_decay", "gated_delta_recurrence", "gdn_decode_step"]
