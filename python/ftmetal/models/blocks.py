@@ -24,7 +24,8 @@ def select_last_rows(x: mx.array, batch: Batch) -> mx.array:
     """The hidden row of each request's last token; decode rows are already one per request."""
     if batch.is_decode:
         return x
-    return x[batch.attn_metadata.get_last_indices(batch.size)]
+    metadata = next(iter(batch.attn_metadata.values()))
+    return x[metadata.get_last_indices(batch.size)]
 
 
 __all__ = ["BaseLLMModel", "select_last_rows"]

@@ -1,15 +1,22 @@
 """Per-step attention metadata records the batch carries.
 
-Split out of FreeToken attention/base.py and attention/linear.py (BaseAttnMetadata,
-FLAMetadata) so core.py can type the batch without importing the backends.
+Split out of FreeToken attention/base.py and attention/linear.py (AttnType,
+BaseAttnMetadata, FLAMetadata) so core.py can type the batch without importing the
+backends. The batch keys its metadata by AttnType, one record per backend.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from enum import Enum
 
 import mlx.core as mx
+
+
+class AttnType(str, Enum):
+    FULL = "full"
+    LINEAR = "linear"
 
 
 class BaseAttnMetadata(ABC):
@@ -19,7 +26,7 @@ class BaseAttnMetadata(ABC):
 
 
 @dataclass
-class LinearAttnMetadata:
+class LinearAttnMetadata(BaseAttnMetadata):
     # Query index pointer over the flattened batch, int32 [size + 1].
     cu_seqlens: mx.array
     # Live GDN state slot per request, int32 [size].
@@ -28,5 +35,8 @@ class LinearAttnMetadata:
     seq_lens_host: list[int]
     slots_host: list[int]
 
+    def get_last_indices(self, bs: int) -> mx.array:
+        return self.cu_seqlens[1 : 1 + bs] - 1
 
-__all__ = ["BaseAttnMetadata", "LinearAttnMetadata"]
+
+__all__ = ["AttnType", "BaseAttnMetadata", "LinearAttnMetadata"]

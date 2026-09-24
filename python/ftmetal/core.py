@@ -1,8 +1,9 @@
 """Request and batch records shared by the scheduler, engine and model.
 
 Port of FreeToken core.py. Divergences: input ids are host numpy arrays and batch
-tensors are mx.arrays; there is no global Context (the engine passes Batch to the
-model) and no padded request rows (nothing is captured into a graph).
+tensors are mx.arrays; the batch is passed to the model instead of living in the
+Context, its attention metadata is a dict keyed by AttnType (fla_metadata is the
+LINEAR entry), and there are no padded request rows (nothing is captured into a graph).
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from typing import Literal
 import mlx.core as mx
 import numpy as np
 
-from ftmetal.attention.metadata import BaseAttnMetadata, LinearAttnMetadata
+from ftmetal.attention.metadata import AttnType, BaseAttnMetadata
 
 
 @dataclass
@@ -103,11 +104,8 @@ class Batch:
     input_ids: mx.array = field(init=False)
     positions: mx.array = field(init=False)
     out_loc: mx.array = field(init=False)
-    # Per-request GDN live slot, int32 [size]; None for models without linear attention.
-    linear_slot_ids: mx.array | None = field(default=None, init=False)
-    fla_metadata: LinearAttnMetadata | None = field(default=None, init=False)
-    # Set by the attention backend's prepare_metadata.
-    attn_metadata: BaseAttnMetadata = field(init=False)
+    # One record per attention backend, set by its prepare_metadata.
+    attn_metadata: dict[AttnType, BaseAttnMetadata] = field(default_factory=dict, init=False)
 
     @property
     def is_prefill(self) -> bool:

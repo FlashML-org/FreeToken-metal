@@ -11,7 +11,7 @@ import mlx.core as mx
 import numpy as np
 
 from ftmetal.attention.base import BaseAttnBackend
-from ftmetal.attention.metadata import LinearAttnMetadata
+from ftmetal.attention.metadata import AttnType, LinearAttnMetadata
 from ftmetal.core import Batch
 
 
@@ -22,7 +22,7 @@ class LinearAttnBackend(BaseAttnBackend):
         assert all(slot is not None for slot in slots), "every request needs a GDN state slot"
         cu = np.zeros(len(lens) + 1, dtype=np.int32)
         np.cumsum(lens, out=cu[1:])
-        batch.fla_metadata = LinearAttnMetadata(
+        batch.attn_metadata[AttnType.LINEAR] = LinearAttnMetadata(
             cu_seqlens=mx.array(cu),
             cache_indices=mx.array(np.asarray(slots, dtype=np.int32)),
             seq_lens_host=lens,

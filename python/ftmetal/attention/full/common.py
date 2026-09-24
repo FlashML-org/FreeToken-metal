@@ -15,7 +15,7 @@ import mlx.core as mx
 import numpy as np
 
 from ftmetal.attention.base import AttentionSpec, BaseAttnBackend
-from ftmetal.attention.metadata import BaseAttnMetadata
+from ftmetal.attention.metadata import AttnType, BaseAttnMetadata
 from ftmetal.core import Batch
 from ftmetal.kvcache.mha_pool import MHAKVCache
 from ftmetal.models.config import ModelConfig
@@ -75,7 +75,7 @@ class FullAttnBackend(BaseAttnBackend):
         cu = np.zeros(len(reqs) + 1, dtype=np.int32)
         np.cumsum(extend_lens, out=cu[1:])
         batch.out_loc = mx.array(out_loc)
-        batch.attn_metadata = FullAttnMetadata(
+        batch.attn_metadata[AttnType.FULL] = FullAttnMetadata(
             cu_seqlens_q=mx.array(cu),
             seq_lens=mx.array(np.asarray(seq_lens, dtype=np.int32)),
             page_table=mx.array(page_table),
@@ -98,7 +98,7 @@ class FullAttnBackend(BaseAttnBackend):
         """q [T, num_heads, D], k / v [T, num_kv_heads, D] -> [T, num_heads, D]."""
         if attn_spec is not None:
             raise ValueError("full attention takes no per-call AttentionSpec")
-        metadata = batch.attn_metadata
+        metadata = batch.attn_metadata[AttnType.FULL]
         assert isinstance(metadata, FullAttnMetadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         return self.attend(q, k, v, layer_id, batch, metadata)

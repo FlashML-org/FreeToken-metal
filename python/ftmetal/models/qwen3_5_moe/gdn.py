@@ -11,6 +11,7 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
+from ftmetal.attention.metadata import AttnType, LinearAttnMetadata
 from ftmetal.context import get_global_ctx
 from ftmetal.core import Batch
 from ftmetal.kernel.gdn import compute_gate_decay, gated_delta_recurrence
@@ -78,12 +79,13 @@ class Qwen3_5GatedDeltaNet(BaseOP):
 
     def forward(self, hidden_states: mx.array, batch: Batch) -> mx.array:
         pool = get_global_ctx().linear_state_pool
-        assert pool is not None and batch.fla_metadata is not None
+        metadata = batch.attn_metadata[AttnType.LINEAR]
+        assert pool is not None and isinstance(metadata, LinearAttnMetadata)
         li = pool.local_index(self.layer_id)
         num_tokens = hidden_states.shape[0]
         conv_in, z = self.in_proj_qkvz.forward_split(hidden_states)
         b, a = self.in_proj_ba.forward_split(hidden_states)
-        slots = batch.fla_metadata.cache_indices
+        slots = metadata.cache_indices
         n_keep = self.conv_kernel_size - 1
 
         if batch.is_decode:
@@ -99,7 +101,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         else:
             outputs = []
             start = 0
-            for i, seq_len in enumerate(batch.fla_metadata.seq_lens_host):
+            for i, seq_len in enumerate(metadata.seq_lens_host):
                 slot = slots[i : i + 1]
                 conv_state = pool.conv_states[li][slot]
                 conv_input = mx.concatenate(

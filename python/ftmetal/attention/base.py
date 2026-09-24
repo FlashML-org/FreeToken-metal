@@ -2,25 +2,19 @@
 
 Port of FreeToken attention/base.py. Divergences: only the FULL and LINEAR types
 exist, the base backend defines prepare_metadata alone (each attention type fixes
-its own forward signature), the metadata records live in attention/metadata.py and
-the CUDA-graph capture hooks are gone.
+its own forward signature), AttnType and the metadata records live in
+attention/metadata.py and the CUDA-graph capture hooks are gone.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from enum import Enum
 
 import mlx.core as mx
 
-from ftmetal.attention.metadata import BaseAttnMetadata
+from ftmetal.attention.metadata import AttnType, BaseAttnMetadata
 from ftmetal.core import Batch
-
-
-class AttnType(str, Enum):
-    FULL = "full"
-    LINEAR = "linear"
 
 
 @dataclass
