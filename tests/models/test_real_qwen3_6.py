@@ -1,0 +1,59 @@
+"""Greedy agreement with mlx-lm on the real Qwen3.6 checkpoint.
+
+Needs FTMETAL_TEST_MODEL_PATH pointing at an MLX Qwen3.6-35B-A3B checkpoint; skipped
+otherwise. bf16 free-running greedy trajectories legitimately diverge after a few
+dozen tokens (mlx-lm's own incremental decode differs from its full forward), so the
+check is teacher forced: mlx-lm's top-1 at every position of our sequence must equal
+our token, except where its top two logits tie.
+"""
+
+from __future__ import annotations
+
+import gc
+import json
+import os
+from pathlib import Path
+
+import mlx.core as mx
+import numpy as np
+import pytest
+from mlx_lm import load
+from mlx_lm.utils import load_tokenizer
+
+from ftmetal.core import SamplingParams
+from ftmetal.engine.config import EngineConfig
+from ftmetal.scheduler.scheduler import Scheduler
+
+MODEL_PATH = os.environ.get("FTMETAL_TEST_MODEL_PATH")
+PROMPT = "The capital of France is"
+STEPS = 32
+TIE_MARGIN = 1e-3
+
+pytestmark = pytest.mark.skipif(MODEL_PATH is None, reason="FTMETAL_TEST_MODEL_PATH is not set")
+
+
+def test_greedy_matches_mlx_lm_teacher_forced() -> None:
+    assert MODEL_PATH is not None
+    generation = json.loads((Path(MODEL_PATH) / "generation_config.json").read_text())
+    eos = set(generation["eos_token_id"])
+    prompt = load_tokenizer(Path(MODEL_PATH)).encode(PROMPT)
+
+    scheduler = Scheduler(EngineConfig(model_path=MODEL_PATH, max_seq_len_override=4096), eos)
+    params = SamplingParams(temperature=0.0, max_tokens=STEPS, ignore_eos=True)
+    ours = scheduler.generate(np.array(prompt, dtype=np.int32), params)
+    assert len(ours) == STEPS
+    decode_steps = [s.iteration_ms for s in scheduler.metrics.steps if s.phase == "decode"]
+    assert scheduler.metrics.decode_tokens_per_second(last=16) > 40.0, decode_steps
+    del scheduler
+    gc.collect()
+    mx.clear_cache()
+
+    reference, _ = load(MODEL_PATH)
+    sequence = prompt + ours[:-1]
+    logits = reference(mx.array(sequence)[None])[0, len(prompt) - 1 :].astype(mx.float32)
+    top1 = mx.argmax(logits, axis=-1).tolist()
+    sorted_logits = mx.sort(logits, axis=-1)
+    margins = (sorted_logits[:, -1] - sorted_logits[:, -2]).tolist()
+    mismatches = [(i, ours[i], top1[i], margins[i]) for i in range(STEPS) if ours[i] != top1[i]]
+    assert all(margin < TIE_MARGIN for _, _, _, margin in mismatches), mismatches
+    assert len(mismatches) <= STEPS // 8, mismatches
