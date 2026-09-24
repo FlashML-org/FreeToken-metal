@@ -40,7 +40,7 @@ class EngineConfig:
     dtype: mx.Dtype = mx.bfloat16
     max_running_req: int = 4
     page_size: int = 32
-    attention_backend: AttentionBackendName = "mlx"
+    attention_backend: AttentionBackendName = "metal"
     max_seq_len_override: int | None = None
     num_page_override: int | None = None
     # Prefill token budget per batch; longer prompts are chunked.

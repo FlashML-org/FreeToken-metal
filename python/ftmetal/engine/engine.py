@@ -53,11 +53,13 @@ class Engine:
         self.model_config = model_config
         self.dtype = config.dtype
 
+        # Delta, not the total: an earlier engine's pools may still be alive in the process.
+        resident_before = mx.get_active_memory()
         self.model = create_model(config.architecture, model_config, config.dtype)
         load_weights(
             self.model, config.model_path, model_weight_rules(config.architecture, model_config)
         )
-        self.weights_bytes = mx.get_active_memory()
+        self.weights_bytes = mx.get_active_memory() - resident_before
         logger.info(f"weights resident: {self.weights_bytes / 2**30:.2f} GiB")
 
         budget = memory_budget_bytes(mx.device_info()["max_recommended_working_set_size"])
