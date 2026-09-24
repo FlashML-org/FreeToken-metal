@@ -91,3 +91,11 @@ def router_topk_ref(gates: mx.array, top_k: int, norm_topk_prob: bool) -> tuple[
     if norm_topk_prob:
         topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
     return topk_ids.astype(mx.int32), topk_weights
+
+
+def add_rms_norm_ref(
+    x: mx.array, r: mx.array, weight: mx.array, eps: float
+) -> tuple[mx.array, mx.array]:
+    """The ops path: the residual add, then mx.fast.rms_norm."""
+    h = x + r
+    return h, mx.fast.rms_norm(h, weight, eps)
