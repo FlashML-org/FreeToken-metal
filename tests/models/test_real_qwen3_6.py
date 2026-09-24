@@ -4,7 +4,9 @@ Needs FTMETAL_TEST_MODEL_PATH pointing at an MLX Qwen3.6-35B-A3B checkpoint; ski
 otherwise. bf16 free-running greedy trajectories legitimately diverge after a few
 dozen tokens (mlx-lm's own incremental decode differs from its full forward), so the
 check is teacher forced: mlx-lm's top-1 at every position of our sequence must equal
-our token, except where its top two logits tie.
+our token, except where its top two logits tie. FTMETAL_TEST_ATTENTION_BACKEND (mlx or
+metal, default mlx) picks the full-attention backend; one real engine fits per process,
+since the global Context keeps the previous engine's pools alive.
 """
 
 from __future__ import annotations
@@ -21,10 +23,12 @@ from mlx_lm import load
 from mlx_lm.utils import load_tokenizer
 
 from ftmetal.core import SamplingParams
-from ftmetal.engine.config import EngineConfig
+from ftmetal.engine.config import AttentionBackendName, EngineConfig
 from ftmetal.scheduler.scheduler import Scheduler
 
 MODEL_PATH = os.environ.get("FTMETAL_TEST_MODEL_PATH")
+ATTENTION_BACKENDS: dict[str, AttentionBackendName] = {"mlx": "mlx", "metal": "metal"}
+ATTENTION_BACKEND = ATTENTION_BACKENDS[os.environ.get("FTMETAL_TEST_ATTENTION_BACKEND", "mlx")]
 PROMPT = "The capital of France is"
 STEPS = 32
 TIE_MARGIN = 1e-3
@@ -38,7 +42,10 @@ def test_greedy_matches_mlx_lm_teacher_forced() -> None:
     eos = set(generation["eos_token_id"])
     prompt = load_tokenizer(Path(MODEL_PATH)).encode(PROMPT)
 
-    scheduler = Scheduler(EngineConfig(model_path=MODEL_PATH, max_seq_len_override=4096), eos)
+    config = EngineConfig(
+        model_path=MODEL_PATH, attention_backend=ATTENTION_BACKEND, max_seq_len_override=4096
+    )
+    scheduler = Scheduler(config, eos)
     params = SamplingParams(temperature=0.0, max_tokens=STEPS, ignore_eos=True)
     ours = scheduler.generate(np.array(prompt, dtype=np.int32), params)
     assert len(ours) == STEPS

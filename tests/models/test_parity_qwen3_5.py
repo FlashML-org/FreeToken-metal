@@ -15,32 +15,41 @@ import numpy as np
 import pytest
 
 from ftmetal.core import SamplingParams
-from ftmetal.engine.config import EngineConfig
+from ftmetal.engine.config import AttentionBackendName, EngineConfig
 from ftmetal.scheduler.scheduler import Scheduler
 from tiny_model import build_reference, reference_greedy, save_checkpoint
 
 
-def make_scheduler(path: Path, page_size: int, max_extend_tokens: int = 64) -> Scheduler:
+def make_scheduler(
+    path: Path,
+    page_size: int,
+    max_extend_tokens: int = 64,
+    attention_backend: AttentionBackendName = "mlx",
+) -> Scheduler:
     config = EngineConfig(
         model_path=str(path),
         dtype=mx.float32,
         max_running_req=2,
         page_size=page_size,
+        attention_backend=attention_backend,
         num_page_override=64,
         max_extend_tokens=max_extend_tokens,
     )
     return Scheduler(config, eos_token_ids={127})
 
 
+@pytest.mark.parametrize("attention_backend", ["mlx", "metal"])
 @pytest.mark.parametrize("page_size", [1, 4])
-def test_greedy_decode_matches_mlx_lm(tmp_path: Path, page_size: int) -> None:
+def test_greedy_decode_matches_mlx_lm(
+    tmp_path: Path, page_size: int, attention_backend: AttentionBackendName
+) -> None:
     model = build_reference(seed=0)
     save_checkpoint(model, tmp_path, quantization=None)
     prompt = [int(t) for t in np.random.default_rng(0).integers(1, 120, size=37)]
     steps = 24
     _, expected = reference_greedy(model, prompt, steps)
 
-    scheduler = make_scheduler(tmp_path, page_size)
+    scheduler = make_scheduler(tmp_path, page_size, attention_backend=attention_backend)
     params = SamplingParams(temperature=0.0, max_tokens=steps, ignore_eos=True)
     tokens = scheduler.generate(np.array(prompt, dtype=np.int32), params)
     assert tokens == expected
@@ -74,7 +83,10 @@ def test_chunked_prefill_matches_full_prefill(tmp_path: Path) -> None:
     assert tokens == expected
 
 
-def test_two_requests_batched_match_single(tmp_path: Path) -> None:
+@pytest.mark.parametrize("attention_backend", ["mlx", "metal"])
+def test_two_requests_batched_match_single(
+    tmp_path: Path, attention_backend: AttentionBackendName
+) -> None:
     model = build_reference(seed=3)
     save_checkpoint(model, tmp_path, quantization=None)
     rng = np.random.default_rng(3)
@@ -82,7 +94,7 @@ def test_two_requests_batched_match_single(tmp_path: Path) -> None:
     steps = 12
     expected = [reference_greedy(model, prompt, steps)[1] for prompt in prompts]
 
-    scheduler = make_scheduler(tmp_path, page_size=4)
+    scheduler = make_scheduler(tmp_path, page_size=4, attention_backend=attention_backend)
     for uid, prompt in enumerate(prompts):
         params = SamplingParams(temperature=0.0, max_tokens=steps, ignore_eos=True)
         scheduler.add_request(uid, np.array(prompt, dtype=np.int32), params)
@@ -92,7 +104,10 @@ def test_two_requests_batched_match_single(tmp_path: Path) -> None:
     scheduler.cache_manager.check_integrity()
 
 
-def test_quantized_greedy_decode_matches_mlx_lm(tmp_path: Path) -> None:
+@pytest.mark.parametrize("attention_backend", ["mlx", "metal"])
+def test_quantized_greedy_decode_matches_mlx_lm(
+    tmp_path: Path, attention_backend: AttentionBackendName
+) -> None:
     model = build_reference(seed=4)
 
     def predicate(path: str, module: nn.Module) -> bool:
@@ -107,7 +122,7 @@ def test_quantized_greedy_decode_matches_mlx_lm(tmp_path: Path) -> None:
     steps = 16
     _, expected = reference_greedy(model, prompt, steps)
 
-    scheduler = make_scheduler(tmp_path, page_size=4)
+    scheduler = make_scheduler(tmp_path, page_size=4, attention_backend=attention_backend)
     params = SamplingParams(temperature=0.0, max_tokens=steps, ignore_eos=True)
     tokens = scheduler.generate(np.array(prompt, dtype=np.int32), params)
     assert tokens == expected

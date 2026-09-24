@@ -22,9 +22,6 @@ def zero_rows_ref(pool: mx.array, ids: mx.array) -> mx.array:
     return out
 
 
-__all__ = ["copy_rows_ref", "scatter_rows_ref", "zero_rows_ref"]
-
-
 def gdn_decode_step_ref(
     conv_pool: mx.array,
     state_pool: mx.array,
@@ -91,3 +88,35 @@ def router_topk_ref(gates: mx.array, top_k: int, norm_topk_prob: bool) -> tuple[
     if norm_topk_prob:
         topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
     return topk_ids.astype(mx.int32), topk_weights
+
+
+def flash_decode_ref(
+    q: mx.array,
+    k_cache: mx.array,
+    v_cache: mx.array,
+    page_table: mx.array,
+    seq_lens: mx.array,
+    page_size: int,
+    scale: float,
+) -> mx.array:
+    """fp32 attention of q [B, Hq, D] over each request's first seq_lens[b] paged keys."""
+    group = q.shape[1] // k_cache.shape[1]
+    offsets = mx.arange(page_size, dtype=mx.int32)
+    outputs = []
+    for i, seq_len in enumerate(seq_lens.tolist()):
+        slots = (page_table[i][:, None] * page_size + offsets).reshape(-1)[:seq_len]
+        keys = mx.repeat(k_cache[slots].astype(mx.float32), group, axis=1)
+        values = mx.repeat(v_cache[slots].astype(mx.float32), group, axis=1)
+        scores = mx.einsum("hd,lhd->hl", q[i].astype(mx.float32), keys) * scale
+        outputs.append(mx.einsum("hl,lhd->hd", mx.softmax(scores, axis=-1), values))
+    return mx.stack(outputs)
+
+
+__all__ = [
+    "copy_rows_ref",
+    "flash_decode_ref",
+    "gdn_decode_step_ref",
+    "router_topk_ref",
+    "scatter_rows_ref",
+    "zero_rows_ref",
+]
