@@ -42,6 +42,13 @@ logger = logging.getLogger(__name__)
 PAGE_TABLE_ALIGN = 128
 
 
+def page_table_width(max_seq_len: int, page_size: int) -> int:
+    """Columns of the page table (the donor's _page_table_width): allocate_paged writes whole
+    trailing pages, so the row must reach align_ceil(max_seq_len, page_size), then pad."""
+    tokens = -(-max_seq_len // page_size) * page_size
+    return -(-tokens // PAGE_TABLE_ALIGN) * PAGE_TABLE_ALIGN
+
+
 class ForwardOutput(NamedTuple):
     next_tokens: mx.array
 
@@ -100,8 +107,10 @@ class Engine:
 
         num_tokens = self.num_pages * config.page_size
         self.max_seq_len = min(config.max_seq_len, num_tokens)
-        width = -(-self.max_seq_len // PAGE_TABLE_ALIGN) * PAGE_TABLE_ALIGN
-        self.page_table = np.zeros((config.max_running_req, width), dtype=np.int32)
+        self.aligned_max_seq_len = page_table_width(self.max_seq_len, config.page_size)
+        self.page_table = np.zeros(
+            (config.max_running_req, self.aligned_max_seq_len), dtype=np.int32
+        )
 
         full_attn_backend = {"mlx": FullAttnMLXBackend, "metal": FullAttnMetalBackend}[
             config.attention_backend
@@ -142,4 +151,4 @@ class Engine:
         return arrays
 
 
-__all__ = ["PAGE_TABLE_ALIGN", "Engine", "ForwardOutput"]
+__all__ = ["PAGE_TABLE_ALIGN", "Engine", "ForwardOutput", "page_table_width"]

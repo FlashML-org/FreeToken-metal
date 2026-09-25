@@ -19,9 +19,11 @@ class TableManager:
         self.max_running_reqs = max_running_reqs
         self.free_slots = list(range(max_running_reqs))
         self.page_table = page_table
-        self.width = page_table.shape[1]
+        self.aligned_max_seq_len = page_table.shape[1]
         self.scratch_row = max_running_reqs
-        self.token_pool = mx.zeros(((max_running_reqs + 1) * self.width, 1), dtype=mx.int32)
+        self.token_pool = mx.zeros(
+            ((max_running_reqs + 1) * self.aligned_max_seq_len, 1), dtype=mx.int32
+        )
         mx.eval(self.token_pool)
 
     @property
@@ -35,9 +37,8 @@ class TableManager:
         self.free_slots.append(slot)
 
     def flat_ids(self, table_idx: int, start: int, stop: int) -> np.ndarray:
-        return np.arange(
-            table_idx * self.width + start, table_idx * self.width + stop, dtype=np.int32
-        )
+        base = table_idx * self.aligned_max_seq_len
+        return np.arange(base + start, base + stop, dtype=np.int32)
 
     def write_tokens(self, table_idx: int, start: int, tokens: np.ndarray) -> None:
         """Host tokens into the pool row of table_idx from position start."""
