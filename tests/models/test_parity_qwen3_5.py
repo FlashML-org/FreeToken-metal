@@ -97,8 +97,8 @@ def test_long_prefill_logits_match_mlx_lm(tmp_path: Path) -> None:
     assert mx.allclose(logits[0], expected_logits[-1], atol=1e-4, rtol=1e-4)
 
 
-# 256 tokens: one 200-token prefill (chunked GDN path, ragged last chunk), or 160 chunked
-# then 40 on the per-token path.
+# One 200-token prefill (chunked GDN path, ragged last chunk), or 160 chunked then 40
+# on the per-token path.
 @pytest.mark.parametrize("max_extend_tokens", [256, 160])
 def test_long_prefill_matches_mlx_lm(tmp_path: Path, max_extend_tokens: int) -> None:
     model = build_reference(seed=5)

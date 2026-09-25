@@ -26,9 +26,9 @@ from ftmetal.models.config import LinearGatedDeltaGroupConfig
 
 # The kernel's fixed l2-norm epsilon for q and k.
 QK_NORM_EPS = 1e-6
-# Shortest prefill run chunked: below two chunks the per-token kernel is faster
-# (crossover near 100 tokens on the M4 Pro at the Qwen3.6 shapes).
-CHUNKED_MIN_TOKENS = 128
+# Shortest prefill run chunked; the per-token kernel is faster below it (crossover
+# near 42 tokens on the M4 Pro at the Qwen3.6 shapes).
+CHUNKED_MIN_TOKENS = 48
 
 
 class Qwen3_5GatedDeltaNet(BaseOP):
