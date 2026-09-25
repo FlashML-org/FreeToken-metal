@@ -5,13 +5,14 @@
 
 The model loads once; each depth then runs one greedy request on a random prompt of
 that many tokens and reports the decode rate over its steps after the warm-up, with
-the mean host and wait time per step. Run one backend per process.
+the mean wall time per step. Run one backend per process.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+import time
 import typing
 
 import numpy as np
@@ -22,6 +23,22 @@ from ftmetal.scheduler.scheduler import Scheduler
 
 # The first decode steps compile kernels and fill the allocator cache.
 WARMUP_STEPS = 8
+
+
+def decode_step_seconds(
+    scheduler: Scheduler, prompt: np.ndarray, params: SamplingParams
+) -> list[float]:
+    """Run one prompt to completion; the wall time of each decode iteration of the loop."""
+    scheduler.add_request(0, prompt, params)
+    data = None
+    seconds: list[float] = []
+    while scheduler.runnable or data is not None:
+        started = time.perf_counter()
+        data = scheduler.overlap_loop(data)
+        if data is not None and data.forward_input.batch.is_decode:
+            seconds.append(time.perf_counter() - started)
+    scheduler.take_results()
+    return seconds
 
 
 def main() -> int:
@@ -46,15 +63,11 @@ def main() -> int:
     rng = np.random.default_rng(0)
     for depth in depths:
         prompt = rng.integers(0, config.model_config.vocab_size, size=depth, dtype=np.int32)
-        scheduler.metrics.steps.clear()
-        scheduler.generate(prompt, params)
-        steps = [s for s in scheduler.metrics.steps if s.phase == "decode"][WARMUP_STEPS:]
-        tokens_per_second = len(steps) / (sum(s.iteration_ms for s in steps) / 1000.0)
-        host_ms = sum(s.host_ms for s in steps) / len(steps)
-        wait_ms = sum(s.wait_ms for s in steps) / len(steps)
+        steps = decode_step_seconds(scheduler, prompt, params)[WARMUP_STEPS:]
+        tokens_per_second = len(steps) / sum(steps)
         print(
             f"{args.attention_backend} depth {depth}: {tokens_per_second:.1f} tok/s over "
-            f"{len(steps)} steps (host {host_ms:.2f} ms, wait {wait_ms:.2f} ms per step)",
+            f"{len(steps)} steps ({1000.0 * sum(steps) / len(steps):.2f} ms per step)",
             flush=True,
         )
     return 0

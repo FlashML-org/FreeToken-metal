@@ -11,8 +11,7 @@ from __future__ import annotations
 
 import logging
 import queue
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal, NamedTuple
 
 import mlx.core as mx
@@ -39,6 +38,7 @@ from ftmetal.message.tokenizer import (
 from ftmetal.scheduler.cache import CacheManager
 from ftmetal.scheduler.decode import DecodeManager
 from ftmetal.scheduler.prefill import ChunkedReq, PrefillManager
+from ftmetal.scheduler.status import SchedulerStatusReporter
 from ftmetal.scheduler.table import TableManager
 
 logger = logging.getLogger(__name__)
@@ -64,32 +64,6 @@ class TokenEvent:
     finish_reason: Literal["stop", "length"] | None = None
 
 
-@dataclass
-class StepMetrics:
-    """One overlap iteration: the batch it launched, and where its wall time went."""
-
-    phase: str
-    size: int
-    num_tokens: int
-    # Scheduling, graph build and dispatch of the launched batch.
-    host_ms: float
-    # Blocked on the previous batch's tokens: GPU time not hidden behind the host.
-    wait_ms: float
-    # Whole iteration; throughput is size / iteration_ms.
-    iteration_ms: float
-
-
-@dataclass
-class SchedulerMetrics:
-    steps: list[StepMetrics] = field(default_factory=list)
-
-    def decode_tokens_per_second(self, last: int = 50) -> float:
-        recent = [s for s in self.steps if s.phase == "decode"][-last:]
-        if not recent:
-            return 0.0
-        return sum(s.size for s in recent) / (sum(s.iteration_ms for s in recent) / 1000.0)
-
-
 class Scheduler:
     def __init__(self, config: EngineConfig, eos_token_ids: set[int]) -> None:
         self.engine = Engine(config)
@@ -107,7 +81,9 @@ class Scheduler:
             self.cache_manager, self.table_manager, self.decode_manager
         )
         self.finished_reqs: set[Req] = set()
-        self.metrics = SchedulerMetrics()
+        self.status_reporter = SchedulerStatusReporter(
+            logger.info, decode_log_interval=config.decode_log_interval
+        )
         # Results not yet taken by the caller (run_forever forwards them as messages).
         self.results: list[TokenEvent] = []
         # Requests whose tokens may still come; reported as failed if run_forever dies.
@@ -137,26 +113,29 @@ class Scheduler:
 
     def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
         """One iteration: launch the next batch, then drain the previous one."""
-        started = time.perf_counter()
         forward_input = self.schedule_next_batch()
         ongoing_data = None
         if forward_input is not None:
+            self.report_status(forward_input)
             ongoing_data = self.forward(forward_input)
-        launched = time.perf_counter()
         self.process_last_data(last_data)
-        drained = time.perf_counter()
-        if forward_input is not None:
-            self.metrics.steps.append(
-                StepMetrics(
-                    phase=forward_input.batch.phase,
-                    size=forward_input.batch.size,
-                    num_tokens=forward_input.num_tokens,
-                    host_ms=(launched - started) * 1000.0,
-                    wait_ms=(drained - launched) * 1000.0,
-                    iteration_ms=(drained - started) * 1000.0,
-                )
-            )
         return ongoing_data
+
+    def report_status(self, forward_input: ForwardInput) -> None:
+        pool = self.engine.linear_state_pool
+        linear_slots = None
+        if pool is not None:
+            linear_slots = (pool.num_slots - pool.num_free_slots, pool.num_slots)
+        self.status_reporter.report_batch(
+            forward_input.batch,
+            new_tokens=forward_input.num_tokens,
+            running_reqs=len(self.decode_manager.running_reqs),
+            queue_reqs=len(self.prefill_manager.pending_list),
+            kv_used_pages=self.cache_manager.num_pages - len(self.cache_manager.free_slots),
+            kv_total_pages=self.cache_manager.num_pages,
+            page_size=self.config.page_size,
+            linear_slots=linear_slots,
+        )
 
     def run_forever(
         self,
@@ -218,13 +197,8 @@ class Scheduler:
             if replies:
                 send_tokenizer.put(BatchTokenizerMsg(data=replies))
 
-            steps = self.metrics.steps
-            if data is None and not self.runnable and steps:
-                logger.info(
-                    f"idle after {len(steps)} steps, decode "
-                    f"{self.metrics.decode_tokens_per_second():.1f} tok/s"
-                )
-                steps.clear()
+            if data is None and not self.runnable:
+                self.status_reporter.report_idle()
 
     def send_result(self, events: list[TokenEvent]) -> None:
         self.results.extend(events)
@@ -331,7 +305,5 @@ __all__ = [
     "ForwardData",
     "ForwardInput",
     "Scheduler",
-    "SchedulerMetrics",
-    "StepMetrics",
     "TokenEvent",
 ]

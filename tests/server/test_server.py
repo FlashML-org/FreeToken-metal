@@ -30,7 +30,8 @@ from ftmetal.core import SamplingParams
 from ftmetal.engine.config import EngineConfig
 from ftmetal.message.frontend import BatchFrontendMsg, UserReply
 from ftmetal.message.tokenizer import AbortMsg, BaseTokenizerMsg
-from ftmetal.scheduler.scheduler import ForwardData, Scheduler, SchedulerMetrics, TokenEvent
+from ftmetal.scheduler.scheduler import ForwardData, Scheduler, TokenEvent
+from ftmetal.scheduler.status import SchedulerStatusReporter
 from ftmetal.server import api_server
 from ftmetal.server.api_server import create_app
 from ftmetal.server.args import ServerArgs
@@ -53,9 +54,9 @@ class ScriptedScheduler(Scheduler):
     def __init__(self, config: EngineConfig, eos_token_ids: set[int]) -> None:
         self.tokenizer = Tokenizer.from_file(str(Path(config.model_path) / "tokenizer.json"))
         self.eos_token_id = min(eos_token_ids)
-        self.metrics = SchedulerMetrics()
         self.results: list[TokenEvent] = []
         self.live_uids: set[int] = set()
+        self.status_reporter = SchedulerStatusReporter(lambda line: None)
         # uid -> (tokens left, whether the last one is EOS)
         self.running: dict[int, tuple[list[int], bool]] = {}
         self.aborted: list[int] = []

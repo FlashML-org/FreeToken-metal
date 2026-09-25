@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import gc
 import os
+import time
 
 import mlx.core as mx
 import numpy as np
@@ -45,10 +46,18 @@ def test_greedy_matches_mlx_lm_teacher_forced() -> None:
     )
     scheduler = Scheduler(config, eos)
     params = SamplingParams(temperature=0.0, max_tokens=STEPS, ignore_eos=True)
-    ours = scheduler.generate(np.array(prompt, dtype=np.int32), params)
+    scheduler.add_request(0, np.array(prompt, dtype=np.int32), params)
+    data = None
+    decode_seconds: list[float] = []
+    while scheduler.runnable or data is not None:
+        started = time.perf_counter()
+        data = scheduler.overlap_loop(data)
+        if data is not None and data.forward_input.batch.is_decode:
+            decode_seconds.append(time.perf_counter() - started)
+    ours = [event.token for event in scheduler.take_results()]
     assert len(ours) == STEPS
-    decode_steps = [s.iteration_ms for s in scheduler.metrics.steps if s.phase == "decode"]
-    assert scheduler.metrics.decode_tokens_per_second(last=16) > 40.0, decode_steps
+    last = decode_seconds[-16:]
+    assert len(last) / sum(last) > 40.0, decode_seconds
     del scheduler
     gc.collect()
     mx.clear_cache()

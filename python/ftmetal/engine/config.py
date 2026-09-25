@@ -45,6 +45,8 @@ class EngineConfig:
     num_page_override: int | None = None
     # Prefill token budget per batch; longer prompts are chunked.
     max_extend_tokens: int = 2048
+    # Decode steps between status log lines.
+    decode_log_interval: int = 40
 
     @cached_property
     def raw_config(self) -> dict[str, object]:
