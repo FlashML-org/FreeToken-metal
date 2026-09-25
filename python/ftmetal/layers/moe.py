@@ -2,20 +2,23 @@
 
 Port of FreeToken layers/moe.py (MoELayer). Divergences: the experts live in one
 fused gate_up_proj and one down_proj bank per layer in bf16 or affine quantization;
-routing is computed by the model and handed to forward. The offload subclass
-arrives in round 3.
+routing is computed by the model and handed to forward; from SORT_MIN_PAIRS pairs up
+the pairs are expert-sorted by the moe_align kernel and un-sorted by moe_combine. The
+offload subclass arrives in round 3.
 """
 
 from __future__ import annotations
 
 import mlx.core as mx
 
+from ftmetal.kernel.moe_align import moe_align, moe_combine
 from ftmetal.layers.activation import silu_and_mul
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.quantization.config import AffineScheme
 
-# Below this many (token, expert) pairs the sort costs more than the scattered reads.
-SORT_MIN_PAIRS = 64
+# From this many (token, expert) pairs the expert-sorted path is at least as fast as the
+# unsorted one; measured on the M4 Pro at Qwen3.6-35B-A3B shapes (256 experts, top-8, 4-bit).
+SORT_MIN_PAIRS = 32
 
 
 class ExpertBank(BaseOP):
@@ -88,22 +91,17 @@ class MoELayer(BaseOP):
     ) -> mx.array:
         """Expert compute for a routing decision (the donor's routed_forward): hidden [T, H],
         weights / ids [T, top_k]; the model computes the routing."""
-        x = mx.expand_dims(hidden_states, (-2, -3))
-        do_sort = topk_ids.size >= SORT_MIN_PAIRS
-        indices = topk_ids
-        inverse_order = None
-        if do_sort:
-            flat = topk_ids.flatten()
-            order = mx.argsort(flat)
-            inverse_order = mx.argsort(order)
-            x = x.flatten(0, -3)[order // self.top_k]
-            indices = flat[order]
-        gate_up = self.gate_up_proj.forward(x, indices, do_sort)
-        y = self.down_proj.forward(silu_and_mul(gate_up), indices, do_sort)
-        if inverse_order is not None:
-            y = mx.unflatten(y[inverse_order], 0, topk_ids.shape)
-        y = y.squeeze(-2)
-        return (y * topk_weights[..., None]).sum(axis=-2)
+        if topk_ids.size < SORT_MIN_PAIRS:
+            x = mx.expand_dims(hidden_states, (-2, -3))
+            gate_up = self.gate_up_proj.forward(x, topk_ids, False)
+            y = self.down_proj.forward(silu_and_mul(gate_up), topk_ids, False)
+            return (y.squeeze(-2) * topk_weights[..., None]).sum(axis=-2)
+        else:
+            alignment = moe_align(topk_ids, self.num_experts)
+            x = mx.expand_dims(hidden_states, -2)[alignment.sorted_token_indices]
+            gate_up = self.gate_up_proj.forward(x, alignment.sorted_expert_ids, True)
+            y = self.down_proj.forward(silu_and_mul(gate_up), alignment.sorted_expert_ids, True)
+            return moe_combine(y, alignment.pair_positions, topk_weights)
 
 
 __all__ = ["SORT_MIN_PAIRS", "ExpertBank", "MoELayer"]
