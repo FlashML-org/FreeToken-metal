@@ -61,8 +61,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self.in_proj_ba = LinearMerged(
             hidden_size, [self.num_v_heads, self.num_v_heads], scheme=ba_scheme, dtype=dtype
         )
-        # The checkpoint's causal depthwise conv weight [conv_dim, kernel, 1] (conv1d.weight).
-        self.conv1d = {"weight": mx.zeros((self.conv_dim, self.conv_kernel_size, 1), dtype=dtype)}
+        self.conv1d = DepthwiseConv1d(self.conv_dim, self.conv_kernel_size, dtype)
         self.dt_bias = mx.ones((self.num_v_heads,), dtype=dtype)
         self.A_log = mx.zeros((self.num_v_heads,), dtype=dtype)
         self.norm = GatedRMSNorm(self.head_v_dim, eps=rms_norm_eps, dtype=dtype)
@@ -128,7 +127,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 pool.conv_states[li],
                 pool.recurrent_states[li],
                 conv_in,
-                self.conv1d["weight"].reshape(self.conv_dim, kernel),
+                self.conv1d.weight.reshape(self.conv_dim, kernel),
                 a,
                 b,
                 self.A_log,
@@ -137,7 +136,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 batch.positions,
             )
         else:
-            conv_weight = self.conv1d["weight"].reshape(self.conv_dim, kernel)
+            conv_weight = self.conv1d.weight.reshape(self.conv_dim, kernel)
             outputs = []
             start = 0
             for i, seq_len in enumerate(metadata.seq_lens_host):
@@ -188,4 +187,16 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         return self.out_proj.forward(out)
 
 
-__all__ = ["Qwen3_5GatedDeltaNet"]
+class DepthwiseConv1d(BaseOP):
+    """Holds the checkpoint's causal depthwise conv weight [conv_dim, K, 1] (key conv1d.weight);
+    the fused kernels read it directly, as in FreeToken."""
+
+    def __init__(self, conv_dim: int, kernel_size: int, dtype: mx.Dtype) -> None:
+        super().__init__()
+        self.weight = mx.zeros((conv_dim, kernel_size, 1), dtype=dtype)
+
+    def forward(self) -> mx.array:
+        return self.weight
+
+
+__all__ = ["DepthwiseConv1d", "Qwen3_5GatedDeltaNet"]
