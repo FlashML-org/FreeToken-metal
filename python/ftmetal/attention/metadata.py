@@ -31,9 +31,15 @@ class LinearAttnMetadata(BaseAttnMetadata):
     cu_seqlens: mx.array
     # Live GDN state slot per request, int32 [size].
     cache_indices: mx.array
+    # Prefill: the slot taking each request's snapshot (its next ping-pong slot), or -1 when
+    # this chunk tracks none, int32 [size].
+    track_slots: mx.array
     # Host copies for loops that pick per-request token ranges.
     seq_lens_host: list[int]
     slots_host: list[int]
+    track_slots_host: list[int]
+    # The snapshot's token count per request (its mamba_last_track_seqlen); 0 when untracked.
+    track_seqlens_host: list[int]
 
     def get_last_indices(self, bs: int) -> mx.array:
         return self.cu_seqlens[1 : 1 + bs] - 1

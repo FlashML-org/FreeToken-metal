@@ -6,7 +6,9 @@ value_head_dim, key_head_dim] (the layouts the GDN kernels read directly); clear
 and copying slots are the in-place row primitives; no extra slot_states and no
 runtime rebuild. The conv state of a slot is a ring [kernel, conv_dim] of the last
 kernel conv inputs stored at position mod kernel, so the fused decode step can
-update it in the same launch that reads it (a shift register would race).
+update it in the same launch that reads it (a shift register would race). A prefill
+snapshot for the hybrid radix cache is a whole slot, written into a request's
+ping-pong slot at a SNAPSHOT_CHUNK boundary of its chunk.
 """
 
 from __future__ import annotations
@@ -17,6 +19,9 @@ from ftmetal.kernel.inplace import copy_rows, zero_rows
 from ftmetal.models.config import LinearGatedDeltaGroupConfig
 
 PADDING_SLOT = 0
+# Prefill snapshots land SNAPSHOT_CHUNK tokens apart from a chunk's first token (the chunked
+# recurrence's chunk size), so a snapshot boundary is a chunk-kernel boundary.
+SNAPSHOT_CHUNK = 64
 
 
 class LinearStatePool:
@@ -119,6 +124,7 @@ def linear_pool_num_slots(max_running_req: int) -> int:
 
 __all__ = [
     "PADDING_SLOT",
+    "SNAPSHOT_CHUNK",
     "LinearStatePool",
     "linear_pool_num_slots",
     "linear_state_bytes_per_req",
