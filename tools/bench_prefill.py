@@ -27,7 +27,7 @@ WARMUP_TOKENS = 2048
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("model_path")
-    parser.add_argument("--depths", default="2048,8192")
+    parser.add_argument("--depths", default="2048,8192,32768")
     parser.add_argument("--repeats", type=int, default=3)
     args = parser.parse_args()
     depths = [int(depth) for depth in args.depths.split(",")]
