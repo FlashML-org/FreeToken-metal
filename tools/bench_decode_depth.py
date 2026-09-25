@@ -51,6 +51,7 @@ def main() -> int:
     )
     parser.add_argument("--depths", default="1024,8192,32768")
     parser.add_argument("--decode-steps", type=int, default=64)
+    parser.add_argument("--page-size", type=int, default=32)
     args = parser.parse_args()
     depths = [int(depth) for depth in args.depths.split(",")]
 
@@ -59,6 +60,7 @@ def main() -> int:
         max_running_req=1,
         attention_backend=args.attention_backend,
         max_seq_len_override=max(depths) + args.decode_steps,
+        page_size=args.page_size,
     )
     scheduler = Scheduler(config, eos_token_ids=set())
     params = SamplingParams(temperature=0.0, max_tokens=args.decode_steps, ignore_eos=True)
@@ -68,8 +70,9 @@ def main() -> int:
         steps = decode_step_seconds(scheduler, prompt, params)[WARMUP_STEPS:]
         tokens_per_second = len(steps) / sum(steps)
         print(
-            f"{args.attention_backend} depth {depth}: {tokens_per_second:.1f} tok/s over "
-            f"{len(steps)} steps ({1000.0 * sum(steps) / len(steps):.2f} ms per step)",
+            f"{args.attention_backend} page {args.page_size} depth {depth}: "
+            f"{tokens_per_second:.1f} tok/s over {len(steps)} steps "
+            f"({1000.0 * sum(steps) / len(steps):.2f} ms per step)",
             flush=True,
         )
     return 0

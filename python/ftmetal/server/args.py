@@ -100,6 +100,12 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         help="KV pages to allocate (default: sized from the memory budget)",
     )
     parser.add_argument(
+        "--page-size",
+        type=positive_int,
+        default=ServerArgs.page_size,
+        help="KV page size in tokens (FreeToken's --page-size)",
+    )
+    parser.add_argument(
         "--attention-backend",
         "--attn",
         choices=SUPPORTED_ATTENTION_BACKENDS.supported_names(),
@@ -119,6 +125,7 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         max_output_tokens=namespace.max_output_tokens,
         max_extend_tokens=namespace.max_extend_tokens,
         num_page_override=namespace.num_page_override,
+        page_size=namespace.page_size,
         attention_backend=namespace.attention_backend,
     )
 
