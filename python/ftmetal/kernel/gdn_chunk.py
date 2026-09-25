@@ -358,15 +358,20 @@ STATE_SOURCE = """
         }
       }
       const float chunk_decay = exp(g_last);
-      for (int kk = 0; kk < NK; ++kk) {
+      // Two state fragments per pass: independent MMA chains, measured faster than one
+      // (and than four, which costs registers).
+      for (int kk = 0; kk < NK; kk += 2) {
         for (int e = 0; e < 2; ++e) {
           st[kk].thread_elements()[e] *= chunk_decay;
+          st[kk + 1].thread_elements()[e] *= chunk_decay;
         }
         for (int j = 0; j < NR; ++j) {
           const frag k_frag = load_frag(k_chunk + 8 * j * qk_stride + 8 * kk, qk_stride, true);
+          const frag k_next = load_frag(k_chunk + 8 * j * qk_stride + 8 * kk + 8, qk_stride, true);
           frag vn_frag;
           simdgroup_load(vn_frag, vn_tg + 64 * j, 8);
           simdgroup_multiply_accumulate(st[kk], k_frag, vn_frag, st[kk]);
+          simdgroup_multiply_accumulate(st[kk + 1], k_next, vn_frag, st[kk + 1]);
         }
       }
     }
