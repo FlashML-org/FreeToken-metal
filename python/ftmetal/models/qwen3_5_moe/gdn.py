@@ -3,8 +3,8 @@
 Port of FreeToken models/qwen3_5_moe/gdn.py. Divergences: decode is one fused
 launch per layer (conv, gating, q/k norm, recurrence) that updates the conv ring and
 the recurrent state in place; prefill runs one request at a time (varlen): mx.conv1d
-over the ring's last taps plus the chunk, the Metal gated delta recurrence, and the
-new states scattered into the pool.
+over the ring's last taps plus the chunk, the chunked gated delta rule (the per-token
+recurrence below CHUNKED_MIN_TOKENS), and the new states scattered into the pool.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from ftmetal.attention.metadata import AttnType, LinearAttnMetadata
 from ftmetal.context import get_global_ctx
 from ftmetal.core import Batch
 from ftmetal.kernel.gdn import compute_gate_decay, gated_delta_recurrence, gdn_decode_step
+from ftmetal.kernel.gdn_chunk import gated_delta_chunked
 from ftmetal.kernel.inplace import scatter_rows
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
@@ -25,6 +26,9 @@ from ftmetal.models.config import LinearGatedDeltaGroupConfig
 
 # The kernel's fixed l2-norm epsilon for q and k.
 QK_NORM_EPS = 1e-6
+# Shortest prefill run chunked; the per-token kernel is faster below it (crossover
+# near 42 tokens on the M4 Pro at the Qwen3.6 shapes).
+CHUNKED_MIN_TOKENS = 48
 
 
 class Qwen3_5GatedDeltaNet(BaseOP):
@@ -119,7 +123,10 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                     conv_out, a[None, start : start + seq_len], b[None, start : start + seq_len]
                 )
                 state = pool.recurrent_states[li][slot]
-                y, new_state = gated_delta_recurrence(q, k, v, g, beta, state)
+                if seq_len >= CHUNKED_MIN_TOKENS:
+                    y, new_state = gated_delta_chunked(q, k, v, g, beta, state)
+                else:
+                    y, new_state = gated_delta_recurrence(q, k, v, g, beta, state)
                 written = min(kernel, seq_len)
                 cells = mx.array([(last - j) % kernel for j in range(written)])
                 ring[cells] = chunk[seq_len - 1 - mx.arange(written)]
