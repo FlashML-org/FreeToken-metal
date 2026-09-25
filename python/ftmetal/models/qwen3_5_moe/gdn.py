@@ -2,22 +2,22 @@
 
 Port of FreeToken models/qwen3_5_moe/gdn.py. Divergences: decode is one fused
 launch per layer (conv, gating, q/k norm, recurrence) that updates the conv ring and
-the recurrent state in place; prefill runs one request at a time (varlen): mx.conv1d
-over the ring's last taps plus the chunk, the chunked gated delta rule (the per-token
-recurrence below CHUNKED_MIN_TOKENS), and the new states scattered into the pool. A
-prefill request with a hybrid-radix track boundary runs the recurrence in two parts and
-writes the state and conv ring at the boundary into its track slot.
+the recurrent state in place; prefill runs one request at a time (varlen): one fused
+launch for conv over the ring's last taps plus the chunk, gating and q/k norm, the
+chunked gated delta rule (the per-token recurrence below CHUNKED_MIN_TOKENS), and the
+new states scattered into the pool. A prefill request with a hybrid-radix track
+boundary runs the recurrence in two parts and writes the state and conv ring at the
+boundary into its track slot.
 """
 
 from __future__ import annotations
 
 import mlx.core as mx
-import mlx.nn as nn
 
 from ftmetal.attention.metadata import AttnType, LinearAttnMetadata
 from ftmetal.context import get_global_ctx
 from ftmetal.core import Batch
-from ftmetal.kernel.gdn import compute_gate_decay, gated_delta_recurrence, gdn_decode_step
+from ftmetal.kernel.gdn import gated_delta_recurrence, gdn_decode_step, gdn_prefill_inputs
 from ftmetal.kernel.gdn_chunk import gated_delta_chunked
 from ftmetal.kernel.inplace import scatter_rows
 from ftmetal.kvcache.linear_state_pool import LinearStatePool
@@ -27,8 +27,6 @@ from ftmetal.layers.norm import GatedRMSNorm
 from ftmetal.layers.quantization.config import AffineScheme
 from ftmetal.models.config import LinearGatedDeltaGroupConfig
 
-# The kernel's fixed l2-norm epsilon for q and k.
-QK_NORM_EPS = 1e-6
 # Shortest prefill run chunked; the per-token kernel is faster below it (crossover
 # near 42 tokens on the M4 Pro at the Qwen3.6 shapes).
 CHUNKED_MIN_TOKENS = 48
@@ -63,27 +61,12 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self.in_proj_ba = LinearMerged(
             hidden_size, [self.num_v_heads, self.num_v_heads], scheme=ba_scheme, dtype=dtype
         )
-        self.conv1d = DepthwiseConv1d(self.conv_dim, self.conv_kernel_size, dtype)
+        # The checkpoint's causal depthwise conv weight [conv_dim, kernel, 1] (conv1d.weight).
+        self.conv1d = {"weight": mx.zeros((self.conv_dim, self.conv_kernel_size, 1), dtype=dtype)}
         self.dt_bias = mx.ones((self.num_v_heads,), dtype=dtype)
         self.A_log = mx.zeros((self.num_v_heads,), dtype=dtype)
         self.norm = GatedRMSNorm(self.head_v_dim, eps=rms_norm_eps, dtype=dtype)
         self.out_proj = Linear(self.value_dim, hidden_size, scheme=out_scheme, dtype=dtype)
-
-    def recurrence_inputs(
-        self, conv_out: mx.array, a: mx.array, b: mx.array
-    ) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array]:
-        """conv_out [B, T, conv_dim]; a, b [B, T, num_v_heads] -> q, k, v, g, beta."""
-        batch_size, seq_len, _ = conv_out.shape
-        q, k, v = mx.split(conv_out, [self.key_dim, 2 * self.key_dim], axis=-1)
-        q = q.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
-        k = k.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
-        v = v.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
-        inv_scale = self.head_k_dim**-0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, QK_NORM_EPS)
-        k = inv_scale * mx.fast.rms_norm(k, None, QK_NORM_EPS)
-        g = compute_gate_decay(self.A_log, a, self.dt_bias)
-        beta = mx.sigmoid(b)
-        return q, k, v, g, beta
 
     @staticmethod
     def recurrence(
@@ -100,7 +83,8 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         li: int,
         inputs: tuple[mx.array, mx.array, mx.array, mx.array, mx.array],
         state: mx.array,
-        conv_inputs: mx.array,
+        taps: mx.array,
+        chunk: mx.array,
         first: int,
         split: int,
         track_slot: mx.array,
@@ -108,8 +92,8 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         """The chunk's recurrence from state, split after split tokens; returns y and the end state.
 
         The state and the conv ring after the first split tokens (positions first ..
-        first + split - 1) go to track_slot. conv_inputs [kernel - 1 + T, conv_dim] are the
-        ring taps before the chunk followed by the chunk, i.e. positions from first - kernel + 1.
+        first + split - 1) go to track_slot. taps [kernel - 1, conv_dim] are the conv
+        inputs before the chunk, chunk [T, conv_dim] the chunk's own.
         """
         kernel = self.conv_kernel_size
         assert split >= 1
@@ -120,11 +104,10 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         y_tail, end_state = self.recurrence(
             q[:, split:], k[:, split:], v[:, split:], g[:, split:], beta[:, split:], split_state
         )
-        # The ring holds position p at cell p mod kernel; row r of conv_inputs is position
-        # first - kernel + 1 + r, so the last kernel positions before first + split are rows
-        # split - 1 .. split + kernel - 2.
-        rows = [split - 1 + (cell - first - split) % kernel for cell in range(kernel)]
-        ring = conv_inputs[mx.array(rows)]
+        # The ring holds position p at cell p mod kernel; the last kernel rows of recent are
+        # positions first + split - kernel .. first + split - 1.
+        recent = mx.concatenate([taps, chunk[max(0, split - kernel) : split]])[-kernel:]
+        ring = recent[mx.array([(cell - first - split) % kernel for cell in range(kernel)])]
         pool.conv_states[li] = scatter_rows(pool.conv_states[li], ring[None], track_slot)
         pool.recurrent_states[li] = scatter_rows(pool.recurrent_states[li], split_state, track_slot)
         return mx.concatenate([y_head, y_tail], axis=1), end_state
@@ -145,7 +128,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 pool.conv_states[li],
                 pool.recurrent_states[li],
                 conv_in,
-                self.conv1d.weight.reshape(self.conv_dim, kernel),
+                self.conv1d["weight"].reshape(self.conv_dim, kernel),
                 a,
                 b,
                 self.A_log,
@@ -154,6 +137,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 batch.positions,
             )
         else:
+            conv_weight = self.conv1d["weight"].reshape(self.conv_dim, kernel)
             outputs = []
             start = 0
             for i, seq_len in enumerate(metadata.seq_lens_host):
@@ -162,23 +146,30 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 last = first + seq_len - 1
                 ring = pool.conv_states[li][slot][0]
                 # The kernel - 1 inputs before this chunk, oldest first, by position mod kernel.
-                taps = mx.array([(first - kernel + 1 + j) % kernel for j in range(kernel - 1)])
+                tap_cells = [(first - kernel + 1 + j) % kernel for j in range(kernel - 1)]
+                taps = ring[mx.array(tap_cells)]
                 chunk = conv_in[start : start + seq_len]
-                conv_input = mx.concatenate([ring[taps], chunk])[None]
-                conv_out = nn.silu(self.conv1d.forward(conv_input))
-                q, k, v, g, beta = self.recurrence_inputs(
-                    conv_out, a[None, start : start + seq_len], b[None, start : start + seq_len]
+                inputs = gdn_prefill_inputs(
+                    chunk,
+                    taps,
+                    conv_weight,
+                    a[start : start + seq_len],
+                    b[start : start + seq_len],
+                    self.A_log,
+                    self.dt_bias,
+                    self.num_k_heads,
                 )
                 state = pool.recurrent_states[li][slot]
                 if metadata.track_slots_host[i] < 0:
-                    y, new_state = self.recurrence(q, k, v, g, beta, state)
+                    y, new_state = self.recurrence(*inputs, state)
                 else:
                     y, new_state = self.recurrence_with_snapshot(
                         pool,
                         li,
-                        (q, k, v, g, beta),
+                        inputs,
                         state,
-                        conv_input[0],
+                        taps,
+                        chunk,
                         first,
                         metadata.track_seqlens_host[i] - first,
                         metadata.track_slots[i : i + 1],
@@ -197,16 +188,4 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         return self.out_proj.forward(out)
 
 
-class DepthwiseConv1d(BaseOP):
-    """Causal depthwise conv over [B, L, conv_dim] with the checkpoint's [conv_dim, K, 1] weight."""
-
-    def __init__(self, conv_dim: int, kernel_size: int, dtype: mx.Dtype) -> None:
-        super().__init__()
-        self.conv_dim = conv_dim
-        self.weight = mx.zeros((conv_dim, kernel_size, 1), dtype=dtype)
-
-    def forward(self, x: mx.array) -> mx.array:
-        return mx.conv1d(x, self.weight, groups=self.conv_dim)
-
-
-__all__ = ["DepthwiseConv1d", "Qwen3_5GatedDeltaNet"]
+__all__ = ["Qwen3_5GatedDeltaNet"]

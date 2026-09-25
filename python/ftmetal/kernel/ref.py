@@ -83,6 +83,38 @@ def gdn_decode_step_ref(
     return conv_out_pool, state_out_pool, mx.stack(ys)
 
 
+def gdn_prefill_inputs_ref(
+    conv_in: mx.array,
+    taps: mx.array,
+    conv_weight: mx.array,
+    a: mx.array,
+    b: mx.array,
+    A_log: mx.array,
+    dt_bias: mx.array,
+    num_k_heads: int,
+) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array]:
+    """fp32 ops path of gdn_prefill_inputs: conv1d over taps + chunk, silu, norms, gates."""
+    seq_len, conv_dim = conv_in.shape
+    num_v_heads = a.shape[1]
+    head_dim = conv_dim // (2 * num_k_heads + num_v_heads)
+    key_width = num_k_heads * head_dim
+    window = mx.concatenate([taps, conv_in]).astype(mx.float32)[None]
+    weight = conv_weight.astype(mx.float32)[:, :, None]
+    conv = mx.conv1d(window, weight, groups=conv_dim)[0]
+    x = conv * mx.sigmoid(conv)
+    q = x[:, :key_width].reshape(1, seq_len, num_k_heads, head_dim)
+    k = x[:, key_width : 2 * key_width].reshape(1, seq_len, num_k_heads, head_dim)
+    v = x[:, 2 * key_width :].reshape(1, seq_len, num_v_heads, head_dim)
+    inv_scale = head_dim**-0.5
+    q = (inv_scale**2) * q * mx.rsqrt((q * q).mean(axis=-1, keepdims=True) + 1e-6)
+    k = inv_scale * k * mx.rsqrt((k * k).mean(axis=-1, keepdims=True) + 1e-6)
+    gate = a.astype(mx.float32) + dt_bias.astype(mx.float32)
+    decay = mx.exp(-mx.exp(A_log.astype(mx.float32)) * nn.softplus(gate))
+    beta = mx.sigmoid(b.astype(mx.float32))
+    dtype = conv_in.dtype
+    return q.astype(dtype), k.astype(dtype), v.astype(dtype), decay[None], beta[None]
+
+
 def router_topk_ref(gates: mx.array, top_k: int, norm_topk_prob: bool) -> tuple[mx.array, mx.array]:
     """The ops path of the router: fp32 softmax, argpartition, renormalized weights."""
     scores = mx.softmax(gates, axis=-1, precise=True)
@@ -143,6 +175,7 @@ __all__ = [
     "copy_rows_ref",
     "flash_decode_ref",
     "gdn_decode_step_ref",
+    "gdn_prefill_inputs_ref",
     "moe_align_ref",
     "moe_combine_ref",
     "router_topk_ref",
