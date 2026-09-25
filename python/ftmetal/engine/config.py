@@ -35,7 +35,7 @@ class EngineConfig:
     model_path: str
     dtype: mx.Dtype = mx.bfloat16
     max_running_req: int = 4
-    page_size: int = 32
+    page_size: int = 1
     # Name in attention.SUPPORTED_ATTENTION_BACKENDS; prefill runs on MLX SDPA under both.
     attention_backend: str = "metal"
     max_seq_len_override: int | None = None

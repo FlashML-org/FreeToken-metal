@@ -75,15 +75,11 @@ def validate_attn_backend(backend: str) -> str:
     return backend
 
 
-def create_attention_backend(
-    backend: str,
-    config: ModelConfig,
-    kvcache: MHAKVCache,
-    page_table: np.ndarray,
-    page_size: int,
-    required: frozenset[AttnType] = frozenset({AttnType.FULL}),
-) -> BaseAttnBackend:
-    """The named backend, after the config-time type x page-size capability check."""
+def check_attention_backend(
+    backend: str, page_size: int, required: frozenset[AttnType] = frozenset({AttnType.FULL})
+) -> BackendInfo:
+    """Config-time type x page-size capability check; the page-size rule is the backend's
+    (its kernels'), never the engine's or the cache's, so it is declared in BackendInfo."""
     validate_attn_backend(backend)
     info = attention_backend_info(backend)
     missing = required - info.supported_types
@@ -95,6 +91,19 @@ def create_attention_backend(
         raise ValueError(
             f"attention backend {backend!r} supports page sizes {info.page_sizes}, got {page_size}"
         )
+    return info
+
+
+def create_attention_backend(
+    backend: str,
+    config: ModelConfig,
+    kvcache: MHAKVCache,
+    page_table: np.ndarray,
+    page_size: int,
+    required: frozenset[AttnType] = frozenset({AttnType.FULL}),
+) -> BaseAttnBackend:
+    """The named backend, after the capability check."""
+    check_attention_backend(backend, page_size, required)
     return SUPPORTED_ATTENTION_BACKENDS[backend](config, kvcache, page_table, page_size)
 
 
@@ -103,6 +112,7 @@ __all__ = [
     "BackendInfo",
     "SUPPORTED_ATTENTION_BACKENDS",
     "attention_backend_info",
+    "check_attention_backend",
     "create_attention_backend",
     "validate_attn_backend",
 ]

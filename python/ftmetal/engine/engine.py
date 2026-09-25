@@ -14,7 +14,7 @@ from typing import NamedTuple
 import mlx.core as mx
 import numpy as np
 
-from ftmetal.attention import create_attention_backend
+from ftmetal.attention import check_attention_backend, create_attention_backend
 from ftmetal.attention.base import AttnType, BaseAttnBackend
 from ftmetal.attention.linear import LinearAttnBackend
 from ftmetal.context import Context, set_global_ctx
@@ -58,6 +58,8 @@ class Engine:
         model_config = config.model_config
         self.model_config = model_config
         self.dtype = config.dtype
+        # Fail on a page size the backend's kernels reject before any pool is allocated.
+        check_attention_backend(config.attention_backend, config.page_size)
 
         # Delta, not the total: an earlier engine's pools may still be alive in the process.
         resident_before = mx.get_active_memory()

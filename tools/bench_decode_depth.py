@@ -51,7 +51,7 @@ def main() -> int:
     )
     parser.add_argument("--depths", default="1024,8192,32768")
     parser.add_argument("--decode-steps", type=int, default=64)
-    parser.add_argument("--page-size", type=int, default=32)
+    parser.add_argument("--page-size", type=int, default=1)
     args = parser.parse_args()
     depths = [int(depth) for depth in args.depths.split(",")]
 
