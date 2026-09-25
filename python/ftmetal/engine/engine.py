@@ -66,7 +66,7 @@ class Engine:
         assert isinstance(working_set, int)
         budget = memory_budget_bytes(working_set)
         linear_group = model_config.linear_attention_group()
-        num_slots = linear_pool_num_slots(config.max_running_req)
+        num_slots = linear_pool_num_slots(config.max_running_req, config.linear_state_cache_ratio)
         linear_state_bytes = 0
         if linear_group is not None:
             linear_state_bytes = num_slots * linear_state_bytes_per_req(linear_group, config.dtype)

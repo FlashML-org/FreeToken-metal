@@ -4,7 +4,9 @@ Port of FreeToken models/qwen3_5_moe/gdn.py. Divergences: decode is one fused
 launch per layer (conv, gating, q/k norm, recurrence) that updates the conv ring and
 the recurrent state in place; prefill runs one request at a time (varlen): mx.conv1d
 over the ring's last taps plus the chunk, the chunked gated delta rule (the per-token
-recurrence below CHUNKED_MIN_TOKENS), and the new states scattered into the pool.
+recurrence below CHUNKED_MIN_TOKENS), and the new states scattered into the pool. A
+prefill request with a hybrid-radix track boundary runs the recurrence in two parts and
+writes the state and conv ring at the boundary into its track slot.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from ftmetal.core import Batch
 from ftmetal.kernel.gdn import compute_gate_decay, gated_delta_recurrence, gdn_decode_step
 from ftmetal.kernel.gdn_chunk import gated_delta_chunked
 from ftmetal.kernel.inplace import scatter_rows
+from ftmetal.kvcache.linear_state_pool import LinearStatePool
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
 from ftmetal.layers.norm import GatedRMSNorm
@@ -82,6 +85,47 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         beta = mx.sigmoid(b)
         return q, k, v, g, beta
 
+    @staticmethod
+    def recurrence(
+        q: mx.array, k: mx.array, v: mx.array, g: mx.array, beta: mx.array, state: mx.array
+    ) -> tuple[mx.array, mx.array]:
+        """The gated delta rule over one request's chunk: chunked from CHUNKED_MIN_TOKENS."""
+        if q.shape[1] >= CHUNKED_MIN_TOKENS:
+            return gated_delta_chunked(q, k, v, g, beta, state)
+        return gated_delta_recurrence(q, k, v, g, beta, state)
+
+    def recurrence_with_snapshot(
+        self,
+        pool: LinearStatePool,
+        li: int,
+        inputs: tuple[mx.array, mx.array, mx.array, mx.array, mx.array],
+        state: mx.array,
+        conv_inputs: mx.array,
+        first: int,
+        split: int,
+        track_slot: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        """The chunk's recurrence from state, split after split tokens; returns y and the end state.
+
+        The state and the conv ring after the first split tokens (positions first ..
+        first + split - 1) go to track_slot. conv_inputs [T, conv_dim] are the chunk's.
+        """
+        kernel = self.conv_kernel_size
+        assert split >= kernel, "the ring at the split must come from this chunk"
+        q, k, v, g, beta = inputs
+        y_head, split_state = self.recurrence(
+            q[:, :split], k[:, :split], v[:, :split], g[:, :split], beta[:, :split], state
+        )
+        y_tail, end_state = self.recurrence(
+            q[:, split:], k[:, split:], v[:, split:], g[:, split:], beta[:, split:], split_state
+        )
+        # The ring holds position p at cell p mod kernel.
+        rows = [split - kernel + (cell - first - split) % kernel for cell in range(kernel)]
+        ring = conv_inputs[mx.array(rows)]
+        pool.conv_states[li] = scatter_rows(pool.conv_states[li], ring[None], track_slot)
+        pool.recurrent_states[li] = scatter_rows(pool.recurrent_states[li], split_state, track_slot)
+        return mx.concatenate([y_head, y_tail], axis=1), end_state
+
     def forward(self, hidden_states: mx.array, batch: Batch) -> mx.array:
         pool = get_global_ctx().linear_state_pool
         metadata = batch.attn_metadata[AttnType.LINEAR]
@@ -123,10 +167,19 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                     conv_out, a[None, start : start + seq_len], b[None, start : start + seq_len]
                 )
                 state = pool.recurrent_states[li][slot]
-                if seq_len >= CHUNKED_MIN_TOKENS:
-                    y, new_state = gated_delta_chunked(q, k, v, g, beta, state)
+                if metadata.track_slots_host[i] < 0:
+                    y, new_state = self.recurrence(q, k, v, g, beta, state)
                 else:
-                    y, new_state = gated_delta_recurrence(q, k, v, g, beta, state)
+                    y, new_state = self.recurrence_with_snapshot(
+                        pool,
+                        li,
+                        (q, k, v, g, beta),
+                        state,
+                        chunk,
+                        first,
+                        metadata.track_seqlens_host[i] - first,
+                        metadata.track_slots[i : i + 1],
+                    )
                 written = min(kernel, seq_len)
                 cells = mx.array([(last - j) % kernel for j in range(written)])
                 ring[cells] = chunk[seq_len - 1 - mx.arange(written)]

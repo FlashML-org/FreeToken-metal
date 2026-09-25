@@ -1,7 +1,8 @@
 """Scheduler behaviour under many requests, aborts and page pressure on the tiny model.
 
 Every completed request must still decode greedily to what mlx-lm produces alone,
-and every resource (pages, table rows, GDN slots) must be back in its free list.
+and every resource (pages, table rows, GDN slots) must be back in its free list or
+held evictable by the prefix cache.
 """
 
 from __future__ import annotations
@@ -33,7 +34,8 @@ def assert_all_freed(scheduler: Scheduler) -> None:
     scheduler.cache_manager.check_integrity()
     assert scheduler.table_manager.available_size == scheduler.config.max_running_req
     pool = scheduler.engine.linear_state_pool
-    assert pool is not None and pool.num_free_slots == pool.num_slots - 1
+    assert pool is not None
+    assert scheduler.cache_manager.mamba_available_size == pool.num_slots - 1
 
 
 def tokens_by_uid(events: list[TokenEvent], uids: list[int]) -> list[list[int]]:

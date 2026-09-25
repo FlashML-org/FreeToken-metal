@@ -47,6 +47,9 @@ class EngineConfig:
     max_extend_tokens: int = 2048
     # Decode steps between status log lines.
     decode_log_interval: int = 40
+    # GDN snapshot cache of the hybrid radix cache: int(ratio * max_running_req) slots (at
+    # least 4) on top of the running requests' own slots.
+    linear_state_cache_ratio: float = 2.0
 
     @cached_property
     def raw_config(self) -> dict[str, object]:

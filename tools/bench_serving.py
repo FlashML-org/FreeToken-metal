@@ -1,11 +1,13 @@
 """HTTP serving benchmark: TTFT and decode tok/s against an OpenAI-compatible server.
 
     uv run python tools/bench_serving.py --base-url http://127.0.0.1:1919 \\
-        [--prompt-tokens 2048] [--max-tokens 256] [--concurrency 1] [--rounds 3]
+        [--prompt-tokens 2048] [--max-tokens 256] [--concurrency 1] [--rounds 3] [--repeat 1]
 
 Each round sends `concurrency` streaming chat completions at once and reports the
 per-request time to first token and the decode rate after it, plus the aggregate
-generated tokens per second of the round. Standard library only.
+generated tokens per second of the round. With --repeat N a round sends the same prompts
+N times in a row: pass 0 is cold, later passes measure prefix-cache hits (warm TTFT).
+Standard library only.
 """
 
 from __future__ import annotations
@@ -115,6 +117,9 @@ def main() -> int:
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument(
+        "--repeat", type=int, default=1, help="passes of each round's prompts (warm TTFT)"
+    )
     args = parser.parse_args()
     model = args.model or served_model(args.base_url)
     print(
@@ -127,20 +132,24 @@ def main() -> int:
             make_prompt(args.prompt_tokens, seed=round_index * 100 + i)
             for i in range(args.concurrency)
         ]
-        started = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-            results = list(
-                pool.map(lambda p: one_request(args.base_url, model, p, args.max_tokens), prompts)
+        for pass_index in range(args.repeat):
+            started = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+                results = list(
+                    pool.map(
+                        lambda p: one_request(args.base_url, model, p, args.max_tokens), prompts
+                    )
+                )
+            wall = time.perf_counter() - started
+            generated = sum(r.completion_tokens for r in results)
+            ttft_ms = statistics.median(r.ttft_s for r in results) * 1000
+            decode = statistics.median(r.decode_tokens_per_second for r in results)
+            label = f"round {round_index}" + (f" pass {pass_index}" if args.repeat > 1 else "")
+            print(
+                f"{label}: ttft median {ttft_ms:.0f} ms, decode per request median "
+                f"{decode:.1f} tok/s, aggregate {generated / wall:.1f} tok/s "
+                f"({generated} tokens in {wall:.1f} s)"
             )
-        wall = time.perf_counter() - started
-        generated = sum(r.completion_tokens for r in results)
-        ttft_ms = statistics.median(r.ttft_s for r in results) * 1000
-        decode = statistics.median(r.decode_tokens_per_second for r in results)
-        print(
-            f"round {round_index}: ttft median {ttft_ms:.0f} ms, decode per request median "
-            f"{decode:.1f} tok/s, aggregate {generated / wall:.1f} tok/s "
-            f"({generated} tokens in {wall:.1f} s)"
-        )
     return 0
 
 
