@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ftmetal.core import host_ints
+from ftmetal.kernel.moe_align import ExpertAlignment
 
 
 def scatter_rows_ref(pool: mx.array, rows: mx.array, dst_ids: mx.array) -> mx.array:
@@ -92,6 +93,30 @@ def router_topk_ref(gates: mx.array, top_k: int, norm_topk_prob: bool) -> tuple[
     return topk_ids.astype(mx.int32), topk_weights
 
 
+def moe_align_ref(topk_ids: mx.array, num_experts: int) -> ExpertAlignment:
+    """The ops path of the alignment: an argsort of the flat expert ids and its inverse."""
+    flat = topk_ids.flatten()
+    order = mx.argsort(flat)
+    counts = mx.equal(flat[:, None], mx.arange(num_experts)).sum(axis=0)
+    expert_offsets = mx.concatenate([mx.zeros((1,), dtype=mx.int32), mx.cumsum(counts)])
+    return ExpertAlignment(
+        expert_offsets=expert_offsets.astype(mx.int32),
+        sorted_token_indices=(order // topk_ids.shape[1]).astype(mx.int32),
+        sorted_expert_ids=flat[order].astype(mx.uint32),
+        pair_positions=mx.argsort(order).astype(mx.int32),
+    )
+
+
+def moe_combine_ref(
+    expert_out: mx.array, pair_positions: mx.array, topk_weights: mx.array
+) -> mx.array:
+    """fp32 gather of each token's expert rows and their routing-weighted sum."""
+    num_tokens, top_k = topk_weights.shape
+    rows = expert_out.reshape(num_tokens * top_k, -1)[pair_positions].astype(mx.float32)
+    weighted = rows.reshape(num_tokens, top_k, -1) * topk_weights.astype(mx.float32)[..., None]
+    return weighted.sum(axis=1).astype(expert_out.dtype)
+
+
 def flash_decode_ref(
     q: mx.array,
     k_cache: mx.array,
@@ -118,6 +143,8 @@ __all__ = [
     "copy_rows_ref",
     "flash_decode_ref",
     "gdn_decode_step_ref",
+    "moe_align_ref",
+    "moe_combine_ref",
     "router_topk_ref",
     "scatter_rows_ref",
     "zero_rows_ref",
