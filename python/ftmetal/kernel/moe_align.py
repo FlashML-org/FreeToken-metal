@@ -15,9 +15,9 @@ import mlx.core as mx
 
 from ftmetal.kernel.custom import metal_kernel
 
-SIMD_WIDTH = 32
 # One threadgroup sorts every pair; each thread owns at most one expert in the scan.
 ALIGN_THREADS = 1024
+# The combine is bandwidth-bound: widths 1-8 and 64-512 threads ran within 5% on the M4 Pro.
 COMBINE_VECTOR = 4
 COMBINE_THREADS = 256
 
