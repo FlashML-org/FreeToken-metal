@@ -2,9 +2,10 @@
 
 Port of FreeToken scheduler/scheduler.py. Divergences: one process and one MLX
 stream, so the launch is an async_eval of the sampled tokens plus every pool array
-and the drain is reading those tokens; requests arrive by add_request and results
-leave through send_result as TokenEvents; run_forever is the server's scheduler
-thread body over the message queues.
+and the drain is reading those tokens (a prefix hit's snapshot restore is an in-place
+copy in the launched graph, ordered by the pool arrays it rebinds); requests arrive by
+add_request and results leave through send_result as TokenEvents; run_forever is the
+server's scheduler thread body over the message queues.
 """
 
 from __future__ import annotations
@@ -122,20 +123,25 @@ class Scheduler:
         return ongoing_data
 
     def report_status(self, forward_input: ForwardInput) -> None:
-        pool = self.engine.linear_state_pool
-        linear_slots = None
-        if pool is not None:
-            linear_slots = (pool.num_slots - pool.num_free_slots, pool.num_slots)
+        kv_used_pages, kv_total_pages = self.cache_manager.page_usage()
         self.status_reporter.report_batch(
             forward_input.batch,
             new_tokens=forward_input.num_tokens,
             running_reqs=len(self.decode_manager.running_reqs),
             queue_reqs=len(self.prefill_manager.pending_list),
-            kv_used_pages=self.cache_manager.num_pages - len(self.cache_manager.free_slots),
-            kv_total_pages=self.cache_manager.num_pages,
+            kv_used_pages=kv_used_pages,
+            kv_total_pages=kv_total_pages,
             page_size=self.config.page_size,
-            linear_slots=linear_slots,
+            linear_slots=self.mamba_slot_usage(),
         )
+
+    def mamba_slot_usage(self) -> tuple[int, int] | None:
+        """(used, total) GDN slots; free slots and evictable snapshots are not used."""
+        pool = self.engine.linear_state_pool
+        if pool is None:
+            return None
+        total = pool.num_slots - 1
+        return total - self.cache_manager.mamba_available_size, total
 
     def run_forever(
         self,
@@ -257,11 +263,23 @@ class Scheduler:
 
     def forward(self, forward_input: ForwardInput) -> ForwardData:
         batch, sample_args, write_ids, _ = forward_input
+        self.restore_linear_states(batch)
         output = self.engine.forward_batch(batch, sample_args)
         self.table_manager.write_sampled(output.next_tokens, write_ids)
         mx.async_eval(output.next_tokens, self.table_manager.token_pool, *self.engine.pool_arrays())
         self.decode_manager.filter_reqs(batch.reqs)
         return ForwardData(forward_input, output)
+
+    def restore_linear_states(self, batch: Batch) -> None:
+        """Copy each prefix hit's tree snapshot into its live slot before the forward reads it."""
+        pool = self.engine.linear_state_pool
+        if pool is None or not batch.is_prefill:
+            return
+        for req in batch.reqs:
+            if req.mamba_restore_src is not None:
+                assert req.linear_slot_idx is not None
+                pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)
+                req.mamba_restore_src = None
 
     def process_last_data(self, last_data: ForwardData | None) -> None:
         if last_data is None:

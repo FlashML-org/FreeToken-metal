@@ -22,6 +22,10 @@ PADDING_SLOT = 0
 # Prefill snapshots land SNAPSHOT_CHUNK tokens apart from a chunk's first token (the chunked
 # recurrence's chunk size), so a snapshot boundary is a chunk-kernel boundary.
 SNAPSHOT_CHUNK = 64
+# Slots a running request can hold unevictably: its live slot, two ping-pong track slots
+# and the committed snapshot its cache handle locks through decode.
+SLOTS_PER_RUNNING_REQ = 4
+MIN_SNAPSHOT_CACHE_SLOTS = 4
 
 
 class LinearStatePool:
@@ -117,13 +121,16 @@ def linear_state_bytes_per_req(
     return len(group.layer_ids) * (conv_bytes + rec_bytes)
 
 
-def linear_pool_num_slots(max_running_req: int) -> int:
-    """Round 1 (no prefix cache): one live slot per running request plus the padding slot."""
-    return max_running_req + 1
+def linear_pool_num_slots(max_running_req: int, linear_state_cache_ratio: float) -> int:
+    """The running requests' slots, a cross-request snapshot cache and the padding slot."""
+    snapshot_cache = max(MIN_SNAPSHOT_CACHE_SLOTS, int(linear_state_cache_ratio * max_running_req))
+    return SLOTS_PER_RUNNING_REQ * max_running_req + snapshot_cache + 1
 
 
 __all__ = [
+    "MIN_SNAPSHOT_CACHE_SLOTS",
     "PADDING_SLOT",
+    "SLOTS_PER_RUNNING_REQ",
     "SNAPSHOT_CHUNK",
     "LinearStatePool",
     "linear_pool_num_slots",

@@ -3,7 +3,8 @@
 Port of FreeToken core.py. Divergences: input ids are host numpy arrays and batch
 tensors are mx.arrays; the batch is passed to the model instead of living in the
 Context, its attention metadata is a dict keyed by AttnType (fla_metadata is the
-LINEAR entry), and there are no padded request rows (nothing is captured into a graph).
+LINEAR entry), and there are no padded request rows (nothing is captured into a graph);
+a Req's cache_handle is None while it locks no cached prefix.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import mlx.core as mx
 import numpy as np
 
 from ftmetal.attention.metadata import AttnType, BaseAttnMetadata
+from ftmetal.kvcache.hybrid_radix_cache import HybridCacheHandle
 
 
 @dataclass
@@ -39,11 +41,19 @@ class Req:
     output_len: int
     uid: int
     sampling_params: SamplingParams
+    # The locked prefix-cache match; None when nothing is locked (a miss, or no prefix cache).
+    cache_handle: HybridCacheHandle | None = None
     # GDN state slots; None for models without linear attention.
     linear_slot_idx: int | None = None
+    # Two track slots that take the prefill snapshots in turn (chunk N + 1 launches before
+    # chunk N's snapshot is committed).
     mamba_ping_pong: tuple[int, int] | None = None
+    # Which ping-pong slot takes the next snapshot.
     mamba_next_track_idx: int = 0
+    # The token count of the snapshot written by the last tracked forward, until committed.
     mamba_last_track_seqlen: int | None = None
+    # On a prefix hit: the tree's snapshot slot to copy into the live slot before the first chunk.
+    mamba_restore_src: int | None = None
     aborted: bool = False
 
     def __post_init__(self) -> None:

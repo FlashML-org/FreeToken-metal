@@ -1,8 +1,11 @@
 """Admission of pending prompts into prefill batches, chunked by a token budget.
 
-Port of FreeToken scheduler/prefill.py. Divergences: no prefix cache in round 1 (the
-match always misses), no multimodal or sliding-window currencies; the GDN live slot
-comes from the CacheManager at admission.
+Port of FreeToken scheduler/prefill.py. Admission matches the prefix cache, locks the
+match and reserves the GDN slots (1 live + 2 ping-pong, evicting tree snapshots if short);
+a hit carries the snapshot slot to restore from. Divergences: no multimodal or
+sliding-window currencies; a miss zeroes its live slot here; the cached part of the
+token pool row is not written (only the extended tokens are ever gathered); a
+continuation chunk inherits the pending track snapshot of the chunk before it.
 """
 
 from __future__ import annotations
@@ -12,9 +15,14 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from ftmetal.core import Batch, Req, SamplingParams
+from ftmetal.kvcache.hybrid_radix_cache import HybridCacheHandle
+from ftmetal.kvcache.radix_cache import align_down
 from ftmetal.scheduler.cache import CacheManager, div_ceil
 from ftmetal.scheduler.decode import DecodeManager
 from ftmetal.scheduler.table import TableManager
+
+# GDN slots a request takes at admission: the live slot and the two ping-pong track slots.
+ADMISSION_LINEAR_SLOTS = 3
 
 
 @dataclass
@@ -48,6 +56,18 @@ class ChunkedReq(Req):
 
 
 @dataclass
+class AdmittedResources:
+    """What a request holds from admission on: its locked match, table row and GDN slots."""
+
+    cache_handle: HybridCacheHandle | None
+    table_idx: int
+    linear_slot_idx: int | None
+    ping_pong: tuple[int, int] | None
+    # The tree snapshot to copy into the live slot before the first chunk.
+    restore_src: int | None
+
+
+@dataclass
 class PrefillAdder:
     token_budget: int
     reserved_size: int
@@ -58,47 +78,82 @@ class PrefillAdder:
         page_size = self.cache_manager.page_size
         return (div_ceil(total_len, page_size) - div_ceil(cached_len, page_size)) * page_size
 
-    def try_allocate_one(self, pending: PendingReq) -> tuple[int, int, int | None] | None:
+    def try_allocate_one(self, pending: PendingReq) -> AdmittedResources | None:
         if self.table_manager.available_size == 0:
             return None
-        cached_len = self.cache_manager.match_len(pending.input_ids)
+        match = self.cache_manager.match_req(pending.input_ids)
+        handle = match.handle
+        cached_len = 0 if handle is None else handle.cached_len
         estimated_size = self.kv_reservation_size(
             pending.input_len + pending.output_len, cached_len
         )
         if estimated_size + self.reserved_size > self.cache_manager.available_size:
             return None
-        if not self.cache_manager.can_allocate_linear_slot:
+        # Locking takes the matched pages out of the evictable budget: check again.
+        self.cache_manager.lock(handle)
+        if estimated_size + self.reserved_size > self.cache_manager.available_size:
+            self.cache_manager.unlock(handle)
             return None
+        pool = self.cache_manager.linear_state_pool
+        if pool is not None:
+            if pool.num_free_slots < ADMISSION_LINEAR_SLOTS:
+                self.cache_manager.ensure_mamba_slots(ADMISSION_LINEAR_SLOTS)
+            if pool.num_free_slots < ADMISSION_LINEAR_SLOTS:
+                self.cache_manager.unlock(handle)
+                return None
         table_idx = self.table_manager.allocate()
-        return cached_len, table_idx, self.cache_manager.allocate_linear_slot()
+        if handle is not None:
+            self.table_manager.page_table[table_idx, :cached_len] = handle.kv_indices
+        linear_slot_idx = ping_pong = None
+        if pool is not None:
+            linear_slot_idx = pool.alloc(1)[0]
+            first, second = pool.alloc(2)
+            ping_pong = (first, second)
+            if match.mamba_value is None:
+                pool.clear_slots([linear_slot_idx])
+        return AdmittedResources(handle, table_idx, linear_slot_idx, ping_pong, match.mamba_value)
 
     def add_one_req(
         self,
         pending: PendingReq,
-        table_idx: int,
         cached_len: int,
-        linear_slot_idx: int | None,
+        resources: AdmittedResources,
+        next_track_idx: int,
+        last_track_seqlen: int | None,
     ) -> Req:
         remain_len = pending.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
+        align = self.cache_manager.prefill_chunk_align
+        if align > 1 and 0 < chunk_size < remain_len:
+            # An unaligned end only loses this prompt's snapshot boundaries: keep it when the
+            # budget left cannot fill one unit rather than stall the request.
+            aligned = align_down(cached_len + chunk_size, align) - cached_len
+            chunk_size = aligned if aligned > 0 else chunk_size
         is_chunked = chunk_size < remain_len
         self.token_budget -= chunk_size
         self.reserved_size += self.kv_reservation_size(
             pending.input_len + pending.output_len, cached_len
         )
         self.table_manager.write_tokens(
-            table_idx, cached_len, pending.input_ids[cached_len : cached_len + chunk_size]
+            resources.table_idx,
+            cached_len,
+            pending.input_ids[cached_len : cached_len + chunk_size],
         )
         req_cls = ChunkedReq if is_chunked else Req
         req = req_cls(
             input_ids=pending.input_ids[: cached_len + chunk_size],
-            table_idx=table_idx,
+            table_idx=resources.table_idx,
             cached_len=cached_len,
             output_len=pending.output_len,
             uid=pending.uid,
             sampling_params=pending.sampling_params,
+            cache_handle=resources.cache_handle,
         )
-        req.linear_slot_idx = linear_slot_idx
+        req.linear_slot_idx = resources.linear_slot_idx
+        req.mamba_ping_pong = resources.ping_pong
+        req.mamba_next_track_idx = next_track_idx
+        req.mamba_last_track_seqlen = last_track_seqlen
+        req.mamba_restore_src = resources.restore_src
         return req
 
     def try_add_one(self, pending: PendingReq) -> Req | None:
@@ -106,14 +161,30 @@ class PrefillAdder:
             return None
         chunked = pending.chunked_req
         if chunked is not None:
-            return self.add_one_req(
-                pending, chunked.table_idx, chunked.cached_len, chunked.linear_slot_idx
+            # A continuation already holds its live state: nothing to restore.
+            resources = AdmittedResources(
+                cache_handle=chunked.cache_handle,
+                table_idx=chunked.table_idx,
+                linear_slot_idx=chunked.linear_slot_idx,
+                ping_pong=chunked.mamba_ping_pong,
+                restore_src=None,
             )
-        resource = self.try_allocate_one(pending)
-        if resource is None:
+            # An earlier chunk's snapshot stays pending until a deeper one replaces it, so a
+            # last chunk too short to track still commits one.
+            return self.add_one_req(
+                pending,
+                chunked.cached_len,
+                resources,
+                chunked.mamba_next_track_idx,
+                chunked.mamba_last_track_seqlen,
+            )
+        resources = self.try_allocate_one(pending)
+        if resources is None:
             return None
-        cached_len, table_idx, linear_slot_idx = resource
-        return self.add_one_req(pending, table_idx, cached_len, linear_slot_idx)
+        cached_len = 0 if resources.cache_handle is None else resources.cache_handle.cached_len
+        return self.add_one_req(
+            pending, cached_len, resources, next_track_idx=0, last_track_seqlen=None
+        )
 
 
 @dataclass
@@ -165,4 +236,11 @@ class PrefillManager:
         return len(self.pending_list) > 0
 
 
-__all__ = ["ChunkedReq", "PendingReq", "PrefillAdder", "PrefillManager"]
+__all__ = [
+    "ADMISSION_LINEAR_SLOTS",
+    "AdmittedResources",
+    "ChunkedReq",
+    "PendingReq",
+    "PrefillAdder",
+    "PrefillManager",
+]

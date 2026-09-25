@@ -1,27 +1,37 @@
-"""Page allocation over the host page table.
+"""Page allocation over the host page table, and the hybrid radix prefix cache.
 
-Port of FreeToken scheduler/cache.py (CacheManager), round 1: no prefix cache, so a
-match always misses, an unfinished request keeps its pages and a finished request
-returns every page. The free list holds page-aligned token slots. The manager also
-owns the GDN state slots (the hybrid radix cache's second currency, round 3): a
-request gets a zeroed live slot at admission and returns it with its pages.
-lazy_free_region batches the frees of one drained step; the drain itself is the
-step fence.
+Port of FreeToken scheduler/cache.py (CacheManager: the hybrid_radix path, and the naive
+one for a model without linear attention). The manager owns both currencies of the hybrid
+cache, KV pages and GDN state slots: a request holds a live slot and two ping-pong track
+slots, a prefill commit donates the frozen track snapshot to the tree and a finish donates
+the live slot. Divergences: host numpy page table and free list (page-aligned token
+slots); the cache type follows the model (hybrid radix with a GDN state pool, no prefix
+cache without one); no SWA currency, runtime rebuild or tool-call anchor. lazy_free_region
+batches the frees of one drained step; the drain itself is the step fence.
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Iterator, NamedTuple
 
 import numpy as np
 
 from ftmetal.core import Req
-from ftmetal.kvcache.linear_state_pool import LinearStatePool
+from ftmetal.kvcache.hybrid_radix_cache import HybridCacheHandle, HybridRadixCache
+from ftmetal.kvcache.linear_state_pool import SNAPSHOT_CHUNK, LinearStatePool
+from ftmetal.kvcache.radix_cache import align_down
 
 
 def div_ceil(a: int, b: int) -> int:
     return -(-a // b)
+
+
+class MatchResult(NamedTuple):
+    # The prefix to lock; None on a miss.
+    handle: HybridCacheHandle | None
+    # The GDN snapshot slot to restore the live slot from; None on a miss.
+    mamba_value: int | None
 
 
 class CacheManager:
@@ -36,30 +46,73 @@ class CacheManager:
         self.page_size = page_size
         self.page_table = page_table
         self.linear_state_pool = linear_state_pool
+        self.prefix_cache: HybridRadixCache | None = None
+        if linear_state_pool is not None:
+            # A snapshot boundary must be a node boundary.
+            assert SNAPSHOT_CHUNK % page_size == 0, (
+                f"hybrid radix needs SNAPSHOT_CHUNK({SNAPSHOT_CHUNK}) % page_size({page_size}) == 0"
+            )
+            self.prefix_cache = HybridRadixCache(page_size)
         self.free_slots = np.arange(num_pages, dtype=np.int32) * page_size
         self.deferred_frees: list[np.ndarray] | None = None
 
     @property
-    def available_size(self) -> int:
-        return len(self.free_slots) * self.page_size
+    def prefill_chunk_align(self) -> int:
+        """A snapshot commits only at a page-aligned boundary, so non-final chunks end on one."""
+        return self.page_size if self.prefix_cache is not None else 1
 
     @property
-    def can_allocate_linear_slot(self) -> bool:
-        pool = self.linear_state_pool
-        return pool is None or pool.num_free_slots >= 1
+    def available_size(self) -> int:
+        """Tokens allocatable now: free pages plus the prefix cache's evictable ones."""
+        evictable = 0 if self.prefix_cache is None else self.prefix_cache.full_evictable_size
+        return evictable + len(self.free_slots) * self.page_size
 
-    def allocate_linear_slot(self) -> int | None:
-        """A zeroed live GDN slot, or None for models without linear attention."""
-        pool = self.linear_state_pool
-        if pool is None:
-            return None
-        slot = pool.alloc(1)[0]
-        pool.clear_slots([slot])
-        return slot
+    @property
+    def mamba_available_size(self) -> int:
+        """GDN slots allocatable now: free slots plus unlocked tree snapshots."""
+        cache, pool = self.hybrid_parts()
+        return pool.num_free_slots + cache.mamba_evictable_size
 
-    def match_len(self, input_ids: np.ndarray) -> int:
-        """Cached prefix length; always 0 without a prefix cache."""
-        return 0
+    def page_usage(self) -> tuple[int, int]:
+        """(used, total) pages; evictable prefix-cache pages count as free."""
+        evictable = 0 if self.prefix_cache is None else self.prefix_cache.full_evictable_size
+        used = self.num_pages - len(self.free_slots) - evictable // self.page_size
+        return used, self.num_pages
+
+    def hybrid_parts(self) -> tuple[HybridRadixCache, LinearStatePool]:
+        cache, pool = self.prefix_cache, self.linear_state_pool
+        assert cache is not None and pool is not None, "the prefix cache needs a GDN state pool"
+        return cache, pool
+
+    def match_req(self, input_ids: np.ndarray) -> MatchResult:
+        """The cached prefix of a prompt, leaving at least its last token to extend."""
+        assert len(input_ids) > 0
+        if self.prefix_cache is None:
+            return MatchResult(None, None)
+        match = self.prefix_cache.match_prefix(input_ids[: len(input_ids) - 1])
+        if match.cached_len == 0:
+            return MatchResult(None, None)
+        return MatchResult(
+            HybridCacheHandle(match.cached_len, match.node, match.kv_indices), match.mamba_value
+        )
+
+    def lock(self, handle: HybridCacheHandle | None) -> None:
+        if handle is not None:
+            self.hybrid_parts()[0].inc_lock(handle.node)
+
+    def unlock(self, handle: HybridCacheHandle | None) -> None:
+        if handle is not None:
+            self.hybrid_parts()[0].dec_lock(handle.node)
+
+    def ensure_mamba_slots(self, num_slots: int) -> None:
+        """Evict LRU tree snapshots until num_slots GDN slots are free (or nothing is evictable)."""
+        cache, pool = self.hybrid_parts()
+        while pool.num_free_slots < num_slots:
+            evicted = cache.evict_mamba(num_slots - pool.num_free_slots)
+            if not evicted.mamba_slots:
+                break
+            pool.free(evicted.mamba_slots)
+            self.free_pages(evicted.kv_indices)
 
     def allocate_paged(self, reqs: list[Req]) -> None:
         needed_pages = 0
@@ -72,6 +125,14 @@ class CacheManager:
                 allocation.append((req.table_idx, first_page, last_page))
         if needed_pages == 0:
             return
+        if needed_pages > len(self.free_slots) and self.prefix_cache is not None:
+            # Evicting KV leaves drops their snapshots too: return both currencies.
+            cache, pool = self.hybrid_parts()
+            evicted = cache.evict_full((needed_pages - len(self.free_slots)) * self.page_size)
+            self.free_slots = np.concatenate(
+                [self.free_slots, evicted.kv_indices[:: self.page_size]]
+            )
+            pool.free(evicted.mamba_slots)
         if needed_pages > len(self.free_slots):
             raise RuntimeError("KV pages exhausted")
         pages = self.free_slots[:needed_pages]
@@ -86,15 +147,105 @@ class CacheManager:
             offset += count
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
-        """Commit a request's pages and GDN slot: without a prefix cache only a finish frees."""
-        if not finished:
+        """Commit a request's prefill snapshot, or on finish its prefix, and free what it owns."""
+        if self.prefix_cache is not None:
+            self.cache_req_hybrid(req, finished=finished)
+        elif finished:
+            stop = div_ceil(req.cached_len, self.page_size) * self.page_size
+            self.free_pages(self.page_table[req.table_idx, :stop])
+
+    def cache_req_hybrid(self, req: Req, *, finished: bool) -> None:
+        """Commit KV and the GDN snapshot of a request.
+
+        A prefill commit donates the frozen ping-pong slot (the snapshot its forward wrote at
+        mamba_last_track_seqlen) to the tree and replaces it if the tree took it. A finish
+        donates the live slot (the state at cached_len, if page-aligned) and frees the rest.
+        """
+        cache, pool = self.hybrid_parts()
+        old_handle = req.cache_handle
+        old_cached_len = 0 if old_handle is None else old_handle.cached_len
+        page_indices = self.page_table[req.table_idx, : req.cached_len]
+        track_seqlen = req.mamba_last_track_seqlen
+
+        if finished:
+            # A pending track snapshot (the request finished before its commit) is a shorter
+            # prefix than the live donate below: insert it first, so only [old, prefix_len)
+            # is this request's duplicate to free. The frozen slot is consumed either way.
+            free_upto = old_cached_len
+            if (
+                track_seqlen is not None
+                and 0 < track_seqlen <= req.cached_len
+                and align_down(track_seqlen, self.page_size) == track_seqlen
+                and req.mamba_ping_pong is not None
+            ):
+                frozen = req.mamba_ping_pong[1 - req.mamba_next_track_idx]
+                prefix_len, mamba_exist = cache.insert(
+                    req.input_ids[:track_seqlen], page_indices[:track_seqlen], frozen
+                )
+                pool.free([slot for slot in req.mamba_ping_pong if mamba_exist or slot != frozen])
+                req.mamba_ping_pong = None
+                self.free_pages(page_indices[free_upto : max(free_upto, prefix_len)])
+                free_upto = max(free_upto, track_seqlen)
+            # The live state is at cached_len; attaching it to a shorter (aligned-down) node
+            # would restore an over-advanced state, so an unaligned finish donates nothing.
+            insert_len = align_down(req.cached_len, self.page_size)
+            keep_live = False
+            if insert_len == req.cached_len and insert_len > 0:
+                assert req.linear_slot_idx is not None
+                prefix_len, mamba_exist = cache.insert(
+                    req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx
+                )
+                self.unlock(old_handle)
+                self.free_pages(page_indices[free_upto : max(free_upto, prefix_len)])
+                keep_live = not mamba_exist
+            else:
+                self.unlock(old_handle)
+                self.free_pages(page_indices[free_upto:])
+            self.free_req_slots(req, keep_live=keep_live)
             return
-        stop = div_ceil(req.cached_len, self.page_size) * self.page_size
-        self.free_pages(self.page_table[req.table_idx, :stop])
-        if req.linear_slot_idx is not None:
-            assert self.linear_state_pool is not None
-            self.linear_state_pool.free([req.linear_slot_idx])
-            req.linear_slot_idx = None
+
+        if track_seqlen is None:
+            return
+        if align_down(track_seqlen, self.page_size) != track_seqlen:
+            # The insert would align the key down and attach an over-advanced state; the next
+            # aligned boundary or the finish commits instead.
+            req.mamba_last_track_seqlen = None
+            return
+        assert req.mamba_ping_pong is not None
+        frozen_idx = 1 - req.mamba_next_track_idx
+        frozen = req.mamba_ping_pong[frozen_idx]
+        prefix_len, mamba_exist = cache.insert(
+            req.input_ids[:track_seqlen], page_indices[:track_seqlen], frozen
+        )
+        self.unlock(old_handle)
+        self.free_pages(page_indices[old_cached_len:prefix_len])
+        # Lock the committed node before the replacement alloc below, whose eviction could
+        # otherwise take this still-unlocked node's pages from under the request.
+        match = cache.match_prefix(req.input_ids[:track_seqlen])
+        if prefix_len > old_cached_len:
+            # The dedup free above returned this request's own pages for the shared span;
+            # the row must name the tree's pages the backends read from now on.
+            self.page_table[req.table_idx, old_cached_len:prefix_len] = match.kv_indices[
+                old_cached_len:prefix_len
+            ]
+        req.cache_handle = HybridCacheHandle(match.cached_len, match.node, match.kv_indices)
+        self.lock(req.cache_handle)
+        if not mamba_exist:
+            self.ensure_mamba_slots(1)
+            ping_pong = list(req.mamba_ping_pong)
+            ping_pong[frozen_idx] = pool.alloc(1)[0]
+            req.mamba_ping_pong = (ping_pong[0], ping_pong[1])
+        req.mamba_last_track_seqlen = None
+
+    def free_req_slots(self, req: Req, *, keep_live: bool = False) -> None:
+        """Free a finished request's ping-pong pair and, unless donated, its live slot."""
+        _, pool = self.hybrid_parts()
+        slots = list(req.mamba_ping_pong) if req.mamba_ping_pong is not None else []
+        if not keep_live and req.linear_slot_idx is not None:
+            slots.append(req.linear_slot_idx)
+        pool.free(slots)
+        req.mamba_ping_pong = None
+        req.linear_slot_idx = None
 
     def free_pages(self, token_slots: np.ndarray) -> None:
         if len(token_slots) == 0:
@@ -117,8 +268,22 @@ class CacheManager:
             self.free_slots = np.concatenate([self.free_slots, *frees])
 
     def check_integrity(self) -> None:
-        assert len(self.free_slots) == self.num_pages, "pages leaked or double freed"
+        """Idle only: every page and GDN slot is free or owned by the prefix cache."""
+        cache_pages = 0
+        if self.prefix_cache is not None:
+            cache, pool = self.hybrid_parts()
+            cache.check_integrity()
+            cache_pages = (cache.full_evictable + cache.full_protected) // self.page_size
+            tree_slots = cache.mamba_evictable + cache.mamba_protected
+            assert pool.num_free_slots + tree_slots == pool.num_slots - 1, (
+                f"GDN slots leaked or double freed: free {pool.num_free_slots} + tree "
+                f"{tree_slots} != {pool.num_slots - 1}"
+            )
+        assert len(self.free_slots) + cache_pages == self.num_pages, (
+            f"pages leaked or double freed: free {len(self.free_slots)} + cache {cache_pages} "
+            f"!= {self.num_pages}"
+        )
         assert np.all(self.free_slots % self.page_size == 0)
 
 
-__all__ = ["CacheManager", "div_ceil"]
+__all__ = ["CacheManager", "MatchResult", "div_ceil"]
