@@ -19,7 +19,7 @@ import numpy as np
 
 from ftmetal.core import Req
 from ftmetal.kvcache.hybrid_radix_cache import HybridCacheHandle, HybridRadixCache
-from ftmetal.kvcache.linear_state_pool import SNAPSHOT_CHUNK, LinearStatePool
+from ftmetal.kvcache.linear_state_pool import LinearStatePool
 from ftmetal.kvcache.radix_cache import align_down
 
 
@@ -48,10 +48,6 @@ class CacheManager:
         self.linear_state_pool = linear_state_pool
         self.prefix_cache: HybridRadixCache | None = None
         if linear_state_pool is not None:
-            # A snapshot boundary must be a node boundary.
-            assert SNAPSHOT_CHUNK % page_size == 0, (
-                f"hybrid radix needs SNAPSHOT_CHUNK({SNAPSHOT_CHUNK}) % page_size({page_size}) == 0"
-            )
             self.prefix_cache = HybridRadixCache(page_size)
         self.free_slots = np.arange(num_pages, dtype=np.int32) * page_size
         self.deferred_frees: list[np.ndarray] | None = None

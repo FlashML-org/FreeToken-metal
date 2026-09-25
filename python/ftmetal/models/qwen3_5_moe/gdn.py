@@ -108,10 +108,11 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         """The chunk's recurrence from state, split after split tokens; returns y and the end state.
 
         The state and the conv ring after the first split tokens (positions first ..
-        first + split - 1) go to track_slot. conv_inputs [T, conv_dim] are the chunk's.
+        first + split - 1) go to track_slot. conv_inputs [kernel - 1 + T, conv_dim] are the
+        ring taps before the chunk followed by the chunk, i.e. positions from first - kernel + 1.
         """
         kernel = self.conv_kernel_size
-        assert split >= kernel, "the ring at the split must come from this chunk"
+        assert split >= 1
         q, k, v, g, beta = inputs
         y_head, split_state = self.recurrence(
             q[:, :split], k[:, :split], v[:, :split], g[:, :split], beta[:, :split], state
@@ -119,8 +120,10 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         y_tail, end_state = self.recurrence(
             q[:, split:], k[:, split:], v[:, split:], g[:, split:], beta[:, split:], split_state
         )
-        # The ring holds position p at cell p mod kernel.
-        rows = [split - kernel + (cell - first - split) % kernel for cell in range(kernel)]
+        # The ring holds position p at cell p mod kernel; row r of conv_inputs is position
+        # first - kernel + 1 + r, so the last kernel positions before first + split are rows
+        # split - 1 .. split + kernel - 2.
+        rows = [split - 1 + (cell - first - split) % kernel for cell in range(kernel)]
         ring = conv_inputs[mx.array(rows)]
         pool.conv_states[li] = scatter_rows(pool.conv_states[li], ring[None], track_slot)
         pool.recurrent_states[li] = scatter_rows(pool.recurrent_states[li], split_state, track_slot)
@@ -175,7 +178,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                         li,
                         (q, k, v, g, beta),
                         state,
-                        chunk,
+                        conv_input[0],
                         first,
                         metadata.track_seqlens_host[i] - first,
                         metadata.track_slots[i : i + 1],

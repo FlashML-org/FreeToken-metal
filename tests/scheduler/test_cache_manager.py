@@ -127,14 +127,6 @@ def prefilled(
     return req
 
 
-def test_page_size_must_divide_the_snapshot_chunk() -> None:
-    for page_size in (1, 4, 32, 64):
-        hybrid_manager(page_size=page_size)
-    for page_size in (3, 48, 128):
-        with pytest.raises(AssertionError, match="SNAPSHOT_CHUNK"):
-            hybrid_manager(page_size=page_size)
-
-
 def test_prefill_commit_donates_the_track_snapshot_and_a_shared_prefix_hits() -> None:
     manager, pool, page_table = hybrid_manager()
     prompt = list(range(1, 10))

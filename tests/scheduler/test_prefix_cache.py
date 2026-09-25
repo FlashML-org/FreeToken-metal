@@ -90,15 +90,16 @@ def test_same_prompt_twice_hits_and_decodes_the_same(tmp_path: Path, page_size: 
 
     scheduler = make_scheduler(tmp_path, page_size=page_size, num_pages=2048 // page_size)
     assert run_alone(scheduler, 0, prompt) == (0, expected)
-    # The prefill tracked the deepest 64-token boundary strictly inside the prompt.
-    assert run_alone(scheduler, 1, prompt) == (128, expected)
+    # The prefill tracked the deepest page boundary strictly inside the prompt.
+    snapshot = page_size * ((len(prompt) - 1) // page_size)
+    assert run_alone(scheduler, 1, prompt) == (snapshot, expected)
     scheduler.cache_manager.check_integrity()
-    assert_hit_logits_match(scheduler, model, prompt, 128)
+    assert_hit_logits_match(scheduler, model, prompt, snapshot)
 
 
 def test_next_turn_resumes_from_the_finished_live_state(tmp_path: Path) -> None:
     """At page size 1 a finish donates its live state at any length: the next turn resumes
-    there (157, off the conv ring's period) and tracks 64 tokens further from it."""
+    there (157, off the conv ring's period) and tracks up to its own last token (256)."""
     model = build_reference(seed=28)
     save_checkpoint(model, tmp_path, quantization=None)
     first = random_tokens(28, 150)
@@ -107,8 +108,8 @@ def test_next_turn_resumes_from_the_finished_live_state(tmp_path: Path) -> None:
     assert tokens == reference_greedy(model, first, STEPS)[1]
     second = first + tokens[: STEPS - 1] + random_tokens(29, 100)
     assert run_alone(scheduler, 1, second) == (157, reference_greedy(model, second, STEPS)[1])
-    third = second[:221] + random_tokens(30, 20)
-    assert_hit_logits_match(scheduler, model, third, 221)
+    third = second[:256] + random_tokens(30, 20)
+    assert_hit_logits_match(scheduler, model, third, 256)
 
 
 def test_prompts_sharing_a_snapshot_prefix_reuse_it(tmp_path: Path) -> None:
@@ -116,14 +117,14 @@ def test_prompts_sharing_a_snapshot_prefix_reuse_it(tmp_path: Path) -> None:
     save_checkpoint(model, tmp_path, quantization=None)
     shared = random_tokens(21, 128)
     first = shared + random_tokens(22, 20)  # its snapshot lands at 128
-    second = shared + random_tokens(23, 100)  # hits 128, then tracks 192
-    third = second[:192] + random_tokens(24, 30)  # hits the snapshot the hit committed
+    second = shared + random_tokens(23, 100)  # hits 128, then tracks 224
+    third = second[:224] + random_tokens(24, 30)  # hits the snapshot the hit committed
     scheduler = make_scheduler(tmp_path)
-    for uid, (prompt, cached_len) in enumerate([(first, 0), (second, 128), (third, 192)]):
+    for uid, (prompt, cached_len) in enumerate([(first, 0), (second, 128), (third, 224)]):
         _, expected = reference_greedy(model, prompt, STEPS)
         assert run_alone(scheduler, uid, prompt) == (cached_len, expected)
     scheduler.cache_manager.check_integrity()
-    assert_hit_logits_match(scheduler, model, third, 192)
+    assert_hit_logits_match(scheduler, model, third, 224)
 
 
 def test_identical_prompts_in_one_batch_dedup_their_commits(tmp_path: Path) -> None:
@@ -139,22 +140,21 @@ def test_identical_prompts_in_one_batch_dedup_their_commits(tmp_path: Path) -> N
     for uid in (0, 1):
         assert [event.token for event in events if event.uid == uid] == expected
     scheduler.cache_manager.check_integrity()
-    assert run_alone(scheduler, 2, prompt) == (64, expected)
-    assert_hit_logits_match(scheduler, model, prompt, 64)
+    assert run_alone(scheduler, 2, prompt) == (96, expected)
+    assert_hit_logits_match(scheduler, model, prompt, 96)
 
 
 def test_chunked_prompt_commits_its_last_tracked_snapshot(tmp_path: Path) -> None:
-    """Chunks of 128: [0, 128) tracks 64, [128, 256) tracks 192, and the last chunk of 44
-    tokens tracks nothing, so the commit takes 192 from the chunk before it."""
+    """Chunks of 128 at page 32: [0, 128) tracks 96, [128, 256) tracks 224, and the last
+    chunk of 44 tokens tracks 288; a hit's own 12-token prefill tracks nothing more."""
     model = build_reference(seed=26)
     save_checkpoint(model, tmp_path, quantization=None)
     prompt = random_tokens(26, 300)
     _, expected = reference_greedy(model, prompt, STEPS)
     scheduler = make_scheduler(tmp_path, max_extend_tokens=128)
     assert run_alone(scheduler, 0, prompt) == (0, expected)
-    assert run_alone(scheduler, 1, prompt) == (192, expected)
-    # The hit's own prefill tracked 256 from its restored state.
-    assert_hit_logits_match(scheduler, model, prompt, 256)
+    assert run_alone(scheduler, 1, prompt) == (288, expected)
+    assert_hit_logits_match(scheduler, model, prompt, 288)
 
 
 def test_eviction_under_small_budgets_keeps_outputs(tmp_path: Path) -> None:

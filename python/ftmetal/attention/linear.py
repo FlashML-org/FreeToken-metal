@@ -1,7 +1,7 @@
 """Linear (GDN) attention: metadata only; the layer computes on the state pool.
 
 Port of FreeToken attention/linear.py (build_fla_metadata with its hybrid-radix track
-metadata). A prefill request whose chunk holds a SNAPSHOT_CHUNK boundary strictly inside
+metadata). A prefill request whose chunk holds a page boundary strictly inside
 it tracks the deepest one: the GDN layer writes the state there into the request's next
 ping-pong slot, and the request records the boundary for its commit. Divergences: the
 builder is a backend with the shared prepare_metadata entry; the track fields are a slot
@@ -17,10 +17,15 @@ import numpy as np
 from ftmetal.attention.base import BaseAttnBackend
 from ftmetal.attention.metadata import AttnType, LinearAttnMetadata
 from ftmetal.core import Batch
-from ftmetal.kvcache.linear_state_pool import SNAPSHOT_CHUNK
 
 
 class LinearAttnBackend(BaseAttnBackend):
+    def __init__(self, page_size: int) -> None:
+        # Snapshot boundaries are page boundaries: the radix tree keys nodes by page, and
+        # the GDN layer can split its recurrence at any token. A kernel that only emits
+        # state at its own chunk ends would add its alignment check here.
+        self.page_size = page_size
+
     def prepare_metadata(self, batch: Batch) -> None:
         lens = [req.extend_len for req in batch.reqs]
         slots: list[int] = []
@@ -30,9 +35,9 @@ class LinearAttnBackend(BaseAttnBackend):
             assert req.linear_slot_idx is not None, "every request needs a GDN state slot"
             slots.append(req.linear_slot_idx)
             track_slot, track_seqlen = -1, 0
-            chunks = (req.extend_len - 1) // SNAPSHOT_CHUNK
-            if batch.is_prefill and req.mamba_ping_pong is not None and chunks > 0:
-                track_seqlen = req.cached_len + chunks * SNAPSHOT_CHUNK
+            pages = (req.extend_len - 1) // self.page_size
+            if batch.is_prefill and req.mamba_ping_pong is not None and pages > 0:
+                track_seqlen = req.cached_len + pages * self.page_size
                 track_slot = req.mamba_ping_pong[req.mamba_next_track_idx]
                 req.mamba_last_track_seqlen = track_seqlen
                 req.mamba_next_track_idx = 1 - req.mamba_next_track_idx

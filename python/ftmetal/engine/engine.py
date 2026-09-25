@@ -121,7 +121,7 @@ class Engine:
             )
         }
         if linear_group is not None:
-            self.attn_backends[AttnType.LINEAR] = LinearAttnBackend()
+            self.attn_backends[AttnType.LINEAR] = LinearAttnBackend(config.page_size)
         self.sampler = Sampler(model_config.vocab_size)
         set_global_ctx(
             Context(
