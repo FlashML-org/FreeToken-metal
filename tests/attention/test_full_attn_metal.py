@@ -119,8 +119,9 @@ def test_decode_matches_reference_and_mlx_backend(
     values = mx.where(mx.array(is_key), values, UNREAD_VALUE).astype(dtype)
     kv_cache.store_kv(keys, values, mx.arange(num_tokens, dtype=mx.int32), layer_id=0)
 
-    metal_backend = FullAttnMetalBackend(config, kv_cache, page_table, PAGE_SIZE)
-    mlx_backend = FullAttnMLXBackend(config, kv_cache, page_table, PAGE_SIZE)
+    (spec,) = config.kv_cache_group_specs()
+    metal_backend = FullAttnMetalBackend(config, spec, kv_cache, page_table, PAGE_SIZE)
+    mlx_backend = FullAttnMLXBackend(config, spec, kv_cache, page_table, PAGE_SIZE)
     metal_backend.prepare_metadata(batch)
     metadata = batch.attn_metadata[AttnType.FULL]
     assert isinstance(metadata, FullAttnMetadata)

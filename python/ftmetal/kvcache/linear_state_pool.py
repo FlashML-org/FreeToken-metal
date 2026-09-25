@@ -8,15 +8,20 @@ runtime rebuild. The conv state of a slot is a ring [kernel, conv_dim] of the la
 kernel conv inputs stored at position mod kernel, so the fused decode step can
 update it in the same launch that reads it (a shift register would race). A prefill
 snapshot for the hybrid radix cache is a whole slot, written into a request's
-ping-pong slot at the deepest page boundary inside its chunk.
+ping-pong slot at the deepest page boundary inside its chunk. The pool is built from
+the LINEAR group's spec and prices itself (FreeToken's engine adds state_pool_bytes to
+the KV family's fixed cost instead).
 """
 
 from __future__ import annotations
 
+from typing import Self
+
 import mlx.core as mx
 
 from ftmetal.kernel.inplace import copy_rows, zero_rows
-from ftmetal.models.config import LinearGatedDeltaGroupConfig
+from ftmetal.kvcache.base import BasePool, PoolConfig, PoolCost
+from ftmetal.models.config import KVCacheGroupSpec
 
 PADDING_SLOT = 0
 # Slots a running request can hold unevictably: its live slot, two ping-pong track slots
@@ -25,35 +30,38 @@ SLOTS_PER_RUNNING_REQ = 4
 MIN_SNAPSHOT_CACHE_SLOTS = 4
 
 
-class LinearStatePool:
-    def __init__(
-        self,
-        group: LinearGatedDeltaGroupConfig,
-        num_slots: int,
-        dtype: mx.Dtype,
-        state_dtype: mx.Dtype = mx.float32,
-    ) -> None:
-        self.group = group
+def linear_pool_num_slots(max_running_req: int, linear_state_cache_ratio: float) -> int:
+    """The running requests' slots, a cross-request snapshot cache and the padding slot."""
+    snapshot_cache = max(MIN_SNAPSHOT_CACHE_SLOTS, int(linear_state_cache_ratio * max_running_req))
+    return SLOTS_PER_RUNNING_REQ * max_running_req + snapshot_cache + 1
+
+
+class LinearStatePool(BasePool):
+    def __init__(self, spec: KVCacheGroupSpec, num_slots: int, dtype: mx.Dtype) -> None:
         self._num_slots = num_slots
         self.conv_dtype = dtype
-        self.state_dtype = state_dtype
-        conv_dim = 2 * group.num_key_heads * group.key_head_dim
-        conv_dim += group.num_value_heads * group.value_head_dim
+        self.state_dtype = spec.state_dtype
         self.conv_states = [
-            mx.zeros((num_slots, group.conv_kernel_dim, conv_dim), dtype=dtype)
-            for _ in group.layer_ids
+            mx.zeros((num_slots, *spec.conv_shape), dtype=dtype) for _ in spec.layer_ids
         ]
         self.recurrent_states = [
-            mx.zeros(
-                (num_slots, group.num_value_heads, group.value_head_dim, group.key_head_dim),
-                dtype=state_dtype,
-            )
-            for _ in group.layer_ids
+            mx.zeros((num_slots, *spec.state_shape), dtype=spec.state_dtype) for _ in spec.layer_ids
         ]
         mx.eval(*self.conv_states, *self.recurrent_states)
-        self.local_index_map = {layer_id: i for i, layer_id in enumerate(group.layer_ids)}
+        self.local_index_map = {layer_id: i for i, layer_id in enumerate(spec.layer_ids)}
         self.padding_slot = PADDING_SLOT
         self.free_slots: list[int] = list(range(1, num_slots))
+
+    @classmethod
+    def kv_cost(cls, spec: KVCacheGroupSpec, config: PoolConfig) -> PoolCost:
+        num_slots = linear_pool_num_slots(config.max_running_req, config.linear_state_cache_ratio)
+        return PoolCost(0, num_slots * spec.slot_bytes(config.dtype))
+
+    @classmethod
+    def from_spec(cls, spec: KVCacheGroupSpec, config: PoolConfig, num_pages: int) -> Self:
+        # Slots follow the concurrency, not the page count.
+        num_slots = linear_pool_num_slots(config.max_running_req, config.linear_state_cache_ratio)
+        return cls(spec, num_slots, config.dtype)
 
     @property
     def num_free_slots(self) -> int:
@@ -107,28 +115,10 @@ class LinearStatePool:
         return per_layer * len(self.conv_states)
 
 
-def linear_state_bytes_per_req(
-    group: LinearGatedDeltaGroupConfig, dtype: mx.Dtype, state_dtype: mx.Dtype = mx.float32
-) -> int:
-    conv_dim = 2 * group.num_key_heads * group.key_head_dim
-    conv_dim += group.num_value_heads * group.value_head_dim
-    conv_bytes = conv_dim * group.conv_kernel_dim * dtype.size
-    rec_bytes = group.num_value_heads * group.key_head_dim * group.value_head_dim
-    rec_bytes *= state_dtype.size
-    return len(group.layer_ids) * (conv_bytes + rec_bytes)
-
-
-def linear_pool_num_slots(max_running_req: int, linear_state_cache_ratio: float) -> int:
-    """The running requests' slots, a cross-request snapshot cache and the padding slot."""
-    snapshot_cache = max(MIN_SNAPSHOT_CACHE_SLOTS, int(linear_state_cache_ratio * max_running_req))
-    return SLOTS_PER_RUNNING_REQ * max_running_req + snapshot_cache + 1
-
-
 __all__ = [
     "MIN_SNAPSHOT_CACHE_SLOTS",
     "PADDING_SLOT",
     "SLOTS_PER_RUNNING_REQ",
     "LinearStatePool",
     "linear_pool_num_slots",
-    "linear_state_bytes_per_req",
 ]

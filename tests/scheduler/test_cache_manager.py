@@ -13,9 +13,10 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+from ftmetal.attention.metadata import AttnType
 from ftmetal.core import Req, SamplingParams
 from ftmetal.kvcache.linear_state_pool import LinearStatePool, linear_pool_num_slots
-from ftmetal.models.config import LinearGatedDeltaGroupConfig
+from ftmetal.models.config import KVCacheGroupSpec
 from ftmetal.scheduler.cache import CacheManager, MatchResult
 from ftmetal.scheduler.prefill import ChunkedReq, PendingReq, PrefillAdder
 from ftmetal.scheduler.table import TableManager
@@ -74,16 +75,14 @@ def test_pages_exhausted_raises() -> None:
 
 
 def make_pool(num_slots: int = 16) -> LinearStatePool:
-    group = LinearGatedDeltaGroupConfig(
+    spec = KVCacheGroupSpec(
         name="linear",
+        attn_type=AttnType.LINEAR,
         layer_ids=(0,),
-        num_key_heads=1,
-        num_value_heads=1,
-        key_head_dim=32,
-        value_head_dim=32,
-        conv_kernel_dim=4,
+        conv_shape=(4, 96),
+        state_shape=(1, 32, 32),
     )
-    return LinearStatePool(group, num_slots=num_slots, dtype=mx.float32)
+    return LinearStatePool(spec, num_slots=num_slots, dtype=mx.float32)
 
 
 def hybrid_manager(

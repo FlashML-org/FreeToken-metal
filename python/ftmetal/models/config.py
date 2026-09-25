@@ -2,15 +2,20 @@
 
 Port of FreeToken models/config.py, reduced to the FULL and LINEAR group kinds and
 the fields Qwen3.5-style hybrid MoE models use. Divergences: the quantization config
-is the MLX checkpoint's affine scheme map; no tensor parallelism, vision or MTP.
+is the MLX checkpoint's affine scheme map; no tensor parallelism, vision or MTP; the
+LINEAR group emits a KVCacheGroupSpec too (its per-slot conv and state shapes), so every
+pool is sized from a spec.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import ClassVar, Literal
 
-from ftmetal.attention.base import AttnType
+import mlx.core as mx
+
+from ftmetal.attention.metadata import AttnType
 from ftmetal.layers.quantization.config import QuantConfig
 
 
@@ -22,17 +27,35 @@ class RotaryConfig:
     base: float
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class KVCacheGroupSpec:
+    """The storage view of one attention group: all its pool needs to size and allocate."""
+
     name: str
+    attn_type: AttnType
     layer_ids: tuple[int, ...]
-    num_kv_heads: int
-    head_dim: int
-    attn_type: AttnType = AttnType.FULL
+    # Paged K/V geometry (FULL).
+    num_kv_heads: int = 0
+    head_dim: int = 0
+    # Per-slot state per layer (LINEAR); () when the type has none.
+    conv_shape: tuple[int, ...] = ()
+    state_shape: tuple[int, ...] = ()
+    # The recurrent state's dtype; the conv state and K/V use the engine dtype.
+    state_dtype: mx.Dtype = mx.float32
 
     @property
     def num_layers(self) -> int:
         return len(self.layer_ids)
+
+    def token_bytes(self, dtype: mx.Dtype) -> int:
+        """K and V bytes per token over the group's layers; 0 for per-slot state."""
+        return 2 * self.num_kv_heads * self.head_dim * dtype.size * self.num_layers
+
+    def slot_bytes(self, dtype: mx.Dtype) -> int:
+        """Conv and recurrent state bytes per slot over the group's layers; 0 for paged K/V."""
+        conv_bytes = math.prod(self.conv_shape) * dtype.size if self.conv_shape else 0
+        state_bytes = math.prod(self.state_shape) * self.state_dtype.size if self.state_shape else 0
+        return (conv_bytes + state_bytes) * self.num_layers
 
 
 @dataclass(frozen=True)
@@ -129,16 +152,30 @@ class ModelConfig:
         return AttnType.FULL
 
     def kv_cache_group_specs(self) -> tuple[KVCacheGroupSpec, ...]:
-        return tuple(
-            KVCacheGroupSpec(
-                name=group.name,
-                layer_ids=group.layer_ids,
-                num_kv_heads=group.num_kv_heads,
-                head_dim=group.head_dim,
-            )
-            for group in self.attention_groups
-            if isinstance(group, FullAttentionGroupConfig)
-        )
+        specs: list[KVCacheGroupSpec] = []
+        for group in self.attention_groups:
+            if isinstance(group, FullAttentionGroupConfig):
+                spec = KVCacheGroupSpec(
+                    name=group.name,
+                    attn_type=AttnType.FULL,
+                    layer_ids=group.layer_ids,
+                    num_kv_heads=group.num_kv_heads,
+                    head_dim=group.head_dim,
+                )
+            else:
+                # A conv ring over q, k and v; the state is [Hv, Dv, Dk] as the GDN kernels read it.
+                conv_dim = 2 * group.num_key_heads * group.key_head_dim
+                conv_dim += group.num_value_heads * group.value_head_dim
+                spec = KVCacheGroupSpec(
+                    name=group.name,
+                    attn_type=AttnType.LINEAR,
+                    layer_ids=group.layer_ids,
+                    conv_shape=(group.conv_kernel_dim, conv_dim),
+                    state_shape=(group.num_value_heads, group.value_head_dim, group.key_head_dim),
+                )
+            specs.append(spec)
+        assert len({spec.attn_type for spec in specs}) == len(specs), "one group per attention type"
+        return tuple(specs)
 
 
 __all__ = [

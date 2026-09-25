@@ -167,7 +167,7 @@ def test_eviction_under_small_budgets_keeps_outputs(tmp_path: Path) -> None:
     scheduler = make_scheduler(
         tmp_path, num_pages=16, max_running_req=1, linear_state_cache_ratio=0.0
     )
-    pool = scheduler.engine.linear_state_pool
+    pool = scheduler.engine.ctx.linear_state_pool
     assert pool is not None and pool.num_slots == 9
     for uid, prompt in enumerate(prompts):
         assert run_alone(scheduler, uid, prompt) == (0, expected[uid])

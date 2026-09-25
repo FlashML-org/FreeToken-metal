@@ -33,7 +33,7 @@ def make_scheduler(path: Path, max_running_req: int, num_pages: int) -> Schedule
 def assert_all_freed(scheduler: Scheduler) -> None:
     scheduler.cache_manager.check_integrity()
     assert scheduler.table_manager.available_size == scheduler.config.max_running_req
-    pool = scheduler.engine.linear_state_pool
+    pool = scheduler.engine.ctx.linear_state_pool
     assert pool is not None
     assert scheduler.cache_manager.mamba_available_size == pool.num_slots - 1
 

@@ -3,16 +3,19 @@
 Port of FreeToken kvcache/mha_pool.py (MHAKVCache). Divergences: one [num_tokens,
 num_kv_heads, head_dim] array per storage layer for K and for V (the page size is
 folded into the token axis, one buffer per layer); store_kv is the in-place
-kv_write primitive and the pool is rebound to its result.
+kv_write primitive and the pool is rebound to its result; kv_cost and from_spec take
+the FULL group's spec.
 """
 
 from __future__ import annotations
 
+from typing import Self
+
 import mlx.core as mx
 
 from ftmetal.kernel.inplace import kv_write
-from ftmetal.kvcache.base import BaseKVCachePool
-from ftmetal.models.config import ModelConfig
+from ftmetal.kvcache.base import BaseKVCachePool, PoolConfig, PoolCost
+from ftmetal.models.config import KVCacheGroupSpec
 
 
 class MHAKVCache(BaseKVCachePool):
@@ -41,12 +44,21 @@ class MHAKVCache(BaseKVCachePool):
         mx.eval(*self.k, *self.v)
 
     @classmethod
-    def kv_cost(cls, model_config: ModelConfig, page_size: int, dtype: mx.Dtype) -> tuple[int, int]:
-        per_token = sum(
-            2 * spec.head_dim * spec.num_kv_heads * dtype.size * spec.num_layers
-            for spec in model_config.kv_cache_group_specs()
+    def kv_cost(cls, spec: KVCacheGroupSpec, config: PoolConfig) -> PoolCost:
+        return PoolCost(spec.token_bytes(config.dtype) * config.page_size, 0)
+
+    @classmethod
+    def from_spec(cls, spec: KVCacheGroupSpec, config: PoolConfig, num_pages: int) -> Self:
+        return cls(
+            num_kv_heads=spec.num_kv_heads,
+            num_layers=spec.num_layers,
+            head_dim=spec.head_dim,
+            # + 1: the dummy page padded page-table entries point at.
+            num_pages=num_pages + 1,
+            page_size=config.page_size,
+            dtype=config.dtype,
+            layer_ids=spec.layer_ids,
         )
-        return per_token * page_size, 0
 
     def dense(self, layer_id: int) -> int:
         return self.layer_map[layer_id]
