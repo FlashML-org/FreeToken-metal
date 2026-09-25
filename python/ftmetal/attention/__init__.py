@@ -1,8 +1,10 @@
 """Attention backends, one package per attention type, and the backend registry.
 
-Port of FreeToken attention/__init__.py. Divergences: creators take the pool and page
-table (no global context at construction), there is no prefill,decode pair and no
-auto resolution: two full-attention kernel sets on one machine, chosen by name.
+Port of FreeToken attention/__init__.py. Divergences: creators take the group's spec,
+its pool and the page table (no global context at construction); LINEAR always gets
+LinearAttnBackend, which only builds metadata (FreeToken's backend-driven type); there
+is no prefill,decode pair and no auto resolution: two full-attention kernel sets on one
+machine, chosen by name.
 """
 
 from __future__ import annotations
@@ -15,17 +17,23 @@ import numpy as np
 from ftmetal.attention.metadata import AttnType
 from ftmetal.utils import Registry
 
-# The package initialises before core (which imports attention.metadata), so the backend
-# base class, which needs core, is a type-only import here and creators import lazily.
+# The package initialises before core (which imports attention.metadata), and before
+# models.config and kvcache (which import it too), so the backend base class, the spec and
+# the pool are type-only imports here and creators import lazily.
 if TYPE_CHECKING:
     from ftmetal.attention.base import BaseAttnBackend
-    from ftmetal.kvcache.mha_pool import MHAKVCache
-    from ftmetal.models.config import ModelConfig
+    from ftmetal.kvcache.base import BasePool
+    from ftmetal.models.config import KVCacheGroupSpec, ModelConfig
 
 
 class BackendCreator(Protocol):
     def __call__(
-        self, config: ModelConfig, kvcache: MHAKVCache, page_table: np.ndarray, page_size: int
+        self,
+        config: ModelConfig,
+        spec: KVCacheGroupSpec,
+        pool: BasePool,
+        page_table: np.ndarray,
+        page_size: int,
     ) -> BaseAttnBackend: ...
 
 
@@ -45,11 +53,15 @@ SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
     "mlx", BackendInfo(supported_types=frozenset({AttnType.FULL}))
 )
 def create_mlx_backend(
-    config: ModelConfig, kvcache: MHAKVCache, page_table: np.ndarray, page_size: int
+    config: ModelConfig,
+    spec: KVCacheGroupSpec,
+    pool: BasePool,
+    page_table: np.ndarray,
+    page_size: int,
 ) -> BaseAttnBackend:
     from ftmetal.attention.full.mlx import FullAttnMLXBackend
 
-    return FullAttnMLXBackend(config, kvcache, page_table, page_size)
+    return FullAttnMLXBackend(config, spec, pool, page_table, page_size)
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register(
@@ -57,11 +69,15 @@ def create_mlx_backend(
     BackendInfo(supported_types=frozenset({AttnType.FULL}), page_sizes=(1, 2, 4, 8, 16, 32, 64)),
 )
 def create_metal_backend(
-    config: ModelConfig, kvcache: MHAKVCache, page_table: np.ndarray, page_size: int
+    config: ModelConfig,
+    spec: KVCacheGroupSpec,
+    pool: BasePool,
+    page_table: np.ndarray,
+    page_size: int,
 ) -> BaseAttnBackend:
     from ftmetal.attention.full.metal import FullAttnMetalBackend
 
-    return FullAttnMetalBackend(config, kvcache, page_table, page_size)
+    return FullAttnMetalBackend(config, spec, pool, page_table, page_size)
 
 
 def attention_backend_info(name: str) -> BackendInfo:
@@ -97,14 +113,20 @@ def check_attention_backend(
 def create_attention_backend(
     backend: str,
     config: ModelConfig,
-    kvcache: MHAKVCache,
+    spec: KVCacheGroupSpec,
+    pool: BasePool,
     page_table: np.ndarray,
     page_size: int,
-    required: frozenset[AttnType] = frozenset({AttnType.FULL}),
 ) -> BaseAttnBackend:
-    """The named backend, after the capability check."""
-    check_attention_backend(backend, page_size, required)
-    return SUPPORTED_ATTENTION_BACKENDS[backend](config, kvcache, page_table, page_size)
+    """The backend for spec's type: LINEAR's metadata builder, else the named backend after
+    the capability check."""
+    if spec.attn_type is AttnType.LINEAR:
+        from ftmetal.attention.linear import LinearAttnBackend
+
+        return LinearAttnBackend(page_size)
+    else:
+        check_attention_backend(backend, page_size, frozenset({spec.attn_type}))
+        return SUPPORTED_ATTENTION_BACKENDS[backend](config, spec, pool, page_table, page_size)
 
 
 __all__ = [

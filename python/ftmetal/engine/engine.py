@@ -1,9 +1,11 @@
 """Engine: the model, its pools and one forward step.
 
 Port of FreeToken engine/engine.py. Divergences: no CUDA graphs, streams or TP; the
-page table is a host numpy array the scheduler owns through the CacheManager; one
-attention backend per attention type in the global Context; the forward returns
-lazy sampled tokens and the caller issues the step's async_eval.
+page table is a host numpy array the scheduler owns through the CacheManager; one pool
+and one attention backend per attention type, created from the model's group specs, in
+the global Context (FreeToken builds one KV family and special-cases the GDN state
+pool); the forward returns lazy sampled tokens and the caller issues the step's
+async_eval.
 """
 
 from __future__ import annotations
@@ -16,22 +18,17 @@ import numpy as np
 
 from ftmetal.attention import check_attention_backend, create_attention_backend
 from ftmetal.attention.base import AttnType, BaseAttnBackend
-from ftmetal.attention.linear import LinearAttnBackend
 from ftmetal.context import Context, set_global_ctx
 from ftmetal.core import Batch
 from ftmetal.engine.cache_budget import (
     activation_reserve_bytes,
     memory_budget_bytes,
     plan_budget,
+    solve_num_pages,
 )
 from ftmetal.engine.config import EngineConfig
 from ftmetal.engine.sample import BatchSamplingArgs, Sampler
-from ftmetal.kvcache.linear_state_pool import (
-    LinearStatePool,
-    linear_pool_num_slots,
-    linear_state_bytes_per_req,
-)
-from ftmetal.kvcache.mha_pool import MHAKVCache
+from ftmetal.kvcache import create_pools, pool_costs
 from ftmetal.models.loader import load_weights
 from ftmetal.models.register import create_model, model_weight_rules
 
@@ -73,38 +70,13 @@ class Engine:
         working_set = mx.device_info()["max_recommended_working_set_size"]
         assert isinstance(working_set, int)
         budget = memory_budget_bytes(working_set)
-        linear_group = model_config.linear_attention_group()
-        num_slots = linear_pool_num_slots(config.max_running_req, config.linear_state_cache_ratio)
-        linear_state_bytes = 0
-        if linear_group is not None:
-            linear_state_bytes = num_slots * linear_state_bytes_per_req(linear_group, config.dtype)
+        specs = model_config.kv_cache_group_specs()
         activations = activation_reserve_bytes(config.max_extend_tokens, model_config.num_qo_heads)
-        report = plan_budget(budget, self.weights_bytes, linear_state_bytes, activations)
+        report = plan_budget(budget, self.weights_bytes, activations, pool_costs(specs, config))
         for line in report.lines():
             logger.info(line)
-
-        kv_specs = model_config.kv_cache_group_specs()
-        assert len(kv_specs) == 1, "one paged-KV group per model"
-        self.num_pages = MHAKVCache.solve_num_pages(
-            model_config,
-            config.page_size,
-            config.dtype,
-            report.kv_available,
-            config.num_page_override,
-        )
-        # + 1: the dummy page padded page-table entries point at.
-        self.kv_cache = MHAKVCache(
-            num_kv_heads=kv_specs[0].num_kv_heads,
-            num_layers=model_config.num_layers,
-            head_dim=kv_specs[0].head_dim,
-            num_pages=self.num_pages + 1,
-            page_size=config.page_size,
-            dtype=config.dtype,
-            layer_ids=kv_specs[0].layer_ids,
-        )
-        self.linear_state_pool: LinearStatePool | None = None
-        if linear_group is not None:
-            self.linear_state_pool = LinearStatePool(linear_group, num_slots, config.dtype)
+        self.num_pages = solve_num_pages(report, config.page_size, config.num_page_override)
+        self.pools = create_pools(specs, config, self.num_pages)
 
         num_tokens = self.num_pages * config.page_size
         self.max_seq_len = min(config.max_seq_len, num_tokens)
@@ -114,25 +86,21 @@ class Engine:
         )
 
         self.attn_backends: dict[AttnType, BaseAttnBackend] = {
-            AttnType.FULL: create_attention_backend(
+            spec.attn_type: create_attention_backend(
                 config.attention_backend,
                 model_config,
-                self.kv_cache,
+                spec,
+                self.pools[spec.attn_type],
                 self.page_table,
                 config.page_size,
             )
+            for spec in specs
         }
-        if linear_group is not None:
-            self.attn_backends[AttnType.LINEAR] = LinearAttnBackend(config.page_size)
         self.sampler = Sampler(model_config.vocab_size)
-        set_global_ctx(
-            Context(
-                page_size=config.page_size,
-                attn_backends=self.attn_backends,
-                kv_cache=self.kv_cache,
-                linear_state_pool=self.linear_state_pool,
-            )
+        self.ctx = Context(
+            page_size=config.page_size, pools=self.pools, attn_backends=self.attn_backends
         )
+        set_global_ctx(self.ctx)
         mx.set_wired_limit(budget)
         logger.info(f"memory after init: {mx.get_active_memory() / 2**30:.2f} GiB")
 
@@ -147,10 +115,7 @@ class Engine:
         return ForwardOutput(self.sampler.sample(logits, args))
 
     def pool_arrays(self) -> list[mx.array]:
-        arrays = self.kv_cache.arrays()
-        if self.linear_state_pool is not None:
-            arrays += self.linear_state_pool.arrays()
-        return arrays
+        return [array for pool in self.pools.values() for array in pool.arrays()]
 
 
 __all__ = ["PAGE_TABLE_ALIGN", "Engine", "ForwardOutput", "page_table_width"]

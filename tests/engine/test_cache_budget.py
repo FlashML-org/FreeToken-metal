@@ -11,15 +11,17 @@ from typing import NamedTuple
 
 import pytest
 
+from ftmetal.attention.metadata import AttnType
 from ftmetal.engine.cache_budget import (
     GIB,
     activation_reserve_bytes,
     memory_budget_bytes,
     plan_budget,
+    solve_num_pages,
 )
 from ftmetal.engine.config import EngineConfig
-from ftmetal.kvcache.linear_state_pool import linear_pool_num_slots, linear_state_bytes_per_req
-from ftmetal.kvcache.mha_pool import MHAKVCache
+from ftmetal.kvcache import pool_costs
+from ftmetal.kvcache.base import PoolCost
 from ftmetal.models.qwen3_5_moe.config import parse_config
 
 # The text_config fields of Qwen3.6-35B-A3B that its attention groups are parsed from.
@@ -127,20 +129,13 @@ def test_qwen3_6_budget_reproduces_pages_and_slots(
         max_extend_tokens=case.max_extend_tokens,
         num_page_override=case.num_page_override,
     )
-    linear_group = model_config.linear_attention_group()
-    assert linear_group is not None
-    num_slots = linear_pool_num_slots(config.max_running_req, config.linear_state_cache_ratio)
-    slot_bytes = linear_state_bytes_per_req(linear_group, config.dtype)
-    assert (num_slots, slot_bytes) == (case.num_slots, GDN_SLOT_BYTES)
+    costs = pool_costs(model_config.kv_cache_group_specs(), config)
+    assert costs[AttnType.LINEAR] == PoolCost(0, case.num_slots * GDN_SLOT_BYTES)
 
     activations = activation_reserve_bytes(config.max_extend_tokens, model_config.num_qo_heads)
-    report = plan_budget(
-        memory_budget_bytes(WORKING_SET_BYTES), WEIGHTS_BYTES, num_slots * slot_bytes, activations
-    )
+    report = plan_budget(memory_budget_bytes(WORKING_SET_BYTES), WEIGHTS_BYTES, activations, costs)
     assert report.lines() == case.lines
     caplog.set_level(logging.INFO)
-    num_pages = MHAKVCache.solve_num_pages(
-        model_config, config.page_size, config.dtype, report.kv_available, config.num_page_override
-    )
+    num_pages = solve_num_pages(report, config.page_size, config.num_page_override)
     assert num_pages == case.num_pages
     assert caplog.messages == [case.pages_line]

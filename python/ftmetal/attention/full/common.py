@@ -17,8 +17,9 @@ import numpy as np
 from ftmetal.attention.base import AttentionSpec, BaseAttnBackend
 from ftmetal.attention.metadata import AttnType, BaseAttnMetadata
 from ftmetal.core import Batch
+from ftmetal.kvcache.base import BasePool
 from ftmetal.kvcache.mha_pool import MHAKVCache
-from ftmetal.models.config import ModelConfig
+from ftmetal.models.config import KVCacheGroupSpec, ModelConfig
 
 
 @dataclass
@@ -43,15 +44,17 @@ class FullAttnBackend(BaseAttnBackend):
     def __init__(
         self,
         config: ModelConfig,
-        kvcache: MHAKVCache,
+        spec: KVCacheGroupSpec,
+        kvcache: BasePool,
         page_table: np.ndarray,
         page_size: int,
     ) -> None:
+        assert isinstance(kvcache, MHAKVCache), "full attention reads the paged K/V pool"
         self.config = config
         self.kvcache = kvcache
         self.page_table_host = page_table
         self.page_size = page_size
-        self.scale = config.head_dim**-0.5
+        self.scale = spec.head_dim**-0.5
         # The dummy page fills unused page-table entries so padded reads stay in bounds.
         self.dummy_page = kvcache.num_pages - 1
 

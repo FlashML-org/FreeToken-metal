@@ -75,7 +75,7 @@ class Scheduler:
             self.engine.num_pages,
             config.page_size,
             self.engine.page_table,
-            self.engine.linear_state_pool,
+            self.engine.ctx.linear_state_pool,
         )
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
@@ -137,7 +137,7 @@ class Scheduler:
 
     def mamba_slot_usage(self) -> tuple[int, int] | None:
         """(used, total) GDN slots; free slots and evictable snapshots are not used."""
-        pool = self.engine.linear_state_pool
+        pool = self.engine.ctx.linear_state_pool
         if pool is None:
             return None
         total = pool.num_slots - 1
@@ -272,7 +272,7 @@ class Scheduler:
 
     def restore_linear_states(self, batch: Batch) -> None:
         """Copy each prefix hit's tree snapshot into its live slot before the forward reads it."""
-        pool = self.engine.linear_state_pool
+        pool = self.engine.ctx.linear_state_pool
         if pool is None or not batch.is_prefill:
             return
         for req in batch.reqs:
