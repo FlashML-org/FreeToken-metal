@@ -33,6 +33,7 @@ nanobind_add_module(
   NB_DOMAIN
   mlx
   ${CMAKE_CURRENT_LIST_DIR}/bindings.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/fdecode.cpp
   ${CMAKE_CURRENT_LIST_DIR}/gdn_step.cpp
   ${CMAKE_CURRENT_LIST_DIR}/rows.cpp)
 

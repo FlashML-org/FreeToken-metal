@@ -3,6 +3,7 @@
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
+#include "fdecode.h"
 #include "gdn_step.h"
 #include "rows.h"
 
@@ -14,6 +15,7 @@ NB_MODULE(_C, m) {
 
   m.def("init_library", &ftmetal::init_library, "source"_a);
   m.def("init_gdn_step_library", &ftmetal::init_gdn_step_library, "source"_a);
+  m.def("init_fdecode_library", &ftmetal::init_fdecode_library, "source"_a);
 
   m.def(
       "scatter_rows",
@@ -72,4 +74,20 @@ NB_MODULE(_C, m) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       "One GDN decode step per request in place on the pools; returns (conv_pool, state_pool, y).");
+
+  m.def(
+      "flash_decode",
+      &ftmetal::flash_decode,
+      "q"_a,
+      "k_cache"_a,
+      "v_cache"_a,
+      "page_table"_a,
+      "seq_lens"_a,
+      "page_size"_a,
+      "num_partitions"_a,
+      "num_simdgroups"_a,
+      "scale"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      "Paged flash-decode of one query per request over its first seq_lens[b] keys; returns [B, Hq, D].");
 }

@@ -6,6 +6,7 @@ Stream = mx.Stream | mx.Device | None
 
 def init_library(source: str) -> None: ...
 def init_gdn_step_library(source: str) -> None: ...
+def init_fdecode_library(source: str) -> None: ...
 def scatter_rows(
     pool: mx.array, rows: mx.array, dst_ids: mx.array, *, stream: Stream = None
 ) -> mx.array: ...
@@ -36,3 +37,16 @@ def gdn_step(
     *,
     stream: Stream = None,
 ) -> list[mx.array]: ...
+def flash_decode(
+    q: mx.array,
+    k_cache: mx.array,
+    v_cache: mx.array,
+    page_table: mx.array,
+    seq_lens: mx.array,
+    page_size: int,
+    num_partitions: int,
+    num_simdgroups: int,
+    scale: float,
+    *,
+    stream: Stream = None,
+) -> mx.array: ...
