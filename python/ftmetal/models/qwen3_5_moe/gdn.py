@@ -27,9 +27,9 @@ from ftmetal.layers.norm import GatedRMSNorm
 from ftmetal.layers.quantization.config import AffineScheme
 from ftmetal.models.config import LinearGatedDeltaGroupConfig
 
-# Shortest prefill run chunked; the per-token kernel is faster below it (crossover
-# near 42 tokens on the M4 Pro at the Qwen3.6 shapes).
-CHUNKED_MIN_TOKENS = 48
+# Shortest prefill run chunked; the per-token kernel is faster below it (crossover at
+# 52-56 tokens on the M4 Pro at the Qwen3.6 shapes, calls serialized as layers are).
+CHUNKED_MIN_TOKENS = 56
 
 
 class Qwen3_5GatedDeltaNet(BaseOP):
