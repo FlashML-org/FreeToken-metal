@@ -14,9 +14,8 @@ from typing import NamedTuple
 import mlx.core as mx
 import numpy as np
 
+from ftmetal.attention import create_attention_backend
 from ftmetal.attention.base import AttnType, BaseAttnBackend
-from ftmetal.attention.full.metal import FullAttnMetalBackend
-from ftmetal.attention.full.mlx import FullAttnMLXBackend
 from ftmetal.attention.linear import LinearAttnBackend
 from ftmetal.context import Context, set_global_ctx
 from ftmetal.core import Batch
@@ -112,12 +111,13 @@ class Engine:
             (config.max_running_req, self.aligned_max_seq_len), dtype=np.int32
         )
 
-        full_attn_backend = {"mlx": FullAttnMLXBackend, "metal": FullAttnMetalBackend}[
-            config.attention_backend
-        ]
         self.attn_backends: dict[AttnType, BaseAttnBackend] = {
-            AttnType.FULL: full_attn_backend(
-                model_config, self.kv_cache, self.page_table, config.page_size
+            AttnType.FULL: create_attention_backend(
+                config.attention_backend,
+                model_config,
+                self.kv_cache,
+                self.page_table,
+                config.page_size,
             )
         }
         if linear_group is not None:

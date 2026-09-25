@@ -20,14 +20,14 @@ import numpy as np
 import pytest
 from mlx_lm import load
 
+from ftmetal.attention import validate_attn_backend
 from ftmetal.core import SamplingParams, host_floats, host_ints
-from ftmetal.engine.config import AttentionBackendName, EngineConfig
+from ftmetal.engine.config import EngineConfig
 from ftmetal.scheduler.scheduler import Scheduler
 from ftmetal.tokenizer import TokenizeManager, load_eos_token_ids
 
 MODEL_PATH = os.environ.get("FTMETAL_TEST_MODEL_PATH")
-ATTENTION_BACKENDS: dict[str, AttentionBackendName] = {"mlx": "mlx", "metal": "metal"}
-ATTENTION_BACKEND = ATTENTION_BACKENDS[os.environ.get("FTMETAL_TEST_ATTENTION_BACKEND", "mlx")]
+ATTENTION_BACKEND = validate_attn_backend(os.environ.get("FTMETAL_TEST_ATTENTION_BACKEND", "mlx"))
 PROMPT = "The capital of France is"
 STEPS = 32
 TIE_MARGIN = 1e-3

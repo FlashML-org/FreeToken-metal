@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 
 from ftmetal.core import SamplingParams
-from ftmetal.engine.config import AttentionBackendName, EngineConfig
+from ftmetal.engine.config import EngineConfig
 from ftmetal.scheduler.scheduler import Scheduler
 from tiny_model import build_reference, reference_greedy, save_checkpoint
 
@@ -24,7 +24,7 @@ def make_scheduler(
     path: Path,
     page_size: int,
     max_extend_tokens: int = 64,
-    attention_backend: AttentionBackendName = "mlx",
+    attention_backend: str = "mlx",
 ) -> Scheduler:
     config = EngineConfig(
         model_path=str(path),
@@ -41,7 +41,7 @@ def make_scheduler(
 @pytest.mark.parametrize("attention_backend", ["mlx", "metal"])
 @pytest.mark.parametrize("page_size", [1, 4])
 def test_greedy_decode_matches_mlx_lm(
-    tmp_path: Path, page_size: int, attention_backend: AttentionBackendName
+    tmp_path: Path, page_size: int, attention_backend: str
 ) -> None:
     model = build_reference(seed=0)
     save_checkpoint(model, tmp_path, quantization=None)
@@ -114,9 +114,7 @@ def test_long_prefill_matches_mlx_lm(tmp_path: Path, max_extend_tokens: int) -> 
 
 
 @pytest.mark.parametrize("attention_backend", ["mlx", "metal"])
-def test_two_requests_batched_match_single(
-    tmp_path: Path, attention_backend: AttentionBackendName
-) -> None:
+def test_two_requests_batched_match_single(tmp_path: Path, attention_backend: str) -> None:
     model = build_reference(seed=3)
     save_checkpoint(model, tmp_path, quantization=None)
     rng = np.random.default_rng(3)
@@ -135,9 +133,7 @@ def test_two_requests_batched_match_single(
 
 
 @pytest.mark.parametrize("attention_backend", ["mlx", "metal"])
-def test_quantized_greedy_decode_matches_mlx_lm(
-    tmp_path: Path, attention_backend: AttentionBackendName
-) -> None:
+def test_quantized_greedy_decode_matches_mlx_lm(tmp_path: Path, attention_backend: str) -> None:
     model = build_reference(seed=4)
 
     def predicate(path: str, module: nn.Module) -> bool:

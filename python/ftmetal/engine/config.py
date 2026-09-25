@@ -11,7 +11,6 @@ import os
 import struct
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Literal
 
 import mlx.core as mx
 
@@ -19,9 +18,6 @@ from ftmetal.layers.quantization.config import QuantConfig
 from ftmetal.models.config import ModelConfig
 from ftmetal.models.loader import config_dict, config_str_list, read_model_config, weight_files
 from ftmetal.models.register import parse_model_config
-
-# Kernel set of the full-attention backend; prefill runs on MLX SDPA under both.
-AttentionBackendName = Literal["mlx", "metal"]
 
 
 def checkpoint_tensor_names(model_path: str) -> list[str]:
@@ -40,7 +36,8 @@ class EngineConfig:
     dtype: mx.Dtype = mx.bfloat16
     max_running_req: int = 4
     page_size: int = 32
-    attention_backend: AttentionBackendName = "metal"
+    # Name in attention.SUPPORTED_ATTENTION_BACKENDS; prefill runs on MLX SDPA under both.
+    attention_backend: str = "metal"
     max_seq_len_override: int | None = None
     num_page_override: int | None = None
     # Prefill token budget per batch; longer prompts are chunked.
@@ -79,4 +76,4 @@ class EngineConfig:
         return os.path.basename(os.path.normpath(self.model_path))
 
 
-__all__ = ["AttentionBackendName", "EngineConfig", "checkpoint_tensor_names"]
+__all__ = ["EngineConfig", "checkpoint_tensor_names"]

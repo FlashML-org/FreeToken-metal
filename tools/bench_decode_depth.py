@@ -13,12 +13,12 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-import typing
 
 import numpy as np
 
+from ftmetal.attention import SUPPORTED_ATTENTION_BACKENDS
 from ftmetal.core import SamplingParams
-from ftmetal.engine.config import AttentionBackendName, EngineConfig
+from ftmetal.engine.config import EngineConfig
 from ftmetal.scheduler.scheduler import Scheduler
 
 # The first decode steps compile kernels and fill the allocator cache.
@@ -45,7 +45,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("model_path")
     parser.add_argument(
-        "--attention-backend", choices=typing.get_args(AttentionBackendName), default="metal"
+        "--attention-backend",
+        choices=SUPPORTED_ATTENTION_BACKENDS.supported_names(),
+        default="metal",
     )
     parser.add_argument("--depths", default="1024,8192,32768")
     parser.add_argument("--decode-steps", type=int, default=64)

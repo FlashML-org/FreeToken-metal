@@ -11,6 +11,7 @@ import argparse
 import os
 from dataclasses import dataclass
 
+from ftmetal.attention import SUPPORTED_ATTENTION_BACKENDS
 from ftmetal.engine.config import EngineConfig
 
 
@@ -101,7 +102,7 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
     parser.add_argument(
         "--attention-backend",
         "--attn",
-        choices=["mlx", "metal"],
+        choices=SUPPORTED_ATTENTION_BACKENDS.supported_names(),
         default=ServerArgs.attention_backend,
     )
     namespace = parser.parse_args(argv)
