@@ -2,7 +2,7 @@
 
 Port of FreeToken layers/norm.py. Divergences: no fused add-residual variant (the
 residual add is a separate elementwise op MLX fuses itself); GatedRMSNorm keeps the
-donor's norm-before-gate silu semantics.
+FreeToken's norm-before-gate silu semantics.
 """
 
 from __future__ import annotations

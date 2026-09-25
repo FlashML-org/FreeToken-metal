@@ -42,7 +42,7 @@ PAGE_TABLE_ALIGN = 128
 
 
 def page_table_width(max_seq_len: int, page_size: int) -> int:
-    """Columns of the page table (the donor's _page_table_width): allocate_paged writes whole
+    """Columns of the page table (FreeToken's _page_table_width): allocate_paged writes whole
     trailing pages, so the row must reach align_ceil(max_seq_len, page_size), then pad."""
     tokens = -(-max_seq_len // page_size) * page_size
     return -(-tokens // PAGE_TABLE_ALIGN) * PAGE_TABLE_ALIGN

@@ -89,7 +89,7 @@ class MoELayer(BaseOP):
     def forward(
         self, hidden_states: mx.array, topk_weights: mx.array, topk_ids: mx.array
     ) -> mx.array:
-        """Expert compute for a routing decision (the donor's routed_forward): hidden [T, H],
+        """Expert compute for a routing decision (FreeToken's routed_forward): hidden [T, H],
         weights / ids [T, top_k]; the model computes the routing."""
         if topk_ids.size < SORT_MIN_PAIRS:
             x = mx.expand_dims(hidden_states, (-2, -3))
