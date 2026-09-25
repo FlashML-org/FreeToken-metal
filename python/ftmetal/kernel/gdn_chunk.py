@@ -1,12 +1,13 @@
 """Chunked gated delta rule for prefill: the WY form over chunks of CHUNK_SIZE tokens.
 
 Port of FreeToken kernel/fla/chunk.py (chunk_gated_delta_rule_fwd). Divergences: two
-launches instead of four; the intra-chunk pass fuses the gate cumsum, the
-beta * K K^T and Q K^T tiles, the blocked inverse of the unit lower-triangular
-I + A and w, u = (I + A)^-1 [beta * exp(G) * K | beta * V]; the state pass fuses the
-output (chunk_o) into the chunk-sequential state update (chunk_delta_h), so per-chunk
-states are never stored. Takes the per-step decay g (not its log) so it is a drop-in
-for gated_delta_recurrence; everything past the inputs is fp32.
+launches instead of four. The intra-chunk pass (one k head for all its v heads) fuses
+the gate cumsum, the beta * K K^T and Q K^T tiles and the blocked inverse of I + A,
+and emits Tb = (I + A)^-1 diag(beta) instead of w and u; the state pass forms
+v_new = Tb (V - exp(G) K S^T) itself and fuses the output (chunk_o) into the
+chunk-sequential state update (chunk_delta_h), so neither w, u nor per-chunk states
+are stored. Takes the per-step decay g (not its log) so it is a drop-in for
+gated_delta_recurrence; everything past the inputs is fp32.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from ftmetal.kernel.custom import metal_kernel
 
 CHUNK_SIZE = 64
 SIMD_WIDTH = 32
+# Simdgroups per intra-chunk threadgroup (one chunk of one k head).
 INTRA_SIMDGROUPS = 8
 # Simdgroups per state-pass threadgroup; each owns 8 value columns of one head's state.
 STATE_SIMDGROUPS = 4
@@ -414,7 +416,7 @@ def gated_delta_chunked(
     batch_size, seq_len, num_k_heads, key_dim = k.shape
     num_v_heads, value_dim = v.shape[2:]
     assert key_dim % SIMD_WIDTH == 0 and value_dim % SIMD_WIDTH == 0
-    assert state.dtype == mx.float32
+    assert q.dtype == k.dtype == v.dtype and state.dtype == mx.float32
     num_chunks = -(-seq_len // CHUNK_SIZE)
     padded_len = num_chunks * CHUNK_SIZE
     template: list[tuple[str, mx.Dtype | int]] = [
