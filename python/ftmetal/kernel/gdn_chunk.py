@@ -21,7 +21,9 @@ SIMD_WIDTH = 32
 # Simdgroups per intra-chunk threadgroup (one chunk of one k head).
 INTRA_SIMDGROUPS = 8
 # Simdgroups per state-pass threadgroup; each owns 8 value columns of one head's state.
-STATE_SIMDGROUPS = 4
+# Registers and threadgroup memory cap the resident simdgroups: 2 measured faster than 1
+# or 4 (T = 2048 state pass 1.95 ms vs 1.98 / 2.33 ms on the M4 Pro).
+STATE_SIMDGROUPS = 2
 
 HEADER = """
 using frag = simdgroup_matrix<float, 8, 8>;
@@ -262,8 +264,9 @@ INTRA_SOURCE = """
 # 8 columns of the state transposed, S^T [Dk, 8], as Dk / 8 fragments in registers,
 # and walks the chunks in order: u = V - exp(G) K S^T, v_new = Tb u,
 # o = exp(G) Q S^T + Aqk v_new, S^T = exp(G_last) S^T + K^T (exp(G_last - G) v_new).
-# v_new and the partial o live in threadgroup memory: registers go to the state, and
-# fewer registers mean more resident simdgroups.
+# v_new lives in threadgroup memory and o is formed row block by row block: registers
+# go to the state and the less of both a simdgroup holds, the more of the grid is
+# resident at once (all of it takes 2 waves at the Qwen3.6 shapes otherwise).
 STATE_SOURCE = """
     constexpr int NK = Dk / 8;
     constexpr int NR = C / 8;
@@ -279,9 +282,8 @@ STATE_SOURCE = """
     const size_t head = (size_t)b * Hv + hv;
     const device float* g_head = gcum + head * num_chunks * C;
 
-    threadgroup float scratch[NSG * 2 * C * 8];
-    threadgroup float* vn_tg = scratch + sg * 2 * C * 8;
-    threadgroup float* o_tg = vn_tg + C * 8;
+    threadgroup float scratch[NSG * C * 8];
+    threadgroup float* vn_tg = scratch + sg * C * 8;
 
     frag st[NK];
     for (int kk = 0; kk < NK; ++kk) {
@@ -305,20 +307,15 @@ STATE_SOURCE = """
       for (int i = 0; i < NR; ++i) {
         const float row_decay = exp(g_head[t0 + 8 * i + fm]);
         frag ks = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-        frag qs = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
         for (int kk = 0; kk < NK; ++kk) {
           const frag k_frag = load_frag(k_chunk + 8 * i * qk_stride + 8 * kk, qk_stride, false);
-          const frag q_frag = load_frag(q_chunk + 8 * i * qk_stride + 8 * kk, qk_stride, false);
           simdgroup_multiply_accumulate(ks, k_frag, st[kk], ks);
-          simdgroup_multiply_accumulate(qs, q_frag, st[kk], qs);
         }
         frag u_frag = load_frag(v_chunk + 8 * i * v_stride, v_stride, false);
         for (int e = 0; e < 2; ++e) {
           u_frag.thread_elements()[e] -= row_decay * ks.thread_elements()[e];
-          qs.thread_elements()[e] *= row_decay;
         }
         simdgroup_store(u_frag, vn_tg + 64 * i, 8);
-        simdgroup_store(qs, o_tg + 64 * i, 8);
       }
       // v_new = Tb u in place, bottom up: row block i reads u of blocks j <= i.
       for (int i = NR - 1; i >= 0; --i) {
@@ -334,8 +331,15 @@ STATE_SOURCE = """
       }
 
       for (int i = 0; i < NR; ++i) {
-        frag acc;
-        simdgroup_load(acc, o_tg + 64 * i, 8);
+        const float row_decay = exp(g_head[t0 + 8 * i + fm]);
+        frag acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (int kk = 0; kk < NK; ++kk) {
+          const frag q_frag = load_frag(q_chunk + 8 * i * qk_stride + 8 * kk, qk_stride, false);
+          simdgroup_multiply_accumulate(acc, q_frag, st[kk], acc);
+        }
+        for (int e = 0; e < 2; ++e) {
+          acc.thread_elements()[e] *= row_decay;
+        }
         for (int j = 0; j <= i; ++j) {
           frag a_frag;
           frag vn_frag;
