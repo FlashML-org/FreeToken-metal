@@ -1,12 +1,16 @@
 """Linear (GDN) attention: metadata only; the layer computes on the state pool.
 
 Port of FreeToken attention/linear.py (build_fla_metadata with its hybrid-radix track
-metadata). A prefill request whose chunk holds a page boundary strictly inside
+metadata). A prefill request whose chunk holds a SNAPSHOT_STRIDE boundary strictly inside
 it tracks the deepest one: the GDN layer writes the state there into the request's next
-ping-pong slot, and the request records the boundary for its commit. Divergences: the
-builder is a backend with the shared prepare_metadata entry; the track fields are a slot
-and a token count per request (the layer splits its recurrence there) instead of chunk
-rows into the kernel's per-chunk states.
+ping-pong slot, and the request records the boundary for its commit. The stride is the
+chunked kernel's CHUNK_SIZE as in FreeToken, independent of the page size (which must
+divide it): at page size 1 a page-based stride would put the snapshot at P-1, past the
+P-2 where Qwen's next turn diverges after the client drops the reasoning, and the turn
+would resume from the previous prefill chunk. Divergences: the builder is a backend with
+the shared prepare_metadata entry; the track fields are a slot and a token count per
+request (the layer splits its recurrence there) instead of chunk rows into the kernel's
+per-chunk states.
 """
 
 from __future__ import annotations
@@ -17,14 +21,20 @@ import numpy as np
 from ftmetal.attention.base import BaseAttnBackend
 from ftmetal.attention.metadata import AttnType, LinearAttnMetadata
 from ftmetal.core import Batch
+from ftmetal.kernel.gdn_chunk import CHUNK_SIZE
+
+# Snapshot boundaries sit cached_len + k * SNAPSHOT_STRIDE; the radix tree keys nodes by
+# page, so the stride is a multiple of the page size and cached_len is page-aligned.
+SNAPSHOT_STRIDE = CHUNK_SIZE
 
 
 class LinearAttnBackend(BaseAttnBackend):
     def __init__(self, page_size: int) -> None:
-        # Snapshot boundaries are page boundaries: the radix tree keys nodes by page, and
-        # the GDN layer can split its recurrence at any token. A kernel that only emits
-        # state at its own chunk ends would add its alignment check here.
-        self.page_size = page_size
+        if SNAPSHOT_STRIDE % page_size != 0:
+            raise ValueError(
+                f"GDN snapshot stride {SNAPSHOT_STRIDE} must be a multiple of page_size "
+                f"{page_size}"
+            )
 
     def prepare_metadata(self, batch: Batch) -> None:
         lens = [req.extend_len for req in batch.reqs]
@@ -35,9 +45,9 @@ class LinearAttnBackend(BaseAttnBackend):
             assert req.linear_slot_idx is not None, "every request needs a GDN state slot"
             slots.append(req.linear_slot_idx)
             track_slot, track_seqlen = -1, 0
-            pages = (req.extend_len - 1) // self.page_size
-            if batch.is_prefill and req.mamba_ping_pong is not None and pages > 0:
-                track_seqlen = req.cached_len + pages * self.page_size
+            strides = (req.extend_len - 1) // SNAPSHOT_STRIDE
+            if batch.is_prefill and req.mamba_ping_pong is not None and strides > 0:
+                track_seqlen = req.cached_len + strides * SNAPSHOT_STRIDE
                 track_slot = req.mamba_ping_pong[req.mamba_next_track_idx]
                 req.mamba_last_track_seqlen = track_seqlen
                 req.mamba_next_track_idx = 1 - req.mamba_next_track_idx

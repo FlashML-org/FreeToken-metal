@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 from mlx_lm.models import qwen3_5 as reference
 
+from ftmetal.attention.linear import SNAPSHOT_STRIDE
 from ftmetal.core import SamplingParams
 from ftmetal.engine.config import EngineConfig
 from ftmetal.scheduler.scheduler import Scheduler
@@ -90,8 +91,8 @@ def test_same_prompt_twice_hits_and_decodes_the_same(tmp_path: Path, page_size: 
 
     scheduler = make_scheduler(tmp_path, page_size=page_size, num_pages=2048 // page_size)
     assert run_alone(scheduler, 0, prompt) == (0, expected)
-    # The prefill tracked the deepest page boundary strictly inside the prompt.
-    snapshot = page_size * ((len(prompt) - 1) // page_size)
+    # The prefill tracked the deepest stride boundary strictly inside the prompt.
+    snapshot = SNAPSHOT_STRIDE * ((len(prompt) - 1) // SNAPSHOT_STRIDE)
     assert run_alone(scheduler, 1, prompt) == (snapshot, expected)
     scheduler.cache_manager.check_integrity()
     assert_hit_logits_match(scheduler, model, prompt, snapshot)
@@ -99,7 +100,7 @@ def test_same_prompt_twice_hits_and_decodes_the_same(tmp_path: Path, page_size: 
 
 def test_next_turn_resumes_from_the_finished_live_state(tmp_path: Path) -> None:
     """At page size 1 a finish donates its live state at any length: the next turn resumes
-    there (157, off the conv ring's period) and tracks up to its own last token (256)."""
+    there (157, off the conv ring's period) and tracks one stride past it (221)."""
     model = build_reference(seed=28)
     save_checkpoint(model, tmp_path, quantization=None)
     first = random_tokens(28, 150)
@@ -109,7 +110,7 @@ def test_next_turn_resumes_from_the_finished_live_state(tmp_path: Path) -> None:
     second = first + tokens[: STEPS - 1] + random_tokens(29, 100)
     assert run_alone(scheduler, 1, second) == (157, reference_greedy(model, second, STEPS)[1])
     third = second[:256] + random_tokens(30, 20)
-    assert_hit_logits_match(scheduler, model, third, 256)
+    assert_hit_logits_match(scheduler, model, third, 221)
 
 
 def test_prompts_sharing_a_snapshot_prefix_reuse_it(tmp_path: Path) -> None:
@@ -117,14 +118,30 @@ def test_prompts_sharing_a_snapshot_prefix_reuse_it(tmp_path: Path) -> None:
     save_checkpoint(model, tmp_path, quantization=None)
     shared = random_tokens(21, 128)
     first = shared + random_tokens(22, 20)  # its snapshot lands at 128
-    second = shared + random_tokens(23, 100)  # hits 128, then tracks 224
-    third = second[:224] + random_tokens(24, 30)  # hits the snapshot the hit committed
+    second = shared + random_tokens(23, 100)  # hits 128, then tracks 192
+    third = second[:192] + random_tokens(24, 30)  # hits the snapshot the hit committed
     scheduler = make_scheduler(tmp_path)
-    for uid, (prompt, cached_len) in enumerate([(first, 0), (second, 128), (third, 224)]):
+    for uid, (prompt, cached_len) in enumerate([(first, 0), (second, 128), (third, 192)]):
         _, expected = reference_greedy(model, prompt, STEPS)
         assert run_alone(scheduler, uid, prompt) == (cached_len, expected)
     scheduler.cache_manager.check_integrity()
-    assert_hit_logits_match(scheduler, model, third, 224)
+    assert_hit_logits_match(scheduler, model, third, 192)
+
+
+def test_next_turn_survives_a_divergence_just_before_the_prompt_end(tmp_path: Path) -> None:
+    """Qwen's template re-renders the previous turn without its "<think>\n", so the next
+    turn diverges two tokens before the previous prompt's end. The snapshot sits at the
+    deepest 64-token stride boundary (128 for a 150-token prompt), before the divergence,
+    so the turn resumes there instead of from the previous prefill chunk."""
+    model = build_reference(seed=31)
+    save_checkpoint(model, tmp_path, quantization=None)
+    first = random_tokens(31, 150)
+    scheduler = make_scheduler(tmp_path, page_size=1, num_pages=2048)
+    _, tokens = run_alone(scheduler, 0, first)
+    assert tokens == reference_greedy(model, first, STEPS)[1]
+    second = first[:-2] + random_tokens(32, 2) + tokens + random_tokens(33, 40)
+    assert run_alone(scheduler, 1, second) == (128, reference_greedy(model, second, STEPS)[1])
+    scheduler.cache_manager.check_integrity()
 
 
 def test_identical_prompts_in_one_batch_dedup_their_commits(tmp_path: Path) -> None:
@@ -140,21 +157,23 @@ def test_identical_prompts_in_one_batch_dedup_their_commits(tmp_path: Path) -> N
     for uid in (0, 1):
         assert [event.token for event in events if event.uid == uid] == expected
     scheduler.cache_manager.check_integrity()
-    assert run_alone(scheduler, 2, prompt) == (96, expected)
-    assert_hit_logits_match(scheduler, model, prompt, 96)
+    assert run_alone(scheduler, 2, prompt) == (64, expected)
+    assert_hit_logits_match(scheduler, model, prompt, 64)
 
 
 def test_chunked_prompt_commits_its_last_tracked_snapshot(tmp_path: Path) -> None:
-    """Chunks of 128 at page 32: [0, 128) tracks 96, [128, 256) tracks 224, and the last
-    chunk of 44 tokens tracks 288; a hit's own 12-token prefill tracks nothing more."""
+    """Chunks of 128 at page 32: [0, 128) tracks 64, [128, 256) tracks 192, and the last
+    chunk of 44 tokens holds no stride boundary, so the carried 192 commits; the finish at
+    308 is not page-aligned and donates nothing. The hit's own 108-token prefill tracks
+    one more stride at 256."""
     model = build_reference(seed=26)
     save_checkpoint(model, tmp_path, quantization=None)
     prompt = random_tokens(26, 300)
     _, expected = reference_greedy(model, prompt, STEPS)
     scheduler = make_scheduler(tmp_path, max_extend_tokens=128)
     assert run_alone(scheduler, 0, prompt) == (0, expected)
-    assert run_alone(scheduler, 1, prompt) == (288, expected)
-    assert_hit_logits_match(scheduler, model, prompt, 288)
+    assert run_alone(scheduler, 1, prompt) == (192, expected)
+    assert_hit_logits_match(scheduler, model, prompt, 256)
 
 
 def test_eviction_under_small_budgets_keeps_outputs(tmp_path: Path) -> None:
