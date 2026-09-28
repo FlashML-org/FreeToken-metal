@@ -89,6 +89,9 @@ class Scheduler:
         self.results: list[TokenEvent] = []
         # Requests whose tokens may still come; reported as failed if run_forever dies.
         self.live_uids: set[int] = set()
+        # The launched-but-not-drained batch (overlap). An abort of one of its requests only
+        # marks the request; process_last_data frees it once the forward has landed.
+        self.inflight_data: ForwardData | None = None
 
     def add_request(self, uid: int, input_ids: np.ndarray, sampling_params: SamplingParams) -> None:
         max_output_len = self.engine.max_seq_len - len(input_ids)
@@ -101,12 +104,23 @@ class Scheduler:
         self.prefill_manager.add_one_req(uid, input_ids, sampling_params)
 
     def abort_request(self, uid: int) -> None:
-        """Drop a pending or running request; a step already launched with it still runs."""
+        """Drop a pending or running request; a step already launched with it still runs.
+
+        FreeToken's fence: a request in the in-flight batch is only marked, and
+        process_last_data frees it after the forward has landed, so its pages, table row
+        and GDN slots are never handed to a new request while the forward still writes
+        them. A request with no forward in flight is freed here; deferring it would leak
+        until its next batch, which strict prefill priority puts arbitrarily far away.
+        """
         req = self.prefill_manager.abort_req(uid) or self.decode_manager.abort_req(uid)
         if req is None:
             return
         req.aborted = True
-        self.free_req_resources(req)
+        inflight = (
+            self.inflight_data is not None and req in self.inflight_data.forward_input.batch.reqs
+        )
+        if not inflight:
+            self.free_req_resources(req)
 
     @property
     def runnable(self) -> bool:
@@ -120,6 +134,7 @@ class Scheduler:
             self.report_status(forward_input)
             ongoing_data = self.forward(forward_input)
         self.process_last_data(last_data)
+        self.inflight_data = ongoing_data
         return ongoing_data
 
     def report_status(self, forward_input: ForwardInput) -> None:
@@ -290,7 +305,14 @@ class Scheduler:
         new_finished: set[Req] = set()
         with self.cache_manager.lazy_free_region():
             for req, next_token in zip(batch.reqs, next_tokens):
-                if isinstance(req, ChunkedReq) or req.aborted:
+                if req.aborted:
+                    # Aborted while this step was in flight: the abort popped it from its
+                    # manager (no further step launches) and this drain frees it exactly
+                    # once, now that the forward has landed. No event: the abort is the
+                    # request's terminal reply.
+                    self.free_req_resources(req)
+                    continue
+                if isinstance(req, ChunkedReq):
                     continue
                 if req in self.finished_reqs:
                     continue
