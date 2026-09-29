@@ -339,7 +339,7 @@ void hook_dispatch_threads(id self, SEL command, GridSize grid, GridSize group) 
 void hook_barrier(id self, SEL command, NS::UInteger scope) {
   if (Session* session = counting_session()) {
     ++session->counts.barriers;
-    session->pending_barrier = true;
+    session->pending_barrier = session->recording;
   }
   Nested nested(active_session);
   original_barrier(self, command, scope);
