@@ -7,8 +7,10 @@ streams one kv head's keys once for all G = Hq / Hkv query heads (GQA packing); 
 partitions fill the GPU at small batch. Divergences from the fp16 original: the dtype
 is a template argument (bf16, fp16, fp32), pool rows are token slots
 page_id * page_size + offset, and the page-table width, partition count and scale are
-runtime values, so a growing context never recompiles. This module only picks the
-partitioning.
+runtime values, so a growing context never recompiles. The grid's partition count
+follows max_seqlen_k; the kernels apply the same rule to each request's own length and
+skip the partitions past it, so a grid fixed at the longest context (a replayed graph)
+does the work of the per-length one. This module only picks the partitioning.
 """
 
 from __future__ import annotations
@@ -69,7 +71,19 @@ def flash_decode(
     ):
         num_partitions *= 2
     return _C.flash_decode(
-        q, k_cache, v_cache, page_table, seq_lens, page_size, num_partitions, num_simdgroups, scale
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        seq_lens,
+        page_size,
+        num_partitions,
+        PARTITION_TOKENS,
+        MIN_PARTITION_TOKENS,
+        MAX_PARTITIONS,
+        MIN_THREADGROUPS,
+        num_simdgroups,
+        scale,
     )
 
 
