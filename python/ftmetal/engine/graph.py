@@ -37,6 +37,17 @@ def determine_graph_bs(max_running_req: int) -> list[int]:
     return [bs for bs in candidates if bs <= max_running_req]
 
 
+def undonated_copies(kernel_names: list[str]) -> int:
+    """Same-dtype vector copies (v_copy<T><T>): an eager step donates their input and skips
+    them, a capture holds the input; in Qwen3.5 decode the partial-rotary RoPE of q and k."""
+    count = 0
+    for name in kernel_names:
+        dtypes = name.removeprefix("v_copy")
+        half = len(dtypes) // 2
+        count += name.startswith("v_copy") and dtypes[:half] == dtypes[half:]
+    return count
+
+
 def pool_arrays(pools: dict[AttnType, BasePool]) -> list[mx.array]:
     return [array for pool in pools.values() for array in pool.arrays()]
 
@@ -93,10 +104,10 @@ class GraphRunner:
             else:
                 self.graphs[bs] = graph
                 stats = graph.stats
-                vector_copies = sum(name.startswith("v_copy") for name in graph.dispatch_names)
                 logger.info(
                     f"captured batch size {bs}: {stats.num_dispatches} dispatches "
-                    f"({vector_copies} vector copies), {len(stats.temporaries)} temporaries, "
+                    f"({undonated_copies(graph.dispatch_names)} same-dtype vector copies), "
+                    f"{len(stats.temporaries)} temporaries, "
                     f"pinned {stats.pinned_bytes / 2**20:.1f} MiB"
                 )
         logger.info(
