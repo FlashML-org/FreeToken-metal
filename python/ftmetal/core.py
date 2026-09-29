@@ -3,8 +3,8 @@
 Port of FreeToken core.py. Divergences: input ids are host numpy arrays and batch
 tensors are mx.arrays; the batch is passed to the model instead of living in the
 Context, its attention metadata is a dict keyed by AttnType (fla_metadata is the
-LINEAR entry), and there are no padded request rows (nothing is captured into a graph);
-a Req's cache_handle is None while it locks no cached prefix.
+LINEAR entry); padded_reqs starts as reqs and only the graph runner pads it; a Req's
+cache_handle is None while it locks no cached prefix.
 """
 
 from __future__ import annotations
@@ -116,6 +116,12 @@ class Batch:
     out_loc: mx.array = field(init=False)
     # One record per attention backend, set by its prepare_metadata.
     attn_metadata: dict[AttnType, BaseAttnMetadata] = field(default_factory=dict, init=False)
+    # reqs followed by the dummy requests that fill a replayed decode batch to its graph's
+    # batch size; set by GraphRunner.pad_batch.
+    padded_reqs: list[Req] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.padded_reqs = self.reqs
 
     @property
     def is_prefill(self) -> bool:
@@ -128,6 +134,10 @@ class Batch:
     @property
     def size(self) -> int:
         return len(self.reqs)
+
+    @property
+    def padded_size(self) -> int:
+        return len(self.padded_reqs)
 
     @property
     def num_tokens(self) -> int:
