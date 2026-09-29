@@ -5,7 +5,9 @@ stream, so the launch is an async_eval of the sampled tokens plus every pool arr
 and the drain is reading those tokens (a prefix hit's snapshot restore is an in-place
 copy in the launched graph, ordered by the pool arrays it rebinds); requests arrive by
 add_request and results leave through send_result as TokenEvents; run_forever is the
-server's scheduler thread body over the message queues.
+server's scheduler thread body over the message queues. A padded decode batch's dummy
+rows read the token pool's scratch row; only real requests allocate pages and write
+sampled tokens.
 """
 
 from __future__ import annotations
@@ -71,6 +73,7 @@ class Scheduler:
         self.config = config
         self.eos_token_ids = eos_token_ids
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
+        assert self.engine.dummy_req.table_idx == self.table_manager.scratch_row
         self.cache_manager = CacheManager(
             self.engine.num_pages,
             config.page_size,
@@ -249,13 +252,17 @@ class Scheduler:
         return self.prepare_batch(batch)
 
     def prepare_batch(self, batch: Batch) -> ForwardInput:
+        self.engine.graph_runner.pad_batch(batch)
         self.cache_manager.allocate_paged(batch.reqs)
         table = self.table_manager
         positions = np.concatenate(
-            [np.arange(req.cached_len, req.device_len, dtype=np.int32) for req in batch.reqs]
+            [np.arange(req.cached_len, req.device_len, dtype=np.int32) for req in batch.padded_reqs]
         )
         input_flat = np.concatenate(
-            [table.flat_ids(req.table_idx, req.cached_len, req.device_len) for req in batch.reqs]
+            [
+                table.flat_ids(req.table_idx, req.cached_len, req.device_len)
+                for req in batch.padded_reqs
+            ]
         )
         write_flat = np.array(
             [
