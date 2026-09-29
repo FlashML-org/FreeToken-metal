@@ -177,7 +177,7 @@ void FlashDecode::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx:
   encoder.set_output_array(out, 2);
   encoder.set_bytes(c.num_partitions, 3);
   encoder.dispatch_threadgroups(
-      MTL::Size(1, c.num_kv_heads, batch), MTL::Size(SIMD_WIDTH, 1, 1));
+      MTL::Size(c.group, c.num_kv_heads, batch), MTL::Size(SIMD_WIDTH, 1, 1));
 }
 
 } // namespace ftmetal
