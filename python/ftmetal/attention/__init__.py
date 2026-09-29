@@ -44,6 +44,9 @@ class BackendInfo:
     supported_types: frozenset[AttnType]
     # Allowed page sizes (None: any); a mismatch is a config error, not a coercion.
     page_sizes: tuple[int, ...] | None = None
+    # Decode runs at the fixed shapes a CommandGraph replays (no per-step host value
+    # shapes the kernels), so the engine may capture it.
+    can_capture: bool = False
 
 
 SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
@@ -66,7 +69,11 @@ def create_mlx_backend(
 
 @SUPPORTED_ATTENTION_BACKENDS.register(
     "metal",
-    BackendInfo(supported_types=frozenset({AttnType.FULL}), page_sizes=(1, 2, 4, 8, 16, 32, 64)),
+    BackendInfo(
+        supported_types=frozenset({AttnType.FULL}),
+        page_sizes=(1, 2, 4, 8, 16, 32, 64),
+        can_capture=True,
+    ),
 )
 def create_metal_backend(
     config: ModelConfig,

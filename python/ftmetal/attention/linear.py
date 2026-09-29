@@ -10,7 +10,8 @@ P-2 where Qwen's next turn diverges after the client drops the reasoning, and th
 would resume from the previous prefill chunk. Divergences: the builder is a backend with
 the shared prepare_metadata entry; the track fields are a slot and a token count per
 request (the layer splits its recurrence there) instead of chunk rows into the kernel's
-per-chunk states.
+per-chunk states; the capture hooks build a padded decode batch's metadata (FreeToken's
+GraphCaptureBuffer.set_batch part), dummy rows on their GDN padding slot.
 """
 
 from __future__ import annotations
@@ -35,6 +36,36 @@ class LinearAttnBackend(BaseAttnBackend):
                 f"GDN snapshot stride {SNAPSHOT_STRIDE} must be a multiple of page_size "
                 f"{page_size}"
             )
+        self.capture_bs: list[int] = []
+        self.capture_cu_seqlens: dict[int, mx.array] = {}
+        self.capture_track_slots: dict[int, mx.array] = {}
+
+    def init_capture_graph(self, max_seq_len: int, bs_list: list[int]) -> None:
+        self.capture_bs = sorted(bs_list)
+        self.capture_cu_seqlens = {bs: mx.arange(bs + 1, dtype=mx.int32) for bs in bs_list}
+        self.capture_track_slots = {bs: mx.full((bs,), -1, dtype=mx.int32) for bs in bs_list}
+        mx.eval(*self.capture_cu_seqlens.values(), *self.capture_track_slots.values())
+
+    def prepare_for_capture(self, batch: Batch) -> None:
+        self.prepare_for_replay(batch)
+
+    def prepare_for_replay(self, batch: Batch) -> None:
+        reqs = batch.padded_reqs
+        size = len(reqs)
+        assert batch.is_decode and size in self.capture_bs
+        slots: list[int] = []
+        for req in reqs:
+            assert req.linear_slot_idx is not None, "every request needs a GDN state slot"
+            slots.append(req.linear_slot_idx)
+        batch.attn_metadata[AttnType.LINEAR] = LinearAttnMetadata(
+            cu_seqlens=self.capture_cu_seqlens[size],
+            cache_indices=mx.array(np.asarray(slots, dtype=np.int32)),
+            track_slots=self.capture_track_slots[size],
+            seq_lens_host=[1] * size,
+            slots_host=slots,
+            track_slots_host=[-1] * size,
+            track_seqlens_host=[0] * size,
+        )
 
     def prepare_metadata(self, batch: Batch) -> None:
         lens = [req.extend_len for req in batch.reqs]
