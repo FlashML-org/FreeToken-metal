@@ -135,6 +135,7 @@ NB_MODULE(_C, m) {
       "Open a capture: outputs are the unevaluated logits and updated pools; eval them next.");
 
   m.def("end_capture", &ftmetal::end_capture, "Close the capture and return its graph.");
+  m.def("abort_capture", &ftmetal::abort_capture, "Drop the open capture, if any.");
 
   m.def(
       "graph_replay",

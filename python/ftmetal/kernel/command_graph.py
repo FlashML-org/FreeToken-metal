@@ -36,6 +36,22 @@ def end_capture() -> _C.Graph:
     return _C.end_capture()
 
 
+def capture(
+    outputs: list[mx.array],
+    step_inputs: list[mx.array],
+    pools: list[mx.array],
+    externals: list[mx.array],
+) -> _C.Graph:
+    """begin_capture, eval of outputs and end_capture; a failed eval closes the capture."""
+    begin_capture(outputs, step_inputs, pools, externals)
+    try:
+        mx.eval(*outputs)
+    except BaseException:
+        _C.abort_capture()
+        raise
+    return end_capture()
+
+
 def replay(
     graph: _C.Graph, step_inputs: list[mx.array], pools: list[mx.array]
 ) -> tuple[mx.array, list[mx.array]]:
@@ -71,6 +87,7 @@ def wait_until_available(arrays: list[mx.array]) -> None:
 __all__ = [
     "begin_capture",
     "begin_count",
+    "capture",
     "check_same_graph",
     "end_capture",
     "end_count",

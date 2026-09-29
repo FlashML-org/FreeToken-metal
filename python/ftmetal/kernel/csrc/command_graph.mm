@@ -802,6 +802,17 @@ void classify(Session& session) {
   }
 }
 
+// MLX 0.32.1's steel GEMMParams (steel/gemm/params.h) is 68 bytes of fields padded to 72
+// by its int64 members; setBytes copies the padding, which holds the caller's stack.
+const uint32_t GEMM_PARAMS_BYTES = 72;
+const uint32_t GEMM_PARAMS_FIELD_BYTES = 68;
+
+// The payload bytes a kernel reads: all of them, except the tail padding of GEMMParams.
+uint32_t compared_length(const std::string& kernel, uint32_t length) {
+  bool is_gemm_params = kernel.rfind("steel_", 0) == 0 && length == GEMM_PARAMS_BYTES;
+  return is_gemm_params ? GEMM_PARAMS_FIELD_BYTES : length;
+}
+
 std::string grid_text(const GridSize& size) {
   return "(" + std::to_string(size.width) + ", " + std::to_string(size.height) + ", " +
       std::to_string(size.depth) + ")";
@@ -908,6 +919,15 @@ std::shared_ptr<Graph> end_capture() {
   }
   classify(*session);
   return session->graph;
+}
+
+void abort_capture() {
+  if (active_session == nullptr || !active_session->recording) {
+    return;
+  }
+  std::unique_ptr<Session> session(active_session);
+  active_session = nullptr;
+  mx::set_cache_limit(session->previous_cache_limit);
 }
 
 std::vector<mx::array> graph_replay(
@@ -1101,7 +1121,7 @@ std::vector<std::string> compare_graphs(const Graph& first, const Graph& second)
             std::memcmp(
                 first.bytes_data.data() + x.offset,
                 second.bytes_data.data() + y.offset,
-                x.length) != 0) {
+                compared_length(first.dispatch_names[d], x.length)) != 0) {
           report(
               where + " slot " + std::to_string(x.index) +
               ": setBytes payload differs (a per-step value passed by value)");

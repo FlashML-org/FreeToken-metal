@@ -168,6 +168,9 @@ void begin_capture(
 // Close this thread's capture; throws when it recorded something replay cannot rebuild.
 std::shared_ptr<Graph> end_capture();
 
+// Drop this thread's capture, if any, without building a graph (after a failed eval).
+void abort_capture();
+
 // One replay of graph on new step inputs and the current pools; returns the logits and
 // the pools (aliasing the pools passed in).
 std::vector<mx::array> graph_replay(
