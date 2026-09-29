@@ -76,6 +76,11 @@ class MHAKVCache(BaseKVCachePool):
     def arrays(self) -> list[mx.array]:
         return [*self.k, *self.v]
 
+    def set_arrays(self, arrays: list[mx.array]) -> None:
+        count = len(self.k)
+        assert len(arrays) == 2 * count
+        self.k, self.v = arrays[:count], arrays[count:]
+
     @property
     def dtype(self) -> mx.Dtype:
         return self._dtype
