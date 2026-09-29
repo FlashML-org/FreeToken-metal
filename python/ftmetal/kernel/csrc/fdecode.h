@@ -16,8 +16,9 @@ namespace ftmetal {
 void init_fdecode_library(const std::string& source);
 
 // q [B, Hq, D]; k_cache / v_cache [num_pages * page_size, Hkv, D] in q's dtype;
-// page_table [B, max_pages] int32; seq_lens [B] int32. The caller picks the split-KV
-// partition count and simdgroups per threadgroup. Returns [B, Hq, D].
+// page_table [B, max_pages] int32; seq_lens [B] int32. The caller picks the grid's
+// split-KV partition count, the partition rule (see PartitionRule) that gives each
+// request its share of the grid, and simdgroups per threadgroup. Returns [B, Hq, D].
 mx::array flash_decode(
     const mx::array& q,
     const mx::array& k_cache,
@@ -26,9 +27,24 @@ mx::array flash_decode(
     const mx::array& seq_lens,
     int page_size,
     int num_partitions,
+    int partition_tokens,
+    int min_partition_tokens,
+    int max_partitions,
+    int min_threadgroups,
     int num_simdgroups,
     float scale,
     mx::StreamOrDevice s = {});
+
+// The caller's partition count for a max_seqlen_k; the kernels apply it on the GPU to
+// each request's own length, capped at the grid's partition count.
+struct PartitionRule {
+  int partition_tokens;
+  int min_partition_tokens;
+  int max_partitions;
+  int min_threadgroups;
+
+  bool operator==(const PartitionRule&) const = default;
+};
 
 struct FlashDecodeConfig {
   int head_dim;
@@ -36,6 +52,7 @@ struct FlashDecodeConfig {
   int num_kv_heads;
   int page_size;
   int num_partitions;
+  PartitionRule rule;
   int num_simdgroups;
   float scale;
 };

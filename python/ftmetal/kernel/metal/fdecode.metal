@@ -1,5 +1,8 @@
 // fdecode: paged flash-decode, one query token per request over the paged K/V pool.
 // The {{...}} tokens are substituted per configuration before compilation.
+// The grid holds P partitions per (request, kv head); a request of seq_len keys uses the
+// first request_partitions(seq_len) of them, so a grid fixed at the longest context (a
+// replayed graph) costs a short request only the partitions it would get on its own.
 // fdecode_partials, grid (32 * NSG * P, HKV, B): a threadgroup streams one kv head's
 // keys of one partition once for all G = Hq / Hkv query heads; each simdgroup takes a
 // contiguous slice and keeps an online softmax per query head whose accumulator is the
@@ -7,7 +10,7 @@
 // overflow); the slices merge through threadgroup memory and simdgroup 0 writes the
 // partition's unnormalized [G, D] accumulator and its (max, sum) in the log2 domain.
 // fdecode_merge, grid (32 * G, HKV, B): one simdgroup per (request, query head) merges
-// its P partials by log-sum-exp.
+// the request's partials by log-sum-exp.
 #include <metal_stdlib>
 using namespace metal;
 
@@ -16,6 +19,10 @@ using namespace metal;
 #define HKV {{HKV}}
 #define BS {{BS}}
 #define NSG {{NSG}}
+#define PARTITION_TOKENS {{PARTITION_TOKENS}}
+#define MIN_PARTITION_TOKENS {{MIN_PARTITION_TOKENS}}
+#define MAX_PARTITIONS {{MAX_PARTITIONS}}
+#define MIN_THREADGROUPS {{MIN_THREADGROUPS}}
 #define LPD (D / 32)
 #define VW (LPD % 4 == 0 ? 4 : 2)
 #define NV (LPD / VW)
@@ -25,6 +32,18 @@ typedef {{STAGE_T}} StageT;
 using InVec = vec<T, VW>;
 using FloatVec = vec<float, VW>;
 using AccVec = vec<AccT, VW>;
+
+// The host's partition count (kernel/fdecode.py) for max_seqlen_k = seq_len, capped at
+// the grid's.
+inline uint request_partitions(uint seq_len, uint batch_size, uint grid_partitions) {
+  uint partitions =
+      clamp((seq_len + PARTITION_TOKENS - 1) / PARTITION_TOKENS, 1u, (uint)MAX_PARTITIONS);
+  const uint min_partition_limit = (seq_len + MIN_PARTITION_TOKENS - 1) / MIN_PARTITION_TOKENS;
+  while (batch_size * HKV * partitions < MIN_THREADGROUPS && partitions < min_partition_limit) {
+    partitions *= 2;
+  }
+  return min(partitions, grid_partitions);
+}
 
 // Buffers: 0 q [B, HKV * G, D], 1 k_cache / 2 v_cache [num_pages * BS, HKV, D],
 // 3 page_table [B, max_pages] int32, 4 seq_lens [B] int32, 5 part_acc [B, HKV, P, G, D]
@@ -46,10 +65,12 @@ using AccVec = vec<AccT, VW>;
   const uint partition = tgpig.x;
   const uint kv_head = tgpig.y;
   const uint b = tgpig.z;
-  const uint num_partitions = tptg.x;
-  const size_t part_row = ((size_t)b * HKV + kv_head) * num_partitions + partition;
-
   const uint seq_len = seq_lens[b];
+  const uint num_partitions = request_partitions(seq_len, tptg.z, tptg.x);
+  if (partition >= num_partitions) {
+    return;
+  }
+  const size_t part_row = ((size_t)b * HKV + kv_head) * tptg.x + partition;
   const uint per_part = (seq_len + num_partitions - 1) / num_partitions;
   const uint t0 = partition * per_part;
   const uint t1 = min(seq_len, t0 + per_part);
@@ -149,33 +170,37 @@ using AccVec = vec<AccT, VW>;
   }
 }
 
-// Buffers: 0 part_acc, 1 part_ml (as above), 2 out [B, HKV * G, D], 3 num_partitions.
+// Buffers: 0 part_acc, 1 part_ml (as above), 2 seq_lens, 3 out [B, HKV * G, D],
+// 4 the grid's partition count P.
 [[kernel]] void fdecode_merge(
     device const float* part_acc [[buffer(0)]],
     device const float* part_ml [[buffer(1)]],
-    device T* out [[buffer(2)]],
-    constant const int& num_partitions [[buffer(3)]],
+    device const int* seq_lens [[buffer(2)]],
+    device T* out [[buffer(3)]],
+    constant const int& grid_partitions [[buffer(4)]],
     uint3 tgpig [[threadgroup_position_in_grid]],
+    uint3 tptg [[threadgroups_per_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
   const uint g = tgpig.x;
   const uint kv_head = tgpig.y;
   const uint b = tgpig.z;
+  const uint num_partitions = request_partitions(seq_lens[b], tptg.z, grid_partitions);
   const uint lane_off = lane * LPD;
   const size_t head_row = (size_t)b * HKV + kv_head;
 
   float m_max = -INFINITY;
-  for (int p = 0; p < num_partitions; ++p)
-    m_max = max(m_max, part_ml[((head_row * num_partitions + p) * G + g) * 2]);
+  for (uint p = 0; p < num_partitions; ++p)
+    m_max = max(m_max, part_ml[((head_row * grid_partitions + p) * G + g) * 2]);
   float l_sum = 0.0f;
   float o[LPD];
   for (int i = 0; i < LPD; ++i) o[i] = 0.0f;
-  for (int p = 0; p < num_partitions; ++p) {
-    const size_t ml_off = ((head_row * num_partitions + p) * G + g) * 2;
+  for (uint p = 0; p < num_partitions; ++p) {
+    const size_t ml_off = ((head_row * grid_partitions + p) * G + g) * 2;
     const float m_p = part_ml[ml_off];
     if (m_p == -INFINITY) continue;
     const float weight = fast::exp2(m_p - m_max);
     l_sum += part_ml[ml_off + 1] * weight;
-    const size_t acc_off = ((head_row * num_partitions + p) * G + g) * D + lane_off;
+    const size_t acc_off = ((head_row * grid_partitions + p) * G + g) * D + lane_off;
     for (int i = 0; i < LPD; ++i) o[i] += part_acc[acc_off + i] * weight;
   }
   const float inv = (l_sum > 0.0f) ? (1.0f / l_sum) : 0.0f;
