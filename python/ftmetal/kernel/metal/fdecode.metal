@@ -6,8 +6,8 @@
 // running weighted mean of V (bounded by max |v|, so a half accumulator cannot
 // overflow); the slices merge through threadgroup memory and simdgroup 0 writes the
 // partition's unnormalized [G, D] accumulator and its (max, sum) in the log2 domain.
-// fdecode_merge, grid (32, HKV, B): one simdgroup per (request, kv head) merges the
-// P partials of each query head by log-sum-exp.
+// fdecode_merge, grid (32 * G, HKV, B): one simdgroup per (request, query head) merges
+// its P partials by log-sum-exp.
 #include <metal_stdlib>
 using namespace metal;
 
@@ -157,29 +157,28 @@ using AccVec = vec<AccT, VW>;
     constant const int& num_partitions [[buffer(3)]],
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
+  const uint g = tgpig.x;
   const uint kv_head = tgpig.y;
   const uint b = tgpig.z;
   const uint lane_off = lane * LPD;
   const size_t head_row = (size_t)b * HKV + kv_head;
 
-  for (int g = 0; g < G; ++g) {
-    float m_max = -INFINITY;
-    for (int p = 0; p < num_partitions; ++p)
-      m_max = max(m_max, part_ml[((head_row * num_partitions + p) * G + g) * 2]);
-    float l_sum = 0.0f;
-    float o[LPD];
-    for (int i = 0; i < LPD; ++i) o[i] = 0.0f;
-    for (int p = 0; p < num_partitions; ++p) {
-      const size_t ml_off = ((head_row * num_partitions + p) * G + g) * 2;
-      const float m_p = part_ml[ml_off];
-      if (m_p == -INFINITY) continue;
-      const float weight = fast::exp2(m_p - m_max);
-      l_sum += part_ml[ml_off + 1] * weight;
-      const size_t acc_off = ((head_row * num_partitions + p) * G + g) * D + lane_off;
-      for (int i = 0; i < LPD; ++i) o[i] += part_acc[acc_off + i] * weight;
-    }
-    const float inv = (l_sum > 0.0f) ? (1.0f / l_sum) : 0.0f;
-    const size_t out_off = (head_row * G + g) * D + lane_off;
-    for (int i = 0; i < LPD; ++i) out[out_off + i] = static_cast<T>(o[i] * inv);
+  float m_max = -INFINITY;
+  for (int p = 0; p < num_partitions; ++p)
+    m_max = max(m_max, part_ml[((head_row * num_partitions + p) * G + g) * 2]);
+  float l_sum = 0.0f;
+  float o[LPD];
+  for (int i = 0; i < LPD; ++i) o[i] = 0.0f;
+  for (int p = 0; p < num_partitions; ++p) {
+    const size_t ml_off = ((head_row * num_partitions + p) * G + g) * 2;
+    const float m_p = part_ml[ml_off];
+    if (m_p == -INFINITY) continue;
+    const float weight = fast::exp2(m_p - m_max);
+    l_sum += part_ml[ml_off + 1] * weight;
+    const size_t acc_off = ((head_row * num_partitions + p) * G + g) * D + lane_off;
+    for (int i = 0; i < LPD; ++i) o[i] += part_acc[acc_off + i] * weight;
   }
+  const float inv = (l_sum > 0.0f) ? (1.0f / l_sum) : 0.0f;
+  const size_t out_off = (head_row * G + g) * D + lane_off;
+  for (int i = 0; i < LPD; ++i) out[out_off + i] = static_cast<T>(o[i] * inv);
 }
