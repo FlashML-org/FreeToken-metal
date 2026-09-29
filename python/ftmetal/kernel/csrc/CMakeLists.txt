@@ -1,9 +1,11 @@
 cmake_minimum_required(VERSION 3.27)
 
-project(ftmetal_kernel LANGUAGES CXX)
+project(ftmetal_kernel LANGUAGES CXX OBJCXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_OBJCXX_STANDARD 20)
+set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(
@@ -33,12 +35,17 @@ nanobind_add_module(
   NB_DOMAIN
   mlx
   ${CMAKE_CURRENT_LIST_DIR}/bindings.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/command_graph.mm
   ${CMAKE_CURRENT_LIST_DIR}/fdecode.cpp
   ${CMAKE_CURRENT_LIST_DIR}/gdn_step.cpp
   ${CMAKE_CURRENT_LIST_DIR}/rows.cpp)
 
 target_include_directories(_C PRIVATE ${MLX_INCLUDE_DIRS})
 target_compile_options(_C PRIVATE ${MLX_CXX_FLAGS})
+# The recorder holds Metal objects by manual retain/release, as metal-cpp does.
+set_source_files_properties(
+  ${CMAKE_CURRENT_LIST_DIR}/command_graph.mm PROPERTIES COMPILE_OPTIONS -fno-objc-arc)
+target_link_libraries(_C PRIVATE "-framework Metal" "-framework Foundation")
 # libmlx symbols resolve from the mlx.core module already loaded in the
 # process, so the build env's mlx wheel location never leaks into an rpath.
 target_link_options(_C PRIVATE -undefined dynamic_lookup)
