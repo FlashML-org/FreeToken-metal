@@ -76,7 +76,7 @@ mx::array scatter_rows(
       pool.shape(),
       pool.dtype(),
       std::make_shared<InPlaceRows>(stream, RowsKind::Scatter),
-      {mx::contiguous(pool, false, stream),
+      {pool,
        mx::contiguous(rows, false, stream),
        mx::contiguous(dst_ids, false, stream)});
 }
@@ -99,7 +99,7 @@ mx::array copy_rows(
       pool.shape(),
       pool.dtype(),
       std::make_shared<InPlaceRows>(stream, RowsKind::Copy),
-      {mx::contiguous(pool, false, stream),
+      {pool,
        mx::contiguous(src_ids, false, stream),
        mx::contiguous(dst_ids, false, stream)});
 }
@@ -114,7 +114,7 @@ mx::array zero_rows(const mx::array& pool, const mx::array& ids, mx::StreamOrDev
       pool.shape(),
       pool.dtype(),
       std::make_shared<InPlaceRows>(stream, RowsKind::Zero),
-      {mx::contiguous(pool, false, stream), mx::contiguous(ids, false, stream)});
+      {pool, mx::contiguous(ids, false, stream)});
 }
 
 std::vector<mx::array> kv_write(
@@ -132,8 +132,8 @@ std::vector<mx::array> kv_write(
       {k_cache.shape(), v_cache.shape()},
       {k_cache.dtype(), v_cache.dtype()},
       std::make_shared<InPlaceRows>(stream, RowsKind::KVWrite),
-      {mx::contiguous(k_cache, false, stream),
-       mx::contiguous(v_cache, false, stream),
+      {k_cache,
+       v_cache,
        mx::contiguous(k, false, stream),
        mx::contiguous(v, false, stream),
        mx::contiguous(out_loc, false, stream)});
