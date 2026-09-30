@@ -4,7 +4,8 @@ Port of FreeToken core.py. Divergences: input ids are host numpy arrays and batc
 tensors are mx.arrays; the batch is passed to the model instead of living in the
 Context, its attention metadata is a dict keyed by AttnType (fla_metadata is the
 LINEAR entry); padded_reqs starts as reqs and only the graph runner pads it; a Req's
-cache_handle is None while it locks no cached prefix.
+cache_handle is None while it locks no cached prefix; SamplingParams is greedy at
+temperature 0 or top-k 1 whatever top_p is (FreeToken also requires top_p == 1).
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ class SamplingParams:
 
     @property
     def is_greedy(self) -> bool:
-        return (self.temperature <= 0.0 or self.top_k == 1) and self.top_p == 1.0
+        return self.temperature <= 0.0 or self.top_k == 1
 
 
 @dataclass(eq=False)

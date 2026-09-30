@@ -19,5 +19,6 @@ from ftmetal.kernel import _C  # noqa: E402
 _C.init_library((METAL_DIR / "rows.metal").read_text())
 _C.init_gdn_step_library((METAL_DIR / "gdn_step.metal").read_text())
 _C.init_fdecode_library((METAL_DIR / "fdecode.metal").read_text())
+_C.init_sample_library((METAL_DIR / "sample.metal").read_text())
 
 __all__ = ["_C"]
