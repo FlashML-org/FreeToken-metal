@@ -5,7 +5,7 @@ the budget is Metal's recommended working set minus a fixed headroom; every pool
 its own spec as (bytes per page, fixed bytes), the fixed costs come off first and the
 paged pools share the rest (FreeToken's engine adds the GDN state pool to the KV
 family's fixed cost by hand); the lines are the ones this engine has (weights, one per
-pool, activations); no MoE expert cache.
+pool, activations, the decode graphs' arena); no MoE expert cache.
 """
 
 from __future__ import annotations
@@ -28,6 +28,11 @@ ACTIVATION_BYTES_PER_TOKEN = 1 << 20
 ATTENTION_SCORE_BYTES = 2
 # Two steps can be in flight under the overlap loop.
 IN_FLIGHT_STEPS = 2
+# The decode CommandGraphs' shared arena, rounded up from Qwen3.6-35B-A3B at a 256k-token
+# page table: 1.05 MiB at batch size 1 and 8.30 MiB at 8, nearly all flash-decode
+# partials (their partition count follows the page-table width).
+GRAPH_FIXED_BYTES = 4 << 20
+GRAPH_BYTES_PER_ROW = 5 << 18
 # Each pool's budget line; the only LINEAR pool so far holds GDN state.
 POOL_LABELS: dict[AttnType, str] = {AttnType.FULL: "kv pages", AttnType.LINEAR: "gdn slots"}
 
@@ -43,6 +48,12 @@ def activation_reserve_bytes(max_extend_tokens: int, num_qo_heads: int) -> int:
     return IN_FLIGHT_STEPS * per_step
 
 
+def graph_reserve_bytes(max_graph_bs: int) -> int:
+    """What decode graphs up to batch size max_graph_bs keep: the arena they share, and
+    the few buffers they pin."""
+    return GRAPH_FIXED_BYTES + max_graph_bs * GRAPH_BYTES_PER_ROW
+
+
 def budget_line(label: str, num_bytes: int) -> str:
     return f"{label:<12}{num_bytes / GIB:8.2f} GiB"
 
@@ -52,6 +63,7 @@ class BudgetReport:
     budget: int
     weights: int
     activations: int
+    graphs: int
     costs: dict[AttnType, PoolCost]
 
     @property
@@ -60,9 +72,10 @@ class BudgetReport:
 
     @property
     def paged_bytes(self) -> int:
-        """What the paged pools share once the weights, activations and fixed costs are off."""
+        """What the paged pools share once the weights, activations, graphs and fixed costs
+        are off."""
         fixed_bytes = sum(cost.fixed_bytes for cost in self.costs.values())
-        return self.budget - self.weights - self.activations - fixed_bytes
+        return self.budget - self.weights - self.activations - self.graphs - fixed_bytes
 
     def lines(self) -> list[str]:
         """The deductions in order, then each paged pool's share of what is left."""
@@ -79,19 +92,23 @@ class BudgetReport:
             for attn_type, cost in self.costs.items()
             if cost.bytes_per_page > 0
         ]
+        graph_lines = [budget_line("graphs", self.graphs)] if self.graphs > 0 else []
         return [
             budget_line("budget", self.budget),
             budget_line("weights", self.weights),
             *fixed_lines,
             budget_line("activations", self.activations),
+            *graph_lines,
             *paged_lines,
         ]
 
 
 def plan_budget(
-    budget: int, weights: int, activations: int, costs: dict[AttnType, PoolCost]
+    budget: int, weights: int, activations: int, graphs: int, costs: dict[AttnType, PoolCost]
 ) -> BudgetReport:
-    report = BudgetReport(budget=budget, weights=weights, activations=activations, costs=costs)
+    report = BudgetReport(
+        budget=budget, weights=weights, activations=activations, graphs=graphs, costs=costs
+    )
     assert report.bytes_per_page > 0, "no paged pool to give the budget to"
     if report.paged_bytes <= 0:
         raise RuntimeError("model does not fit the memory budget:\n" + "\n".join(report.lines()))
@@ -117,10 +134,13 @@ __all__ = [
     "ACTIVATION_BYTES_PER_TOKEN",
     "ACTIVATION_FIXED_BYTES",
     "ATTENTION_SCORE_BYTES",
+    "GRAPH_BYTES_PER_ROW",
+    "GRAPH_FIXED_BYTES",
     "IN_FLIGHT_STEPS",
     "POOL_LABELS",
     "BudgetReport",
     "activation_reserve_bytes",
+    "graph_reserve_bytes",
     "memory_budget_bytes",
     "plan_budget",
     "solve_num_pages",

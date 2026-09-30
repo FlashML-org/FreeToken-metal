@@ -26,7 +26,9 @@ from ftmetal.attention.base import AttnType, BaseAttnBackend
 from ftmetal.context import Context, set_global_ctx
 from ftmetal.core import Batch, Req, SamplingParams
 from ftmetal.engine.cache_budget import (
+    GIB,
     activation_reserve_bytes,
+    graph_reserve_bytes,
     memory_budget_bytes,
     plan_budget,
     solve_num_pages,
@@ -73,12 +75,23 @@ class Engine:
         self.weights_bytes = mx.get_active_memory() - resident_before
         logger.info(f"weights resident: {self.weights_bytes / 2**30:.2f} GiB")
 
+        can_capture = attention_backend_info(config.attention_backend).can_capture
+        if config.command_graph and not can_capture:
+            logger.warning(
+                f"CommandGraph needs a capturable attention backend, not "
+                f"{config.attention_backend!r}: decode runs eagerly"
+            )
+        use_graphs = config.command_graph and can_capture
+        graph_bs_list = determine_graph_bs(config.max_running_req) if use_graphs else []
+        graph_reserve = graph_reserve_bytes(max(graph_bs_list)) if graph_bs_list else 0
+
         working_set = mx.device_info()["max_recommended_working_set_size"]
         assert isinstance(working_set, int)
         budget = memory_budget_bytes(working_set)
         specs = model_config.kv_cache_group_specs()
         activations = activation_reserve_bytes(config.max_extend_tokens, model_config.num_qo_heads)
-        report = plan_budget(budget, self.weights_bytes, activations, pool_costs(specs, config))
+        costs = pool_costs(specs, config)
+        report = plan_budget(budget, self.weights_bytes, activations, graph_reserve, costs)
         for line in report.lines():
             logger.info(line)
         self.num_pages = solve_num_pages(report, config.page_size, config.num_page_override)
@@ -118,26 +131,24 @@ class Engine:
         )
         set_global_ctx(self.ctx)
         mx.set_wired_limit(budget)
-        logger.info(f"memory after init: {mx.get_active_memory() / 2**30:.2f} GiB")
+        logger.info(f"memory after init: {mx.get_active_memory() / GIB:.2f} GiB")
 
         # Padded decode rows run on the dummy page and the GDN padding slot.
         linear_state_pool = self.ctx.linear_state_pool
         if linear_state_pool is not None:
             self.dummy_req.linear_slot_idx = linear_state_pool.padding_slot
-        can_capture = attention_backend_info(config.attention_backend).can_capture
-        if config.command_graph and not can_capture:
-            logger.warning(
-                f"CommandGraph needs a capturable attention backend, not "
-                f"{config.attention_backend!r}: decode runs eagerly"
-            )
-        use_graphs = config.command_graph and can_capture
         self.graph_runner = GraphRunner(
             self.model,
             self.attn_backends,
             self.pools,
             self.dummy_req,
-            determine_graph_bs(config.max_running_req) if use_graphs else [],
+            graph_bs_list,
             self.aligned_max_seq_len,
+            graph_reserve,
+        )
+        logger.info(
+            f"memory after graphs: {mx.get_active_memory() / GIB:.2f} GiB, "
+            f"peak {mx.get_peak_memory() / GIB:.2f} GiB"
         )
 
     def prepare_metadata(self, batch: Batch) -> None:

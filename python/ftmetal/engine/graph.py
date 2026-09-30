@@ -102,13 +102,16 @@ class GraphRunner:
         dummy_req: Req,
         graph_bs_list: list[int],
         max_seq_len: int,
+        reserve_bytes: int,
     ) -> None:
-        """An empty graph_bs_list turns replay off; max_seq_len is the page-table row width."""
+        """An empty graph_bs_list turns replay off; max_seq_len is the page-table row width;
+        the graphs may keep reserve_bytes (their arena and pinned buffers)."""
         self.model = model
         self.attn_backends = attn_backends
         self.pools = pools
         self.dummy_req = dummy_req
         self.graph_bs_list = sorted(graph_bs_list)
+        self.reserve_bytes = reserve_bytes
         self.graphs: dict[int, _C.Graph] = {}
         self.plans: dict[int, ArenaPlan] = {}
         self.arena: mx.array | None = None
@@ -153,6 +156,15 @@ class GraphRunner:
                 f"{plan.lower_bound / MIB:.2f} MiB), pinned "
                 f"{stats.capture_pinned_bytes / MIB:.1f} -> {stats.pinned_bytes / MIB:.3f} MiB"
             )
+        while self.graphs and self.graph_bytes() > self.reserve_bytes:
+            bs = max(self.graphs)
+            logger.warning(
+                f"CommandGraph: {self.graph_bytes() / MIB:.2f} MiB of arena and pinned buffers "
+                f"exceed the {self.reserve_bytes / MIB:.2f} MiB graph reserve: batch size {bs} "
+                f"runs eagerly"
+            )
+            self.graphs.pop(bs)
+            self.plans.pop(bs)
         if self.graphs:
             self.bind_arena(checks)
         if pool is not None:
@@ -162,8 +174,13 @@ class GraphRunner:
         logger.info(
             f"CommandGraph: batch sizes {sorted(self.graphs)} captured in "
             f"{time.perf_counter() - started:.1f} s; arena {arena_bytes / MIB:.2f} MiB, "
-            f"pinned {pinned_bytes / MIB:.3f} MiB"
+            f"pinned {pinned_bytes / MIB:.3f} MiB, reserve {self.reserve_bytes / MIB:.2f} MiB"
         )
+
+    def graph_bytes(self) -> int:
+        """What the graphs keep once bound: the arena they share and their pinned buffers."""
+        arena_bytes = max(self.plans[bs].arena_bytes for bs in self.graphs)
+        return arena_bytes + sum(graph.stats.pinned_bytes for graph in self.graphs.values())
 
     def bind_arena(self, checks: dict[int, ReplayCheck]) -> None:
         """One arena for every graph; a graph whose replay on the arena filled with 0xFF

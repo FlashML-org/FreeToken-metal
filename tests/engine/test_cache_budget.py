@@ -15,6 +15,7 @@ from ftmetal.attention.metadata import AttnType
 from ftmetal.engine.cache_budget import (
     GIB,
     activation_reserve_bytes,
+    graph_reserve_bytes,
     memory_budget_bytes,
     plan_budget,
     solve_num_pages,
@@ -133,9 +134,25 @@ def test_qwen3_6_budget_reproduces_pages_and_slots(
     assert costs[AttnType.LINEAR] == PoolCost(0, case.num_slots * GDN_SLOT_BYTES)
 
     activations = activation_reserve_bytes(config.max_extend_tokens, model_config.num_qo_heads)
-    report = plan_budget(memory_budget_bytes(WORKING_SET_BYTES), WEIGHTS_BYTES, activations, costs)
+    budget = memory_budget_bytes(WORKING_SET_BYTES)
+    report = plan_budget(budget, WEIGHTS_BYTES, activations, 0, costs)
     assert report.lines() == case.lines
     caplog.set_level(logging.INFO)
     num_pages = solve_num_pages(report, config.page_size, config.num_page_override)
     assert num_pages == case.num_pages
     assert caplog.messages == [case.pages_line]
+
+
+def test_graph_reserve_comes_off_the_paged_pools() -> None:
+    model_config = parse_config(QWEN3_6_TEXT_CONFIG)
+    config = EngineConfig(model_path="unused", max_running_req=8)
+    costs = pool_costs(model_config.kv_cache_group_specs(), config)
+    activations = activation_reserve_bytes(config.max_extend_tokens, model_config.num_qo_heads)
+    budget = memory_budget_bytes(WORKING_SET_BYTES)
+    graphs = graph_reserve_bytes(8)
+    without = plan_budget(budget, WEIGHTS_BYTES, activations, 0, costs)
+    with_graphs = plan_budget(budget, WEIGHTS_BYTES, activations, graphs, costs)
+    assert without.paged_bytes - with_graphs.paged_bytes == graphs
+    assert "graphs" not in "".join(without.lines())
+    lines = with_graphs.lines()
+    assert lines.index("graphs          0.01 GiB") == lines.index("activations     5.25 GiB") + 1

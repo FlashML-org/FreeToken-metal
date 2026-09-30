@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 from ftmetal.core import Batch, SamplingParams
-from ftmetal.engine import graph
+from ftmetal.engine import engine, graph
 from ftmetal.engine.config import EngineConfig
 from ftmetal.engine.graph import GraphRunner
 from ftmetal.kernel._ext import _C
@@ -102,6 +102,18 @@ def test_buckets_share_one_tight_arena(tmp_path: Path) -> None:
         assert plan.arena_bytes <= 1.1 * plan.lower_bound
         assert stats.num_pinned_temporaries == 0
         assert stats.pinned_bytes < stats.capture_pinned_bytes
+
+
+def test_graph_reserve_drops_the_largest_buckets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = build_reference(seed=24)
+    save_checkpoint(model, tmp_path, quantization=None)
+    # Room for the arena of batch size 2, not for that of 4.
+    monkeypatch.setattr(engine, "graph_reserve_bytes", lambda max_graph_bs: 20_000)
+    runner = make_scheduler(tmp_path, max_running_req=4, command_graph=True).engine.graph_runner
+    assert sorted(runner.graphs) == [1, 2]
+    assert runner.arena is not None and runner.graph_bytes() <= runner.arena.nbytes <= 20_000
 
 
 def test_failed_capture_leaves_its_bucket_eager(
