@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 MIB = 1 << 20
 
-# FreeToken's ladder: 1, 2, 4, then every multiple of 8.
+# Batch-size buckets: 1, 2, 4, then every multiple of this.
 GRAPH_BS_STRIDE = 8
 
 
