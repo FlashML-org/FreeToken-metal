@@ -1,18 +1,20 @@
-// CommandGraph recorder, capture classification and the GraphReplay primitive (see
-// command_graph.h). The recorder replaces methods of the concrete classes behind a
-// probe encoder and command buffer made on MLX's own device, so MTL_DEBUG_LAYER's
-// wrapper classes are hooked the same way; every hook chains to the original and does
-// nothing else while no session is open on the calling thread. The MLX internals read
-// through member pointers (CommandEncoder::temporaries_ and encoder_,
+// CommandGraph recorder, capture classification, block placement and the GraphReplay
+// primitive (see command_graph.h). The recorder replaces methods of the concrete classes
+// behind a probe encoder and command buffer made on MLX's own device, so
+// MTL_DEBUG_LAYER's wrapper classes are hooked the same way; every hook chains to the
+// original and does nothing else while no session is open on the calling thread. The
+// MLX internals read through member pointers (CommandEncoder::temporaries_ and encoder_,
 // Device::library_kernels_ and kernel_mtx_) are pinned to the mlx 0.32.1 headers.
 
 #include "command_graph.h"
 
 #include <objc/runtime.h>
 
+#include <algorithm>
 #include <cstring>
 #include <mutex>
 #include <shared_mutex>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -103,6 +105,8 @@ struct Session {
   std::vector<mx::array> pools;
   std::vector<mx::array> externals;
   std::vector<mx::array> intermediates;
+  // Each intermediate's primitive name: eval detaches the arrays from their primitives.
+  std::vector<std::string> intermediate_names;
   std::vector<mx::array> leaves;
   std::vector<TemporaryRecord> temporaries;
   std::vector<mx::array> temporary_arrays;
@@ -198,7 +202,7 @@ void record_dispatch(Session& session, GridSize grid, GridSize group, bool is_th
   dispatch.bindings_begin = static_cast<uint32_t>(graph.bindings.size());
   for (const auto& pending : session.pending_bindings) {
     graph.bindings.push_back(
-        {pending.buffer, pending.offset, pending.index, BufferRole::Null, 0});
+        {pending.buffer, pending.offset, pending.index, BufferRole::Null, 0, -1, -1});
   }
   dispatch.bindings_end = static_cast<uint32_t>(graph.bindings.size());
   dispatch.bytes_begin = static_cast<uint32_t>(graph.bytes_arguments.size());
@@ -586,6 +590,28 @@ void check_evaluated(const std::vector<mx::array>& arrays, const char* what) {
   }
 }
 
+// Release what the recorder retained for buffer, if it did.
+void release_retained(Graph& graph, const void* buffer) {
+  if (buffer != nullptr && graph.retained_objects.erase(const_cast<void*>(buffer)) > 0) {
+    static_cast<NS::Object*>(const_cast<void*>(buffer))->release();
+  }
+}
+
+std::string array_label(const std::string& primitive, const mx::array& array) {
+  std::ostringstream label;
+  label << primitive << " " << array.dtype() << " [";
+  for (size_t i = 0; i < array.shape().size(); ++i) {
+    label << (i > 0 ? ", " : "") << array.shape(i);
+  }
+  label << "]";
+  return label.str();
+}
+
+// Wait for the GPU, so the host may read and write buffers the graph binds.
+void synchronize_gpu() {
+  mx::synchronize(mx::default_stream(mx::Device::gpu));
+}
+
 struct BufferClass {
   BufferRole role;
   uint32_t parameter;
@@ -670,8 +696,19 @@ void classify(Session& session) {
     graph.dispatch_names.push_back(it == names.end() ? "?" : it->second);
   }
 
+  // Traversal reaches a buffer's views before the array that made it: the last wins.
+  std::unordered_map<const void*, std::string> producer_labels;
+  for (size_t i = 0; i < session.intermediates.size(); ++i) {
+    const auto& array = session.intermediates[i];
+    if (has_data(array)) {
+      producer_labels[array.buffer().ptr()] =
+          array_label(session.intermediate_names[i], array);
+    }
+  }
+
   const int num_roles = static_cast<int>(BufferRole::Null) + 1;
   std::vector<std::unordered_map<const void*, uint32_t>> ordinals(num_roles);
+  std::unordered_map<const void*, int32_t> block_ids;
   std::vector<std::string> unclassified;
   size_t num_unclassified = 0;
   for (size_t d = 0; d < graph.dispatches.size(); ++d) {
@@ -699,6 +736,21 @@ void classify(Session& session) {
       auto ordinal =
           role_ordinals.emplace(binding.buffer, static_cast<uint32_t>(role_ordinals.size()))
               .first->second;
+      if (binding.role == BufferRole::Intermediate || binding.role == BufferRole::Temporary) {
+        auto [block, is_new] =
+            block_ids.emplace(binding.buffer, static_cast<int32_t>(graph.blocks.size()));
+        if (is_new) {
+          std::string label = binding.role == BufferRole::Temporary
+              ? "temporary of " + graph.dispatch_names[d]
+              : producer_labels[binding.buffer];
+          graph.blocks.push_back(
+              {binding.buffer,
+               static_cast<int64_t>(binding.buffer->length()),
+               binding.role,
+               std::move(label)});
+        }
+        binding.block = block->second;
+      }
       if (is_parameter(binding.role)) {
         binding.id = buffer_class.parameter;
         binding.offset -= buffer_class.base_offset;
@@ -790,16 +842,32 @@ void classify(Session& session) {
   for (const auto& array : session.temporary_arrays) {
     pin(array);
   }
-  stats.num_held_arrays =
-      static_cast<int64_t>(session.intermediates.size() + session.leaves.size());
+  stats.capture_pinned_bytes = stats.pinned_bytes;
   stats.calls = session.counts;
 
-  auto& held = graph.held_arrays;
-  held.reserve(
-      session.intermediates.size() + session.leaves.size() + session.temporary_arrays.size());
-  for (auto* arrays : {&session.intermediates, &session.leaves, &session.temporary_arrays}) {
-    held.insert(held.end(), arrays->begin(), arrays->end());
+  // Replay binds the step inputs, pools and logits it is given and the externals stay
+  // alive with their owners: the graph keeps none of the capture's.
+  for (const auto& [buffer, buffer_class] : classes) {
+    if (buffer_class.role == BufferRole::StepInput) {
+      stats.step_input_bytes +=
+          static_cast<int64_t>(static_cast<const MTL::Buffer*>(buffer)->length());
+    }
+    if (buffer_class.role != BufferRole::Constant &&
+        buffer_class.role != BufferRole::Intermediate &&
+        buffer_class.role != BufferRole::Temporary) {
+      release_retained(graph, buffer);
+    }
   }
+  for (const auto& leaf : session.leaves) {
+    auto it = has_data(leaf) ? classes.find(leaf.buffer().ptr()) : classes.end();
+    if (it != classes.end() && it->second.role == BufferRole::Constant) {
+      graph.constants.push_back(leaf);
+    }
+  }
+  graph.intermediates = std::move(session.intermediates);
+  graph.temporaries = std::move(session.temporary_arrays);
+  stats.num_held_arrays = static_cast<int64_t>(
+      graph.constants.size() + graph.intermediates.size() + graph.temporaries.size());
 }
 
 // MLX 0.32.1's steel GEMMParams (steel/gemm/params.h) is 68 bytes of fields padded to 72
@@ -892,9 +960,13 @@ void begin_capture(
     for (const auto& input : array.inputs()) {
       stack.push_back(input);
     }
+    session->intermediate_names.push_back(array.primitive().name());
     session->intermediates.push_back(std::move(array));
   }
   session->previous_cache_limit = mx::set_cache_limit(0);
+  // Fresh allocations: a cached buffer can be up to twice the size asked for, and a
+  // block spans its whole buffer.
+  mx::clear_cache();
   active_session = session.release();
 }
 
@@ -947,9 +1019,12 @@ std::vector<mx::array> graph_replay(
           " differs in shape or dtype from the capture");
     }
   };
+  if (graph->is_placed && !graph->arena) {
+    throw std::invalid_argument("graph_replay: the graph's blocks are placed; bind an arena first");
+  }
   auto stream = mx::to_stream(s);
   std::vector<mx::array> inputs;
-  inputs.reserve(step_inputs.size() + pools.size());
+  inputs.reserve(step_inputs.size() + pools.size() + 1);
   for (size_t k = 0; k < step_inputs.size(); ++k) {
     check(step_inputs[k], graph->step_inputs[k], "step input", k);
     inputs.push_back(mx::contiguous(step_inputs[k], false, stream));
@@ -961,6 +1036,9 @@ std::vector<mx::array> graph_replay(
     inputs.push_back(pools[k]);
     shapes.push_back(pools[k].shape());
     dtypes.push_back(pools[k].dtype());
+  }
+  if (graph->arena) {
+    inputs.push_back(*graph->arena);
   }
   return mx::array::make_arrays(
       std::move(shapes), dtypes, std::make_shared<GraphReplay>(stream, std::move(graph)), inputs);
@@ -984,23 +1062,36 @@ void GraphReplay::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx:
     outputs[1 + k].copy_shared_buffer(pool);
   }
   // Step inputs, then pools, then the logits: the buffer and offset each parameter binds.
-  std::vector<std::pair<const MTL::Buffer*, int64_t>> parameters;
-  parameters.reserve(inputs.size() + 1);
-  for (const auto& input : inputs) {
-    parameters.emplace_back(static_cast<const MTL::Buffer*>(input.buffer().ptr()), input.offset());
-  }
-  parameters.emplace_back(static_cast<const MTL::Buffer*>(logits.buffer().ptr()), logits.offset());
   size_t pool_base = num_step_inputs;
   size_t logits_index = num_step_inputs + num_pools;
+  std::vector<std::pair<const MTL::Buffer*, int64_t>> parameters;
+  parameters.reserve(logits_index + 1);
+  for (size_t k = 0; k < logits_index; ++k) {
+    parameters.emplace_back(
+        static_cast<const MTL::Buffer*>(inputs[k].buffer().ptr()), inputs[k].offset());
+  }
+  parameters.emplace_back(static_cast<const MTL::Buffer*>(logits.buffer().ptr()), logits.offset());
+  const MTL::Buffer* arena_buffer = nullptr;
+  int64_t arena_base = 0;
+  if (graph.arena) {
+    const auto& arena = inputs.back();
+    arena_buffer = static_cast<const MTL::Buffer*>(arena.buffer().ptr());
+    arena_base = arena.offset();
+  }
 
   auto& encoder = mx::metal::get_command_encoder(stream());
-  // Orders this replay after everything already in the encoder, a previous replay included.
+  // Orders this replay after everything already in the encoder, a previous replay (and
+  // its use of a shared arena) included.
   encoder.barrier();
   for (const auto& input : inputs) {
     encoder.set_input_array(input, 0);
   }
   for (const auto& output : outputs) {
     encoder.register_output_array(output);
+  }
+  // The arena is written too: the next command buffer to use it waits on this one's fence.
+  if (graph.arena) {
+    encoder.register_output_array(inputs.back());
   }
   for (const auto& dispatch : graph.dispatches) {
     if (dispatch.barrier_before) {
@@ -1030,7 +1121,11 @@ void GraphReplay::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx:
         case BufferRole::Null:
           break;
         default:
-          encoder.set_buffer(binding.buffer, binding.index, binding.offset);
+          if (binding.arena_offset >= 0) {
+            encoder.set_buffer(arena_buffer, binding.index, arena_base + binding.arena_offset);
+          } else {
+            encoder.set_buffer(binding.buffer, binding.index, binding.offset);
+          }
       }
     }
     for (uint32_t i = dispatch.bytes_begin; i < dispatch.bytes_end; ++i) {
@@ -1156,6 +1251,142 @@ std::vector<std::string> compare_graphs(const Graph& first, const Graph& second)
         "... and " + std::to_string(num_differences - MAX_REPORTED_DIFFERENCES) + " more");
   }
   return differences;
+}
+
+std::vector<std::vector<int32_t>> dispatch_blocks(const Graph& graph) {
+  std::vector<std::vector<int32_t>> tape;
+  tape.reserve(graph.dispatches.size());
+  for (const auto& dispatch : graph.dispatches) {
+    auto& blocks = tape.emplace_back();
+    for (uint32_t i = dispatch.bindings_begin; i < dispatch.bindings_end; ++i) {
+      int32_t block = graph.bindings[i].block;
+      if (block >= 0 && std::find(blocks.begin(), blocks.end(), block) == blocks.end()) {
+        blocks.push_back(block);
+      }
+    }
+  }
+  return tape;
+}
+
+void poison_blocks(Graph& graph, const std::vector<int32_t>& blocks) {
+  if (graph.is_placed) {
+    throw std::invalid_argument("poison_blocks: the graph's blocks are already placed");
+  }
+  synchronize_gpu();
+  for (int32_t block : blocks) {
+    if (block < 0 || block >= static_cast<int32_t>(graph.blocks.size())) {
+      throw std::invalid_argument("poison_blocks: no block " + std::to_string(block));
+    }
+    auto* buffer = graph.blocks[block].buffer;
+    auto* contents = static_cast<uint8_t*>(buffer->contents());
+    graph.poisoned.emplace_back(
+        block, std::vector<uint8_t>(contents, contents + buffer->length()));
+    std::memset(contents, 0xFF, buffer->length());
+  }
+}
+
+void restore_blocks(Graph& graph) {
+  synchronize_gpu();
+  for (auto it = graph.poisoned.rbegin(); it != graph.poisoned.rend(); ++it) {
+    auto* buffer = graph.blocks[it->first].buffer;
+    std::memcpy(buffer->contents(), it->second.data(), it->second.size());
+  }
+  graph.poisoned.clear();
+}
+
+void place_blocks(Graph& graph, const std::vector<int64_t>& offsets) {
+  if (graph.is_placed || !graph.poisoned.empty()) {
+    throw std::invalid_argument("place_blocks: placed already, or poisoned blocks not restored");
+  }
+  if (offsets.size() != graph.blocks.size()) {
+    throw std::invalid_argument(
+        "place_blocks: " + std::to_string(offsets.size()) + " offsets for " +
+        std::to_string(graph.blocks.size()) + " blocks");
+  }
+  std::unordered_set<const void*> pinned;
+  int64_t arena_bytes = 0;
+  for (size_t b = 0; b < graph.blocks.size(); ++b) {
+    const auto& block = graph.blocks[b];
+    if (offsets[b] >= 0) {
+      arena_bytes = std::max(arena_bytes, offsets[b] + block.length);
+    } else if (block.role == BufferRole::Temporary) {
+      pinned.insert(block.buffer);
+    } else {
+      throw std::invalid_argument(
+          "place_blocks: intermediate block " + std::to_string(b) + " (" + block.label +
+          ") has no arena offset");
+    }
+  }
+  for (auto& binding : graph.bindings) {
+    if (binding.block >= 0 && offsets[binding.block] >= 0) {
+      binding.arena_offset = offsets[binding.block] + binding.offset;
+    }
+    bool is_bound_as_is = binding.role == BufferRole::External ||
+        binding.role == BufferRole::Constant || binding.role == BufferRole::Null ||
+        pinned.count(binding.buffer) > 0;
+    if (!is_parameter(binding.role) && !is_bound_as_is && binding.arena_offset < 0) {
+      throw std::logic_error("place_blocks: a binding is neither arena, parameter nor pinned");
+    }
+  }
+
+  // Every block the arena now holds goes back to MLX: the arrays that own it, and what
+  // the recorder retained, but for pipelines and the pinned temporaries.
+  std::unordered_set<const void*> kept(pinned.begin(), pinned.end());
+  for (const auto& dispatch : graph.dispatches) {
+    kept.insert(dispatch.pipeline);
+  }
+  for (auto it = graph.retained_objects.begin(); it != graph.retained_objects.end();) {
+    if (kept.count(*it) > 0) {
+      ++it;
+    } else {
+      static_cast<NS::Object*>(*it)->release();
+      it = graph.retained_objects.erase(it);
+    }
+  }
+  graph.intermediates.clear();
+  std::erase_if(graph.temporaries, [&pinned](const mx::array& temporary) {
+    return !has_data(temporary) || pinned.count(temporary.buffer().ptr()) == 0;
+  });
+
+  GraphStats& stats = graph.stats;
+  stats.arena_bytes = arena_bytes;
+  stats.num_pinned_temporaries = static_cast<int64_t>(pinned.size());
+  std::unordered_set<const void*> owned(pinned.begin(), pinned.end());
+  for (const auto& constant : graph.constants) {
+    owned.insert(constant.buffer().ptr());
+  }
+  stats.pinned_bytes = 0;
+  for (const void* buffer : owned) {
+    stats.pinned_bytes += static_cast<int64_t>(static_cast<const MTL::Buffer*>(buffer)->length());
+  }
+  stats.num_held_arrays = static_cast<int64_t>(graph.constants.size() + graph.temporaries.size());
+  graph.is_placed = true;
+}
+
+void bind_arena(Graph& graph, const mx::array& arena) {
+  if (!graph.is_placed) {
+    throw std::invalid_argument("bind_arena: place the graph's blocks first");
+  }
+  if (arena.dtype() != mx::uint8 || !arena.flags().row_contiguous ||
+      arena.status() == mx::array::Status::unscheduled || !has_data(arena)) {
+    throw std::invalid_argument("bind_arena: the arena must be evaluated contiguous uint8");
+  }
+  if (static_cast<int64_t>(arena.nbytes()) < graph.stats.arena_bytes) {
+    throw std::invalid_argument(
+        "bind_arena: the arena holds " + std::to_string(arena.nbytes()) +
+        " bytes, the graph needs " + std::to_string(graph.stats.arena_bytes));
+  }
+  graph.arena = arena;
+}
+
+void poison_arena(const Graph& graph) {
+  if (!graph.arena) {
+    throw std::invalid_argument("poison_arena: the graph has no arena");
+  }
+  synchronize_gpu();
+  const auto& arena = *graph.arena;
+  auto* buffer = static_cast<MTL::Buffer*>(const_cast<void*>(arena.buffer().ptr()));
+  std::memset(static_cast<uint8_t*>(buffer->contents()) + arena.offset(), 0xFF, arena.nbytes());
 }
 
 void begin_count() {

@@ -138,12 +138,62 @@ NB_MODULE(_C, m) {
       .def_ro("num_temporary_buffers", &ftmetal::GraphStats::num_temporary_buffers)
       .def_ro("num_held_arrays", &ftmetal::GraphStats::num_held_arrays)
       .def_ro("temporaries", &ftmetal::GraphStats::temporaries)
+      .def_ro("capture_pinned_bytes", &ftmetal::GraphStats::capture_pinned_bytes)
       .def_ro("pinned_bytes", &ftmetal::GraphStats::pinned_bytes)
+      .def_ro("step_input_bytes", &ftmetal::GraphStats::step_input_bytes)
+      .def_ro("num_pinned_temporaries", &ftmetal::GraphStats::num_pinned_temporaries)
+      .def_ro("arena_bytes", &ftmetal::GraphStats::arena_bytes)
       .def_ro("calls", &ftmetal::GraphStats::calls);
 
   nb::class_<ftmetal::Graph>(m, "Graph")
       .def_ro("stats", &ftmetal::Graph::stats)
-      .def_ro("dispatch_names", &ftmetal::Graph::dispatch_names);
+      .def_ro("dispatch_names", &ftmetal::Graph::dispatch_names)
+      .def_prop_ro(
+          "block_sizes",
+          [](const ftmetal::Graph& graph) {
+            std::vector<int64_t> sizes;
+            for (const auto& block : graph.blocks) {
+              sizes.push_back(block.length);
+            }
+            return sizes;
+          })
+      .def_prop_ro(
+          "block_labels",
+          [](const ftmetal::Graph& graph) {
+            std::vector<std::string> labels;
+            for (const auto& block : graph.blocks) {
+              labels.push_back(block.label);
+            }
+            return labels;
+          })
+      .def_prop_ro(
+          "temporary_blocks",
+          [](const ftmetal::Graph& graph) {
+            std::vector<int32_t> blocks;
+            for (size_t b = 0; b < graph.blocks.size(); ++b) {
+              if (graph.blocks[b].role == ftmetal::BufferRole::Temporary) {
+                blocks.push_back(static_cast<int32_t>(b));
+              }
+            }
+            return blocks;
+          })
+      .def_prop_ro("dispatch_blocks", &ftmetal::dispatch_blocks)
+      .def_prop_ro(
+          "dispatch_barriers",
+          [](const ftmetal::Graph& graph) {
+            std::vector<bool> barriers;
+            for (const auto& dispatch : graph.dispatches) {
+              barriers.push_back(dispatch.barrier_before);
+            }
+            return barriers;
+          })
+      .def_prop_ro("dispatch_encoders", [](const ftmetal::Graph& graph) {
+        std::vector<uint32_t> encoders;
+        for (const auto& dispatch : graph.dispatches) {
+          encoders.push_back(dispatch.encoder);
+        }
+        return encoders;
+      });
 
   m.def(
       "begin_capture",
@@ -173,6 +223,27 @@ NB_MODULE(_C, m) {
       "first"_a,
       "second"_a,
       "Differences that forbid replaying one capture in place of the other.");
+
+  m.def(
+      "poison_blocks",
+      &ftmetal::poison_blocks,
+      "graph"_a,
+      "blocks"_a,
+      "Fill the blocks' buffers with 0xFF, saving their contents for restore_blocks.");
+  m.def("restore_blocks", &ftmetal::restore_blocks, "graph"_a, "Undo poison_blocks.");
+  m.def(
+      "place_blocks",
+      &ftmetal::place_blocks,
+      "graph"_a,
+      "offsets"_a,
+      "Bind block b at arena offset offsets[b] (-1: a pinned temporary); release the rest.");
+  m.def(
+      "bind_arena",
+      &ftmetal::bind_arena,
+      "graph"_a,
+      "arena"_a,
+      "The uint8 arena a placed graph replays in.");
+  m.def("poison_arena", &ftmetal::poison_arena, "graph"_a, "Fill the graph's arena with 0xFF.");
 
   m.def("begin_count", &ftmetal::begin_count, "Count encoder calls on this thread.");
   m.def("end_count", &ftmetal::end_count, "Stop counting; returns the counts.");

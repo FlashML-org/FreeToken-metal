@@ -1,10 +1,23 @@
-"""CommandGraph capture and replay on a small synthetic step: no checkpoint needed."""
+"""CommandGraph capture and replay on a small synthetic step, and the arena planner on
+random tapes: no checkpoint needed."""
+
+import random
 
 import mlx.core as mx
 import pytest
 
 from ftmetal.kernel._ext import _C
-from ftmetal.kernel.command_graph import begin_capture, check_same_graph, end_capture, replay
+from ftmetal.kernel.command_graph import (
+    ARENA_ALIGNMENT,
+    begin_capture,
+    check_same_graph,
+    end_capture,
+    place_blocks,
+    plan_arena,
+    plan_graph_arena,
+    replay,
+)
+from ftmetal.kernel.custom import metal_kernel
 from ftmetal.kernel.inplace import scatter_rows
 
 HIDDEN = 256
@@ -145,3 +158,168 @@ def test_capture_fails_on_a_buffer_outside_the_graph() -> None:
     mx.eval(logits, updated, unrelated)
     with pytest.raises(RuntimeError, match="neither whitelisted"):
         end_capture()
+
+
+def random_tape(
+    rng: random.Random,
+) -> tuple[dict[int, int], list[list[int]], list[bool]]:
+    """Blocks of random sizes, each bound by one to four dispatches of a random tape."""
+    num_dispatches = rng.randint(1, 40)
+    num_blocks = rng.randint(1, 30)
+    block_sizes = {block: rng.randint(1, 3 * ARENA_ALIGNMENT) for block in range(num_blocks)}
+    dispatch_blocks: list[list[int]] = [[] for _ in range(num_dispatches)]
+    for block in block_sizes:
+        for d in rng.sample(range(num_dispatches), min(num_dispatches, rng.randint(1, 4))):
+            dispatch_blocks[d].append(block)
+    separated = [rng.random() < 0.3 for _ in range(num_dispatches)]
+    return block_sizes, dispatch_blocks, separated
+
+
+@pytest.mark.parametrize("seed", range(200))
+def test_plan_arena_never_shares_bytes_without_a_barrier_between(seed: int) -> None:
+    rng = random.Random(seed)
+    block_sizes, dispatch_blocks, separated = random_tape(rng)
+    # A block the caller leaves out (pinned) is not placed even though the tape binds it.
+    pinned = rng.choice(list(block_sizes))
+    placed_sizes = {block: size for block, size in block_sizes.items() if block != pinned}
+    plan = plan_arena(placed_sizes, dispatch_blocks, separated)
+
+    uses = {
+        block: [d for d, blocks in enumerate(dispatch_blocks) if block in blocks]
+        for block in placed_sizes
+    }
+    assert plan.placements.keys() == {block for block in placed_sizes if uses[block]}
+    for block, (offset, size) in plan.placements.items():
+        assert offset % ARENA_ALIGNMENT == 0 and size % ARENA_ALIGNMENT == 0
+        assert size >= placed_sizes[block] and offset + size <= plan.arena_bytes
+
+    def barrier_between(before: int, after: int) -> bool:
+        return any(separated[d] for d in range(before + 1, after + 1))
+
+    for a, (offset_a, size_a) in plan.placements.items():
+        for b, (offset_b, size_b) in plan.placements.items():
+            if a < b and offset_a < offset_b + size_b and offset_b < offset_a + size_a:
+                assert barrier_between(max(uses[a]), min(uses[b])) or barrier_between(
+                    max(uses[b]), min(uses[a])
+                ), f"blocks {a} and {b} share bytes while both may be live"
+    assert plan.lower_bound <= plan.arena_bytes
+    assert (plan.lower_bound > 0) == bool(plan.placements)
+
+
+def test_plan_arena_ping_pongs_a_residual_stream() -> None:
+    """x[i + 1] = x[i] + f(norm(x[i])), one barrier between dispatches: the stream takes
+    two slots and the arena is the lower bound."""
+    size = 4 * ARENA_ALIGNMENT
+    num_layers = 6
+    dispatch_blocks: list[list[int]] = []
+    stream = [0]
+    block_sizes = {0: size}
+    for _ in range(num_layers):
+        x = stream[-1]
+        normed, update, out = range(len(block_sizes), len(block_sizes) + 3)
+        block_sizes.update({normed: size, update: size, out: size})
+        dispatch_blocks += [[x, normed], [normed, update], [x, update, out]]
+        stream.append(out)
+    plan = plan_arena(block_sizes, dispatch_blocks, [True] * len(dispatch_blocks))
+    offsets = [plan.placements[block].offset for block in stream]
+    assert len(set(offsets)) == 2
+    assert all(offsets[i] == offsets[i + 2] != offsets[i + 1] for i in range(len(offsets) - 2))
+    assert plan.arena_bytes == plan.lower_bound == 3 * size
+
+
+def arena_for(graph: _C.Graph) -> mx.array:
+    """Plan and place graph's blocks, bind them to a fresh arena filled with 0xFF."""
+    plan = plan_graph_arena(graph, [])
+    place_blocks(graph, plan)
+    arena = mx.zeros((plan.arena_bytes,), dtype=mx.uint8)
+    mx.eval(arena)
+    _C.bind_arena(graph, arena)
+    _C.poison_arena(graph)
+    return arena
+
+
+def test_arena_replay_matches_eager_and_releases_the_capture() -> None:
+    step = TinyStep()
+    graph, _ = capture(step, step_inputs(1), zero_pool())
+    stats = graph.stats
+    assert stats.pinned_bytes == stats.capture_pinned_bytes > 0
+    assert len(graph.temporary_blocks) >= 3
+
+    plan = plan_graph_arena(graph, [])
+    place_blocks(graph, plan)
+    assert graph.stats.arena_bytes <= plan.arena_bytes <= sum(graph.block_sizes) + ARENA_ALIGNMENT
+    assert graph.stats.pinned_bytes < stats.capture_pinned_bytes
+    assert graph.stats.num_pinned_temporaries == 0
+    with pytest.raises(ValueError, match="bind an arena"):
+        replay(graph, step_inputs(2), [zero_pool()])
+    arena = mx.zeros((plan.arena_bytes,), dtype=mx.uint8)
+    mx.eval(arena)
+    _C.bind_arena(graph, arena)
+    _C.poison_arena(graph)
+
+    eager_pool, replay_pool = zero_pool(), zero_pool()
+    for seed in range(2, 6):
+        x, rows, positions = step_inputs(seed)
+        expected, eager_pool = step.forward(x, rows, positions, eager_pool)
+        logits, (replay_pool,) = replay(graph, [x, rows, positions], [replay_pool])
+        mx.eval(expected, eager_pool, logits, replay_pool)
+        assert mx.array_equal(logits, expected)
+        assert mx.array_equal(replay_pool, eager_pool)
+
+
+# Writes out[0] only: the other elements keep the init_value MLX fills them with, from a
+# scalar temporary the host writes at eval time.
+FIRST_ELEMENT_KERNEL = metal_kernel(
+    name="first_element",
+    input_names=["x"],
+    output_names=["out"],
+    source="if (thread_position_in_grid.x == 0) { out[0] = x[0]; }",
+)
+
+
+def test_poison_finds_a_host_initialized_temporary() -> None:
+    """A temporary the replay reads before writing changes the logits when poisoned; pinned,
+    it keeps them exact on an arena full of 0xFF."""
+    x = mx.arange(8, dtype=mx.float32) + 1
+    pool = mx.zeros((1, 8), dtype=mx.float32)
+    rows = mx.array([0], dtype=mx.int32)
+    mx.eval(x, pool, rows)
+
+    def forward(pool: mx.array) -> tuple[mx.array, mx.array]:
+        (first,) = FIRST_ELEMENT_KERNEL(
+            inputs=[x * 2],
+            grid=(32, 1, 1),
+            threadgroup=(32, 1, 1),
+            output_shapes=[(8,)],
+            output_dtypes=[mx.float32],
+            init_value=5.0,
+        )
+        logits = (first + x).reshape(1, 8)
+        return logits, scatter_rows(pool, logits, rows)
+
+    expected, _ = forward(pool)
+    mx.eval(expected)
+    logits, updated = forward(pool)
+    begin_capture([logits, updated], [rows], [pool], [x])
+    mx.eval(logits, updated)
+    graph = end_capture()
+
+    temporaries = graph.temporary_blocks
+    changed = []
+    for block in temporaries:
+        _C.poison_blocks(graph, [block])
+        poisoned, (pool,) = replay(graph, [rows], [pool])
+        mx.eval(poisoned)
+        _C.restore_blocks(graph)
+        if not mx.array_equal(poisoned, expected):
+            changed.append(block)
+    assert len(changed) == 1 and graph.block_labels[changed[0]].startswith("temporary of ")
+
+    place_blocks(graph, plan_graph_arena(graph, changed))
+    assert graph.stats.num_pinned_temporaries == 1
+    arena = mx.zeros((max(graph.stats.arena_bytes, ARENA_ALIGNMENT),), dtype=mx.uint8)
+    mx.eval(arena)
+    _C.bind_arena(graph, arena)
+    _C.poison_arena(graph)
+    logits, _ = replay(graph, [rows], [pool])
+    assert mx.array_equal(logits, expected)
