@@ -25,6 +25,15 @@ def test_greedy_is_argmax() -> None:
     assert mx.array_equal(sampler.sample(logits, args), mx.argmax(logits, axis=-1))
 
 
+def test_temperature_zero_is_greedy_whatever_top_p_and_top_k() -> None:
+    params = [
+        SamplingParams(temperature=0.0, top_k=20, top_p=0.95),
+        SamplingParams(temperature=0.7, top_k=1, top_p=0.5),
+    ]
+    assert all(p.is_greedy for p in params)
+    assert Sampler(vocab_size=8).prepare(batch_of(params)).temperatures is None
+
+
 def test_top_k_keeps_exactly_k_candidates() -> None:
     logits = mx.array([[1.0, 5.0, 3.0, 4.0, 2.0], [0.0, 0.0, 9.0, 1.0, 2.0]])
     masked = apply_top_k(logits, mx.array([2, 1], dtype=mx.int32))
