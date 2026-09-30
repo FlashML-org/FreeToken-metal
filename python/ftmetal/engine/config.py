@@ -32,11 +32,11 @@ def checkpoint_tensor_names(model_path: str) -> list[str]:
 
 
 def command_graph_from_env() -> bool:
-    """FTMETAL_COMMAND_GRAPH: 1 replays decode steps from captured graphs, 0 (default) not."""
+    """FTMETAL_COMMAND_GRAPH: 1 (default) replays decode steps from captured graphs, 0 not."""
     value = read_env("COMMAND_GRAPH")
     if value not in (None, "0", "1"):
         raise ValueError(f"FTMETAL_COMMAND_GRAPH must be 0 or 1, got {value!r}")
-    return value == "1"
+    return value != "0"
 
 
 @dataclass(frozen=True)

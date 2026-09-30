@@ -5,6 +5,7 @@ Replay needs the Metal kernels, so these run on the GPU like the rest of the sui
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import mlx.core as mx
@@ -55,13 +56,18 @@ def test_graph_ladder_ends_at_max_running_req(max_running_req: int, ladder: list
 
 
 def engine_config(
-    path: Path, max_running_req: int, command_graph: bool, page_size: int = 4
+    path: Path,
+    max_running_req: int,
+    command_graph: bool,
+    page_size: int = 4,
+    attention_backend: str = "metal",
 ) -> EngineConfig:
     return EngineConfig(
         model_path=str(path),
         dtype=mx.float32,
         max_running_req=max_running_req,
         page_size=page_size,
+        attention_backend=attention_backend,
         num_page_override=NUM_TOKENS // page_size,
         max_extend_tokens=128,
         command_graph=command_graph,
@@ -181,6 +187,18 @@ def test_capture_failure_fails_the_startup(
         monkeypatch.setattr(graph, "capture", capture_failing_at_two)
     with pytest.raises(RuntimeError, match="capture failed: injected"):
         Engine(engine_config(tmp_path, max_running_req=4, command_graph=True))
+
+
+def test_uncapturable_backend_decodes_eagerly_with_a_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    model = build_reference(seed=26)
+    save_checkpoint(model, tmp_path, quantization=None)
+    config = engine_config(tmp_path, 2, command_graph=True, attention_backend="mlx")
+    with caplog.at_level(logging.WARNING, logger=engine.__name__):
+        runner = Engine(config).graph_runner
+    assert runner.graphs == {}
+    assert "CommandGraph needs a capturable attention backend" in caplog.text
 
 
 def prefilled_scheduler(path: Path, prompts: list[list[int]], command_graph: bool) -> Scheduler:
