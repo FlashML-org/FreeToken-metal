@@ -187,22 +187,68 @@ def test_failed_capture_pads_past_its_bucket(
     assert set(log.sizes) == {(2, 4), (1, 1)}
 
 
+def prefilled_scheduler(path: Path, prompts: list[list[int]], command_graph: bool) -> Scheduler:
+    """A scheduler whose requests have all prefilled, at their first decode step."""
+    scheduler = make_scheduler(path, max_running_req=4, command_graph=command_graph)
+    for uid, prompt in enumerate(prompts):
+        params = SamplingParams(temperature=0.0, max_tokens=16, ignore_eos=True)
+        scheduler.add_request(uid, np.array(prompt, dtype=np.int32), params)
+    while scheduler.prefill_manager.runnable:
+        forward_input = scheduler.schedule_next_batch()
+        assert forward_input is not None
+        scheduler.process_last_data(scheduler.forward(forward_input))
+    return scheduler
+
+
+def pad_decode_batches(
+    monkeypatch: pytest.MonkeyPatch, scheduler: Scheduler, padded_size: int
+) -> None:
+    """Pad every decode batch to padded_size with dummy requests, graphs or not."""
+    dummy_req = scheduler.engine.dummy_req
+
+    def pad_batch(batch: Batch) -> None:
+        extra = padded_size - batch.size if batch.is_decode else 0
+        batch.padded_reqs = batch.reqs + [dummy_req] * extra
+
+    monkeypatch.setattr(scheduler.engine.graph_runner, "pad_batch", pad_batch)
+
+
+def test_padded_eager_decode_matches_unpadded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Eager decode of a batch padded with dummy rows: the metadata covers the padded rows
+    like the step inputs, and the real rows get the unpadded batch's logits and tokens."""
+    model = build_reference(seed=25)
+    save_checkpoint(model, tmp_path, quantization=None)
+    rng = np.random.default_rng(25)
+    prompts = [[int(t) for t in rng.integers(1, 120, size=n)] for n in (14, 37, 22)]
+    steps = [9, 5, 12]
+    expected = [reference_greedy(model, p, n)[1] for p, n in zip(prompts, steps)]
+
+    logits: dict[int, mx.array] = {}
+    for padded_size in (3, 4):
+        scheduler = prefilled_scheduler(tmp_path, prompts, command_graph=False)
+        pad_decode_batches(monkeypatch, scheduler, padded_size)
+        forward_input = scheduler.schedule_next_batch()
+        assert forward_input is not None
+        batch = forward_input.batch
+        assert batch.is_decode and (batch.size, batch.padded_size) == (3, padded_size)
+        logits[padded_size] = scheduler.engine.model.forward(batch)[: batch.size]
+    assert mx.array_equal(logits[4], logits[3]).item()
+
+    scheduler = make_scheduler(tmp_path, max_running_req=4, command_graph=False)
+    pad_decode_batches(monkeypatch, scheduler, 4)
+    assert generate(scheduler, prompts, steps) == expected
+
+
 def test_padded_decode_step_captures_the_replayed_graph(tmp_path: Path) -> None:
     """The double-capture check of a real padded decode step (three requests in bucket 4)
     against the graph the engine replays, which was captured on dummy rows."""
     model = build_reference(seed=22)
     save_checkpoint(model, tmp_path, quantization=None)
     rng = np.random.default_rng(22)
-    scheduler = make_scheduler(tmp_path, max_running_req=4, command_graph=True)
-    for uid, length in enumerate((10, 27, 18)):
-        params = SamplingParams(temperature=0.0, max_tokens=16, ignore_eos=True)
-        prompt = rng.integers(1, 120, size=length).astype(np.int32)
-        scheduler.add_request(uid, prompt, params)
-    while scheduler.prefill_manager.runnable:
-        forward_input = scheduler.schedule_next_batch()
-        assert forward_input is not None
-        scheduler.process_last_data(scheduler.forward(forward_input))
-
+    prompts = [[int(t) for t in rng.integers(1, 120, size=n)] for n in (10, 27, 18)]
+    scheduler = prefilled_scheduler(tmp_path, prompts, command_graph=True)
     runner = scheduler.engine.graph_runner
     forward_input = scheduler.schedule_next_batch()
     assert forward_input is not None

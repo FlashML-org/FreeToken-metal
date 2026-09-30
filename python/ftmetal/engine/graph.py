@@ -2,8 +2,8 @@
 
 Port of FreeToken engine/graph.py. Divergences: a graph is a CommandGraph capture
 (kernel/command_graph.py) instead of a CUDA graph, so there is no GraphCaptureBuffer:
-the step inputs (input_ids, positions, out_loc and the attention metadata a backend's
-prepare_for_replay builds at the bucket's fixed shapes) are rebound by every replay,
+the step inputs (input_ids, positions, out_loc and the metadata arrays a backend's
+prepare_for_replay leaves at the bucket's fixed shapes) are rebound by every replay,
 and so are the pools, which the replay takes and returns; the bs ladder ends at
 max_running_req, on the ladder or not; the intermediates and temporaries of every
 capture are planned into one arena all buckets share, allocated after the captures,
@@ -191,6 +191,7 @@ class GraphRunner:
         batch.input_ids = mx.zeros((len(reqs),), dtype=mx.int32)
         batch.positions = mx.full((len(reqs),), self.dummy_req.cached_len, dtype=mx.int32)
         for backend in self.attn_backends.values():
+            backend.prepare_metadata(batch)
             backend.prepare_for_capture(batch)
         return batch
 
@@ -237,7 +238,8 @@ class GraphRunner:
         return pinned
 
     def capture(self, batch: Batch) -> _C.Graph:
-        """One real forward of a padded decode batch, its metadata prepared, under the recorder."""
+        """One real forward of a padded decode batch, its metadata at its bucket's shapes,
+        under the recorder."""
         parameters = tree_flatten(self.model.parameters())
         externals = [value for _, value in parameters if isinstance(value, mx.array)]
         step_inputs = self.step_inputs(batch)

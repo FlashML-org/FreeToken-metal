@@ -4,9 +4,8 @@ Port of FreeToken engine/engine.py. Divergences: CommandGraph replays instead of
 graphs (engine/graph.py), no streams or TP; the page table is a host numpy array the
 scheduler owns through the CacheManager; one pool and one attention backend per
 attention type, created from the model's group specs, in the global Context (FreeToken
-builds one KV family and special-cases the GDN state pool); a batch the graph runner
-replays gets its metadata from the runner, not prepare_metadata; the forward returns
-lazy sampled tokens and the caller issues the step's async_eval.
+builds one KV family and special-cases the GDN state pool); the forward returns lazy
+sampled tokens and the caller issues the step's async_eval.
 """
 
 from __future__ import annotations
@@ -152,16 +151,14 @@ class Engine:
         )
 
     def prepare_metadata(self, batch: Batch) -> None:
-        """Eager metadata; a batch the graph runner replays gets its own in the replay."""
-        if not self.graph_runner.can_replay(batch):
-            for backend in self.attn_backends.values():
-                backend.prepare_metadata(batch)
+        for backend in self.attn_backends.values():
+            backend.prepare_metadata(batch)
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         if self.graph_runner.can_replay(batch):
             logits = self.graph_runner.replay(batch)
         else:
-            logits = self.model.forward(batch)
+            logits = self.model.forward(batch)[: batch.size]
         for req in batch.reqs:
             req.complete_one()
         return ForwardOutput(self.sampler.sample(logits, args))

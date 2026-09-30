@@ -3,16 +3,16 @@
 Port of the shared part of FreeToken's full-attention backends (attention/fa.py's
 prepare_metadata, capture hooks and forward). Divergences: the metadata is built from
 the host page table into fresh mx.arrays each step, out_loc is computed here, and the
-kernel implementation is the subclass's attend(). A replayed decode batch's page table
-is its requests' whole page-table rows (the graph's width is the row width) and
-max_seqlen_k is the row width too, so the flash-decode partition count is fixed per
-graph; entries past a request's keys are stale but in bounds and never read.
+kernel implementation is the subclass's attend(). prepare_for_replay swaps a decode
+batch's page table for its requests' whole page-table rows (the graph's width is the
+row width) and max_seqlen_k for the row width, so the flash-decode partition count is
+fixed per graph; entries past a request's keys are stale but in bounds and never read.
 """
 
 from __future__ import annotations
 
 from abc import abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import mlx.core as mx
 import numpy as np
@@ -65,10 +65,9 @@ class FullAttnBackend(BaseAttnBackend):
         self.dummy_page = kvcache.num_pages - 1
         self.capture_max_seq_len = 0
         self.capture_bs: list[int] = []
-        self.capture_cu_seqlens_q: dict[int, mx.array] = {}
 
     def prepare_metadata(self, batch: Batch) -> None:
-        reqs = batch.reqs
+        reqs = batch.padded_reqs
         seq_lens = [req.device_len for req in reqs]
         extend_lens = [req.extend_len for req in reqs]
         cached_lens = [req.cached_len for req in reqs]
@@ -102,31 +101,16 @@ class FullAttnBackend(BaseAttnBackend):
         assert max_seq_len == self.page_table_host.shape[1], "a graph spans whole table rows"
         self.capture_max_seq_len = max_seq_len
         self.capture_bs = sorted(bs_list)
-        self.capture_cu_seqlens_q = {bs: mx.arange(bs + 1, dtype=mx.int32) for bs in bs_list}
-        mx.eval(*self.capture_cu_seqlens_q.values())
-
-    def prepare_for_capture(self, batch: Batch) -> None:
-        self.prepare_for_replay(batch)
 
     def prepare_for_replay(self, batch: Batch) -> None:
-        reqs = batch.padded_reqs
-        size = len(reqs)
-        assert batch.is_decode and size in self.capture_bs
-        cached_lens = [req.cached_len for req in reqs]
-        seq_lens = [req.device_len for req in reqs]
-        table = self.page_table_host[[req.table_idx for req in reqs]]
-        batch.out_loc = mx.array(table[np.arange(size), cached_lens])
+        metadata = batch.attn_metadata[AttnType.FULL]
+        assert isinstance(metadata, FullAttnMetadata)
+        assert batch.is_decode and batch.padded_size in self.capture_bs
+        table = self.page_table_host[[req.table_idx for req in batch.padded_reqs]]
         if self.page_size > 1:
             table = table[:, :: self.page_size] // self.page_size
-        batch.attn_metadata[AttnType.FULL] = FullAttnMetadata(
-            cu_seqlens_q=self.capture_cu_seqlens_q[size],
-            seq_lens=mx.array(np.asarray(seq_lens, dtype=np.int32)),
-            page_table=mx.array(table),
-            max_seqlen_q=1,
-            max_seqlen_k=self.capture_max_seq_len,
-            seq_lens_host=seq_lens,
-            extend_lens_host=[1] * size,
-            cached_lens_host=cached_lens,
+        batch.attn_metadata[AttnType.FULL] = replace(
+            metadata, page_table=mx.array(table), max_seqlen_k=self.capture_max_seq_len
         )
 
     def forward(

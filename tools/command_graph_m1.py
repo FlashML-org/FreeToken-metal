@@ -11,7 +11,8 @@ model.forward, captures that first step once more for the double-capture check a
 the runner's graph, then runs the same steps as replays of the runner's graph, each run
 from the same state (the GDN slot is saved in a spare slot and restored; KV slots are
 rewritten before they are read). Every step feeds its greedy token back, and both runs
-build their metadata with the backends' prepare_for_replay, so they run the same
+build their metadata as the scheduler does (the replay turns it into its bucket's fixed
+shapes); flash-decode partitions each request by its own length, so both run the same
 kernels. The script reports logits and token agreement, the graph's statistics and
 arena plan, and per step the dispatches and command buffers (counted by the recorder's
 hooks) and the host time: launch wall and thread CPU time up to the async_eval return,
@@ -34,7 +35,6 @@ import numpy as np
 import ftmetal
 from ftmetal.core import Batch, Req, SamplingParams, host_ints
 from ftmetal.engine.config import EngineConfig
-from ftmetal.engine.graph import GraphRunner
 from ftmetal.kernel._ext import _C
 from ftmetal.kernel.command_graph import (
     ArenaPlan,
@@ -84,19 +84,15 @@ def prefill(scheduler: Scheduler, prompt: np.ndarray, max_tokens: int) -> Req:
 
 
 def decode_batch(scheduler: Scheduler, req: Req, token: mx.array, allocate: bool) -> Batch:
-    """The decode batch of req's next token, padded to its bucket, without metadata."""
+    """The decode batch of req's next token, padded to its bucket, with its metadata."""
     if allocate:
         scheduler.cache_manager.allocate_paged([req])
     batch = Batch(reqs=[req], phase="decode")
     scheduler.engine.graph_runner.pad_batch(batch)
     batch.input_ids = token
     batch.positions = mx.array([req.cached_len], dtype=mx.int32)
+    scheduler.engine.prepare_metadata(batch)
     return batch
-
-
-def prepare_for_replay(runner: GraphRunner, batch: Batch) -> None:
-    for backend in runner.attn_backends.values():
-        backend.prepare_for_replay(batch)
 
 
 def greedy(logits: mx.array) -> mx.array:
@@ -108,8 +104,6 @@ def host_logits(logits: mx.array) -> np.ndarray:
 
 
 def eager_step(scheduler: Scheduler, batch: Batch) -> mx.array:
-    """model.forward on the metadata a replay of batch's bucket would get."""
-    prepare_for_replay(scheduler.engine.graph_runner, batch)
     logits = scheduler.engine.model.forward(batch)
     batch.reqs[0].complete_one()
     return logits
@@ -281,7 +275,8 @@ def main() -> int:
 
     restore()
     batch = decode_batch(scheduler, req, first_token, allocate=False)
-    prepare_for_replay(runner, batch)
+    for backend in runner.attn_backends.values():
+        backend.prepare_for_replay(batch)
     captured = runner.capture(batch)
     restore()
     replay_logits: list[np.ndarray] = []

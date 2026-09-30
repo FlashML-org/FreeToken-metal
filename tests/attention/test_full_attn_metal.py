@@ -206,6 +206,7 @@ def test_replay_metadata_matches_reference_and_eager(
     eager = backend.forward(q[:size], k[:size], v[:size], 0, batch)
     backend.init_capture_graph(REPLAY_MAX_SEQ_LEN, [padded_size])
     batch.padded_reqs = batch.reqs + [dummy] * num_dummies
+    backend.prepare_metadata(batch)
     backend.prepare_for_replay(batch)
     replayed = backend.forward(q, k, v, 0, batch)[:size]
     reference = flash_decode_ref(
