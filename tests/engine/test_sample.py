@@ -1,9 +1,10 @@
-"""Sampler contract: greedy argmax, top-k / top-p masks, per-row temperatures."""
+"""Sampler contract: greedy argmax, top-k / top-p masks, per-row temperatures, both paths."""
 
 from __future__ import annotations
 
 import mlx.core as mx
 import numpy as np
+import pytest
 
 from ftmetal.core import Batch, Req, SamplingParams
 from ftmetal.engine.sample import Sampler, apply_top_k, apply_top_p
@@ -49,8 +50,9 @@ def test_top_p_keeps_smallest_prefix_reaching_p() -> None:
     assert (masked > -mx.inf).tolist() == [[True, True, True, False]]
 
 
-def test_mixed_batch_samples_only_from_allowed_tokens() -> None:
-    sampler = Sampler(vocab_size=6)
+@pytest.mark.parametrize("use_kernel", [True, False])
+def test_mixed_batch_samples_only_from_allowed_tokens(use_kernel: bool) -> None:
+    sampler = Sampler(vocab_size=6, use_kernel=use_kernel)
     params = [
         SamplingParams(temperature=1.0, top_k=1),
         SamplingParams(temperature=0.7, top_p=0.5),
@@ -60,3 +62,11 @@ def test_mixed_batch_samples_only_from_allowed_tokens() -> None:
     logits = mx.array([[0.0, 8.0, 0.0, 0.0, 0.0, 0.0]] * 3)
     for _ in range(5):
         assert sampler.sample(logits, args).tolist() == [1, 1, 1]
+
+
+def test_env_selects_the_mlx_ops(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("FTMETAL_SAMPLE_KERNEL", "FREETOKEN_SAMPLE_KERNEL"):
+        monkeypatch.delenv(name, raising=False)
+    assert Sampler(vocab_size=6).use_kernel
+    monkeypatch.setenv("FTMETAL_SAMPLE_KERNEL", "0")
+    assert not Sampler(vocab_size=6).use_kernel
