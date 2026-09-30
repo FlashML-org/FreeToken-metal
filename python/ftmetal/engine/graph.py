@@ -4,11 +4,11 @@ Port of FreeToken engine/graph.py. Divergences: a graph is a CommandGraph captur
 (kernel/command_graph.py) instead of a CUDA graph, so there is no GraphCaptureBuffer:
 the step inputs (input_ids, positions, out_loc and the attention metadata a backend's
 prepare_for_replay builds at the bucket's fixed shapes) are rebound by every replay,
-and so are the pools, which the replay takes and returns; the bs ladder is capped by
-max_running_req; the intermediates and temporaries of every capture are planned into
-one arena all buckets share, allocated after the captures, and a temporary a replay
-reads before writing (poison test) stays pinned instead; a bucket whose capture or
-arena check fails stays eager (pad_batch does not pad to it).
+and so are the pools, which the replay takes and returns; the bs ladder ends at
+max_running_req, on the ladder or not; the intermediates and temporaries of every
+capture are planned into one arena all buckets share, allocated after the captures,
+and a temporary a replay reads before writing (poison test) stays pinned instead; a
+bucket whose capture or arena check fails stays eager (pad_batch does not pad to it).
 """
 
 from __future__ import annotations
@@ -45,9 +45,9 @@ GRAPH_BS_STRIDE = 8
 
 
 def determine_graph_bs(max_running_req: int) -> list[int]:
-    """FreeToken's _determine_cuda_graph_bs with max_running_req as the largest batch."""
-    candidates = [1, 2, 4, *range(GRAPH_BS_STRIDE, max_running_req + 1, GRAPH_BS_STRIDE)]
-    return [bs for bs in candidates if bs <= max_running_req]
+    """The ladder below max_running_req, then max_running_req itself: a full batch replays."""
+    candidates = [1, 2, 4, *range(GRAPH_BS_STRIDE, max_running_req, GRAPH_BS_STRIDE)]
+    return [bs for bs in candidates if bs < max_running_req] + [max_running_req]
 
 
 def undonated_copies(kernel_names: list[str]) -> int:

@@ -14,7 +14,7 @@ import pytest
 from ftmetal.core import Batch, SamplingParams
 from ftmetal.engine import engine, graph
 from ftmetal.engine.config import EngineConfig
-from ftmetal.engine.graph import GraphRunner
+from ftmetal.engine.graph import GraphRunner, determine_graph_bs
 from ftmetal.kernel._ext import _C
 from ftmetal.kernel.command_graph import check_same_graph
 from ftmetal.scheduler.scheduler import Scheduler, TokenEvent
@@ -31,6 +31,22 @@ class ReplayLog:
     def __call__(self, batch: Batch) -> mx.array:
         self.sizes.append((batch.size, batch.padded_size))
         return self.runner_replay(batch)
+
+
+@pytest.mark.parametrize(
+    ("max_running_req", "ladder"),
+    [
+        (1, [1]),
+        (3, [1, 2, 3]),
+        (4, [1, 2, 4]),
+        (6, [1, 2, 4, 6]),
+        (8, [1, 2, 4, 8]),
+        (12, [1, 2, 4, 8, 12]),
+        (24, [1, 2, 4, 8, 16, 24]),
+    ],
+)
+def test_graph_ladder_ends_at_max_running_req(max_running_req: int, ladder: list[int]) -> None:
+    assert determine_graph_bs(max_running_req) == ladder
 
 
 def make_scheduler(path: Path, max_running_req: int, command_graph: bool) -> Scheduler:
