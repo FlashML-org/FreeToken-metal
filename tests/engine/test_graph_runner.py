@@ -20,6 +20,9 @@ from ftmetal.kernel.command_graph import check_same_graph
 from ftmetal.scheduler.scheduler import Scheduler, TokenEvent
 from tiny_model import build_reference, reference_greedy, save_checkpoint
 
+# Tokens of KV cache every test engine gets, whatever its page size.
+NUM_TOKENS = 512
+
 
 class ReplayLog:
     """Wraps a runner's replay to record (batch size, padded size) of every replay."""
@@ -49,16 +52,24 @@ def test_graph_ladder_ends_at_max_running_req(max_running_req: int, ladder: list
     assert determine_graph_bs(max_running_req) == ladder
 
 
-def make_scheduler(path: Path, max_running_req: int, command_graph: bool) -> Scheduler:
-    config = EngineConfig(
+def engine_config(
+    path: Path, max_running_req: int, command_graph: bool, page_size: int = 4
+) -> EngineConfig:
+    return EngineConfig(
         model_path=str(path),
         dtype=mx.float32,
         max_running_req=max_running_req,
-        page_size=4,
-        num_page_override=128,
+        page_size=page_size,
+        num_page_override=NUM_TOKENS // page_size,
         max_extend_tokens=128,
         command_graph=command_graph,
     )
+
+
+def make_scheduler(
+    path: Path, max_running_req: int, command_graph: bool, page_size: int = 4
+) -> Scheduler:
+    config = engine_config(path, max_running_req, command_graph, page_size)
     return Scheduler(config, eos_token_ids={127})
 
 
@@ -72,15 +83,29 @@ def generate(scheduler: Scheduler, prompts: list[list[int]], steps: list[int]) -
 
 
 @pytest.mark.parametrize(
-    ("max_running_req", "lengths", "steps"),
-    [(1, [23], [12]), (4, [9, 41, 17, 33], [6, 11, 3, 14])],
+    ("max_running_req", "page_size", "lengths", "steps", "replayed_sizes"),
+    [
+        (1, 4, [23], [12], {(1, 1)}),
+        (4, 4, [9, 41, 17, 33], [6, 11, 3, 14], {(4, 4), (3, 4), (2, 2), (1, 1)}),
+        (4, 1, [9, 41, 17, 33], [6, 11, 3, 14], {(4, 4), (3, 4), (2, 2), (1, 1)}),
+        # Off the ladder: the top bucket is max_running_req itself, and five rows pad to it.
+        (
+            6,
+            4,
+            [9, 41, 17, 33, 25, 12],
+            [6, 11, 3, 14, 8, 5],
+            {(6, 6), (5, 6), (4, 4), (3, 4), (2, 2), (1, 1)},
+        ),
+    ],
 )
 def test_replay_matches_eager_across_bucket_switches(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     max_running_req: int,
+    page_size: int,
     lengths: list[int],
     steps: list[int],
+    replayed_sizes: set[tuple[int, int]],
 ) -> None:
     model = build_reference(seed=20)
     save_checkpoint(model, tmp_path, quantization=None)
@@ -88,23 +113,18 @@ def test_replay_matches_eager_across_bucket_switches(
     prompts = [[int(t) for t in rng.integers(1, 120, size=n)] for n in lengths]
     expected = [reference_greedy(model, p, n)[1] for p, n in zip(prompts, steps)]
 
-    eager = make_scheduler(tmp_path, max_running_req, command_graph=False)
+    eager = make_scheduler(tmp_path, max_running_req, command_graph=False, page_size=page_size)
     assert eager.engine.graph_runner.graphs == {}
     assert generate(eager, prompts, steps) == expected
 
-    replayed = make_scheduler(tmp_path, max_running_req, command_graph=True)
+    replayed = make_scheduler(tmp_path, max_running_req, command_graph=True, page_size=page_size)
     runner = replayed.engine.graph_runner
-    assert sorted(runner.graphs) == [bs for bs in (1, 2, 4) if bs <= max_running_req]
+    assert sorted(runner.graphs) == determine_graph_bs(max_running_req)
     log = ReplayLog(runner)
     monkeypatch.setattr(runner, "replay", log)
     assert generate(replayed, prompts, steps) == expected
-    # Every decode step replays; as requests finish the batch shrinks through the buckets,
-    # three live requests padded to four.
-    sizes = set(log.sizes)
-    if max_running_req == 1:
-        assert sizes == {(1, 1)}
-    else:
-        assert {(4, 4), (3, 4), (2, 2), (1, 1)} <= sizes
+    # Every decode step replays; as requests finish the batch shrinks through the buckets.
+    assert set(log.sizes) >= replayed_sizes
 
 
 def test_buckets_share_one_tight_arena(tmp_path: Path) -> None:
