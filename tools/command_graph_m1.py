@@ -1,25 +1,27 @@
-"""CommandGraph M1 check on the real model: bs=1 decode, eager against capture and replay.
+"""CommandGraph check on the real model: bs=1 decode, eager against the engine's replay.
 
     uv run python tools/command_graph_m1.py /path/to/Qwen3.6-35B-A3B-MLX \\
         [--context 2048] [--steps 18] [--timing-steps 64]
 
-One request prefills a real prompt (the engine's own source, tokenized) through the
-scheduler. From its first decode position the script then runs the decode steps twice
+The engine starts with CommandGraph on at max_running_req 1, so its graph runner
+captures batch size 1 on a dummy row and replays it from the shared arena. One request
+prefills a real prompt (the engine's own source, tokenized) through the scheduler. From
+its first decode position the script runs the decode steps eagerly through
+model.forward, captures that first step once more for the double-capture check against
+the runner's graph, then runs the same steps as replays of the runner's graph, each run
 from the same state (the GDN slot is saved in a spare slot and restored; KV slots are
-rewritten before they are read): eagerly through model.forward, then as two captures
-(the double-capture check compares them) followed by replays of the first graph. Every
-step feeds its greedy token back. Each decode batch has the fixed shapes a graph needs:
-the page table is aligned_max_seq_len / page_size columns wide and flash-decode's
-partition count follows max_seqlen_k = aligned_max_seq_len, so both runs use the same
-kernels. The script reports logits and token agreement, the graph's statistics, and
-per step the dispatches and command buffers (counted by the recorder's hooks) and the
-host time: launch wall and thread CPU time up to the async_eval return, and the whole
-step with a busy-wait for the token.
+rewritten before they are read). Every step feeds its greedy token back, and both runs
+build their metadata with the backends' prepare_for_replay, so they run the same
+kernels. The script reports logits and token agreement, the graph's statistics and
+arena plan, and per step the dispatches and command buffers (counted by the recorder's
+hooks) and the host time: launch wall and thread CPU time up to the async_eval return,
+and the whole step with a busy-wait for the token.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import statistics
 import sys
 import time
@@ -28,26 +30,19 @@ from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
-from mlx.utils import tree_flatten
 
 import ftmetal
-from ftmetal.attention.full.common import FullAttnBackend, FullAttnMetadata
-from ftmetal.attention.metadata import AttnType, LinearAttnMetadata
 from ftmetal.core import Batch, Req, SamplingParams, host_ints
 from ftmetal.engine.config import EngineConfig
-from ftmetal.engine.engine import Engine
+from ftmetal.engine.graph import GraphRunner
 from ftmetal.kernel._ext import _C
 from ftmetal.kernel.command_graph import (
-    begin_capture,
+    ArenaPlan,
     begin_count,
     check_same_graph,
-    end_capture,
     end_count,
-    replay,
     wait_until_available,
 )
-from ftmetal.kvcache.linear_state_pool import LinearStatePool
-from ftmetal.kvcache.mha_pool import MHAKVCache
 from ftmetal.scheduler.scheduler import Scheduler
 from ftmetal.tokenizer import TokenizeManager
 
@@ -55,14 +50,6 @@ from ftmetal.tokenizer import TokenizeManager
 WARMUP_STEPS = 8
 # Decode positions reserved past the prompt beyond the steps the script runs.
 SEQ_LEN_SLACK = 16
-
-
-@dataclass
-class DecodeStep:
-    batch: Batch
-    # The graph's step inputs, in capture order: input_ids, positions, out_loc,
-    # cu_seqlens_q, seq_lens, page_table, cu_seqlens, cache_indices, track_slots.
-    step_inputs: list[mx.array]
 
 
 @dataclass
@@ -96,77 +83,20 @@ def prefill(scheduler: Scheduler, prompt: np.ndarray, max_tokens: int) -> Req:
     return req
 
 
-def decode_step(scheduler: Scheduler, req: Req, token: mx.array, allocate: bool) -> DecodeStep:
-    """The decode batch of req's next token with bucket-fixed metadata shapes."""
-    engine = scheduler.engine
+def decode_batch(scheduler: Scheduler, req: Req, token: mx.array, allocate: bool) -> Batch:
+    """The decode batch of req's next token, padded to its bucket, without metadata."""
     if allocate:
         scheduler.cache_manager.allocate_paged([req])
-    page_size = engine.config.page_size
-    full_backend = engine.attn_backends[AttnType.FULL]
-    assert isinstance(full_backend, FullAttnBackend)
-    row = engine.page_table[req.table_idx]
-    pages = -(-req.device_len // page_size)
-    page_table = np.full(
-        (1, engine.aligned_max_seq_len // page_size), full_backend.dummy_page, dtype=np.int32
-    )
-    page_table[0, :pages] = row[: pages * page_size : page_size] // page_size
-    assert req.linear_slot_idx is not None
     batch = Batch(reqs=[req], phase="decode")
+    scheduler.engine.graph_runner.pad_batch(batch)
     batch.input_ids = token
     batch.positions = mx.array([req.cached_len], dtype=mx.int32)
-    batch.out_loc = mx.array(row[req.cached_len : req.device_len])
-    full = FullAttnMetadata(
-        cu_seqlens_q=mx.array([0, 1], dtype=mx.int32),
-        seq_lens=mx.array([req.device_len], dtype=mx.int32),
-        page_table=mx.array(page_table),
-        max_seqlen_q=1,
-        max_seqlen_k=engine.aligned_max_seq_len,
-        seq_lens_host=[req.device_len],
-        extend_lens_host=[1],
-        cached_lens_host=[req.cached_len],
-    )
-    linear = LinearAttnMetadata(
-        cu_seqlens=mx.array([0, 1], dtype=mx.int32),
-        cache_indices=mx.array([req.linear_slot_idx], dtype=mx.int32),
-        track_slots=mx.array([-1], dtype=mx.int32),
-        seq_lens_host=[1],
-        slots_host=[req.linear_slot_idx],
-        track_slots_host=[-1],
-        track_seqlens_host=[0],
-    )
-    batch.attn_metadata[AttnType.FULL] = full
-    batch.attn_metadata[AttnType.LINEAR] = linear
-    step_inputs = [
-        batch.input_ids,
-        batch.positions,
-        batch.out_loc,
-        full.cu_seqlens_q,
-        full.seq_lens,
-        full.page_table,
-        linear.cu_seqlens,
-        linear.cache_indices,
-        linear.track_slots,
-    ]
-    return DecodeStep(batch, step_inputs)
+    return batch
 
 
-def set_pool_arrays(engine: Engine, arrays: list[mx.array]) -> None:
-    """Rebind the pools to arrays, in engine.pool_arrays() order."""
-    offset = 0
-    for pool in engine.pools.values():
-        if isinstance(pool, MHAKVCache):
-            count = len(pool.k)
-            pool.k = arrays[offset : offset + count]
-            pool.v = arrays[offset + count : offset + 2 * count]
-            offset += 2 * count
-        elif isinstance(pool, LinearStatePool):
-            count = len(pool.conv_states)
-            pool.conv_states = arrays[offset : offset + count]
-            pool.recurrent_states = arrays[offset + count : offset + 2 * count]
-            offset += 2 * count
-        else:
-            raise TypeError(f"unknown pool {type(pool).__name__}")
-    assert offset == len(arrays)
+def prepare_for_replay(runner: GraphRunner, batch: Batch) -> None:
+    for backend in runner.attn_backends.values():
+        backend.prepare_for_replay(batch)
 
 
 def greedy(logits: mx.array) -> mx.array:
@@ -177,30 +107,17 @@ def host_logits(logits: mx.array) -> np.ndarray:
     return np.array(logits.astype(mx.float32))
 
 
-def eager_step(engine: Engine, step: DecodeStep) -> mx.array:
-    logits = engine.model.forward(step.batch)
-    step.batch.reqs[0].complete_one()
+def eager_step(scheduler: Scheduler, batch: Batch) -> mx.array:
+    """model.forward on the metadata a replay of batch's bucket would get."""
+    prepare_for_replay(scheduler.engine.graph_runner, batch)
+    logits = scheduler.engine.model.forward(batch)
+    batch.reqs[0].complete_one()
     return logits
 
 
-def capture_step(
-    engine: Engine, step: DecodeStep, externals: list[mx.array]
-) -> tuple[_C.Graph, mx.array]:
-    """One real decode step under the recorder; returns its graph and logits."""
-    pools = engine.pool_arrays()
-    logits = engine.model.forward(step.batch)
-    updated = engine.pool_arrays()
-    begin_capture([logits, *updated], step.step_inputs, pools, externals)
-    mx.eval(logits, *updated)
-    graph = end_capture()
-    step.batch.reqs[0].complete_one()
-    return graph, logits
-
-
-def replay_step(engine: Engine, step: DecodeStep, graph: _C.Graph) -> mx.array:
-    logits, pools = replay(graph, step.step_inputs, engine.pool_arrays())
-    set_pool_arrays(engine, pools)
-    step.batch.reqs[0].complete_one()
+def replay_step(scheduler: Scheduler, batch: Batch) -> mx.array:
+    logits = scheduler.engine.graph_runner.replay(batch)
+    batch.reqs[0].complete_one()
     return logits
 
 
@@ -209,8 +126,7 @@ def timed_steps(
     req: Req,
     token: mx.array,
     num_steps: int,
-    allocate: bool,
-    graph: _C.Graph | None,
+    replayed: bool,
 ) -> tuple[list[StepTiming], list[int]]:
     """num_steps pipelined-free steps, each waited for by busy-waiting on its token."""
     engine = scheduler.engine
@@ -219,11 +135,11 @@ def timed_steps(
     for _ in range(num_steps):
         begin_count()
         started_wall, started_cpu = time.perf_counter(), time.thread_time()
-        step = decode_step(scheduler, req, token, allocate)
-        if graph is None:
-            logits = eager_step(engine, step)
+        batch = decode_batch(scheduler, req, token, allocate=not replayed)
+        if replayed:
+            logits = replay_step(scheduler, batch)
         else:
-            logits = replay_step(engine, step, graph)
+            logits = eager_step(scheduler, batch)
         token = greedy(logits)
         mx.async_eval(token, *engine.pool_arrays())
         launched_wall, launched_cpu = time.perf_counter(), time.thread_time()
@@ -261,7 +177,7 @@ def summarize(name: str, timings: list[StepTiming]) -> None:
     )
 
 
-def print_graph(graph: _C.Graph) -> None:
+def print_graph(graph: _C.Graph, plan: ArenaPlan, hidden_size: int) -> None:
     stats = graph.stats
     temporaries = stats.temporaries
     calls = stats.calls
@@ -276,7 +192,21 @@ def print_graph(graph: _C.Graph) -> None:
         f"{stats.num_pool_buffers} pools, {stats.num_external_buffers} externals, "
         f"{stats.num_constant_buffers} constants, {stats.num_intermediate_buffers} intermediates, "
         f"{stats.num_temporary_buffers} temporaries; {stats.num_held_arrays} held arrays, "
-        f"pinned {stats.pinned_bytes / 2**20:.2f} MiB",
+        f"pinned {stats.capture_pinned_bytes / 2**20:.2f} MiB at capture, "
+        f"{stats.pinned_bytes / 2**20:.3f} MiB on the arena "
+        f"({stats.num_pinned_temporaries} temporaries fail the poison test)",
+        flush=True,
+    )
+    residual = [
+        plan.placements[block].offset
+        for block, label in enumerate(graph.block_labels)
+        if label.startswith("Add ") and label.endswith(f"[1, {hidden_size}]")
+    ]
+    print(
+        f"arena: {plan.arena_bytes / 2**20:.3f} MiB for {len(graph.block_sizes)} blocks of "
+        f"{sum(graph.block_sizes) / 2**20:.2f} MiB, lower bound {plan.lower_bound / 2**20:.3f} "
+        f"MiB (x{plan.arena_bytes / plan.lower_bound:.4f}); residual stream: {len(residual)} "
+        f"adds at {len(set(residual))} offsets, first {residual[:8]}",
         flush=True,
     )
     nbytes = sum(nbytes for nbytes, _ in temporaries)
@@ -304,7 +234,7 @@ def main() -> int:
     parser.add_argument("--attention-backend", default="metal")
     parser.add_argument("--page-size", type=int, default=1)
     args = parser.parse_args()
-    assert args.steps >= 3, "two captures and at least one replay"
+    assert args.steps >= 1, "at least one replay"
     decode_steps = args.steps + args.timing_steps
 
     config = EngineConfig(
@@ -313,16 +243,20 @@ def main() -> int:
         attention_backend=args.attention_backend,
         max_seq_len_override=args.context + decode_steps + SEQ_LEN_SLACK,
         page_size=args.page_size,
+        command_graph=True,
     )
     scheduler = Scheduler(config, eos_token_ids=set())
     engine = scheduler.engine
+    runner = engine.graph_runner
+    assert 1 in runner.graphs, "the engine did not capture batch size 1"
     req = prefill(scheduler, prompt_tokens(args.model_path, args.context), decode_steps + 1)
     first_token = mx.array([int(req.input_ids[-1])], dtype=mx.int32)
     saved_lens = (req.cached_len, req.device_len)
     state_pool = engine.ctx.linear_state_pool
-    assert state_pool is not None and req.linear_slot_idx is not None
+    live_slot = req.linear_slot_idx
+    assert state_pool is not None and live_slot is not None
     (spare_slot,) = state_pool.alloc(1)
-    state_pool.copy_from(req.linear_slot_idx, spare_slot)
+    state_pool.copy_from(live_slot, spare_slot)
     mx.eval(*engine.pool_arrays())
     print(
         f"prefilled {args.context} tokens; decoding from position {req.cached_len}, "
@@ -330,54 +264,52 @@ def main() -> int:
         flush=True,
     )
 
+    def restore() -> None:
+        state_pool.copy_from(spare_slot, live_slot)
+        mx.eval(*engine.pool_arrays())
+        req.cached_len, req.device_len = saved_lens
+
     eager_logits: list[np.ndarray] = []
     token = first_token
     for _ in range(args.steps):
-        logits = eager_step(engine, decode_step(scheduler, req, token, allocate=True))
+        logits = eager_step(scheduler, decode_batch(scheduler, req, token, allocate=True))
         token = greedy(logits)
         eager_logits.append(host_logits(logits))
     eager_timings, eager_tokens = timed_steps(
-        scheduler, req, token, args.timing_steps, allocate=True, graph=None
+        scheduler, req, token, args.timing_steps, replayed=False
     )
 
-    state_pool.copy_from(spare_slot, req.linear_slot_idx)
-    mx.eval(*engine.pool_arrays())
-    req.cached_len, req.device_len = saved_lens
-    externals = [
-        value for _, value in tree_flatten(engine.model.parameters()) if isinstance(value, mx.array)
-    ]
-    graphs: list[_C.Graph] = []
+    restore()
+    batch = decode_batch(scheduler, req, first_token, allocate=False)
+    prepare_for_replay(runner, batch)
+    captured = runner.capture(batch)
+    restore()
     replay_logits: list[np.ndarray] = []
     token = first_token
-    for _ in range(2):
-        step = decode_step(scheduler, req, token, allocate=False)
-        mx.eval(*step.step_inputs)
-        graph, logits = capture_step(engine, step, externals)
-        graphs.append(graph)
-        token = greedy(logits)
-        replay_logits.append(host_logits(logits))
-    for _ in range(args.steps - 2):
-        logits = replay_step(engine, decode_step(scheduler, req, token, allocate=False), graphs[0])
+    for _ in range(args.steps):
+        logits = replay_step(scheduler, decode_batch(scheduler, req, token, allocate=False))
         token = greedy(logits)
         replay_logits.append(host_logits(logits))
     replay_timings, replay_tokens = timed_steps(
-        scheduler, req, token, args.timing_steps, allocate=False, graph=graphs[0]
+        scheduler, req, token, args.timing_steps, replayed=True
     )
 
-    print_graph(graphs[0])
+    print_graph(runner.graphs[1], runner.plans[1], engine.model_config.hidden_size)
     try:
-        check_same_graph(graphs[0], graphs[1])
+        check_same_graph(runner.graphs[1], captured)
     except RuntimeError as error:
+        same_graph = False
         print(f"double-capture check FAILED: {error}", flush=True)
     else:
-        print("double-capture check passed", flush=True)
+        same_graph = True
+        print("double-capture check passed: the real step records the runner's graph", flush=True)
     exact = [np.array_equal(e, r) for e, r in zip(eager_logits, replay_logits)]
     max_diff = max(float(np.abs(e - r).max()) for e, r in zip(eager_logits, replay_logits))
     eager_top = [int(e.argmax()) for e in eager_logits]
     replay_top = [int(r.argmax()) for r in replay_logits]
     print(
-        f"logits: {sum(exact)} of {len(exact)} steps bit-exact (2 captures, "
-        f"{len(exact) - 2} replays), max |diff| {max_diff:.3g}; greedy tokens "
+        f"logits: {sum(exact)} of {len(exact)} replayed steps bit-exact, "
+        f"max |diff| {max_diff:.3g}; greedy tokens "
         f"{'identical' if eager_top == replay_top else 'DIFFER'}: {replay_top}",
         flush=True,
     )
@@ -388,9 +320,12 @@ def main() -> int:
     )
     summarize("eager", eager_timings)
     summarize("replay", replay_timings)
-    passed = all(exact) and eager_tokens == replay_tokens
+    passed = same_graph and all(exact) and eager_tokens == replay_tokens
     return 0 if passed else 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    status = main()
+    sys.stdout.flush()
+    # A model-holding process must not linger in MLX teardown.
+    os._exit(status)
