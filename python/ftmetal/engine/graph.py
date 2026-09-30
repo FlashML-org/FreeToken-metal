@@ -5,13 +5,17 @@ Port of FreeToken engine/graph.py. Divergences: a graph is a CommandGraph captur
 the step inputs (input_ids, positions, out_loc and the attention metadata a backend's
 prepare_for_replay builds at the bucket's fixed shapes) are rebound by every replay,
 and so are the pools, which the replay takes and returns; the bs ladder is capped by
-max_running_req; a bucket whose capture fails stays eager (pad_batch does not pad to it).
+max_running_req; the intermediates and temporaries of every capture are planned into
+one arena all buckets share, allocated after the captures, and a temporary a replay
+reads before writing (poison test) stays pinned instead; a bucket whose capture or
+arena check fails stays eager (pad_batch does not pad to it).
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass, replace
 
 import mlx.core as mx
 from mlx.utils import tree_flatten
@@ -21,11 +25,20 @@ from ftmetal.attention.full.common import FullAttnMetadata
 from ftmetal.attention.metadata import LinearAttnMetadata
 from ftmetal.core import Batch, Req
 from ftmetal.kernel._ext import _C
-from ftmetal.kernel.command_graph import capture, replay
+from ftmetal.kernel.command_graph import (
+    ArenaPlan,
+    capture,
+    place_blocks,
+    plan_graph_arena,
+    replay,
+)
 from ftmetal.kvcache.base import BasePool
+from ftmetal.kvcache.linear_state_pool import LinearStatePool
 from ftmetal.models.blocks import BaseLLMModel
 
 logger = logging.getLogger(__name__)
+
+MIB = 1 << 20
 
 # FreeToken's ladder: 1, 2, 4, then every multiple of 8.
 GRAPH_BS_STRIDE = 8
@@ -62,6 +75,24 @@ def set_pool_arrays(pools: dict[AttnType, BasePool], arrays: list[mx.array]) -> 
     assert offset == len(arrays)
 
 
+def bit_equal(first: mx.array, second: mx.array) -> bool:
+    return (
+        first.shape == second.shape
+        and first.dtype == second.dtype
+        and mx.array_equal(first.view(mx.uint8), second.view(mx.uint8)).item() is True
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class ReplayCheck:
+    """A bucket's check batch: dummy rows on their own GDN slots (the dummy rows of a
+    capture share the padding slot and race on it), and a clean replay's logits."""
+
+    step_inputs: list[mx.array]
+    slots: list[int]
+    logits: mx.array
+
+
 class GraphRunner:
     def __init__(
         self,
@@ -79,41 +110,127 @@ class GraphRunner:
         self.dummy_req = dummy_req
         self.graph_bs_list = sorted(graph_bs_list)
         self.graphs: dict[int, _C.Graph] = {}
+        self.plans: dict[int, ArenaPlan] = {}
+        self.arena: mx.array | None = None
+        linear_state_pool = pools.get(AttnType.LINEAR)
+        assert linear_state_pool is None or isinstance(linear_state_pool, LinearStatePool)
+        self.linear_state_pool = linear_state_pool
         if self.graph_bs_list:
             self.capture_all(max_seq_len)
         else:
             logger.info("CommandGraph is off: decode runs eagerly")
 
     def capture_all(self, max_seq_len: int) -> None:
-        """Capture every bucket on a batch of dummy requests, largest first."""
+        """Capture, poison-test and plan every bucket on dummy requests, largest first, then
+        bind all to one arena and check each replay on it against its capture's."""
         for backend in self.attn_backends.values():
             backend.init_capture_graph(max_seq_len, self.graph_bs_list)
         started = time.perf_counter()
+        pool = self.linear_state_pool
+        check_slots = pool.alloc(max(self.graph_bs_list)) if pool is not None else []
+        checks: dict[int, ReplayCheck] = {}
         for bs in sorted(self.graph_bs_list, reverse=True):
-            batch = Batch(reqs=[self.dummy_req] * bs, phase="decode")
-            batch.input_ids = mx.zeros((bs,), dtype=mx.int32)
-            batch.positions = mx.full((bs,), self.dummy_req.cached_len, dtype=mx.int32)
-            for backend in self.attn_backends.values():
-                backend.prepare_for_capture(batch)
+            bucket_started = time.perf_counter()
             try:
-                graph = self.capture(batch)
+                graph = self.capture(self.dummy_batch([self.dummy_req] * bs))
+                check = self.clean_check(graph, bs, check_slots[:bs])
+                pinned = self.poisoned_temporaries(graph, check)
+                plan = plan_graph_arena(graph, pinned)
+                place_blocks(graph, plan)
             except (RuntimeError, ValueError) as error:
                 logger.warning(f"CommandGraph capture of batch size {bs} failed, eager: {error}")
                 # A capture refused before its eval leaves the dummy step's pools lazy.
                 mx.eval(*pool_arrays(self.pools))
-            else:
-                self.graphs[bs] = graph
-                stats = graph.stats
-                logger.info(
-                    f"captured batch size {bs}: {stats.num_dispatches} dispatches "
-                    f"({undonated_copies(graph.dispatch_names)} same-dtype vector copies), "
-                    f"{len(stats.temporaries)} temporaries, "
-                    f"pinned {stats.pinned_bytes / 2**20:.1f} MiB"
-                )
+                continue
+            self.graphs[bs], self.plans[bs], checks[bs] = graph, plan, check
+            stats = graph.stats
+            elapsed = time.perf_counter() - bucket_started
+            logger.info(
+                f"captured batch size {bs} in {elapsed:.2f} s: {stats.num_dispatches} dispatches "
+                f"({undonated_copies(graph.dispatch_names)} same-dtype vector copies), "
+                f"{len(stats.temporaries)} temporaries ({len(pinned)} fail the poison test), "
+                f"arena {plan.arena_bytes / MIB:.2f} MiB (lower bound "
+                f"{plan.lower_bound / MIB:.2f} MiB), pinned "
+                f"{stats.capture_pinned_bytes / MIB:.1f} -> {stats.pinned_bytes / MIB:.3f} MiB"
+            )
+        if self.graphs:
+            self.bind_arena(checks)
+        if pool is not None:
+            pool.free(check_slots)
+        pinned_bytes = sum(graph.stats.pinned_bytes for graph in self.graphs.values())
+        arena_bytes = 0 if self.arena is None else self.arena.nbytes
         logger.info(
             f"CommandGraph: batch sizes {sorted(self.graphs)} captured in "
-            f"{time.perf_counter() - started:.1f} s"
+            f"{time.perf_counter() - started:.1f} s; arena {arena_bytes / MIB:.2f} MiB, "
+            f"pinned {pinned_bytes / MIB:.3f} MiB"
         )
+
+    def bind_arena(self, checks: dict[int, ReplayCheck]) -> None:
+        """One arena for every graph; a graph whose replay on the arena filled with 0xFF
+        differs from its clean replay stays eager."""
+        arena = mx.zeros((max(plan.arena_bytes for plan in self.plans.values()),), mx.uint8)
+        mx.eval(arena)
+        self.arena = arena
+        for bs in sorted(self.graphs, reverse=True):
+            graph = self.graphs[bs]
+            _C.bind_arena(graph, arena)
+            _C.poison_arena(graph)
+            check = checks[bs]
+            if not bit_equal(self.replay_rows(graph, check.step_inputs, check.slots), check.logits):
+                logger.warning(f"CommandGraph batch size {bs} differs on the arena, eager")
+                self.graphs.pop(bs)
+                self.plans.pop(bs)
+
+    def dummy_batch(self, reqs: list[Req]) -> Batch:
+        """A decode batch of dummy requests with its metadata for a capture."""
+        batch = Batch(reqs=reqs, phase="decode")
+        batch.input_ids = mx.zeros((len(reqs),), dtype=mx.int32)
+        batch.positions = mx.full((len(reqs),), self.dummy_req.cached_len, dtype=mx.int32)
+        for backend in self.attn_backends.values():
+            backend.prepare_for_capture(batch)
+        return batch
+
+    def clean_check(self, graph: _C.Graph, bs: int, slots: list[int]) -> ReplayCheck:
+        """The check batch of bucket bs (its GDN rows on slots), and a replay of it."""
+        if self.linear_state_pool is None:
+            reqs = [self.dummy_req] * bs
+        else:
+            reqs = [replace(self.dummy_req, linear_slot_idx=slot) for slot in slots]
+        step_inputs = self.step_inputs(self.dummy_batch(reqs))
+        mx.eval(*step_inputs)
+        logits = self.replay_rows(graph, step_inputs, slots)
+        return ReplayCheck(step_inputs=step_inputs, slots=slots, logits=logits)
+
+    def replay_rows(
+        self, graph: _C.Graph, step_inputs: list[mx.array], slots: list[int]
+    ) -> mx.array:
+        """Logits of a replay of a check batch, its GDN slots zeroed first."""
+        if self.linear_state_pool is not None:
+            self.linear_state_pool.clear_slots(slots)
+        logits, pools = replay(graph, step_inputs, pool_arrays(self.pools))
+        set_pool_arrays(self.pools, pools)
+        mx.eval(logits, *pools)
+        return logits
+
+    def poisoned_temporaries(self, graph: _C.Graph, check: ReplayCheck) -> list[int]:
+        """Temporaries a replay reads before it writes them (host-initialized constants):
+        filled with 0xFF, each changes the logits. One replay poisons them all; only when
+        that one differs is each tested alone."""
+        temporaries = graph.temporary_blocks
+
+        def logits_change(blocks: list[int]) -> bool:
+            _C.poison_blocks(graph, blocks)
+            logits = self.replay_rows(graph, check.step_inputs, check.slots)
+            changed = not bit_equal(logits, check.logits)
+            _C.restore_blocks(graph)
+            return changed
+
+        if not temporaries or not logits_change(temporaries):
+            return []
+        pinned = [block for block in temporaries if logits_change([block])]
+        labels = [graph.block_labels[block] for block in pinned]
+        logger.warning(f"CommandGraph: {len(pinned)} temporaries stay pinned: {labels}")
+        return pinned
 
     def capture(self, batch: Batch) -> _C.Graph:
         """One real forward of a padded decode batch, its metadata prepared, under the recorder."""

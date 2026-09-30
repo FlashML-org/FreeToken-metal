@@ -91,6 +91,19 @@ def test_replay_matches_eager_across_bucket_switches(
         assert {(4, 4), (3, 4), (2, 2), (1, 1)} <= sizes
 
 
+def test_buckets_share_one_tight_arena(tmp_path: Path) -> None:
+    model = build_reference(seed=23)
+    save_checkpoint(model, tmp_path, quantization=None)
+    runner = make_scheduler(tmp_path, max_running_req=4, command_graph=True).engine.graph_runner
+    assert sorted(runner.graphs) == [1, 2, 4] and runner.arena is not None
+    assert runner.arena.nbytes == max(plan.arena_bytes for plan in runner.plans.values())
+    for bs, captured in runner.graphs.items():
+        plan, stats = runner.plans[bs], captured.stats
+        assert plan.arena_bytes <= 1.1 * plan.lower_bound
+        assert stats.num_pinned_temporaries == 0
+        assert stats.pinned_bytes < stats.capture_pinned_bytes
+
+
 def test_failed_capture_leaves_its_bucket_eager(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
