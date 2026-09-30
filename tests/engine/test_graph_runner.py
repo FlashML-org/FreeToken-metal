@@ -167,8 +167,9 @@ def test_failed_capture_pads_past_its_bucket(
     assert set(log.sizes) == {(2, 4), (1, 1)}
 
 
-def test_padded_decode_steps_capture_the_same_graph(tmp_path: Path) -> None:
-    """The double-capture check on two real padded decode steps (three requests in bucket 4)."""
+def test_padded_decode_step_captures_the_replayed_graph(tmp_path: Path) -> None:
+    """The double-capture check of a real padded decode step (three requests in bucket 4)
+    against the graph the engine replays, which was captured on dummy rows."""
     model = build_reference(seed=22)
     save_checkpoint(model, tmp_path, quantization=None)
     rng = np.random.default_rng(22)
@@ -183,15 +184,10 @@ def test_padded_decode_steps_capture_the_same_graph(tmp_path: Path) -> None:
         scheduler.process_last_data(scheduler.forward(forward_input))
 
     runner = scheduler.engine.graph_runner
-    captures: list[_C.Graph] = []
-    for _ in range(2):
-        forward_input = scheduler.schedule_next_batch()
-        assert forward_input is not None
-        batch = forward_input.batch
-        assert batch.is_decode and (batch.size, batch.padded_size) == (3, 4)
-        for backend in runner.attn_backends.values():
-            backend.prepare_for_replay(batch)
-        captures.append(runner.capture(batch))
-        for req in batch.reqs:
-            req.complete_one()
-    check_same_graph(captures[0], captures[1])
+    forward_input = scheduler.schedule_next_batch()
+    assert forward_input is not None
+    batch = forward_input.batch
+    assert batch.is_decode and (batch.size, batch.padded_size) == (3, 4)
+    for backend in runner.attn_backends.values():
+        backend.prepare_for_replay(batch)
+    check_same_graph(runner.graphs[batch.padded_size], runner.capture(batch))
