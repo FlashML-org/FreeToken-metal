@@ -42,6 +42,9 @@ class FullAttnMetadata(BaseAttnMetadata):
     def get_last_indices(self, bs: int) -> mx.array:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
 
+    def step_inputs(self) -> list[mx.array]:
+        return [self.cu_seqlens_q, self.seq_lens, self.page_table]
+
 
 class FullAttnBackend(BaseAttnBackend):
     def __init__(

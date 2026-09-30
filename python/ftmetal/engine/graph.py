@@ -21,9 +21,8 @@ from dataclasses import dataclass, replace
 import mlx.core as mx
 from mlx.utils import tree_flatten
 
-from ftmetal.attention.base import AttnType, BaseAttnBackend
-from ftmetal.attention.full.common import FullAttnMetadata
-from ftmetal.attention.metadata import LinearAttnMetadata
+from ftmetal.attention.base import BaseAttnBackend
+from ftmetal.attention.metadata import AttnType
 from ftmetal.core import Batch, Req
 from ftmetal.kernel._ext import _C
 from ftmetal.kernel.command_graph import (
@@ -264,13 +263,7 @@ class GraphRunner:
         """input_ids, positions, out_loc, then each backend's metadata arrays, in capture order."""
         arrays = [batch.input_ids, batch.positions, batch.out_loc]
         for attn_type in self.attn_backends:
-            metadata = batch.attn_metadata[attn_type]
-            if isinstance(metadata, FullAttnMetadata):
-                arrays += [metadata.cu_seqlens_q, metadata.seq_lens, metadata.page_table]
-            elif isinstance(metadata, LinearAttnMetadata):
-                arrays += [metadata.cu_seqlens, metadata.cache_indices, metadata.track_slots]
-            else:
-                raise TypeError(f"no step inputs for {type(metadata).__name__}")
+            arrays += batch.attn_metadata[attn_type].step_inputs()
         return arrays
 
     def can_replay(self, batch: Batch) -> bool:

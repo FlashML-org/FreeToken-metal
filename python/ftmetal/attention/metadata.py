@@ -2,7 +2,9 @@
 
 Split out of FreeToken attention/base.py and attention/linear.py (AttnType,
 BaseAttnMetadata, FLAMetadata) so core.py can type the batch without importing the
-backends. The batch keys its metadata by AttnType, one record per backend.
+backends. The batch keys its metadata by AttnType, one record per backend. Divergence:
+a record names its step_inputs, the arrays a CommandGraph replay rebinds (FreeToken
+copies them into a backend's static capture buffers instead).
 """
 
 from __future__ import annotations
@@ -24,6 +26,10 @@ class BaseAttnMetadata(ABC):
     def get_last_indices(self, bs: int) -> mx.array:
         """Row of each request's last query token in the flattened batch."""
 
+    @abstractmethod
+    def step_inputs(self) -> list[mx.array]:
+        """The device arrays a replay of a captured decode step rebinds, in capture order."""
+
 
 @dataclass
 class LinearAttnMetadata(BaseAttnMetadata):
@@ -43,6 +49,9 @@ class LinearAttnMetadata(BaseAttnMetadata):
 
     def get_last_indices(self, bs: int) -> mx.array:
         return self.cu_seqlens[1 : 1 + bs] - 1
+
+    def step_inputs(self) -> list[mx.array]:
+        return [self.cu_seqlens, self.cache_indices, self.track_slots]
 
 
 __all__ = ["AttnType", "BaseAttnMetadata", "LinearAttnMetadata"]
