@@ -51,17 +51,6 @@ def determine_graph_bs(max_running_req: int) -> list[int]:
     return [bs for bs in candidates if bs < max_running_req] + [max_running_req]
 
 
-def undonated_copies(kernel_names: list[str]) -> int:
-    """Same-dtype vector copies (v_copy<T><T>): an eager step donates their input and skips
-    them, a capture holds the input; in Qwen3.5 decode the partial-rotary RoPE of q and k."""
-    count = 0
-    for name in kernel_names:
-        dtypes = name.removeprefix("v_copy")
-        half = len(dtypes) // 2
-        count += name.startswith("v_copy") and dtypes[:half] == dtypes[half:]
-    return count
-
-
 def bit_equal(first: mx.array, second: mx.array) -> bool:
     return (
         first.shape == second.shape
@@ -128,8 +117,7 @@ class GraphRunner:
             stats = graph.stats
             elapsed = time.perf_counter() - bucket_started
             logger.info(
-                f"captured batch size {bs} in {elapsed:.2f} s: {stats.num_dispatches} dispatches "
-                f"({undonated_copies(graph.dispatch_names)} same-dtype vector copies), "
+                f"captured batch size {bs} in {elapsed:.2f} s: {stats.num_dispatches} dispatches, "
                 f"{len(stats.temporaries)} temporaries ({len(pinned)} fail the poison test), "
                 f"arena {plan.arena_bytes / MIB:.2f} MiB (lower bound "
                 f"{plan.lower_bound / MIB:.2f} MiB), pinned "

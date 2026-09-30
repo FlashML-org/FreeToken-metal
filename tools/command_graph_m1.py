@@ -83,6 +83,17 @@ def prefill(scheduler: Scheduler, prompt: np.ndarray, max_tokens: int) -> Req:
     return req
 
 
+def undonated_copies(kernel_names: list[str]) -> int:
+    """Same-dtype vector copies (v_copy<T><T>): an eager step donates their input and skips
+    them, a capture holds the input; in Qwen3.5 decode the partial-rotary RoPE of q and k."""
+    count = 0
+    for name in kernel_names:
+        dtypes = name.removeprefix("v_copy")
+        half = len(dtypes) // 2
+        count += name.startswith("v_copy") and dtypes[:half] == dtypes[half:]
+    return count
+
+
 def decode_batch(scheduler: Scheduler, req: Req, token: mx.array, allocate: bool) -> Batch:
     """The decode batch of req's next token, padded to its bucket, with its metadata."""
     if allocate:
@@ -176,7 +187,8 @@ def print_graph(graph: _C.Graph, plan: ArenaPlan, hidden_size: int) -> None:
     temporaries = stats.temporaries
     calls = stats.calls
     print(
-        f"graph: {stats.num_dispatches} dispatches in {stats.num_encoders} recorded encoders, "
+        f"graph: {stats.num_dispatches} dispatches ({undonated_copies(graph.dispatch_names)} "
+        f"same-dtype vector copies) in {stats.num_encoders} recorded encoders, "
         f"{stats.num_barriers} barriers, {stats.num_bindings} bindings, "
         f"{stats.num_bytes_arguments} setBytes",
         flush=True,
