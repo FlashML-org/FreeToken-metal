@@ -130,7 +130,7 @@ def create_attention_backend(
     if spec.attn_type is AttnType.LINEAR:
         from ftmetal.attention.linear import LinearAttnBackend
 
-        return LinearAttnBackend(page_size)
+        return LinearAttnBackend(pool, page_size)
     else:
         check_attention_backend(backend, page_size, frozenset({spec.attn_type}))
         return SUPPORTED_ATTENTION_BACKENDS[backend](config, spec, pool, page_table, page_size)

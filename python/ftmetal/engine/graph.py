@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import mlx.core as mx
 from mlx.utils import tree_flatten
@@ -34,7 +34,6 @@ from ftmetal.kernel.command_graph import (
 )
 from ftmetal.kvcache import pool_arrays, set_pool_arrays
 from ftmetal.kvcache.base import BasePool
-from ftmetal.kvcache.linear_state_pool import LinearStatePool
 from ftmetal.models.blocks import BaseLLMModel
 
 logger = logging.getLogger(__name__)
@@ -72,11 +71,9 @@ def bit_equal(first: mx.array, second: mx.array) -> bool:
 
 @dataclass(frozen=True, kw_only=True)
 class ReplayCheck:
-    """A bucket's check batch: dummy rows on their own GDN slots (the dummy rows of a
-    capture share the padding slot and race on it), and a clean replay's logits."""
+    """A bucket's capture batch as step inputs, and the logits of a clean replay of it."""
 
     step_inputs: list[mx.array]
-    slots: list[int]
     logits: mx.array
 
 
@@ -102,9 +99,6 @@ class GraphRunner:
         self.graphs: dict[int, _C.Graph] = {}
         self.plans: dict[int, ArenaPlan] = {}
         self.arena: mx.array | None = None
-        linear_state_pool = pools.get(AttnType.LINEAR)
-        assert linear_state_pool is None or isinstance(linear_state_pool, LinearStatePool)
-        self.linear_state_pool = linear_state_pool
         if self.graph_bs_list:
             self.capture_all(max_seq_len)
         else:
@@ -112,18 +106,20 @@ class GraphRunner:
 
     def capture_all(self, max_seq_len: int) -> None:
         """Capture, poison-test and plan every bucket on dummy requests, largest first, then
-        bind all to one arena and check each replay on it against its capture's."""
+        bind all to one arena and check each replay on it against its clean replay."""
         for backend in self.attn_backends.values():
             backend.init_capture_graph(max_seq_len, self.graph_bs_list)
         started = time.perf_counter()
-        pool = self.linear_state_pool
-        check_slots = pool.alloc(max(self.graph_bs_list)) if pool is not None else []
         checks: dict[int, ReplayCheck] = {}
         for bs in sorted(self.graph_bs_list, reverse=True):
             bucket_started = time.perf_counter()
             try:
-                graph = self.capture(self.dummy_batch([self.dummy_req] * bs))
-                check = self.clean_check(graph, bs, check_slots[:bs])
+                batch = self.capture_batch(bs)
+                graph = self.capture(batch)
+                step_inputs = self.step_inputs(batch)
+                check = ReplayCheck(
+                    step_inputs=step_inputs, logits=self.check_replay(graph, step_inputs)
+                )
                 pinned = self.poisoned_temporaries(graph, check)
                 plan = plan_graph_arena(graph, pinned)
                 place_blocks(graph, plan)
@@ -154,8 +150,8 @@ class GraphRunner:
             self.plans.pop(bs)
         if self.graphs:
             self.bind_arena(checks)
-        if pool is not None:
-            pool.free(check_slots)
+        for backend in self.attn_backends.values():
+            backend.release_capture()
         pinned_bytes = sum(graph.stats.pinned_bytes for graph in self.graphs.values())
         arena_bytes = 0 if self.arena is None else self.arena.nbytes
         logger.info(
@@ -180,38 +176,25 @@ class GraphRunner:
             _C.bind_arena(graph, arena)
             _C.poison_arena(graph)
             check = checks[bs]
-            if not bit_equal(self.replay_rows(graph, check.step_inputs, check.slots), check.logits):
+            if not bit_equal(self.check_replay(graph, check.step_inputs), check.logits):
                 logger.warning(f"CommandGraph batch size {bs} differs on the arena, eager")
                 self.graphs.pop(bs)
                 self.plans.pop(bs)
 
-    def dummy_batch(self, reqs: list[Req]) -> Batch:
-        """A decode batch of dummy requests with its metadata for a capture."""
-        batch = Batch(reqs=reqs, phase="decode")
-        batch.input_ids = mx.zeros((len(reqs),), dtype=mx.int32)
-        batch.positions = mx.full((len(reqs),), self.dummy_req.cached_len, dtype=mx.int32)
+    def capture_batch(self, bs: int) -> Batch:
+        """A decode batch of bs dummy requests with its capture metadata."""
+        batch = Batch(reqs=[self.dummy_req] * bs, phase="decode")
+        batch.input_ids = mx.zeros((bs,), dtype=mx.int32)
+        batch.positions = mx.full((bs,), self.dummy_req.cached_len, dtype=mx.int32)
         for backend in self.attn_backends.values():
             backend.prepare_metadata(batch)
             backend.prepare_for_capture(batch)
         return batch
 
-    def clean_check(self, graph: _C.Graph, bs: int, slots: list[int]) -> ReplayCheck:
-        """The check batch of bucket bs (its GDN rows on slots), and a replay of it."""
-        if self.linear_state_pool is None:
-            reqs = [self.dummy_req] * bs
-        else:
-            reqs = [replace(self.dummy_req, linear_slot_idx=slot) for slot in slots]
-        step_inputs = self.step_inputs(self.dummy_batch(reqs))
-        mx.eval(*step_inputs)
-        logits = self.replay_rows(graph, step_inputs, slots)
-        return ReplayCheck(step_inputs=step_inputs, slots=slots, logits=logits)
-
-    def replay_rows(
-        self, graph: _C.Graph, step_inputs: list[mx.array], slots: list[int]
-    ) -> mx.array:
-        """Logits of a replay of a check batch, its GDN slots zeroed first."""
-        if self.linear_state_pool is not None:
-            self.linear_state_pool.clear_slots(slots)
+    def check_replay(self, graph: _C.Graph, step_inputs: list[mx.array]) -> mx.array:
+        """Logits of a replay of a capture batch, from the state reset_capture_state leaves."""
+        for backend in self.attn_backends.values():
+            backend.reset_capture_state()
         logits, pools = replay(graph, step_inputs, pool_arrays(self.pools))
         set_pool_arrays(self.pools, pools)
         mx.eval(logits, *pools)
@@ -225,7 +208,7 @@ class GraphRunner:
 
         def logits_change(blocks: list[int]) -> bool:
             _C.poison_blocks(graph, blocks)
-            logits = self.replay_rows(graph, check.step_inputs, check.slots)
+            logits = self.check_replay(graph, check.step_inputs)
             changed = not bit_equal(logits, check.logits)
             _C.restore_blocks(graph)
             return changed
