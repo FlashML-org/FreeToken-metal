@@ -132,7 +132,7 @@ def test_graph_reserve_drops_the_largest_buckets(
     assert runner.arena is not None and runner.graph_bytes() <= runner.arena.nbytes <= 20_000
 
 
-def test_failed_capture_leaves_its_bucket_eager(
+def test_failed_capture_pads_past_its_bucket(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     model = build_reference(seed=21)
@@ -162,9 +162,9 @@ def test_failed_capture_leaves_its_bucket_eager(
     log = ReplayLog(runner)
     monkeypatch.setattr(runner, "replay", log)
     assert generate(scheduler, prompts, steps) == expected
-    # Two live requests run eagerly (their bucket has no graph and they are not padded);
-    # one alone replays.
-    assert set(log.sizes) == {(1, 1)}
+    # Two live requests replay padded to four (their own bucket has no graph); one alone
+    # replays unpadded.
+    assert set(log.sizes) == {(2, 4), (1, 1)}
 
 
 def test_padded_decode_steps_capture_the_same_graph(tmp_path: Path) -> None:

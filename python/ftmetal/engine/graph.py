@@ -8,7 +8,8 @@ and so are the pools, which the replay takes and returns; the bs ladder ends at
 max_running_req, on the ladder or not; the intermediates and temporaries of every
 capture are planned into one arena all buckets share, allocated after the captures,
 and a temporary a replay reads before writing (poison test) stays pinned instead; a
-bucket whose capture or arena check fails stays eager (pad_batch does not pad to it).
+bucket whose capture or arena check fails is not replayed, pad_batch pads its batches
+to the next captured bucket instead.
 """
 
 from __future__ import annotations
@@ -286,9 +287,9 @@ class GraphRunner:
         return logits[: batch.size]
 
     def pad_batch(self, batch: Batch) -> None:
-        """Pad a decode batch with dummy requests to its bucket when that bucket was captured."""
-        bucket = next((bs for bs in self.graph_bs_list if bs >= batch.size), None)
-        if batch.is_decode and bucket is not None and bucket in self.graphs:
+        """Pad a decode batch with dummy requests to the smallest captured bucket it fits."""
+        bucket = min((bs for bs in self.graphs if bs >= batch.size), default=None)
+        if batch.is_decode and bucket is not None:
             padded_size = bucket
         else:
             padded_size = batch.size
