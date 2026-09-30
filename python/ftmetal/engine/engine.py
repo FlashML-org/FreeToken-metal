@@ -34,9 +34,9 @@ from ftmetal.engine.cache_budget import (
     solve_num_pages,
 )
 from ftmetal.engine.config import EngineConfig
-from ftmetal.engine.graph import GraphRunner, determine_graph_bs, pool_arrays
+from ftmetal.engine.graph import GraphRunner, determine_graph_bs
 from ftmetal.engine.sample import BatchSamplingArgs, Sampler
-from ftmetal.kvcache import create_pools, pool_costs
+from ftmetal.kvcache import create_pools, pool_arrays, pool_costs
 from ftmetal.models.loader import load_weights
 from ftmetal.models.register import create_model, model_weight_rules
 

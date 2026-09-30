@@ -32,6 +32,7 @@ from ftmetal.kernel.command_graph import (
     plan_graph_arena,
     replay,
 )
+from ftmetal.kvcache import pool_arrays, set_pool_arrays
 from ftmetal.kvcache.base import BasePool
 from ftmetal.kvcache.linear_state_pool import LinearStatePool
 from ftmetal.models.blocks import BaseLLMModel
@@ -59,20 +60,6 @@ def undonated_copies(kernel_names: list[str]) -> int:
         half = len(dtypes) // 2
         count += name.startswith("v_copy") and dtypes[:half] == dtypes[half:]
     return count
-
-
-def pool_arrays(pools: dict[AttnType, BasePool]) -> list[mx.array]:
-    return [array for pool in pools.values() for array in pool.arrays()]
-
-
-def set_pool_arrays(pools: dict[AttnType, BasePool], arrays: list[mx.array]) -> None:
-    """Rebind every pool to its part of arrays, in pool_arrays order."""
-    offset = 0
-    for pool in pools.values():
-        count = len(pool.arrays())
-        pool.set_arrays(arrays[offset : offset + count])
-        offset += count
-    assert offset == len(arrays)
 
 
 def bit_equal(first: mx.array, second: mx.array) -> bool:
@@ -289,4 +276,4 @@ class GraphRunner:
         batch.padded_reqs = batch.reqs + [self.dummy_req] * (padded_size - batch.size)
 
 
-__all__ = ["GraphRunner", "determine_graph_bs", "pool_arrays", "set_pool_arrays"]
+__all__ = ["GraphRunner", "determine_graph_bs"]
