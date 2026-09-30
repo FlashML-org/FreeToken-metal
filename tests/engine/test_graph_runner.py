@@ -11,9 +11,11 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+from ftmetal.attention.linear import LinearAttnBackend
 from ftmetal.core import Batch, SamplingParams
 from ftmetal.engine import engine, graph
 from ftmetal.engine.config import EngineConfig
+from ftmetal.engine.engine import Engine
 from ftmetal.engine.graph import GraphRunner, determine_graph_bs
 from ftmetal.kernel._ext import _C
 from ftmetal.kernel.command_graph import check_same_graph
@@ -140,29 +142,27 @@ def test_buckets_share_one_tight_arena(tmp_path: Path) -> None:
         assert stats.pinned_bytes < stats.capture_pinned_bytes
 
 
-def test_graph_reserve_drops_the_largest_buckets(
+def test_graph_reserve_exceeded_fails_the_startup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     model = build_reference(seed=24)
     save_checkpoint(model, tmp_path, quantization=None)
     # Room for the arena of batch size 2, not for that of 4.
     monkeypatch.setattr(engine, "graph_reserve_bytes", lambda max_graph_bs: 20_000)
-    runner = make_scheduler(tmp_path, max_running_req=4, command_graph=True).engine.graph_runner
-    assert sorted(runner.graphs) == [1, 2]
-    assert runner.arena is not None and runner.graph_bytes() <= runner.arena.nbytes <= 20_000
+    with pytest.raises(RuntimeError, match="graph reserve"):
+        Engine(engine_config(tmp_path, max_running_req=4, command_graph=True))
 
 
-def test_failed_capture_pads_past_its_bucket(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("failing_part", ["backend", "recorder"])
+def test_capture_failure_fails_the_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_part: str
 ) -> None:
     model = build_reference(seed=21)
     save_checkpoint(model, tmp_path, quantization=None)
-    rng = np.random.default_rng(21)
-    prompts = [[int(t) for t in rng.integers(1, 120, size=n)] for n in (12, 30)]
-    steps = [4, 9]
-    expected = [reference_greedy(model, p, n)[1] for p, n in zip(prompts, steps)]
-
     real_capture = graph.capture
+
+    def prepare_failing(self: LinearAttnBackend, batch: Batch) -> None:
+        raise RuntimeError("capture failed: injected")
 
     def capture_failing_at_two(
         outputs: list[mx.array],
@@ -172,19 +172,15 @@ def test_failed_capture_pads_past_its_bucket(
     ) -> _C.Graph:
         captured = real_capture(outputs, step_inputs, pools, externals)
         if outputs[0].shape[0] == 2:
-            raise RuntimeError("CommandGraph capture failed: injected")
+            raise RuntimeError("capture failed: injected")
         return captured
 
-    monkeypatch.setattr(graph, "capture", capture_failing_at_two)
-    scheduler = make_scheduler(tmp_path, max_running_req=4, command_graph=True)
-    runner = scheduler.engine.graph_runner
-    assert sorted(runner.graphs) == [1, 4]
-    log = ReplayLog(runner)
-    monkeypatch.setattr(runner, "replay", log)
-    assert generate(scheduler, prompts, steps) == expected
-    # Two live requests replay padded to four (their own bucket has no graph); one alone
-    # replays unpadded.
-    assert set(log.sizes) == {(2, 4), (1, 1)}
+    if failing_part == "backend":
+        monkeypatch.setattr(LinearAttnBackend, "prepare_for_capture", prepare_failing)
+    else:
+        monkeypatch.setattr(graph, "capture", capture_failing_at_two)
+    with pytest.raises(RuntimeError, match="capture failed: injected"):
+        Engine(engine_config(tmp_path, max_running_req=4, command_graph=True))
 
 
 def prefilled_scheduler(path: Path, prompts: list[list[int]], command_graph: bool) -> Scheduler:

@@ -7,9 +7,10 @@ prepare_for_replay leaves at the bucket's fixed shapes) are rebound by every rep
 and so are the pools, which the replay takes and returns; the bs ladder ends at
 max_running_req, on the ladder or not; the intermediates and temporaries of every
 capture are planned into one arena all buckets share, allocated after the captures,
-and a temporary a replay reads before writing (poison test) stays pinned instead; a
-bucket whose capture or arena check fails is not replayed, pad_batch pads its batches
-to the next captured bucket instead.
+and a temporary a replay reads before writing (poison test) stays pinned instead; each
+capture batch is replayed on the poisoned arena and must give its clean replay's
+logits, and graphs outgrowing the memory budget's graph reserve fail the startup like
+a failed capture.
 """
 
 from __future__ import annotations
@@ -95,6 +96,7 @@ class GraphRunner:
         self.pools = pools
         self.dummy_req = dummy_req
         self.graph_bs_list = sorted(graph_bs_list)
+        self.max_graph_bs = max(graph_bs_list, default=0)
         self.reserve_bytes = reserve_bytes
         self.graphs: dict[int, _C.Graph] = {}
         self.plans: dict[int, ArenaPlan] = {}
@@ -111,23 +113,17 @@ class GraphRunner:
             backend.init_capture_graph(max_seq_len, self.graph_bs_list)
         started = time.perf_counter()
         checks: dict[int, ReplayCheck] = {}
-        for bs in sorted(self.graph_bs_list, reverse=True):
+        for bs in reversed(self.graph_bs_list):
             bucket_started = time.perf_counter()
-            try:
-                batch = self.capture_batch(bs)
-                graph = self.capture(batch)
-                step_inputs = self.step_inputs(batch)
-                check = ReplayCheck(
-                    step_inputs=step_inputs, logits=self.check_replay(graph, step_inputs)
-                )
-                pinned = self.poisoned_temporaries(graph, check)
-                plan = plan_graph_arena(graph, pinned)
-                place_blocks(graph, plan)
-            except (RuntimeError, ValueError) as error:
-                logger.warning(f"CommandGraph capture of batch size {bs} failed, eager: {error}")
-                # A capture refused before its eval leaves the dummy step's pools lazy.
-                mx.eval(*pool_arrays(self.pools))
-                continue
+            batch = self.capture_batch(bs)
+            graph = self.capture(batch)
+            step_inputs = self.step_inputs(batch)
+            check = ReplayCheck(
+                step_inputs=step_inputs, logits=self.check_replay(graph, step_inputs)
+            )
+            pinned = self.poisoned_temporaries(graph, check)
+            plan = plan_graph_arena(graph, pinned)
+            place_blocks(graph, plan)
             self.graphs[bs], self.plans[bs], checks[bs] = graph, plan, check
             stats = graph.stats
             elapsed = time.perf_counter() - bucket_started
@@ -139,47 +135,41 @@ class GraphRunner:
                 f"{plan.lower_bound / MIB:.2f} MiB), pinned "
                 f"{stats.capture_pinned_bytes / MIB:.1f} -> {stats.pinned_bytes / MIB:.3f} MiB"
             )
-        while self.graphs and self.graph_bytes() > self.reserve_bytes:
-            bs = max(self.graphs)
-            logger.warning(
-                f"CommandGraph: {self.graph_bytes() / MIB:.2f} MiB of arena and pinned buffers "
-                f"exceed the {self.reserve_bytes / MIB:.2f} MiB graph reserve: batch size {bs} "
-                f"runs eagerly"
+        graph_bytes = self.graph_bytes()
+        if graph_bytes > self.reserve_bytes:
+            raise RuntimeError(
+                f"CommandGraph: {graph_bytes / MIB:.2f} MiB of arena and pinned buffers exceed "
+                f"the {self.reserve_bytes / MIB:.2f} MiB graph reserve of the memory budget"
             )
-            self.graphs.pop(bs)
-            self.plans.pop(bs)
-        if self.graphs:
-            self.bind_arena(checks)
+        self.bind_arena(checks)
         for backend in self.attn_backends.values():
             backend.release_capture()
-        pinned_bytes = sum(graph.stats.pinned_bytes for graph in self.graphs.values())
-        arena_bytes = 0 if self.arena is None else self.arena.nbytes
         logger.info(
-            f"CommandGraph: batch sizes {sorted(self.graphs)} captured in "
-            f"{time.perf_counter() - started:.1f} s; arena {arena_bytes / MIB:.2f} MiB, "
-            f"pinned {pinned_bytes / MIB:.3f} MiB, reserve {self.reserve_bytes / MIB:.2f} MiB"
+            f"CommandGraph: batch sizes {self.graph_bs_list} captured in "
+            f"{time.perf_counter() - started:.1f} s; arena and pinned buffers "
+            f"{graph_bytes / MIB:.2f} MiB of the {self.reserve_bytes / MIB:.2f} MiB reserve"
         )
 
     def graph_bytes(self) -> int:
         """What the graphs keep once bound: the arena they share and their pinned buffers."""
-        arena_bytes = max(self.plans[bs].arena_bytes for bs in self.graphs)
+        arena_bytes = max(plan.arena_bytes for plan in self.plans.values())
         return arena_bytes + sum(graph.stats.pinned_bytes for graph in self.graphs.values())
 
     def bind_arena(self, checks: dict[int, ReplayCheck]) -> None:
-        """One arena for every graph; a graph whose replay on the arena filled with 0xFF
-        differs from its clean replay stays eager."""
+        """One arena for every graph; each graph's replay on the arena filled with 0xFF must
+        give its clean replay's logits."""
         arena = mx.zeros((max(plan.arena_bytes for plan in self.plans.values()),), mx.uint8)
         mx.eval(arena)
         self.arena = arena
-        for bs in sorted(self.graphs, reverse=True):
-            graph = self.graphs[bs]
+        for bs, graph in self.graphs.items():
             _C.bind_arena(graph, arena)
             _C.poison_arena(graph)
             check = checks[bs]
             if not bit_equal(self.check_replay(graph, check.step_inputs), check.logits):
-                logger.warning(f"CommandGraph batch size {bs} differs on the arena, eager")
-                self.graphs.pop(bs)
-                self.plans.pop(bs)
+                raise RuntimeError(
+                    f"CommandGraph batch size {bs}: a replay on the poisoned arena differs "
+                    f"from its clean replay"
+                )
 
     def capture_batch(self, bs: int) -> Batch:
         """A decode batch of bs dummy requests with its capture metadata."""
@@ -239,7 +229,7 @@ class GraphRunner:
         return arrays
 
     def can_replay(self, batch: Batch) -> bool:
-        return batch.is_decode and batch.padded_size in self.graphs
+        return batch.is_decode and batch.size <= self.max_graph_bs
 
     def replay(self, batch: Batch) -> mx.array:
         """Logits [batch.size, vocab] of a padded decode batch; the pools are rebound."""
@@ -252,10 +242,9 @@ class GraphRunner:
         return logits[: batch.size]
 
     def pad_batch(self, batch: Batch) -> None:
-        """Pad a decode batch with dummy requests to the smallest captured bucket it fits."""
-        bucket = min((bs for bs in self.graphs if bs >= batch.size), default=None)
-        if batch.is_decode and bucket is not None:
-            padded_size = bucket
+        """Pad a decode batch with dummy requests to the smallest bucket it fits."""
+        if self.can_replay(batch):
+            padded_size = next(bs for bs in self.graph_bs_list if bs >= batch.size)
         else:
             padded_size = batch.size
         batch.padded_reqs = batch.reqs + [self.dummy_req] * (padded_size - batch.size)
