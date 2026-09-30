@@ -1,4 +1,5 @@
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
@@ -6,6 +7,7 @@
 #include "fdecode.h"
 #include "gdn_step.h"
 #include "rows.h"
+#include "sample.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -16,6 +18,7 @@ NB_MODULE(_C, m) {
   m.def("init_library", &ftmetal::init_library, "source"_a);
   m.def("init_gdn_step_library", &ftmetal::init_gdn_step_library, "source"_a);
   m.def("init_fdecode_library", &ftmetal::init_fdecode_library, "source"_a);
+  m.def("init_sample_library", &ftmetal::init_sample_library, "source"_a);
 
   m.def(
       "scatter_rows",
@@ -94,4 +97,17 @@ NB_MODULE(_C, m) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       "Paged flash-decode of one query per request over its first seq_lens[b] keys; returns [B, Hq, D].");
+
+  m.def(
+      "sample_tokens",
+      &ftmetal::sample_tokens,
+      "logits"_a,
+      "temperatures"_a,
+      "top_k"_a.none(),
+      "top_p"_a.none(),
+      "num_groups"_a,
+      "random_bits"_a.none() = nb::none(),
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      "One token per row from softmax(logits / T) under top-k / top-p; returns int32 [B].");
 }

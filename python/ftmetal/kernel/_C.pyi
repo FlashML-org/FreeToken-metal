@@ -7,6 +7,7 @@ Stream = mx.Stream | mx.Device | None
 def init_library(source: str) -> None: ...
 def init_gdn_step_library(source: str) -> None: ...
 def init_fdecode_library(source: str) -> None: ...
+def init_sample_library(source: str) -> None: ...
 def scatter_rows(
     pool: mx.array, rows: mx.array, dst_ids: mx.array, *, stream: Stream = None
 ) -> mx.array: ...
@@ -51,6 +52,16 @@ def flash_decode(
     min_threadgroups: int,
     num_simdgroups: int,
     scale: float,
+    *,
+    stream: Stream = None,
+) -> mx.array: ...
+def sample_tokens(
+    logits: mx.array,
+    temperatures: mx.array,
+    top_k: mx.array | None,
+    top_p: mx.array | None,
+    num_groups: int,
+    random_bits: mx.array | None = None,
     *,
     stream: Stream = None,
 ) -> mx.array: ...

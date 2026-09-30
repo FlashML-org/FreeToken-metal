@@ -35,7 +35,8 @@ nanobind_add_module(
   ${CMAKE_CURRENT_LIST_DIR}/bindings.cpp
   ${CMAKE_CURRENT_LIST_DIR}/fdecode.cpp
   ${CMAKE_CURRENT_LIST_DIR}/gdn_step.cpp
-  ${CMAKE_CURRENT_LIST_DIR}/rows.cpp)
+  ${CMAKE_CURRENT_LIST_DIR}/rows.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/sample.cpp)
 
 target_include_directories(_C PRIVATE ${MLX_INCLUDE_DIRS})
 target_compile_options(_C PRIVATE ${MLX_CXX_FLAGS})
