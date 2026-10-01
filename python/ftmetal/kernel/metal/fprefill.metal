@@ -34,10 +34,11 @@ using namespace metal;
 #define UNROLL _Pragma("clang loop unroll(full)")
 typedef {{T}} T;
 
-// Threadgroup rows are padded by 16 bytes against bank conflicts.
+// V rows are padded by 16 bytes against bank conflicts. K is staged transposed, [D][BK],
+// so that S = Q K^T loads it untransposed; its rows stay unpadded: a K fragment's 2-way
+// bank conflict costs less than the threadgroup memory a pad takes.
 constant constexpr int PAD = 16 / sizeof(T);
-// K is staged transposed, [D][BK], so that S = Q K^T loads it untransposed.
-constant constexpr int LDK = BK + PAD;
+constant constexpr int LDK = BK;
 constant constexpr int LDV = D + PAD;
 constant constexpr int VEC = 4;
 using Vec2 = vec<T, 2>;

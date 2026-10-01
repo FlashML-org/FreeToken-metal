@@ -84,10 +84,9 @@ def prefill_tiles(
 
 
 def threadgroup_memory_bytes(head_dim: int, block_k: int, head_split: int, itemsize: int) -> int:
-    """fprefill.metal's threadgroup arrays: K transposed [D, BK] and V [BK, D], each row
-    padded by 16 bytes, and with a head split each simdgroup's [8, BK] fp32 partial scores."""
-    pad = 16 // itemsize
-    staged_bytes = (head_dim * (block_k + pad) + block_k * (head_dim + pad)) * itemsize
+    """fprefill.metal's threadgroup arrays: K transposed [D, BK], V [BK, D] with rows padded
+    by 16 bytes, and with a head split each simdgroup's [8, BK] fp32 partial scores."""
+    staged_bytes = (head_dim * block_k + block_k * (head_dim + 16 // itemsize)) * itemsize
     num_simdgroups = THREADGROUP_ROWS // FRAGMENT_ROWS * head_split
     score_bytes = num_simdgroups * FRAGMENT_ROWS * block_k * 4 if head_split > 1 else 0
     return staged_bytes + score_bytes
