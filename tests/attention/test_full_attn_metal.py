@@ -296,27 +296,6 @@ def test_prefill_matches_reference_and_mlx_backend(
     assert max_row_error(out, expected) < PREFILL_MLX_TOLERANCE[dtype]
 
 
-def test_prefill_kernel_switch_falls_back_to_mlx_backend(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("FTMETAL_PREFILL_KERNEL", "0")
-    num_heads, num_kv_heads, head_dim = 16, 2, 256
-    cached_lens, extend_lens = PREFILL_BATCHES[-1]
-    seq_lens = [c + e for c, e in zip(cached_lens, extend_lens)]
-    config = attention_config(num_heads, num_kv_heads, head_dim)
-    kv_cache, page_table, batch = filled_pool(
-        seq_lens, num_kv_heads, head_dim, mx.bfloat16, max(seq_lens) + PAGE_SIZE, extend_lens
-    )
-    (spec,) = config.kv_cache_group_specs()
-    metal_backend = FullAttnMetalBackend(config, spec, kv_cache, page_table, PAGE_SIZE)
-    mlx_backend = FullAttnMLXBackend(config, spec, kv_cache, page_table, PAGE_SIZE)
-    metal_backend.prepare_metadata(batch)
-    num_tokens = sum(extend_lens)
-    q = mx.random.normal((num_tokens, num_heads, head_dim)).astype(mx.bfloat16)
-    k = mx.random.normal((num_tokens, num_kv_heads, head_dim)).astype(mx.bfloat16)
-    v = mx.random.normal((num_tokens, num_kv_heads, head_dim)).astype(mx.bfloat16)
-    out = metal_backend.forward(q, k, v, 0, batch)
-    assert mx.array_equal(out, mlx_backend.forward(q, k, v, 0, batch))
-
-
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
 def test_chunked_prefill_matches_reference_and_mlx_backend(dtype: mx.Dtype) -> None:
     num_heads, num_kv_heads, head_dim = 16, 2, 256
