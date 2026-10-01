@@ -225,7 +225,7 @@ inline void fprefill_tile(
   }
 }
 
-[[kernel]] void fprefill(
+[[kernel, max_total_threads_per_threadgroup(NSG * 32)]] void fprefill(
     device const T* q [[buffer(0)]],
     device const T* k_cache [[buffer(1)]],
     device const T* v_cache [[buffer(2)]],
@@ -245,7 +245,7 @@ inline void fprefill_tile(
       tgpig.x, tgpig.y, 0, 1, sg, lane, k_tg, v_tg, s_tg);
 }
 
-[[kernel]] void fprefill_partials(
+[[kernel, max_total_threads_per_threadgroup(NSG * 32)]] void fprefill_partials(
     device const T* q [[buffer(0)]],
     device const T* k_cache [[buffer(1)]],
     device const T* v_cache [[buffer(2)]],
