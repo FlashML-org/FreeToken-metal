@@ -112,6 +112,8 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         "--attn",
         choices=SUPPORTED_ATTENTION_BACKENDS.supported_names(),
         default=ServerArgs.attention_backend,
+        help="metal: paged flash-prefill and flash-decode kernels (FTMETAL_PREFILL_KERNEL=0 "
+        "keeps prefill on SDPA); mlx: SDPA over gathered pages",
     )
     parser.add_argument(
         "--disable-command-graph",
