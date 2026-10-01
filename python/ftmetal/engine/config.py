@@ -45,7 +45,8 @@ class EngineConfig:
     dtype: mx.Dtype = mx.bfloat16
     max_running_req: int = 4
     page_size: int = 1
-    # Name in attention.SUPPORTED_ATTENTION_BACKENDS; prefill runs on MLX SDPA under both.
+    # Name in attention.SUPPORTED_ATTENTION_BACKENDS: metal runs the paged flash-prefill and
+    # flash-decode kernels, mlx runs MLX SDPA over gathered pages.
     attention_backend: str = "metal"
     max_seq_len_override: int | None = None
     num_page_override: int | None = None
