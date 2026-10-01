@@ -40,7 +40,8 @@ typedef {{T}} T;
 constant constexpr int PAD = 16 / sizeof(T);
 constant constexpr int LDK = BK;
 constant constexpr int LDV = D + PAD;
-constant constexpr int VEC = 4;
+// Staging loads and stores move 16 bytes.
+constant constexpr int VEC = 16 / sizeof(T);
 using Vec2 = vec<T, 2>;
 using LoadVec = vec<T, VEC>;
 
