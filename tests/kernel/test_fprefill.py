@@ -6,7 +6,8 @@ reference (flash_prefill_ref) gathers each request's keys and runs SDPA in fp32 
 causal mask aligned to the request's cached prefix. The lengths put tiles across the
 causal diagonal (every tile of more than one query, and a cached prefix that ends inside
 a key block), leave partial last tiles, and make the split-KV rule both split and not;
-num_partitions forces the split on batches of unequal requests.
+num_partitions forces the split on batches of unequal requests. Groups that do not divide
+the threadgroup's 32 rows (3, 12) leave padding rows in every tile.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from ftmetal.kernel.ref import flash_prefill_ref
 
 PAGE_SIZES = [1, 4, 16, 64]
 HEAD_DIMS = [128, 256]
-GROUPS = [1, 4, 8]
+GROUPS = [1, 3, 4, 8, 12]
 CACHED_LENS = [0, 1, 37, 2048, 5000]
 EXTEND_LENS = [1, 2, 31, 32, 33, 100, 2048]
 # Unequal requests in one batch: (cached_lens, extend_lens).
