@@ -140,3 +140,14 @@ def test_donated_query_buffer_keeps_the_output(num_partitions: int | None) -> No
     # q * 1 is q bit for bit, held by nothing but the call.
     donated = flash_prefill(q * 1, *args)
     assert mx.array_equal(kept, donated)
+
+
+@pytest.mark.parametrize(
+    ("cached_len", "extend_len", "num_partitions"), [(30720, 2048, 1), (30720, 64, 8)]
+)
+def test_partition_rule_at_the_qwen3_6_shape(
+    cached_len: int, extend_len: int, num_partitions: int
+) -> None:
+    """A long chunk fills the GPU with its tiles; a short turn over a long prefix splits."""
+    tiles = prefill_tiles([extend_len], [cached_len], num_heads=16, num_kv_heads=2)
+    assert tiles.num_partitions == num_partitions
