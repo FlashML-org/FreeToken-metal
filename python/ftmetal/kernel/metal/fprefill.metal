@@ -6,10 +6,10 @@
 // heads adjacent) in 8-row groups, each group on DS simdgroups that split the head dim.
 // It streams the tile's visible keys [0, position of its last query] in BK-key blocks:
 // K and V rows are gathered into threadgroup memory through the page table one key at a
-// time (any page size), K transposed; S = Q K^T and O += P V run on 8x8 simdgroup
-// matrices with fp32 accumulators, the DS partial products of S summed through
-// threadgroup memory; the online softmax keeps each row's (max, sum) in fp32 in the
-// log2 domain. Only blocks that cross the causal diagonal are masked.
+// time (any page size), K transposed; S = Q K^T and O += P V (P rounded to the input
+// type) run on 8x8 simdgroup matrices with fp32 accumulators, the DS partial products of S
+// summed through threadgroup memory; the online softmax keeps each row's (max, sum) in
+// fp32 in the log2 domain. Only blocks that cross the causal diagonal are masked.
 // fprefill, grid (32 * NSG * num_tiles, HKV, 1): one pass, writes the output.
 // fprefill_partials, grid (32 * NSG * num_tiles, HKV, P): split-KV, each partition takes
 // an equal share of the tile's key blocks and writes its unnormalized [M, D] accumulator
@@ -195,8 +195,9 @@ inline void fprefill_tile(
     UNROLL for (int d = 0; d < TDH; ++d) o[d] *= correction;
 
     UNROLL for (int k = 0; k < TK; ++k) {
-      simdgroup_matrix<float, 8, 8> p_mat;
-      reinterpret_cast<thread float2&>(p_mat.thread_elements()) = s[k];
+      // P in the input type makes PV the same T x T -> fp32 product as Q K^T.
+      simdgroup_matrix<T, 8, 8> p_mat;
+      reinterpret_cast<thread Vec2&>(p_mat.thread_elements()) = Vec2(s[k]);
       UNROLL for (int d = 0; d < TDH; ++d) {
         simdgroup_matrix<T, 8, 8> v_mat;
         simdgroup_load(v_mat, v_tg + k * 8 * LDV + column0 + d * 8, LDV);
