@@ -14,8 +14,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from ftmetal.attention.full.common import FullAttnMetadata
-from ftmetal.attention.full.metal import FullAttnMetalBackend
+from ftmetal.attention.full.metal import FullAttnMetalBackend, MetalAttnMetadata
 from ftmetal.attention.full.mlx import FullAttnMLXBackend
 from ftmetal.attention.metadata import AttnType
 from ftmetal.core import Batch, Req, SamplingParams
@@ -177,7 +176,7 @@ def test_decode_matches_reference_and_mlx_backend(
     mlx_backend = FullAttnMLXBackend(config, spec, kv_cache, page_table, PAGE_SIZE)
     metal_backend.prepare_metadata(batch)
     metadata = batch.attn_metadata[AttnType.FULL]
-    assert isinstance(metadata, FullAttnMetadata)
+    assert isinstance(metadata, MetalAttnMetadata)
 
     q = mx.random.normal((batch_size, num_heads, head_dim)).astype(dtype)
     k = mx.random.normal((batch_size, num_kv_heads, head_dim)).astype(dtype)
@@ -228,7 +227,7 @@ def test_replay_metadata_matches_reference_and_eager(
 
     backend.prepare_metadata(batch)
     metadata = batch.attn_metadata[AttnType.FULL]
-    assert isinstance(metadata, FullAttnMetadata)
+    assert isinstance(metadata, MetalAttnMetadata)
     eager = backend.forward(q[:size], k[:size], v[:size], 0, batch)
     backend.init_capture_graph(REPLAY_MAX_SEQ_LEN, [padded_size])
     batch.padded_reqs = batch.reqs + [dummy] * num_dummies
@@ -273,7 +272,7 @@ def test_prefill_matches_reference_and_mlx_backend(
     mlx_backend = FullAttnMLXBackend(config, spec, kv_cache, page_table, PAGE_SIZE)
     metal_backend.prepare_metadata(batch)
     metadata = batch.attn_metadata[AttnType.FULL]
-    assert isinstance(metadata, FullAttnMetadata) and metadata.max_seqlen_q > 1
+    assert isinstance(metadata, MetalAttnMetadata) and metadata.max_seqlen_q > 1
 
     num_tokens = sum(extend_lens)
     q = mx.random.normal((num_tokens, num_heads, head_dim)).astype(dtype)
@@ -321,7 +320,7 @@ def test_chunked_prefill_matches_reference_and_mlx_backend(dtype: mx.Dtype) -> N
         batch = Batch(reqs=[req], phase="prefill")
         metal_backend.prepare_metadata(batch)
         metadata = batch.attn_metadata[AttnType.FULL]
-        assert isinstance(metadata, FullAttnMetadata)
+        assert isinstance(metadata, MetalAttnMetadata)
         q = mx.random.normal((stop - start, num_heads, head_dim)).astype(dtype)
         k = mx.random.normal((stop - start, num_kv_heads, head_dim)).astype(dtype)
         v = mx.random.normal((stop - start, num_kv_heads, head_dim)).astype(dtype)

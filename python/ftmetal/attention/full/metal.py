@@ -7,6 +7,8 @@ planned once in prepare_metadata and shared by every layer.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import mlx.core as mx
 import numpy as np
 
@@ -14,12 +16,20 @@ from ftmetal.attention.full.common import FullAttnBackend, FullAttnMetadata
 from ftmetal.attention.metadata import AttnType
 from ftmetal.core import Batch
 from ftmetal.kernel.fdecode import flash_decode
-from ftmetal.kernel.fprefill import flash_prefill, prefill_tiles
+from ftmetal.kernel.fprefill import PrefillTiles, flash_prefill, prefill_tiles
 from ftmetal.kvcache.base import BasePool
 from ftmetal.models.config import KVCacheGroupSpec, ModelConfig
 
 
+@dataclass
+class MetalAttnMetadata(FullAttnMetadata):
+    # Prefill: the flash_prefill tiles, planned once for every layer; None for decode batches.
+    prefill_tiles: PrefillTiles | None = None
+
+
 class FullAttnMetalBackend(FullAttnBackend):
+    metadata_cls = MetalAttnMetadata
+
     def __init__(
         self,
         config: ModelConfig,
@@ -34,7 +44,7 @@ class FullAttnMetalBackend(FullAttnBackend):
     def prepare_metadata(self, batch: Batch) -> None:
         super().prepare_metadata(batch)
         metadata = batch.attn_metadata[AttnType.FULL]
-        assert isinstance(metadata, FullAttnMetadata)
+        assert isinstance(metadata, MetalAttnMetadata)
         metadata.prefill_tiles = (
             prefill_tiles(
                 metadata.extend_lens_host,
@@ -67,7 +77,7 @@ class FullAttnMetalBackend(FullAttnBackend):
                 self.scale,
             )
         else:
-            assert metadata.prefill_tiles is not None
+            assert isinstance(metadata, MetalAttnMetadata) and metadata.prefill_tiles is not None
             return flash_prefill(
                 q,
                 self.kvcache.k_cache(layer_id),
@@ -79,4 +89,4 @@ class FullAttnMetalBackend(FullAttnBackend):
             )
 
 
-__all__ = ["FullAttnMetalBackend"]
+__all__ = ["FullAttnMetalBackend", "MetalAttnMetadata"]

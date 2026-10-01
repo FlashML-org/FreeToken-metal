@@ -20,7 +20,6 @@ import numpy as np
 from ftmetal.attention.base import AttentionSpec, BaseAttnBackend
 from ftmetal.attention.metadata import AttnType, BaseAttnMetadata
 from ftmetal.core import Batch
-from ftmetal.kernel.fprefill import PrefillTiles
 from ftmetal.kvcache.base import BasePool
 from ftmetal.kvcache.mha_pool import MHAKVCache
 from ftmetal.models.config import KVCacheGroupSpec, ModelConfig
@@ -39,8 +38,6 @@ class FullAttnMetadata(BaseAttnMetadata):
     seq_lens_host: list[int]
     extend_lens_host: list[int]
     cached_lens_host: list[int]
-    # Prefill on the metal backend: the flash-prefill tiles, planned once for every layer.
-    prefill_tiles: PrefillTiles | None = None
 
     def get_last_indices(self, bs: int) -> mx.array:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
@@ -50,6 +47,9 @@ class FullAttnMetadata(BaseAttnMetadata):
 
 
 class FullAttnBackend(BaseAttnBackend):
+    # The record prepare_metadata builds; a backend whose kernels plan more extends it.
+    metadata_cls: type[FullAttnMetadata] = FullAttnMetadata
+
     def __init__(
         self,
         config: ModelConfig,
@@ -89,7 +89,7 @@ class FullAttnBackend(BaseAttnBackend):
         cu = np.zeros(len(reqs) + 1, dtype=np.int32)
         np.cumsum(extend_lens, out=cu[1:])
         batch.out_loc = mx.array(out_loc)
-        batch.attn_metadata[AttnType.FULL] = FullAttnMetadata(
+        batch.attn_metadata[AttnType.FULL] = self.metadata_cls(
             cu_seqlens_q=mx.array(cu),
             seq_lens=mx.array(np.asarray(seq_lens, dtype=np.int32)),
             page_table=mx.array(page_table),
