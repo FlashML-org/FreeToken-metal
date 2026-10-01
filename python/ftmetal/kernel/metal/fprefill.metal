@@ -40,8 +40,10 @@ typedef {{T}} T;
 constant constexpr int PAD = 16 / sizeof(T);
 constant constexpr int LDK = BK;
 constant constexpr int LDV = D + PAD;
-// Staging loads and stores move 16 bytes.
+// Staging loads and stores move 16 bytes; KEY_LANES lanes cover 128 bytes of a key's row
+// (64 when D / VEC is not a multiple of 8).
 constant constexpr int VEC = 16 / sizeof(T);
+constant constexpr int KEY_LANES = D / VEC % 8 == 0 ? 8 : 4;
 using Vec2 = vec<T, 2>;
 using LoadVec = vec<T, VEC>;
 
@@ -62,6 +64,11 @@ inline float fragment_row_max(float x) {
 inline float fragment_row_sum(float x) {
   x += simd_shuffle_xor(x, 1);
   return x + simd_shuffle_xor(x, 8);
+}
+
+// Offset of a key's row for one kv head in the [num_pages * BS, HKV, D] pool.
+inline size_t key_row_offset(const device int* page_row, uint key, uint kv_head) {
+  return (((size_t)page_row[key / BS] * BS + key % BS) * HKV + kv_head) * D;
 }
 
 // Buffers: 0 q [num_tokens, HKV * G, D], 1 k_cache / 2 v_cache [num_pages * BS, HKV, D],
@@ -127,21 +134,25 @@ inline void fprefill_tile(
   const device int* page_row = page_table + (size_t)request * max_pages;
   for (uint block = block_begin; block < block_end; ++block) {
     const uint k0 = block * BK;
-    // Lanes take consecutive keys so the transposed K stores spread over the banks.
+    // Each simdgroup load reads whole lines of few keys: KEY_LANES lanes per K key (keys
+    // vary fastest across lane groups for the transposed stores), 32 lanes along a V key.
     for (uint i = sg * 32 + lane; i < BK * D / VEC; i += NSG * 32) {
-      const uint key_row = i % BK;
-      const uint column = i / BK * VEC;
-      const uint key = k0 + key_row;
+      const uint k_row = i / KEY_LANES % BK;
+      const uint k_column = i / (KEY_LANES * BK) * (KEY_LANES * VEC) + i % KEY_LANES * VEC;
+      const uint v_row = i / (D / VEC);
+      const uint v_column = i % (D / VEC) * VEC;
       LoadVec k_vec = LoadVec(0);
       LoadVec v_vec = LoadVec(0);
-      if (key < kv_end) {
-        const size_t slot = (size_t)page_row[key / BS] * BS + key % BS;
-        const size_t offset = (slot * HKV + kv_head) * D + column;
-        k_vec = *(const device LoadVec*)(k_cache + offset);
-        v_vec = *(const device LoadVec*)(v_cache + offset);
+      if (k0 + k_row < kv_end) {
+        k_vec = *(const device LoadVec*)(
+            k_cache + key_row_offset(page_row, k0 + k_row, kv_head) + k_column);
       }
-      UNROLL for (int j = 0; j < VEC; ++j) k_tg[(column + j) * LDK + key_row] = k_vec[j];
-      *(threadgroup LoadVec*)(v_tg + key_row * LDV + column) = v_vec;
+      if (k0 + v_row < kv_end) {
+        v_vec = *(const device LoadVec*)(
+            v_cache + key_row_offset(page_row, k0 + v_row, kv_head) + v_column);
+      }
+      UNROLL for (int j = 0; j < VEC; ++j) k_tg[(k_column + j) * LDK + k_row] = k_vec[j];
+      *(threadgroup LoadVec*)(v_tg + v_row * LDV + v_column) = v_vec;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
