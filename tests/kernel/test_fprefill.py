@@ -120,3 +120,21 @@ def test_unequal_requests_match_sdpa(
         check_prefill(
             cached_lens, extend_lens, page_size, head_dim, group, dtype, num_partitions, seed=i
         )
+
+
+@pytest.mark.parametrize("num_partitions", [None, 3])
+def test_donated_query_buffer_keeps_the_output(num_partitions: int | None) -> None:
+    """The output may take q's buffer when nothing else holds q; it must not change."""
+    cached_lens, extend_lens = BATCHES[0]
+    seq_lens = [c + e for c, e in zip(cached_lens, extend_lens)]
+    head_dim, group = 256, 8
+    k_cache, v_cache, page_table = filled_pool(seq_lens, 1, head_dim, mx.bfloat16, seed=0)
+    q = mx.random.normal((sum(extend_lens), NUM_KV_HEADS * group, head_dim)).astype(mx.bfloat16)
+    planned = prefill_tiles(extend_lens, cached_lens, NUM_KV_HEADS * group, NUM_KV_HEADS)
+    tiles = planned if num_partitions is None else replace(planned, num_partitions=num_partitions)
+    args = (k_cache, v_cache, mx.array(page_table), tiles, 1, head_dim**-0.5)
+    mx.eval(q)
+    kept = flash_prefill(q, *args)
+    # q * 1 is q bit for bit, held by nothing but the call.
+    donated = flash_prefill(q * 1, *args)
+    assert mx.array_equal(kept, donated)

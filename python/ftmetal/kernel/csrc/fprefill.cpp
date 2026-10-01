@@ -109,8 +109,14 @@ void FlashPrefill::eval_cpu(const std::vector<mx::array>&, std::vector<mx::array
 
 void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) {
   check_pools_row_contiguous(inputs, "fprefill");
+  const auto& q = inputs[0];
   auto& out = outputs[0];
-  out.set_data(mx::allocator::malloc(out.nbytes()));
+  // A threadgroup reads only its own tile's query rows, all before it writes them.
+  if (q.is_donatable() && q.flags().row_contiguous && q.size() == out.size()) {
+    out.copy_shared_buffer(q);
+  } else {
+    out.set_data(mx::allocator::malloc(out.nbytes()));
+  }
   int num_tiles = inputs[4].shape(0);
   if (num_tiles == 0) {
     return;
