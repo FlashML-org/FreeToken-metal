@@ -31,9 +31,10 @@ NUM_KV_HEADS = 2
 SPARE_PAGES = 3
 UNREAD_VALUE = 1e3
 # Worst |error| over a row relative to the row's largest |value|. Past fp32 the kernel
-# rounds only its bf16 output, half an ulp at the row's top binade (2^-8); one ulp leaves
-# room for the fp32 summation order. fp32 inputs differ by summation order alone.
-TOLERANCE = {mx.bfloat16: 2**-7, mx.float32: 1e-5}
+# rounds only its 16-bit output, half an ulp at the row's top binade (bf16 2^-8, half
+# 2^-11); one ulp leaves room for the fp32 summation order. fp32 inputs differ by
+# summation order alone.
+TOLERANCE = {mx.bfloat16: 2**-7, mx.float16: 2**-10, mx.float32: 1e-5}
 
 
 def filled_pool(
@@ -109,7 +110,7 @@ def test_one_request_matches_sdpa(page_size: int, head_dim: int, group: int) -> 
 
 
 @pytest.mark.parametrize("num_partitions", [None, 1, 3, 7])
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
 @pytest.mark.parametrize("group", GROUPS)
 @pytest.mark.parametrize("head_dim", HEAD_DIMS)
 @pytest.mark.parametrize("page_size", PAGE_SIZES)
