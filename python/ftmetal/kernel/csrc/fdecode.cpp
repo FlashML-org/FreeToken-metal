@@ -3,6 +3,7 @@
 #include <cmath>
 #include <stdexcept>
 
+#include "metal_primitive.h"
 #include "mlx/allocator.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/utils.h"
@@ -16,27 +17,6 @@ const int SIMD_WIDTH = 32;
 // From this head dim up 16-bit inputs accumulate in half: fp32 accumulators cost
 // occupancy and ran 2x slower at D=256 on the M4 Pro.
 const int HALF_ACCUMULATOR_HEAD_DIM = 256;
-
-std::string metal_type(mx::Dtype dtype) {
-  switch (dtype) {
-    case mx::float16:
-      return "half";
-    case mx::bfloat16:
-      return "bfloat";
-    case mx::float32:
-      return "float";
-    default:
-      throw std::invalid_argument(
-          "ftmetal fdecode: unsupported dtype " + mx::type_to_name(dtype));
-  }
-}
-
-void replace_all(std::string& text, const std::string& token, const std::string& value) {
-  for (size_t pos = text.find(token); pos != std::string::npos; pos = text.find(token, pos)) {
-    text.replace(pos, token.size(), value);
-    pos += value.size();
-  }
-}
 
 } // namespace
 
@@ -68,7 +48,7 @@ mx::array flash_decode(
   int num_heads = q.shape(1);
   int head_dim = q.shape(2);
   int num_kv_heads = k_cache.shape(1);
-  metal_type(q.dtype());
+  metal_type(q.dtype(), "fdecode");
   if (k_cache.dtype() != q.dtype() || v_cache.dtype() != q.dtype()) {
     throw std::invalid_argument("ftmetal fdecode: k/v cache must be in q's dtype");
   }
@@ -106,13 +86,11 @@ mx::array flash_decode(
       {partition_tokens, min_partition_tokens, max_partitions, min_threadgroups},
       num_simdgroups,
       scale};
-  std::vector<mx::array> inputs = {q, k_cache, v_cache, page_table, seq_lens};
-  // The k/v pools (inputs 1 and 2) stay as they are (see rows.h); eval_gpu checks them.
-  for (size_t i : {0, 3, 4}) {
-    inputs[i] = mx::contiguous(inputs[i], false, stream);
-  }
   return mx::array(
-      q.shape(), q.dtype(), std::make_shared<FlashDecode>(stream, config), std::move(inputs));
+      q.shape(),
+      q.dtype(),
+      std::make_shared<FlashDecode>(stream, config),
+      paged_attention_inputs(q, k_cache, v_cache, page_table, seq_lens, stream));
 }
 
 bool FlashDecode::is_equivalent(const mx::Primitive& other) const {
@@ -129,9 +107,7 @@ void FlashDecode::eval_cpu(const std::vector<mx::array>&, std::vector<mx::array>
 }
 
 void FlashDecode::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) {
-  if (!inputs[1].flags().row_contiguous || !inputs[2].flags().row_contiguous) {
-    throw std::runtime_error("ftmetal fdecode: k/v cache must be row contiguous");
-  }
+  check_pools_row_contiguous(inputs, "fdecode");
   auto& out = outputs[0];
   out.set_data(mx::allocator::malloc(out.nbytes()));
   int batch = inputs[0].shape(0);
@@ -141,7 +117,7 @@ void FlashDecode::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx:
   const auto& c = config_;
   auto dtype = out.dtype();
   // 16-bit inputs stage the cross-simdgroup merge in half; fp32 inputs stay fp32.
-  std::string type = metal_type(dtype);
+  std::string type = metal_type(dtype, "fdecode");
   std::string stage_type = dtype == mx::float32 ? "float" : "half";
   std::string acc_type = c.head_dim >= HALF_ACCUMULATOR_HEAD_DIM ? stage_type : "float";
   std::string library_name = "ftmetal_fdecode_" + type + "_" + acc_type + "_" +
@@ -170,15 +146,9 @@ void FlashDecode::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx:
     return source;
   });
 
-  // Per-partition unnormalized accumulators and (max, sum) pairs live only in this step.
-  mx::array part_acc(
-      {batch, c.num_kv_heads, c.num_partitions, c.group, c.head_dim}, mx::float32, nullptr, {});
-  mx::array part_ml({batch, c.num_kv_heads, c.num_partitions, c.group, 2}, mx::float32, nullptr, {});
-  part_acc.set_data(mx::allocator::malloc(part_acc.nbytes()));
-  part_ml.set_data(mx::allocator::malloc(part_ml.nbytes()));
   auto& encoder = mx::metal::get_command_encoder(s);
-  encoder.add_temporary(part_acc);
-  encoder.add_temporary(part_ml);
+  auto [part_acc, part_ml] =
+      split_partials({batch, c.num_kv_heads, c.num_partitions, c.group}, c.head_dim, encoder);
 
   int max_pages = inputs[3].shape(1);
   float scale_log2e = c.scale * static_cast<float>(M_LOG2E);

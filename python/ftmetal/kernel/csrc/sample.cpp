@@ -2,6 +2,7 @@
 
 #include <stdexcept>
 
+#include "metal_primitive.h"
 #include "mlx/allocator.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/utils.h"
@@ -35,27 +36,6 @@ struct RoundSpec {
 };
 
 const RoundSpec NO_ROUND{KIND_NONE, 0, false, false};
-
-std::string metal_type(mx::Dtype dtype) {
-  switch (dtype) {
-    case mx::float16:
-      return "half";
-    case mx::bfloat16:
-      return "bfloat";
-    case mx::float32:
-      return "float";
-    default:
-      throw std::invalid_argument(
-          "ftmetal sample: unsupported logits dtype " + mx::type_to_name(dtype));
-  }
-}
-
-void replace_all(std::string& text, const std::string& token, const std::string& value) {
-  for (size_t pos = text.find(token); pos != std::string::npos; pos = text.find(token, pos)) {
-    text.replace(pos, token.size(), value);
-    pos += value.size();
-  }
-}
 
 void check_rows(const mx::array& x, int rows, mx::Dtype dtype, const char* what) {
   if (x.ndim() != 1 || x.shape(0) != rows || x.dtype() != dtype) {
@@ -140,7 +120,7 @@ mx::array sample_tokens(
   if (logits.ndim() != 2 || logits.shape(1) < 1) {
     throw std::invalid_argument("ftmetal sample: logits must be [B, V] with V >= 1");
   }
-  metal_type(logits.dtype());
+  metal_type(logits.dtype(), "sample");
   int rows = logits.shape(0);
   check_rows(temperatures, rows, mx::float32, "temperatures");
   if (random_bits) {
@@ -202,7 +182,7 @@ void SampleTokens::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
   uint32_t groups = c.num_groups;
   uint32_t chunk = (vocab + groups - 1) / groups;
   int key_bits = logits.dtype() == mx::float32 ? 32 : 16;
-  std::string type = metal_type(logits.dtype());
+  std::string type = metal_type(logits.dtype(), "sample");
   std::string library_name = "ftmetal_sample_" + type;
 
   auto s = stream();

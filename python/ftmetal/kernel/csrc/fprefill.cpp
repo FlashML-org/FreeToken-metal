@@ -3,6 +3,7 @@
 #include <cmath>
 #include <stdexcept>
 
+#include "metal_primitive.h"
 #include "mlx/allocator.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/utils.h"
@@ -15,27 +16,6 @@ std::string fprefill_source;
 const int SIMD_WIDTH = 32;
 const int FRAGMENT_SIZE = 8;
 const int MAX_THREADGROUP_THREADS = 1024;
-
-std::string metal_type(mx::Dtype dtype) {
-  switch (dtype) {
-    case mx::float16:
-      return "half";
-    case mx::bfloat16:
-      return "bfloat";
-    case mx::float32:
-      return "float";
-    default:
-      throw std::invalid_argument(
-          "ftmetal fprefill: unsupported dtype " + mx::type_to_name(dtype));
-  }
-}
-
-void replace_all(std::string& text, const std::string& token, const std::string& value) {
-  for (size_t pos = text.find(token); pos != std::string::npos; pos = text.find(token, pos)) {
-    text.replace(pos, token.size(), value);
-    pos += value.size();
-  }
-}
 
 } // namespace
 
@@ -65,7 +45,7 @@ mx::array flash_prefill(
   int num_heads = q.shape(1);
   int head_dim = q.shape(2);
   int num_kv_heads = k_cache.shape(1);
-  metal_type(q.dtype());
+  metal_type(q.dtype(), "fprefill");
   if (k_cache.dtype() != q.dtype() || v_cache.dtype() != q.dtype()) {
     throw std::invalid_argument("ftmetal fprefill: k/v cache must be in q's dtype");
   }
@@ -111,13 +91,11 @@ mx::array flash_prefill(
       block_k,
       num_partitions,
       scale};
-  std::vector<mx::array> inputs = {q, k_cache, v_cache, page_table, tiles};
-  // The k/v pools (inputs 1 and 2) stay as they are (see rows.h); eval_gpu checks them.
-  for (size_t i : {0, 3, 4}) {
-    inputs[i] = mx::contiguous(inputs[i], false, stream);
-  }
   return mx::array(
-      q.shape(), q.dtype(), std::make_shared<FlashPrefill>(stream, config), std::move(inputs));
+      q.shape(),
+      q.dtype(),
+      std::make_shared<FlashPrefill>(stream, config),
+      paged_attention_inputs(q, k_cache, v_cache, page_table, tiles, stream));
 }
 
 bool FlashPrefill::is_equivalent(const mx::Primitive& other) const {
@@ -130,9 +108,7 @@ void FlashPrefill::eval_cpu(const std::vector<mx::array>&, std::vector<mx::array
 }
 
 void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) {
-  if (!inputs[1].flags().row_contiguous || !inputs[2].flags().row_contiguous) {
-    throw std::runtime_error("ftmetal fprefill: k/v cache must be row contiguous");
-  }
+  check_pools_row_contiguous(inputs, "fprefill");
   auto& out = outputs[0];
   out.set_data(mx::allocator::malloc(out.nbytes()));
   int num_tiles = inputs[4].shape(0);
@@ -140,7 +116,7 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
     return;
   }
   const auto& c = config_;
-  std::string type = metal_type(out.dtype());
+  std::string type = metal_type(out.dtype(), "fprefill");
   std::string library_name = "ftmetal_fprefill_" + type + "_" + std::to_string(c.head_dim) +
       "_" + std::to_string(c.group) + "_" + std::to_string(c.num_kv_heads) + "_" +
       std::to_string(c.page_size) + "_" + std::to_string(c.num_row_groups) + "_" +
@@ -178,14 +154,8 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
     return;
   }
 
-  // Per-partition unnormalized accumulators and (max, sum) pairs live only in this step.
-  mx::array part_acc(
-      {num_tiles, c.num_kv_heads, c.num_partitions, rows, c.head_dim}, mx::float32, nullptr, {});
-  mx::array part_ml({num_tiles, c.num_kv_heads, c.num_partitions, rows, 2}, mx::float32, nullptr, {});
-  part_acc.set_data(mx::allocator::malloc(part_acc.nbytes()));
-  part_ml.set_data(mx::allocator::malloc(part_ml.nbytes()));
-  encoder.add_temporary(part_acc);
-  encoder.add_temporary(part_ml);
+  auto [part_acc, part_ml] =
+      split_partials({num_tiles, c.num_kv_heads, c.num_partitions, rows}, c.head_dim, encoder);
 
   encoder.set_compute_pipeline_state(d.get_kernel("fprefill_partials", library));
   for (int i = 0; i < 5; ++i) {
