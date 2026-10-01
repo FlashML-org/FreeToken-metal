@@ -5,6 +5,7 @@
 #include <nanobind/stl/vector.h>
 
 #include "fdecode.h"
+#include "fprefill.h"
 #include "gdn_step.h"
 #include "rows.h"
 #include "sample.h"
@@ -18,6 +19,7 @@ NB_MODULE(_C, m) {
   m.def("init_library", &ftmetal::init_library, "source"_a);
   m.def("init_gdn_step_library", &ftmetal::init_gdn_step_library, "source"_a);
   m.def("init_fdecode_library", &ftmetal::init_fdecode_library, "source"_a);
+  m.def("init_fprefill_library", &ftmetal::init_fprefill_library, "source"_a);
   m.def("init_sample_library", &ftmetal::init_sample_library, "source"_a);
 
   m.def(
@@ -97,6 +99,24 @@ NB_MODULE(_C, m) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       "Paged flash-decode of one query per request over its first seq_lens[b] keys; returns [B, Hq, D].");
+
+  m.def(
+      "flash_prefill",
+      &ftmetal::flash_prefill,
+      "q"_a,
+      "k_cache"_a,
+      "v_cache"_a,
+      "page_table"_a,
+      "tiles"_a,
+      "page_size"_a,
+      "num_row_groups"_a,
+      "head_split"_a,
+      "block_k"_a,
+      "num_partitions"_a,
+      "scale"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      "Paged causal flash-attention of each tile's queries over its request's keys; returns [T, Hq, D].");
 
   m.def(
       "sample_tokens",
