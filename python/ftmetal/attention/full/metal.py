@@ -10,8 +10,7 @@ from __future__ import annotations
 import mlx.core as mx
 import numpy as np
 
-from ftmetal.attention.full.common import FullAttnMetadata
-from ftmetal.attention.full.mlx import FullAttnMLXBackend
+from ftmetal.attention.full.common import FullAttnBackend, FullAttnMetadata
 from ftmetal.attention.metadata import AttnType
 from ftmetal.core import Batch
 from ftmetal.kernel.fdecode import flash_decode
@@ -20,7 +19,7 @@ from ftmetal.kvcache.base import BasePool
 from ftmetal.models.config import KVCacheGroupSpec, ModelConfig
 
 
-class FullAttnMetalBackend(FullAttnMLXBackend):
+class FullAttnMetalBackend(FullAttnBackend):
     def __init__(
         self,
         config: ModelConfig,
