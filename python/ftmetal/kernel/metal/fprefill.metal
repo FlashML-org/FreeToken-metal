@@ -301,7 +301,7 @@ inline void fprefill_tile(
       o[i] += part_acc[part_row * D + lane * LPD + i] * weight;
     }
   }
-  const float inv_l = 1.0f / l_sum;
+  const float inv_l = l_sum > 0.0f ? 1.0f / l_sum : 0.0f;
   const size_t out_offset =
       ((size_t)(tile.y + row / G) * HKV * G + kv_head * G + row % G) * D + lane * LPD;
   UNROLL for (int i = 0; i < LPD; ++i) out[out_offset + i] = static_cast<T>(o[i] * inv_l);
