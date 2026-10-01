@@ -6,10 +6,13 @@ threadgroup streams one kv head's visible keys once for the tile's G = Hq / Hkv 
 heads (GQA packing), gathering them through the page table; the queries' own keys are
 already in the pool. Split-KV partitions fill the GPU when the tiles are few (a short
 turn over a long cached prefix), the partials merged by a second pass. This module lists
-the tiles and picks the partitioning.
+the tiles and picks the partitioning, once per batch (prefill_tiles), and launches the
+primitive per layer (flash_prefill).
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import mlx.core as mx
 import numpy as np
@@ -33,31 +36,26 @@ MIN_PARTITION_TOKENS = 512
 MAX_PARTITIONS = 32
 
 
-def flash_prefill(
-    q: mx.array,
-    k_cache: mx.array,
-    v_cache: mx.array,
-    page_table: mx.array,
-    extend_lens: list[int],
-    cached_lens: list[int],
-    page_size: int,
-    scale: float,
-    num_partitions: int | None = None,
-) -> mx.array:
-    """Causal attention of each request's extend_lens[b] queries over its paged keys.
+@dataclass(frozen=True, kw_only=True)
+class PrefillTiles:
+    """A batch's flash-prefill work list, shared by every full-attention layer of the step."""
 
-    q [T, Hq, D] holds the requests' queries back to back; request b's queries sit at
-    positions cached_lens[b] .. cached_lens[b] + extend_lens[b] - 1 and its pool keys
-    (page_table [B, max_pages] int32 page ids, k_cache / v_cache [num_pages * page_size,
-    Hkv, D] in q's dtype) already include them. num_partitions overrides the split-KV
-    partition count. Returns [T, Hq, D].
+    # [num_tiles, 4] int32 rows (request, first query row, query count, first query position).
+    table: mx.array
+    num_partitions: int
+
+
+def prefill_tiles(
+    extend_lens: list[int], cached_lens: list[int], num_heads: int, num_kv_heads: int
+) -> PrefillTiles:
+    """Cut request b's extend_lens[b] queries (after cached_lens[b] cached keys) into tiles.
+
+    A tile holds THREADGROUP_ROWS // G consecutive queries of one request; the split-KV
+    partition count follows the tile count and the longest key range.
     """
-    num_heads, head_dim = q.shape[1:]
-    num_kv_heads = k_cache.shape[1]
-    assert num_heads % num_kv_heads == 0
+    assert num_heads % num_kv_heads == 0 and len(extend_lens) == len(cached_lens)
     group = num_heads // num_kv_heads
-    assert group <= THREADGROUP_ROWS and head_dim <= MAX_HEAD_DIM
-    assert q.shape[0] == sum(extend_lens) and len(extend_lens) == len(cached_lens)
+    assert group <= THREADGROUP_ROWS
     tile_queries = THREADGROUP_ROWS // group
     extend = np.asarray(extend_lens, dtype=np.int64)
     cached = np.asarray(cached_lens, dtype=np.int64)
@@ -71,29 +69,51 @@ def flash_prefill(
     # The longest key ranges first, so they do not trail the dispatch.
     order = np.argsort(-kv_end, kind="stable")
     row0 = (np.cumsum(extend) - extend)[request] + q0
-    tiles = np.stack([request, row0, count, position], axis=1)[order].astype(np.int32)
-    if num_partitions is None:
-        num_partitions = max(
-            1,
-            min(
-                -(-TARGET_THREADGROUPS // (len(tiles) * num_kv_heads)),
-                int(kv_end.max()) // MIN_PARTITION_TOKENS,
-                MAX_PARTITIONS,
-            ),
-        )
+    table = np.stack([request, row0, count, position], axis=1)[order].astype(np.int32)
+    num_partitions = max(
+        1,
+        min(
+            -(-TARGET_THREADGROUPS // (len(table) * num_kv_heads)),
+            int(kv_end.max()) // MIN_PARTITION_TOKENS,
+            MAX_PARTITIONS,
+        ),
+    )
+    return PrefillTiles(table=mx.array(table), num_partitions=num_partitions)
+
+
+def flash_prefill(
+    q: mx.array,
+    k_cache: mx.array,
+    v_cache: mx.array,
+    page_table: mx.array,
+    tiles: PrefillTiles,
+    page_size: int,
+    scale: float,
+) -> mx.array:
+    """Causal attention of each request's queries over its paged keys.
+
+    q [T, Hq, D] holds the requests' queries back to back, cut into tiles by
+    prefill_tiles; page_table [B, max_pages] int32 page ids, k_cache / v_cache
+    [num_pages * page_size, Hkv, D] in q's dtype, already holding the queries' own keys.
+    Returns [T, Hq, D].
+    """
+    num_heads, head_dim = q.shape[1:]
+    num_kv_heads = k_cache.shape[1]
+    assert num_heads % num_kv_heads == 0 and num_heads // num_kv_heads <= THREADGROUP_ROWS
+    assert head_dim <= MAX_HEAD_DIM
     return _C.flash_prefill(
         q,
         k_cache,
         v_cache,
         page_table,
-        mx.array(tiles),
+        tiles.table,
         page_size,
         THREADGROUP_ROWS // FRAGMENT_ROWS,
         2 if head_dim >= SPLIT_HEAD_DIM else 1,
         BLOCK_K[q.dtype.size],
-        num_partitions,
+        tiles.num_partitions,
         scale,
     )
 
 
-__all__ = ["flash_prefill"]
+__all__ = ["PrefillTiles", "flash_prefill", "prefill_tiles"]

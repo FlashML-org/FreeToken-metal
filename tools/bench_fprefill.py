@@ -21,7 +21,7 @@ import time
 import mlx.core as mx
 import numpy as np
 
-from ftmetal.kernel.fprefill import flash_prefill
+from ftmetal.kernel.fprefill import flash_prefill, prefill_tiles
 
 NUM_HEADS = 16
 NUM_KV_HEADS = 2
@@ -45,6 +45,8 @@ class PrefillCall:
         self.prefix = mx.array(self.slots[:cached_len])
         self.k = self.k_cache[fresh]
         self.v = self.v_cache[fresh]
+        # Planned once per batch, as the engine does for all of a step's layers.
+        self.tiles = prefill_tiles([extend_len], [cached_len], NUM_HEADS, NUM_KV_HEADS)
         mx.eval(self.page_table, self.k_cache, self.v_cache, self.prefix, self.k, self.v)
 
     def kernel(self, q: mx.array) -> mx.array:
@@ -53,8 +55,7 @@ class PrefillCall:
             self.k_cache,
             self.v_cache,
             self.page_table,
-            [self.extend_len],
-            [self.cached_len],
+            self.tiles,
             PAGE_SIZE,
             HEAD_DIM**-0.5,
         )

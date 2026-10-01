@@ -20,6 +20,7 @@ import numpy as np
 from ftmetal.attention.base import AttentionSpec, BaseAttnBackend
 from ftmetal.attention.metadata import AttnType, BaseAttnMetadata
 from ftmetal.core import Batch
+from ftmetal.kernel.fprefill import PrefillTiles
 from ftmetal.kvcache.base import BasePool
 from ftmetal.kvcache.mha_pool import MHAKVCache
 from ftmetal.models.config import KVCacheGroupSpec, ModelConfig
@@ -38,6 +39,8 @@ class FullAttnMetadata(BaseAttnMetadata):
     seq_lens_host: list[int]
     extend_lens_host: list[int]
     cached_lens_host: list[int]
+    # Prefill on the metal backend: the flash-prefill tiles, planned once for every layer.
+    prefill_tiles: PrefillTiles | None = None
 
     def get_last_indices(self, bs: int) -> mx.array:
         return self.cu_seqlens_q[1 : 1 + bs] - 1

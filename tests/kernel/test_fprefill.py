@@ -11,11 +11,13 @@ num_partitions forces the split on batches of unequal requests.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import mlx.core as mx
 import numpy as np
 import pytest
 
-from ftmetal.kernel.fprefill import flash_prefill
+from ftmetal.kernel.fprefill import flash_prefill, prefill_tiles
 from ftmetal.kernel.ref import flash_prefill_ref
 
 PAGE_SIZES = [1, 4, 16, 64]
@@ -75,9 +77,14 @@ def check_prefill(
     seq_lens = [c + e for c, e in zip(cached_lens, extend_lens)]
     k_cache, v_cache, page_table = filled_pool(seq_lens, page_size, head_dim, dtype, seed)
     q = mx.random.normal((sum(extend_lens), NUM_KV_HEADS * group, head_dim)).astype(dtype)
-    args = (q, k_cache, v_cache, mx.array(page_table), extend_lens, cached_lens, page_size)
-    out = flash_prefill(*args, head_dim**-0.5, num_partitions=num_partitions)
-    expected = flash_prefill_ref(*args, head_dim**-0.5)
+    planned = prefill_tiles(extend_lens, cached_lens, NUM_KV_HEADS * group, NUM_KV_HEADS)
+    tiles = planned if num_partitions is None else replace(planned, num_partitions=num_partitions)
+    table = mx.array(page_table)
+    scale = head_dim**-0.5
+    out = flash_prefill(q, k_cache, v_cache, table, tiles, page_size, scale)
+    expected = flash_prefill_ref(
+        q, k_cache, v_cache, table, extend_lens, cached_lens, page_size, scale
+    )
     assert out.shape == q.shape and out.dtype == dtype
     error = max_row_error(out, expected)
     assert error < TOLERANCE[dtype], (cached_lens, extend_lens, num_partitions, error)
