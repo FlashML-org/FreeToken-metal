@@ -18,16 +18,18 @@ import mlx.core as mx
 import numpy as np
 
 from ftmetal.kernel._ext import _C
+from ftmetal.kernel.fdecode import THREADGROUP_MEMORY_BYTES
 
 FRAGMENT_ROWS = 8
 # Tile shape tuned on the M4 Pro at the Qwen3.6 shape (D 256, G 8): 32 query rows (tokens
 # x query heads) per threadgroup and 16-key blocks; from D 256 up two simdgroups split
 # each 8-row group's head dim, since one simdgroup's fp32 [8, 256] accumulator costs
-# occupancy (4.2 against 5.5 TFLOP/s). fp32 inputs halve the block to fit the 32 KiB of
-# threadgroup memory.
+# occupancy (4.2 against 5.5 TFLOP/s). The block halves until the staged keys and values
+# fit THREADGROUP_MEMORY_BYTES (fp32 at D 256: 8 keys).
 THREADGROUP_ROWS = 32
-BLOCK_K = {2: 16, 4: 8}
+MAX_BLOCK_K = 16
 SPLIT_HEAD_DIM = 256
+# D 512 would fit only 8-key blocks, or 16-key blocks with K and V sharing one buffer.
 MAX_HEAD_DIM = 256
 # Split-KV up to about TARGET_THREADGROUPS threadgroups (some six waves of the ~40 the M4
 # Pro runs at once), keeping at least MIN_PARTITION_TOKENS keys per partition.
@@ -81,6 +83,16 @@ def prefill_tiles(
     return PrefillTiles(table=mx.array(table), num_partitions=num_partitions)
 
 
+def threadgroup_memory_bytes(head_dim: int, block_k: int, head_split: int, itemsize: int) -> int:
+    """fprefill.metal's threadgroup arrays: K transposed [D, BK] and V [BK, D], each row
+    padded by 16 bytes, and with a head split each simdgroup's [8, BK] fp32 partial scores."""
+    pad = 16 // itemsize
+    staged_bytes = (head_dim * (block_k + pad) + block_k * (head_dim + pad)) * itemsize
+    num_simdgroups = THREADGROUP_ROWS // FRAGMENT_ROWS * head_split
+    score_bytes = num_simdgroups * FRAGMENT_ROWS * block_k * 4 if head_split > 1 else 0
+    return staged_bytes + score_bytes
+
+
 def flash_prefill(
     q: mx.array,
     k_cache: mx.array,
@@ -101,6 +113,14 @@ def flash_prefill(
     num_kv_heads = k_cache.shape[1]
     assert num_heads % num_kv_heads == 0 and num_heads // num_kv_heads <= THREADGROUP_ROWS
     assert head_dim <= MAX_HEAD_DIM
+    head_split = 2 if head_dim >= SPLIT_HEAD_DIM else 1
+    block_k = MAX_BLOCK_K
+    while (
+        threadgroup_memory_bytes(head_dim, block_k, head_split, q.dtype.size)
+        > THREADGROUP_MEMORY_BYTES
+    ):
+        block_k //= 2
+    assert block_k >= FRAGMENT_ROWS
     return _C.flash_prefill(
         q,
         k_cache,
@@ -109,8 +129,8 @@ def flash_prefill(
         tiles.table,
         page_size,
         THREADGROUP_ROWS // FRAGMENT_ROWS,
-        2 if head_dim >= SPLIT_HEAD_DIM else 1,
-        BLOCK_K[q.dtype.size],
+        head_split,
+        block_k,
         tiles.num_partitions,
         scale,
     )
