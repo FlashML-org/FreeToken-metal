@@ -6,6 +6,9 @@ import mlx.nn as nn
 from ftmetal.core import host_ints
 from ftmetal.kernel.moe_align import ExpertAlignment
 
+# Queries per SDPA call of flash_prefill_ref, which materializes [Hq, rows, keys] fp32 scores.
+PREFILL_REF_QUERY_ROWS = 512
+
 
 def scatter_rows_ref(pool: mx.array, rows: mx.array, dst_ids: mx.array) -> mx.array:
     out = mx.array(pool)
@@ -171,9 +174,43 @@ def flash_decode_ref(
     return mx.stack(outputs)
 
 
+def flash_prefill_ref(
+    q: mx.array,
+    k_cache: mx.array,
+    v_cache: mx.array,
+    page_table: mx.array,
+    extend_lens: list[int],
+    cached_lens: list[int],
+    page_size: int,
+    scale: float,
+) -> mx.array:
+    """fp32 SDPA of each request's queries in q [T, Hq, D] over its paged keys, causal from
+    its cached prefix; at most PREFILL_REF_QUERY_ROWS queries per call bound the scores."""
+    offsets = mx.arange(page_size, dtype=mx.int32)
+    outputs = []
+    row = 0
+    for i, (extend_len, cached_len) in enumerate(zip(extend_lens, cached_lens)):
+        slots = (page_table[i][:, None] * page_size + offsets).reshape(-1)
+        slots = slots[: cached_len + extend_len]
+        keys = k_cache[slots].astype(mx.float32).transpose(1, 0, 2)[None]
+        values = v_cache[slots].astype(mx.float32).transpose(1, 0, 2)[None]
+        for start in range(0, extend_len, PREFILL_REF_QUERY_ROWS):
+            stop = min(extend_len, start + PREFILL_REF_QUERY_ROWS)
+            queries = q[row + start : row + stop].astype(mx.float32).transpose(1, 0, 2)[None]
+            # The causal mask aligns the last query with the last key.
+            visible = cached_len + stop
+            out = mx.fast.scaled_dot_product_attention(
+                queries, keys[:, :, :visible], values[:, :, :visible], scale=scale, mask="causal"
+            )
+            outputs.append(out[0].transpose(1, 0, 2))
+        row += extend_len
+    return mx.concatenate(outputs)
+
+
 __all__ = [
     "copy_rows_ref",
     "flash_decode_ref",
+    "flash_prefill_ref",
     "gdn_decode_step_ref",
     "gdn_prefill_inputs_ref",
     "moe_align_ref",
