@@ -2,6 +2,7 @@
 
 The mlx-lm model is the reference; save_checkpoint writes it in the MLX checkpoint
 layout ftmetal loads, and reference_greedy is the contiguous-cache greedy decode.
+TINY_FULL_ATTENTION_CONFIG drops the linear layers, so the engine has no GDN state pool.
 """
 
 from __future__ import annotations
@@ -40,11 +41,16 @@ TINY_TEXT_CONFIG = {
     "rope_parameters": {"type": "default", "rope_theta": 10000, "partial_rotary_factor": 0.25},
 }
 
+TINY_FULL_ATTENTION_CONFIG = {**TINY_TEXT_CONFIG, "full_attention_interval": 1}
 
-def build_reference(seed: int) -> reference.Model:
+
+def build_reference(seed: int, text_config: dict[str, object] | None = None) -> reference.Model:
     mx.random.seed(seed)
     model = reference.Model(
-        reference.ModelArgs(model_type="qwen3_5_moe", text_config=TINY_TEXT_CONFIG)
+        reference.ModelArgs(
+            model_type="qwen3_5_moe",
+            text_config=TINY_TEXT_CONFIG if text_config is None else text_config,
+        )
     )
     # Random init leaves the norm weights at one; perturb them so the parity is not trivial.
     params: dict[str, mx.array] = {}
@@ -65,7 +71,7 @@ def save_checkpoint(model: reference.Model, path: Path, quantization: dict | Non
     config = {
         "architectures": ["Qwen3_5MoeForConditionalGeneration"],
         "model_type": "qwen3_5_moe",
-        "text_config": TINY_TEXT_CONFIG,
+        "text_config": model.args.text_config,
         "eos_token_id": [127],
     }
     if quantization is not None:
@@ -88,4 +94,20 @@ def reference_greedy(
     return prefill_logits, tokens
 
 
-__all__ = ["TINY_TEXT_CONFIG", "build_reference", "reference_greedy", "save_checkpoint"]
+def uncached_greedy(model: reference.Model, prompt: list[int], steps: int) -> list[int]:
+    """Greedy decode rerunning the whole sequence per token: mlx-lm 0.31's contiguous cache
+    path builds its linear-attention mask from layer 0's cache, so it fails without one."""
+    sequence = list(prompt)
+    for _ in range(steps):
+        sequence.append(int(mx.argmax(model(mx.array(sequence)[None])[0, -1])))
+    return sequence[len(prompt) :]
+
+
+__all__ = [
+    "TINY_FULL_ATTENTION_CONFIG",
+    "TINY_TEXT_CONFIG",
+    "build_reference",
+    "reference_greedy",
+    "save_checkpoint",
+    "uncached_greedy",
+]

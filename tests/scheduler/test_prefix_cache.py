@@ -1,10 +1,11 @@
-"""The hybrid radix prefix cache end to end on the tiny model.
+"""The radix prefix caches end to end on the tiny model.
 
 A prompt sharing a snapshot boundary with an earlier one is admitted with that prefix
 cached (KV pages reused, GDN state restored from the snapshot) and must still decode
 greedily to what mlx-lm produces alone; so must every request while both currencies are
 evicted under a small page and slot budget. The tiny model's greedy tokens hardly depend
-on the GDN state, so a hit's prefill logits are also held to mlx-lm's at 1e-4.
+on the GDN state, so a hit's prefill logits are also held to mlx-lm's at 1e-4. Without
+linear layers the engine takes the plain radix cache, held to the same contract.
 """
 
 from __future__ import annotations
@@ -18,9 +19,15 @@ from mlx_lm.models import qwen3_5 as reference
 
 from ftmetal.attention.linear import SNAPSHOT_STRIDE
 from ftmetal.core import SamplingParams
-from ftmetal.engine.config import EngineConfig
+from ftmetal.engine.config import CacheTypeChoice, EngineConfig
 from ftmetal.scheduler.scheduler import Scheduler
-from tiny_model import build_reference, reference_greedy, save_checkpoint
+from tiny_model import (
+    TINY_FULL_ATTENTION_CONFIG,
+    build_reference,
+    reference_greedy,
+    save_checkpoint,
+    uncached_greedy,
+)
 
 STEPS = 8
 
@@ -33,6 +40,7 @@ def make_scheduler(
     max_running_req: int = 2,
     max_extend_tokens: int = 512,
     linear_state_cache_ratio: float = 2.0,
+    cache_type: CacheTypeChoice = "radix",
 ) -> Scheduler:
     config = EngineConfig(
         model_path=str(path),
@@ -42,6 +50,7 @@ def make_scheduler(
         num_page_override=num_pages,
         max_extend_tokens=max_extend_tokens,
         linear_state_cache_ratio=linear_state_cache_ratio,
+        cache_type=cache_type,
     )
     return Scheduler(config, eos_token_ids={127})
 
@@ -59,10 +68,9 @@ def run_alone(scheduler: Scheduler, uid: int, prompt: list[int]) -> tuple[int, l
     return cached_len, [event.token for event in scheduler.take_results()]
 
 
-def assert_hit_logits_match(
-    scheduler: Scheduler, model: reference.Model, prompt: list[int], cached_len: int
-) -> None:
-    """Admit prompt, restore its snapshot and run its prefill forward alone against mlx-lm.
+def prefill_logits(scheduler: Scheduler, prompt: list[int]) -> tuple[int, mx.array]:
+    """Admit prompt, restore its snapshot and run its prefill forward alone; returns the
+    prefix its admission found cached and the last position's logits.
 
     Leaves the scheduler mid-request: call it last.
     """
@@ -71,9 +79,16 @@ def assert_hit_logits_match(
     forward_input = scheduler.schedule_next_batch()
     assert forward_input is not None
     batch = forward_input.batch
-    assert batch.reqs[0].cached_len == cached_len
     scheduler.restore_linear_states(batch)
-    logits = scheduler.engine.model.forward(batch)[0]
+    return batch.reqs[0].cached_len, scheduler.engine.model.forward(batch)[0]
+
+
+def assert_hit_logits_match(
+    scheduler: Scheduler, model: reference.Model, prompt: list[int], cached_len: int
+) -> None:
+    """The prompt's prefill hits cached_len and its logits match mlx-lm's."""
+    hit_len, logits = prefill_logits(scheduler, prompt)
+    assert hit_len == cached_len
     expected = reference_greedy(model, prompt, 1)[0][-1]
     assert mx.allclose(logits, expected, atol=1e-4, rtol=1e-4)
 
@@ -196,3 +211,36 @@ def test_eviction_under_small_budgets_keeps_outputs(tmp_path: Path) -> None:
     assert run_alone(scheduler, 7, prompts[5]) == (128, expected[5])
     scheduler.cache_manager.check_integrity()
     assert_hit_logits_match(scheduler, model, prompts[5], 128)
+
+
+def test_plain_radix_reuses_a_shared_prefix_without_linear_layers(tmp_path: Path) -> None:
+    """No linear layers, no GDN state pool: the engine takes the plain radix cache. A prompt
+    sharing a prefix with an earlier one reuses its pages up to the page boundary below the
+    divergence, decodes to mlx-lm's uncached tokens, and prefills to the logits of a naive
+    engine that reuses nothing."""
+    model = build_reference(seed=40, text_config=TINY_FULL_ATTENTION_CONFIG)
+    save_checkpoint(model, tmp_path, quantization=None)
+    shared = random_tokens(40, 101)
+    first = shared + random_tokens(41, 20)
+    second = shared + random_tokens(42, 30)
+    third = shared + random_tokens(43, 10)
+    scheduler = make_scheduler(tmp_path, page_size=4)
+    assert scheduler.engine.ctx.linear_state_pool is None
+    assert scheduler.cache_manager.cache_type == "radix"
+    for uid, (prompt, cached_len) in enumerate([(first, 0), (second, 100)]):
+        assert run_alone(scheduler, uid, prompt) == (
+            cached_len,
+            uncached_greedy(model, prompt, STEPS),
+        )
+        scheduler.cache_manager.check_integrity()
+    hit_len, hit_logits = prefill_logits(scheduler, third)
+    assert hit_len == 100
+    mx.eval(hit_logits)  # before the next engine replaces the global context
+
+    naive = make_scheduler(tmp_path, page_size=4, cache_type="naive")
+    assert naive.cache_manager.prefix_cache is None
+    miss_len, miss_logits = prefill_logits(naive, third)
+    assert miss_len == 0
+    assert mx.allclose(hit_logits, miss_logits, atol=1e-4, rtol=1e-4)
+    expected = model(mx.array(third)[None])[0, -1]
+    assert mx.allclose(hit_logits, expected, atol=1e-4, rtol=1e-4)
