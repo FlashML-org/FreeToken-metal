@@ -32,6 +32,9 @@ TOKENIZER_FILE = "tokenizer.json"
 TOKENIZER_CONFIG_FILE = "tokenizer_config.json"
 CHAT_TEMPLATE_FILE = "chat_template.jinja"
 GENERATION_CONFIG_FILE = "generation_config.json"
+# The tokenizer_config.json entries apply_chat_template hands the template (Gemma's opens
+# with bos_token).
+TEMPLATE_SPECIAL_TOKENS = ("bos_token", "eos_token", "pad_token", "unk_token")
 # What a byte-level decode yields for a UTF-8 sequence the last token left incomplete.
 REPLACEMENT_CHARACTER = "�"
 
@@ -112,12 +115,19 @@ class TokenizeManager:
         environment.filters["tojson"] = tojson
         environment.globals["raise_exception"] = raise_exception
         self.chat_template = environment.from_string((path / CHAT_TEMPLATE_FILE).read_text())
+        tokenizer_config = read_json_object(path / TOKENIZER_CONFIG_FILE)
+        self.special_tokens: dict[str, str] = {}
+        for name in TEMPLATE_SPECIAL_TOKENS:
+            token = tokenizer_config.get(name)
+            if isinstance(token, str):
+                self.special_tokens[name] = token
 
     def render_prompt(self, msg: TokenizeMsg) -> str:
         return self.chat_template.render(
             messages=msg.text,
             tools=msg.tools,
             add_generation_prompt=True,
+            **self.special_tokens,
             **msg.chat_template_kwargs,
         )
 
@@ -223,6 +233,7 @@ class DetokenizeManager:
 
 
 __all__ = [
+    "TEMPLATE_SPECIAL_TOKENS",
     "DecodeStatus",
     "DetokenizeManager",
     "TokenizeManager",
