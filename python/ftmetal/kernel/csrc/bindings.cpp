@@ -94,6 +94,7 @@ NB_MODULE(_C, m) {
       "min_partition_tokens"_a,
       "max_partitions"_a,
       "min_threadgroups"_a,
+      "num_head_groups"_a,
       "num_simdgroups"_a,
       "scale"_a,
       nb::kw_only(),

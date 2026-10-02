@@ -159,7 +159,7 @@ def max_row_error(out: mx.array, reference: mx.array) -> float:
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
 @pytest.mark.parametrize("num_heads,num_kv_heads", [(16, 2), (8, 1)])
-@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("head_dim", [128, 256, 512])
 @pytest.mark.parametrize("batch_size", sorted(SEQ_LENS))
 def test_decode_matches_reference_and_mlx_backend(
     batch_size: int, head_dim: int, num_heads: int, num_kv_heads: int, dtype: mx.Dtype
@@ -251,7 +251,7 @@ def test_replay_metadata_matches_reference_and_eager(
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
 @pytest.mark.parametrize("num_heads,num_kv_heads", [(16, 2), (8, 1)])
-@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("head_dim", [128, 256, 512])
 @pytest.mark.parametrize(("cached_lens", "extend_lens"), PREFILL_BATCHES)
 def test_prefill_matches_reference_and_mlx_backend(
     cached_lens: list[int],

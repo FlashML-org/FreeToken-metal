@@ -36,6 +36,7 @@ mx::array flash_decode(
     int min_partition_tokens,
     int max_partitions,
     int min_threadgroups,
+    int num_head_groups,
     int num_simdgroups,
     float scale,
     mx::StreamOrDevice s) {
@@ -73,6 +74,9 @@ mx::array flash_decode(
   if (num_partitions < 1 || num_simdgroups < 1) {
     throw std::invalid_argument("ftmetal fdecode: partitions and simdgroups must be >= 1");
   }
+  if (num_head_groups < 1 || (num_heads / num_kv_heads) % num_head_groups != 0) {
+    throw std::invalid_argument("ftmetal fdecode: num_head_groups must divide Hq / Hkv");
+  }
   if (partition_tokens < 1 || min_partition_tokens < 1 || max_partitions < 1) {
     throw std::invalid_argument("ftmetal fdecode: partition rule values must be >= 1");
   }
@@ -84,6 +88,7 @@ mx::array flash_decode(
       page_size,
       num_partitions,
       {partition_tokens, min_partition_tokens, max_partitions, min_threadgroups},
+      num_head_groups,
       num_simdgroups,
       scale};
   return mx::array(
@@ -99,6 +104,7 @@ bool FlashDecode::is_equivalent(const mx::Primitive& other) const {
       o->config_.group == config_.group && o->config_.num_kv_heads == config_.num_kv_heads &&
       o->config_.page_size == config_.page_size &&
       o->config_.num_partitions == config_.num_partitions && o->config_.rule == config_.rule &&
+      o->config_.num_head_groups == config_.num_head_groups &&
       o->config_.num_simdgroups == config_.num_simdgroups && o->config_.scale == config_.scale;
 }
 
@@ -123,7 +129,8 @@ void FlashDecode::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx:
   std::string library_name = "ftmetal_fdecode_" + type + "_" + acc_type + "_" +
       std::to_string(c.head_dim) + "_" + std::to_string(c.group) + "_" +
       std::to_string(c.num_kv_heads) + "_" + std::to_string(c.page_size) + "_" +
-      std::to_string(c.num_simdgroups) + "_" + std::to_string(c.rule.partition_tokens) + "_" +
+      std::to_string(c.num_head_groups) + "_" + std::to_string(c.num_simdgroups) + "_" +
+      std::to_string(c.rule.partition_tokens) + "_" +
       std::to_string(c.rule.min_partition_tokens) + "_" + std::to_string(c.rule.max_partitions) +
       "_" + std::to_string(c.rule.min_threadgroups);
 
@@ -139,6 +146,7 @@ void FlashDecode::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx:
     replace_all(source, "{{HKV}}", std::to_string(c.num_kv_heads));
     replace_all(source, "{{BS}}", std::to_string(c.page_size));
     replace_all(source, "{{NSG}}", std::to_string(c.num_simdgroups));
+    replace_all(source, "{{HG}}", std::to_string(c.num_head_groups));
     replace_all(source, "{{PARTITION_TOKENS}}", std::to_string(c.rule.partition_tokens));
     replace_all(source, "{{MIN_PARTITION_TOKENS}}", std::to_string(c.rule.min_partition_tokens));
     replace_all(source, "{{MAX_PARTITIONS}}", std::to_string(c.rule.max_partitions));
@@ -161,7 +169,7 @@ void FlashDecode::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx:
   encoder.set_bytes(max_pages, 7);
   encoder.set_bytes(scale_log2e, 8);
   encoder.dispatch_threadgroups(
-      MTL::Size(c.num_partitions, c.num_kv_heads, batch),
+      MTL::Size(c.num_partitions, c.num_kv_heads * c.num_head_groups, batch),
       MTL::Size(SIMD_WIDTH * c.num_simdgroups, 1, 1));
 
   encoder.set_compute_pipeline_state(d.get_kernel("fdecode_merge", library));

@@ -51,6 +51,7 @@ def flash_decode(
     min_partition_tokens: int,
     max_partitions: int,
     min_threadgroups: int,
+    num_head_groups: int,
     num_simdgroups: int,
     scale: float,
     *,
