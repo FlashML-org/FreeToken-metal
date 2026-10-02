@@ -34,7 +34,11 @@ IN_FLIGHT_STEPS = 2
 GRAPH_FIXED_BYTES = 4 << 20
 GRAPH_BYTES_PER_ROW = 5 << 18
 # Each pool's budget line; the only LINEAR pool so far holds GDN state.
-POOL_LABELS: dict[AttnType, str] = {AttnType.FULL: "kv pages", AttnType.LINEAR: "gdn slots"}
+POOL_LABELS: dict[AttnType, str] = {
+    AttnType.FULL: "kv pages",
+    AttnType.SWA: "swa window",
+    AttnType.LINEAR: "gdn slots",
+}
 
 
 def memory_budget_bytes(recommended_working_set: int) -> int:

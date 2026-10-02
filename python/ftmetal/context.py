@@ -2,8 +2,8 @@
 
 Port of FreeToken core.py (Context, set_global_ctx, get_global_ctx), in its own
 module because core.py cannot import the backends. Divergences: the pools and the
-attention backends are one per AttnType (kv_cache and linear_state_pool are views of
-the pools); the batch is not here (it is passed to BaseLLMModel.forward) and neither
+attention backends are one per AttnType (kv_cache, swa_pool and linear_state_pool are
+views of the pools); the batch is not here (it is passed to BaseLLMModel.forward) and neither
 is the page table (the CacheManager owns it).
 """
 
@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from ftmetal.attention.base import AttnType, BaseAttnBackend
 from ftmetal.kvcache.base import BaseKVCachePool, BasePool
 from ftmetal.kvcache.linear_state_pool import LinearStatePool
+from ftmetal.kvcache.swa_pool import SWAKVCache
 
 
 @dataclass
@@ -26,6 +27,12 @@ class Context:
     def kv_cache(self) -> BaseKVCachePool:
         pool = self.pools[AttnType.FULL]
         assert isinstance(pool, BaseKVCachePool)
+        return pool
+
+    @property
+    def swa_pool(self) -> SWAKVCache | None:
+        pool = self.pools.get(AttnType.SWA)
+        assert pool is None or isinstance(pool, SWAKVCache)
         return pool
 
     @property
