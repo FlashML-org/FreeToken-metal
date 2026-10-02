@@ -1,14 +1,19 @@
-"""Radix tree nodes over whole pages of token ids, and the page-aligned walk.
+"""Radix tree nodes over whole pages of token ids, the page-aligned walk, the plain prefix cache.
 
 Port of FreeToken kvcache/radix_cache.py (RadixTreeNode, the tree walk, the key per page
-size). Divergences: keys and values are host numpy int32 arrays; a child is keyed by the
-tuple of its first page's tokens at every page size; the node carries no SWA fields and
-there is no plain RadixPrefixCache (the hybrid cache is the only tree).
+size, RadixPrefixCache). Divergences: keys and values are host numpy int32 arrays; a child
+is keyed by the tuple of its first page's tokens at every page size; the node carries no
+SWA fields; RadixPrefixCache takes HybridRadixCache's shapes (a match carries its KV slots,
+inc_lock/dec_lock take the node, insert returns the end node), has no reset and
+check_integrity recomputes its size counters.
 """
 
 from __future__ import annotations
 
+import heapq
 import time
+from dataclasses import dataclass
+from typing import NamedTuple
 
 import numpy as np
 
@@ -112,4 +117,141 @@ def tree_walk(root: RadixTreeNode, input_ids: np.ndarray) -> tuple[RadixTreeNode
     return node, prefix_len
 
 
-__all__ = ["EMPTY_IDS", "PageKey", "RadixTreeNode", "align_down", "page_key", "tree_walk"]
+@dataclass(frozen=True)
+class RadixCacheHandle:
+    """A locked matched prefix: the lock target node and the KV slots of [0, cached_len)."""
+
+    cached_len: int
+    node: RadixTreeNode
+    kv_indices: np.ndarray
+
+
+class RadixMatch(NamedTuple):
+    # KV slots of [0, cached_len).
+    kv_indices: np.ndarray
+    cached_len: int
+    # The matched node (lock target); the root on a miss.
+    node: RadixTreeNode
+
+
+class RadixPrefixCache:
+    def __init__(self, page_size: int) -> None:
+        self.page_size = page_size
+        self.root = RadixTreeNode(page_size)
+        self.root.ref_count = 1  # the root is always protected
+        self.evictable_size = 0
+        self.protected_size = 0
+
+    def match_prefix(self, input_ids: np.ndarray) -> RadixMatch:
+        """The longest page-aligned cached prefix of input_ids."""
+        node, prefix_len = tree_walk(self.root, input_ids)
+        return RadixMatch(self.collect_kv(node), prefix_len, node)
+
+    def insert(self, input_ids: np.ndarray, kv_indices: np.ndarray) -> tuple[int, RadixTreeNode]:
+        """Insert the page-aligned prefix, donating the KV slots of its uncached part.
+
+        Returns (length already cached before the insert, the node ending the inserted
+        prefix). The caller keeps, and frees, its own slots for the already cached part.
+        """
+        insert_len = align_down(len(input_ids), self.page_size)
+        input_ids, kv_indices = input_ids[:insert_len], kv_indices[:insert_len]
+        node, prefix_len = tree_walk(self.root, input_ids)
+        if prefix_len != insert_len:
+            new_node = RadixTreeNode(self.page_size)
+            new_node.set_key_value(input_ids[prefix_len:].copy(), kv_indices[prefix_len:].copy())
+            new_node.set_parent(node)
+            self.evictable_size += new_node.length
+            node = new_node
+        return prefix_len, node
+
+    def inc_lock(self, node: RadixTreeNode) -> None:
+        """Pin the KV of root..node."""
+        while not node.is_root():
+            if node.ref_count == 0:
+                self.evictable_size -= node.length
+                self.protected_size += node.length
+            node.ref_count += 1
+            node = node.parent
+
+    def dec_lock(self, node: RadixTreeNode) -> None:
+        while not node.is_root():
+            node.ref_count -= 1
+            assert node.ref_count >= 0
+            if node.ref_count == 0:
+                self.evictable_size += node.length
+                self.protected_size -= node.length
+            node = node.parent
+
+    def evict(self, num_tokens: int) -> np.ndarray:
+        """Evict at least num_tokens of KV by LRU over unlocked leaves; returns their slots."""
+        if num_tokens == 0:
+            return EMPTY_IDS
+        assert num_tokens <= self.evictable_size, (
+            f"Cannot evict {num_tokens}, only {self.evictable_size} is evictable"
+        )
+        leaves = [node for node in self.leaves() if node.ref_count == 0]
+        heapq.heapify(leaves)
+        evicted: list[np.ndarray] = []
+        evicted_size = 0
+        while evicted_size < num_tokens:
+            assert leaves, f"Cannot evict enough cache, need {num_tokens}, evicted {evicted_size}"
+            node = heapq.heappop(leaves)
+            assert node.ref_count == 0 and node.is_leaf() and not node.is_root()
+            evicted_size += node.length
+            evicted.append(node.value)
+            self.evictable_size -= node.length
+            parent = node.parent
+            parent.children.pop(page_key(node.key, self.page_size))
+            # The root is always protected, so it is never pushed.
+            if parent.is_leaf() and parent.ref_count == 0:
+                heapq.heappush(leaves, parent)
+        return np.concatenate(evicted)
+
+    def check_integrity(self) -> None:
+        evictable = protected = 0
+        stack = list(self.root.children.values())
+        while stack:
+            node = stack.pop()
+            assert node.ref_count >= 0
+            if node.ref_count == 0:
+                evictable += node.length
+            else:
+                protected += node.length
+            stack.extend(node.children.values())
+        assert (evictable, protected) == (self.evictable_size, self.protected_size), (
+            f"size counters ({self.evictable_size}, {self.protected_size}) drifted from the "
+            f"nodes ({evictable}, {protected})"
+        )
+
+    def collect_kv(self, node: RadixTreeNode) -> np.ndarray:
+        values: list[np.ndarray] = []
+        while not node.is_root():
+            values.append(node.value)
+            node = node.parent
+        values.reverse()
+        return np.concatenate(values) if values else EMPTY_IDS
+
+    def leaves(self) -> list[RadixTreeNode]:
+        out: list[RadixTreeNode] = []
+        stack = [self.root]
+        while stack:
+            node = stack.pop()
+            if node.is_leaf():
+                if not node.is_root():
+                    out.append(node)
+            else:
+                stack.extend(node.children.values())
+        return out
+
+
+__all__ = [
+    "EMPTY_IDS",
+    "PageKey",
+    "RadixCacheHandle",
+    "RadixMatch",
+    "RadixPrefixCache",
+    "RadixTreeNode",
+    "align_down",
+    "page_key",
+    "tree_walk",
+]
