@@ -12,9 +12,10 @@ from __future__ import annotations
 import argparse
 import os
 from dataclasses import dataclass
+from typing import get_args
 
 from ftmetal.attention import SUPPORTED_ATTENTION_BACKENDS
-from ftmetal.engine.config import EngineConfig, command_graph_from_env
+from ftmetal.engine.config import CacheTypeChoice, EngineConfig, command_graph_from_env
 
 
 @dataclass(frozen=True)
@@ -108,6 +109,13 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         help="KV page size in tokens (FreeToken's --page-size)",
     )
     parser.add_argument(
+        "--cache-type",
+        choices=get_args(CacheTypeChoice),
+        default=ServerArgs.cache_type,
+        help="radix reuses cached prompt prefixes (with GDN state snapshots on a model with "
+        "linear attention); naive reuses nothing and needs a model without linear attention",
+    )
+    parser.add_argument(
         "--attention-backend",
         "--attn",
         choices=SUPPORTED_ATTENTION_BACKENDS.supported_names(),
@@ -135,6 +143,7 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         max_extend_tokens=namespace.max_extend_tokens,
         num_page_override=namespace.num_page_override,
         page_size=namespace.page_size,
+        cache_type=namespace.cache_type,
         attention_backend=namespace.attention_backend,
         command_graph=not namespace.disable_command_graph and command_graph_from_env(),
     )

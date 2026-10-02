@@ -41,7 +41,7 @@ def pages_of(row: np.ndarray, page_size: int) -> set[int]:
 def test_allocate_then_finish_returns_every_page(page_size: int) -> None:
     num_pages = 64
     page_table = np.zeros((2, 128), dtype=np.int32)
-    manager = CacheManager(num_pages, page_size, page_table)
+    manager = CacheManager(num_pages, page_size, page_table, "naive")
     reqs = [make_req(0, 5, 3), make_req(1, 9, 1)]
     manager.allocate_paged(reqs)
     used_pages = sum(-(-req.device_len // page_size) for req in reqs)
@@ -69,7 +69,7 @@ def test_allocate_then_finish_returns_every_page(page_size: int) -> None:
 
 def test_pages_exhausted_raises() -> None:
     page_table = np.zeros((1, 64), dtype=np.int32)
-    manager = CacheManager(2, 4, page_table)
+    manager = CacheManager(2, 4, page_table, "naive")
     with pytest.raises(RuntimeError):
         manager.allocate_paged([make_req(0, 12, 1)])
 
@@ -90,7 +90,7 @@ def hybrid_manager(
 ) -> tuple[CacheManager, LinearStatePool, np.ndarray]:
     pool = make_pool(num_slots)
     page_table = np.zeros((4, 64), dtype=np.int32)
-    return CacheManager(num_pages, page_size, page_table, pool), pool, page_table
+    return CacheManager(num_pages, page_size, page_table, "hybrid_radix", pool), pool, page_table
 
 
 def prefilled(
@@ -215,7 +215,7 @@ def test_page_pressure_evicts_tree_leaves_and_their_snapshots() -> None:
         sampling_params=SamplingParams(max_tokens=1),
     )
     manager.allocate_paged([big])  # 6 pages: the tree's two must go
-    assert manager.prefix_cache is not None and manager.prefix_cache.full_evictable_size == 0
+    assert manager.evictable_size == 0
     assert pool.num_free_slots == pool.num_slots - 1
     assert manager.match_req(np.array(range(1, 11), dtype=np.int32)) == MatchResult(None, None)
 
@@ -271,7 +271,7 @@ def test_hybrid_prefill_chunks_end_on_a_page_boundary() -> None:
 
 def test_without_a_prefix_cache_chunks_are_not_aligned() -> None:
     page_table = np.zeros((4, 512), dtype=np.int32)
-    manager = CacheManager(64, 32, page_table)
+    manager = CacheManager(64, 32, page_table, "naive")
     assert manager.prefill_chunk_align == 1
     table = TableManager(max_running_reqs=4, page_table=page_table)
     pending = PendingReq(0, np.arange(300, dtype=np.int32), SamplingParams(max_tokens=1))
