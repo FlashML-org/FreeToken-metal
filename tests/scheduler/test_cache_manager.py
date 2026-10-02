@@ -12,6 +12,8 @@ test_commit_repoints_page_table.py, on a tiny real LinearStatePool.
 
 from __future__ import annotations
 
+import logging
+from functools import partial
 from typing import Literal
 
 import mlx.core as mx
@@ -337,11 +339,26 @@ def radix_manager(num_pages: int = 16, page_size: int = 4) -> tuple[CacheManager
 
 
 def test_cache_type_resolves_radix_to_the_hybrid_radix_on_a_gdn_model() -> None:
-    assert resolve_cache_type("radix", has_linear_attention=False) == "radix"
-    assert resolve_cache_type("naive", has_linear_attention=False) == "naive"
-    assert resolve_cache_type("radix", has_linear_attention=True) == "hybrid_radix"
+    resolve = partial(resolve_cache_type, has_sliding_window=False)
+    assert resolve("radix", has_linear_attention=False) == "radix"
+    assert resolve("naive", has_linear_attention=False) == "naive"
+    assert resolve("radix", has_linear_attention=True) == "hybrid_radix"
     with pytest.raises(ValueError):
-        resolve_cache_type("naive", has_linear_attention=True)
+        resolve("naive", has_linear_attention=True)
+
+
+def test_cache_type_resolves_radix_to_naive_on_a_sliding_window_model(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="ftmetal.scheduler.cache"):
+        resolved = resolve_cache_type("radix", has_linear_attention=False, has_sliding_window=True)
+    assert resolved == "naive"
+    assert len(caplog.records) == 1 and "SWA radix cache" in caplog.text
+    caplog.clear()
+    assert resolve_cache_type("naive", has_linear_attention=False, has_sliding_window=True) == (
+        "naive"
+    )
+    assert not caplog.records
 
 
 def test_radix_prefill_commit_publishes_the_prompt_and_a_shared_prefix_hits() -> None:

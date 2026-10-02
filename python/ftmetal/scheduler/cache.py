@@ -9,15 +9,17 @@ sliding-window model's window slots are the second currency (FreeToken's swa_pag
 lifecycle): every token of a new page gets one, the ones behind a request's window are
 freed as it slides, the rest with the pages on finish. Divergences: host numpy page table
 and free list (page-aligned token slots); naive is refused on a model with linear
-attention; eviction stops at what is evictable and exhaustion raises; no SWA radix cache,
-runtime rebuild or tool-call anchor. lazy_free_region batches the frees of one drained
-step; the drain itself is the step fence, so window slots slide out when the step that
-last extended a request drains (FreeToken frees them when it schedules the next one,
-every 128 decode forwards, relying on stream order).
+attention; radix on a sliding-window model runs naive, as there is no SWA radix cache;
+eviction stops at what is evictable and exhaustion raises; no runtime rebuild or
+tool-call anchor. lazy_free_region batches the frees of one drained step; the drain
+itself is the step fence, so window slots slide out when the step that last extended a
+request drains (FreeToken frees them when it schedules the next one, every 128 decode
+forwards, relying on stream order).
 """
 
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from typing import Iterator, Literal, NamedTuple
 
@@ -32,20 +34,31 @@ from ftmetal.kvcache.swa_pool import SWAKVCache
 
 CacheType = Literal["naive", "radix", "hybrid_radix"]
 
+logger = logging.getLogger(__name__)
+
 
 def div_ceil(a: int, b: int) -> int:
     return -(-a // b)
 
 
-def resolve_cache_type(requested: CacheTypeChoice, has_linear_attention: bool) -> CacheType:
-    """Radix on a model with linear attention is the hybrid radix, the only tree that can
-    resume a GDN state."""
-    if not has_linear_attention:
-        return requested
-    elif requested == "naive":
+def resolve_cache_type(
+    requested: CacheTypeChoice, *, has_linear_attention: bool, has_sliding_window: bool
+) -> CacheType:
+    """Radix is the radix cache that matches the model: on a model with linear attention the
+    hybrid radix, the only tree that can resume a GDN state."""
+    if has_linear_attention and requested == "naive":
         raise ValueError("--cache-type naive is not supported on a model with linear attention")
-    else:
+    elif has_linear_attention:
         return "hybrid_radix"
+    elif has_sliding_window and requested == "radix":
+        # Resolves to swa_radix once the SWA radix cache lands.
+        logger.warning(
+            "the SWA radix cache is not implemented yet: --cache-type radix runs naive and "
+            "prefix reuse is off for this sliding-window model"
+        )
+        return "naive"
+    else:
+        return requested
 
 
 class MatchResult(NamedTuple):
@@ -72,6 +85,9 @@ class CacheManager:
         self.is_hybrid = cache_type == "hybrid_radix"
         assert self.is_hybrid == (linear_state_pool is not None), (
             "the hybrid radix cache, and only it, drives a GDN state pool"
+        )
+        assert swa_pool is None or cache_type == "naive", (
+            f"window slots ride the naive cache only, not {cache_type}"
         )
         self.linear_state_pool = linear_state_pool
         self.swa_pool = swa_pool

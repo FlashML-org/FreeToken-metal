@@ -70,7 +70,11 @@ class TokenEvent:
 class Scheduler:
     def __init__(self, config: EngineConfig, eos_token_ids: set[int]) -> None:
         # Before the engine loads anything: an unsupported --cache-type fails fast.
-        cache_type = resolve_cache_type(config.cache_type, config.model_config.has_linear_attention)
+        cache_type = resolve_cache_type(
+            config.cache_type,
+            has_linear_attention=config.model_config.has_linear_attention,
+            has_sliding_window=config.model_config.swa_attention_group() is not None,
+        )
         self.engine = Engine(config)
         self.config = config
         self.eos_token_ids = eos_token_ids

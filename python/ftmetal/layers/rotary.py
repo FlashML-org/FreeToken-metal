@@ -31,6 +31,8 @@ class RotaryEmbedding(BaseOP):
             exponents = mx.arange(0, rotary_dim, 2, dtype=mx.float32) / head_dim
             still = mx.full(((head_dim - rotary_dim) // 2,), mx.inf, dtype=mx.float32)
             self._freqs = mx.concatenate([base**exponents, still])
+            # A constant of every step, not a kernel a captured step would record.
+            mx.eval(self._freqs)
 
     def forward(self, positions: mx.array, x: mx.array) -> mx.array:
         """x is [num_tokens, num_heads, head_dim]; positions is int32 [num_tokens]."""
