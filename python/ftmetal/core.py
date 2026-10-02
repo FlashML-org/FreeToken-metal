@@ -56,6 +56,8 @@ class Req:
     mamba_last_track_seqlen: int | None = None
     # On a prefix hit: the tree's snapshot slot to copy into the live slot before the first chunk.
     mamba_restore_src: int | None = None
+    # SWA: tokens below this have had their window slots freed (slid out of the window).
+    swa_evicted_seqlen: int = 0
     aborted: bool = False
 
     def __post_init__(self) -> None:

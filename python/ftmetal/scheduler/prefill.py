@@ -2,10 +2,12 @@
 
 Port of FreeToken scheduler/prefill.py. Admission matches the prefix cache, locks the
 match and reserves the GDN slots (1 live + 2 ping-pong, evicting tree snapshots if short);
-a hit carries the snapshot slot to restore from. Divergences: no multimodal or
-sliding-window currencies; a miss zeroes its live slot here; the cached part of the
-token pool row is not written (only the extended tokens are ever gathered); a
-continuation chunk inherits the pending track snapshot of the chunk before it.
+a hit carries the snapshot slot to restore from; a continuation chunk inherits the window
+slots freed so far. Divergences: no multimodal currency, and no window-slot admission
+check or chunk cap (the naive window pool holds every running request's window and one
+step's tokens); a miss zeroes its live slot here; the cached part of the token pool row
+is not written (only the extended tokens are ever gathered); a continuation chunk
+inherits the pending track snapshot of the chunk before it.
 """
 
 from __future__ import annotations
@@ -120,6 +122,7 @@ class PrefillAdder:
         resources: AdmittedResources,
         next_track_idx: int,
         last_track_seqlen: int | None,
+        swa_evicted_seqlen: int,
     ) -> Req:
         remain_len = pending.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
@@ -154,6 +157,7 @@ class PrefillAdder:
         req.mamba_next_track_idx = next_track_idx
         req.mamba_last_track_seqlen = last_track_seqlen
         req.mamba_restore_src = resources.restore_src
+        req.swa_evicted_seqlen = swa_evicted_seqlen
         return req
 
     def try_add_one(self, pending: PendingReq) -> Req | None:
@@ -177,13 +181,19 @@ class PrefillAdder:
                 resources,
                 chunked.mamba_next_track_idx,
                 chunked.mamba_last_track_seqlen,
+                chunked.swa_evicted_seqlen,
             )
         resources = self.try_allocate_one(pending)
         if resources is None:
             return None
         cached_len = 0 if resources.cache_handle is None else resources.cache_handle.cached_len
         return self.add_one_req(
-            pending, cached_len, resources, next_track_idx=0, last_track_seqlen=None
+            pending,
+            cached_len,
+            resources,
+            next_track_idx=0,
+            last_track_seqlen=None,
+            swa_evicted_seqlen=0,
         )
 
 
