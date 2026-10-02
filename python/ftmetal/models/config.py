@@ -1,10 +1,11 @@
 """Model configuration: attention groups and the per-model geometry.
 
-Port of FreeToken models/config.py, reduced to the FULL and LINEAR group kinds and
-the fields Qwen3.5-style hybrid MoE models use. Divergences: the quantization config
-is the MLX checkpoint's affine scheme map; no tensor parallelism, vision or MTP; the
-LINEAR group emits a KVCacheGroupSpec too (its per-slot conv and state shapes), so every
-pool is sized from a spec.
+Port of FreeToken models/config.py, reduced to the FULL, SWA and LINEAR group kinds and
+the fields Qwen3.5-style hybrid MoE and Gemma4 models use. Divergences: the quantization
+config is the MLX checkpoint's affine scheme map; no tensor parallelism, vision or MTP;
+the LINEAR group emits a KVCacheGroupSpec too (its per-slot conv and state shapes), so
+every pool is sized from a spec; the rope variant is a rope_type field, not a scaling
+dictionary.
 """
 
 from __future__ import annotations
@@ -25,6 +26,9 @@ class RotaryConfig:
     rotary_dim: int
     max_position: int
     base: float
+    # proportional: the first rotary_dim / 2 frequency pairs of a head_dim-wide rope rotate,
+    # the rest pass through (Gemma4's global layers); default: the first rotary_dim dims.
+    rope_type: Literal["default", "proportional"] = "default"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -34,9 +38,11 @@ class KVCacheGroupSpec:
     name: str
     attn_type: AttnType
     layer_ids: tuple[int, ...]
-    # Paged K/V geometry (FULL).
+    # Paged K/V geometry (FULL, SWA).
     num_kv_heads: int = 0
     head_dim: int = 0
+    # The keys a query attends to, its own included (SWA).
+    sliding_window: int | None = None
     # Per-slot state per layer (LINEAR); () when the type has none.
     conv_shape: tuple[int, ...] = ()
     state_shape: tuple[int, ...] = ()
@@ -74,6 +80,18 @@ class FullAttentionGroupConfig(BaseAttentionGroupConfig):
     num_kv_heads: int
     head_dim: int
     rotary_config: RotaryConfig
+    # V is the K projection's output, normed on its own (Gemma4's global layers).
+    k_eq_v: bool = False
+
+
+@dataclass(frozen=True)
+class SWAAttentionGroupConfig(BaseAttentionGroupConfig):
+    kind: ClassVar[Literal["swa"]] = "swa"
+
+    num_kv_heads: int
+    head_dim: int
+    rotary_config: RotaryConfig
+    sliding_window: int
 
 
 @dataclass(frozen=True)
@@ -88,7 +106,9 @@ class LinearGatedDeltaGroupConfig(BaseAttentionGroupConfig):
     output_gate: str = "silu"
 
 
-AttentionGroupConfig = FullAttentionGroupConfig | LinearGatedDeltaGroupConfig
+AttentionGroupConfig = (
+    FullAttentionGroupConfig | SWAAttentionGroupConfig | LinearGatedDeltaGroupConfig
+)
 
 
 @dataclass(frozen=True)
@@ -116,6 +136,10 @@ class ModelConfig:
     shared_expert_intermediate_size: int = 0
     use_qk_norm: bool = False
     attn_output_gate: bool = False
+    # None: head_dim ** -0.5 of each attention group.
+    attn_sm_scale: float | None = None
+    final_logit_softcapping: float | None = None
+    embedding_scale: float | None = None
 
     @property
     def is_moe(self) -> bool:
@@ -137,6 +161,12 @@ class ModelConfig:
             raise ValueError("expected at most one full attention group")
         return groups[0] if groups else None
 
+    def swa_attention_group(self) -> SWAAttentionGroupConfig | None:
+        groups = [g for g in self.attention_groups if isinstance(g, SWAAttentionGroupConfig)]
+        if len(groups) > 1:
+            raise ValueError("expected at most one sliding-window attention group")
+        return groups[0] if groups else None
+
     def linear_attention_group(self) -> LinearGatedDeltaGroupConfig | None:
         groups = [g for g in self.attention_groups if isinstance(g, LinearGatedDeltaGroupConfig)]
         if len(groups) > 1:
@@ -147,9 +177,13 @@ class ModelConfig:
         return isinstance(self.attention_group_for_layer(layer_id), LinearGatedDeltaGroupConfig)
 
     def attn_type_for_layer(self, layer_id: int) -> AttnType:
-        if self.is_linear_layer(layer_id):
+        group = self.attention_group_for_layer(layer_id)
+        if isinstance(group, LinearGatedDeltaGroupConfig):
             return AttnType.LINEAR
-        return AttnType.FULL
+        elif isinstance(group, SWAAttentionGroupConfig):
+            return AttnType.SWA
+        else:
+            return AttnType.FULL
 
     def kv_cache_group_specs(self) -> tuple[KVCacheGroupSpec, ...]:
         specs: list[KVCacheGroupSpec] = []
@@ -161,6 +195,15 @@ class ModelConfig:
                     layer_ids=group.layer_ids,
                     num_kv_heads=group.num_kv_heads,
                     head_dim=group.head_dim,
+                )
+            elif isinstance(group, SWAAttentionGroupConfig):
+                spec = KVCacheGroupSpec(
+                    name=group.name,
+                    attn_type=AttnType.SWA,
+                    layer_ids=group.layer_ids,
+                    num_kv_heads=group.num_kv_heads,
+                    head_dim=group.head_dim,
+                    sliding_window=group.sliding_window,
                 )
             else:
                 # A conv ring over q, k and v; the state is [Hv, Dv, Dk] as the GDN kernels read it.
@@ -186,4 +229,5 @@ __all__ = [
     "LinearGatedDeltaGroupConfig",
     "ModelConfig",
     "RotaryConfig",
+    "SWAAttentionGroupConfig",
 ]

@@ -18,6 +18,7 @@ import mlx.core as mx
 
 class AttnType(str, Enum):
     FULL = "full"
+    SWA = "swa"
     LINEAR = "linear"
 
 
