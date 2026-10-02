@@ -1,8 +1,10 @@
-"""Full attention on mx.fast.scaled_dot_product_attention over gathered pages.
+"""Full and sliding-window attention on mx.fast.scaled_dot_product_attention over
+gathered pages.
 
 The parity oracle and bring-up backend: decode gathers every request's pages into a
 padded [size, max_seqlen_k] window and masks the tail; prefill runs one SDPA per
-request over its cached prefix plus the fresh keys.
+request over its cached prefix plus the fresh keys, causal or, for a window row (which
+starts at its oldest visible key), banded to the window.
 """
 
 from __future__ import annotations
@@ -16,8 +18,8 @@ from ftmetal.core import Batch
 class FullAttnMLXBackend(FullAttnBackend):
     def token_slots(self, metadata: FullAttnMetadata) -> mx.array:
         """Page ids [size, max_pages] -> token slots [size, max_pages * page_size]."""
-        offsets = mx.arange(self.page_size, dtype=mx.int32)
-        slots = metadata.page_table[:, :, None] * self.page_size + offsets
+        offsets = mx.arange(self.table_page_size, dtype=mx.int32)
+        slots = metadata.page_table[:, :, None] * self.table_page_size + offsets
         return slots.reshape(metadata.page_table.shape[0], -1)
 
     def attend(
@@ -60,12 +62,20 @@ class FullAttnMLXBackend(FullAttnBackend):
                 values = mx.concatenate([v_cache[prefix], fresh_v])
             else:
                 keys, values = fresh_k, fresh_v
+            if self.sliding_window is None:
+                visible: mx.array | str = "causal"
+            else:
+                positions = mx.arange(cached_len, cached_len + extend_len)[:, None]
+                key_positions = mx.arange(cached_len + extend_len)[None, :]
+                visible = (key_positions <= positions) & (
+                    key_positions > positions - self.sliding_window
+                )
             out = mx.fast.scaled_dot_product_attention(
                 q[start : start + extend_len].transpose(1, 0, 2)[None],
                 keys.transpose(1, 0, 2)[None],
                 values.transpose(1, 0, 2)[None],
                 scale=self.scale,
-                mask="causal",
+                mask=visible,
             )
             outputs.append(out[0].transpose(1, 0, 2))
             start += extend_len

@@ -5,7 +5,10 @@ tails, spare pages and the dummy page that pads short page-table rows) holds hug
 and values, so reading one shows up in the output. Replay metadata (a page table as wide
 as the longest context, so flash-decode's grid holds the most partitions) must give the
 per-length metadata's results. Prefill runs flash-prefill over the same pools, one batch
-of unequal requests or one long prompt chunk by chunk.
+of unequal requests or one long prompt chunk by chunk. Sliding-window attention runs on
+a window pool whose slots back only the keys a step's windows reach; every other full
+slot maps to the sentinel, which holds huge keys and values like every unused window
+slot, and the reference attends over the whole row under the window mask.
 """
 
 from __future__ import annotations
@@ -20,7 +23,8 @@ from ftmetal.attention.metadata import AttnType
 from ftmetal.core import Batch, Req, SamplingParams
 from ftmetal.kernel.ref import flash_decode_ref, flash_prefill_ref
 from ftmetal.kvcache.mha_pool import MHAKVCache
-from ftmetal.models.config import ModelConfig
+from ftmetal.kvcache.swa_pool import SENTINEL_SLOT, SWAKVCache
+from ftmetal.models.config import KVCacheGroupSpec, ModelConfig
 from ftmetal.models.qwen3_5_moe.config import parse_config
 
 PAGE_SIZE = 32
@@ -338,3 +342,236 @@ def test_chunked_prefill_matches_reference_and_mlx_backend(dtype: mx.Dtype) -> N
         )
         assert max_row_error(out, reference) < TOLERANCE[dtype]
         assert max_row_error(out, expected) < PREFILL_MLX_TOLERANCE[dtype]
+
+
+# Sliding windows: one key, inside a short row, Gemma4's.
+WINDOWS = [1, 7, 1024]
+# Window decode batches: keys per request, current token included.
+WINDOW_SEQ_LENS = [[1], [7, 8, 9], [1, 1024, 1025, 3001]]
+# Window prefill batches: cached prefix and new tokens per request.
+WINDOW_PREFILL_BATCHES = [([0], [2048]), ([5000], [64]), ([1023, 0, 6], [2, 1100, 3])]
+WINDOW_FULL_SLOTS = 16384
+
+
+def window_pool(
+    cached_lens: list[int],
+    extend_lens: list[int],
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: mx.Dtype,
+    window: int,
+) -> tuple[SWAKVCache, np.ndarray, Batch]:
+    """A window pool backing each request's keys from its window start on, random rows in
+    those slots and UNREAD_VALUE in every other slot (the sentinel included); the page table
+    holds shuffled full slots, one row per request plus the dummy row."""
+    spec = KVCacheGroupSpec(
+        name="swa",
+        attn_type=AttnType.SWA,
+        layer_ids=(0,),
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        sliding_window=window,
+    )
+    seq_lens = [c + e for c, e in zip(cached_lens, extend_lens)]
+    num_swa_tokens = sum(seq_lens) + SPARE_PAGES
+    pool = SWAKVCache(spec, num_swa_tokens, WINDOW_FULL_SLOTS, dtype)
+    rng = np.random.default_rng(sum(seq_lens) + window)
+    full_slots = rng.permutation(WINDOW_FULL_SLOTS - 1).astype(np.int32)
+    page_table = np.full((len(seq_lens) + 1, max(seq_lens)), WINDOW_FULL_SLOTS - 1, np.int32)
+    reqs = []
+    start = 0
+    for i, (cached_len, seq_len) in enumerate(zip(cached_lens, seq_lens)):
+        page_table[i, :seq_len] = full_slots[start : start + seq_len]
+        start += seq_len
+        pool.alloc_swa(page_table[i, max(0, cached_len - window + 1) : seq_len])
+        reqs.append(
+            Req(
+                input_ids=np.zeros(seq_len, dtype=np.int32),
+                table_idx=i,
+                cached_len=cached_len,
+                output_len=1,
+                uid=i,
+                sampling_params=SamplingParams(),
+            )
+        )
+    is_key = np.ones((num_swa_tokens, 1, 1), dtype=bool)
+    is_key[pool.free_swa_slots] = False
+    is_key[SENTINEL_SLOT] = False
+    shape = (num_swa_tokens, num_kv_heads, head_dim)
+    keys = mx.where(mx.array(is_key), mx.random.normal(shape), UNREAD_VALUE).astype(dtype)
+    values = mx.where(mx.array(is_key), mx.random.normal(shape), UNREAD_VALUE).astype(dtype)
+    pool.store_kv(keys, values, mx.arange(num_swa_tokens, dtype=mx.int32), layer_id=0)
+    phase = "decode" if max(extend_lens) == 1 else "prefill"
+    return pool, page_table, Batch(reqs=reqs, phase=phase)
+
+
+def window_reference(
+    q: mx.array,
+    pool: SWAKVCache,
+    page_table: np.ndarray,
+    cached_lens: list[int],
+    extend_lens: list[int],
+    scale: float,
+) -> mx.array:
+    """fp32 attention over each request's whole row of window slots (the sentinel before
+    its window start) under the absolute-position window mask."""
+    rows = [
+        pool.translate(page_table[i, : c + e])
+        for i, (c, e) in enumerate(zip(cached_lens, extend_lens))
+    ]
+    table = np.full((len(rows), max(len(row) for row in rows)), SENTINEL_SLOT, np.int32)
+    for i, row in enumerate(rows):
+        table[i, : len(row)] = row
+    return flash_prefill_ref(
+        q,
+        pool.k_cache(0),
+        pool.v_cache(0),
+        mx.array(table),
+        extend_lens,
+        cached_lens,
+        1,
+        scale,
+        pool.sliding_window,
+    )
+
+
+def window_backends(
+    pool: SWAKVCache, page_table: np.ndarray, num_heads: int, head_dim: int
+) -> tuple[FullAttnMetalBackend, FullAttnMLXBackend]:
+    config = attention_config(num_heads, pool.k_cache(0).shape[1], head_dim)
+    spec = KVCacheGroupSpec(
+        name="swa",
+        attn_type=AttnType.SWA,
+        layer_ids=(0,),
+        num_kv_heads=pool.k_cache(0).shape[1],
+        head_dim=head_dim,
+        sliding_window=pool.sliding_window,
+    )
+    return (
+        FullAttnMetalBackend(config, spec, pool, page_table, 1),
+        FullAttnMLXBackend(config, spec, pool, page_table, 1),
+    )
+
+
+def check_window_step(
+    cached_lens: list[int],
+    extend_lens: list[int],
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: mx.Dtype,
+    window: int,
+) -> None:
+    mx.random.seed(sum(cached_lens) + window + head_dim)
+    pool, page_table, batch = window_pool(
+        cached_lens, extend_lens, num_kv_heads, head_dim, dtype, window
+    )
+    metal_backend, mlx_backend = window_backends(pool, page_table, num_heads, head_dim)
+    metal_backend.prepare_metadata(batch)
+    metadata = batch.attn_metadata[AttnType.SWA]
+    assert isinstance(metadata, MetalAttnMetadata)
+    assert max(metadata.seq_lens_host) <= window + max(extend_lens) - 1
+    num_tokens = sum(extend_lens)
+    q = mx.random.normal((num_tokens, num_heads, head_dim)).astype(dtype)
+    k = mx.random.normal((num_tokens, num_kv_heads, head_dim)).astype(dtype)
+    v = mx.random.normal((num_tokens, num_kv_heads, head_dim)).astype(dtype)
+    out = metal_backend.forward(q, k, v, 0, batch)
+    expected = mlx_backend.forward(q, k, v, 0, batch)
+    reference = window_reference(q, pool, page_table, cached_lens, extend_lens, head_dim**-0.5)
+    assert out.shape == q.shape and out.dtype == dtype
+    assert max_row_error(out, reference) < TOLERANCE[dtype]
+    assert max_row_error(out, expected) < PREFILL_MLX_TOLERANCE[dtype]
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("num_heads,num_kv_heads", [(16, 8), (8, 1)])
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("window", WINDOWS)
+@pytest.mark.parametrize("seq_lens", WINDOW_SEQ_LENS)
+def test_window_decode_matches_reference_and_mlx_backend(
+    seq_lens: list[int],
+    window: int,
+    head_dim: int,
+    num_heads: int,
+    num_kv_heads: int,
+    dtype: mx.Dtype,
+) -> None:
+    check_window_step(
+        [n - 1 for n in seq_lens],
+        [1] * len(seq_lens),
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        dtype,
+        window,
+    )
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("num_heads,num_kv_heads", [(16, 8), (8, 1)])
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("window", WINDOWS)
+@pytest.mark.parametrize(("cached_lens", "extend_lens"), WINDOW_PREFILL_BATCHES)
+def test_window_prefill_matches_reference_and_mlx_backend(
+    cached_lens: list[int],
+    extend_lens: list[int],
+    window: int,
+    head_dim: int,
+    num_heads: int,
+    num_kv_heads: int,
+    dtype: mx.Dtype,
+) -> None:
+    check_window_step(cached_lens, extend_lens, num_heads, num_kv_heads, head_dim, dtype, window)
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("num_dummies", [0, 2])
+def test_window_replay_metadata_matches_reference_and_eager(
+    num_dummies: int, dtype: mx.Dtype
+) -> None:
+    """A replayed window decode step runs on the window-wide row the eager step builds."""
+    num_heads, num_kv_heads, head_dim, window = 16, 8, 256, 1024
+    seq_lens = [5, 1024, 3001]
+    size = len(seq_lens)
+    mx.random.seed(size + num_dummies)
+    cached_lens = [n - 1 for n in seq_lens]
+    pool, page_table, batch = window_pool(
+        cached_lens, [1] * size, num_kv_heads, head_dim, dtype, window
+    )
+    dummy = Req(
+        input_ids=np.zeros(1, dtype=np.int32),
+        table_idx=size,
+        cached_len=0,
+        output_len=1,
+        uid=-1,
+        sampling_params=SamplingParams(),
+    )
+    backend, _ = window_backends(pool, page_table, num_heads, head_dim)
+    padded_size = size + num_dummies
+    q = mx.random.normal((padded_size, num_heads, head_dim)).astype(dtype)
+    k = mx.random.normal((padded_size, num_kv_heads, head_dim)).astype(dtype)
+    v = mx.random.normal((padded_size, num_kv_heads, head_dim)).astype(dtype)
+
+    backend.prepare_metadata(batch)
+    eager = backend.forward(q[:size], k[:size], v[:size], 0, batch)
+    backend.init_capture_graph(page_table.shape[1], [padded_size])
+    batch.padded_reqs = batch.reqs + [dummy] * num_dummies
+    backend.prepare_metadata(batch)
+    backend.prepare_for_replay(batch)
+    metadata = batch.attn_metadata[AttnType.SWA]
+    assert isinstance(metadata, MetalAttnMetadata)
+    assert (
+        metadata.page_table.shape
+        == (padded_size, window)
+        == (
+            padded_size,
+            metadata.max_seqlen_k,
+        )
+    )
+    replayed = backend.forward(q, k, v, 0, batch)[:size]
+    reference = window_reference(
+        q[:size], pool, page_table, cached_lens, [1] * size, head_dim**-0.5
+    )
+    assert max_row_error(replayed, reference) < TOLERANCE[dtype]
+    if num_dummies == 0:
+        assert mx.array_equal(replayed, eager)

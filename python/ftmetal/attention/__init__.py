@@ -3,8 +3,8 @@
 Port of FreeToken attention/__init__.py. Divergences: creators take the group's spec,
 its pool and the page table (no global context at construction); LINEAR always gets
 LinearAttnBackend, which only builds metadata (FreeToken's backend-driven type); there
-is no prefill,decode pair and no auto resolution: two full-attention kernel sets on one
-machine, chosen by name.
+is no prefill,decode pair and no auto resolution: two kernel sets on one machine, chosen
+by name, each serving the paged types (FULL, SWA) with one instance per type.
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register(
-    "mlx", BackendInfo(supported_types=frozenset({AttnType.FULL}))
+    "mlx", BackendInfo(supported_types=frozenset({AttnType.FULL, AttnType.SWA}))
 )
 def create_mlx_backend(
     config: ModelConfig,
@@ -70,7 +70,7 @@ def create_mlx_backend(
 @SUPPORTED_ATTENTION_BACKENDS.register(
     "metal",
     BackendInfo(
-        supported_types=frozenset({AttnType.FULL}),
+        supported_types=frozenset({AttnType.FULL, AttnType.SWA}),
         page_sizes=(1, 2, 4, 8, 16, 32, 64),
         can_capture=True,
     ),
