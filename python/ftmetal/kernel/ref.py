@@ -183,9 +183,11 @@ def flash_prefill_ref(
     cached_lens: list[int],
     page_size: int,
     scale: float,
+    sliding_window: int | None = None,
 ) -> mx.array:
     """fp32 SDPA of each request's queries in q [T, Hq, D] over its paged keys, causal from
-    its cached prefix; at most PREFILL_REF_QUERY_ROWS queries per call bound the scores."""
+    its cached prefix and, with a sliding window W, limited to the last W keys; at most
+    PREFILL_REF_QUERY_ROWS queries per call bound the scores."""
     offsets = mx.arange(page_size, dtype=mx.int32)
     outputs = []
     row = 0
@@ -197,10 +199,16 @@ def flash_prefill_ref(
         for start in range(0, extend_len, PREFILL_REF_QUERY_ROWS):
             stop = min(extend_len, start + PREFILL_REF_QUERY_ROWS)
             queries = q[row + start : row + stop].astype(mx.float32).transpose(1, 0, 2)[None]
-            # The causal mask aligns the last query with the last key.
             visible = cached_len + stop
+            if sliding_window is None:
+                # The causal mask aligns the last query with the last key.
+                mask: mx.array | str = "causal"
+            else:
+                positions = mx.arange(cached_len + start, visible)[:, None]
+                key_positions = mx.arange(visible)[None, :]
+                mask = (key_positions <= positions) & (key_positions > positions - sliding_window)
             out = mx.fast.scaled_dot_product_attention(
-                queries, keys[:, :, :visible], values[:, :, :visible], scale=scale, mask="causal"
+                queries, keys[:, :, :visible], values[:, :, :visible], scale=scale, mask=mask
             )
             outputs.append(out[0].transpose(1, 0, 2))
         row += extend_len

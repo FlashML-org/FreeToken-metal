@@ -33,7 +33,9 @@ mx::array flash_prefill(
     int num_row_groups,
     int head_split,
     int block_k,
+    bool kv_shared,
     int num_partitions,
+    int sliding_window,
     float scale,
     mx::StreamOrDevice s) {
   if (q.ndim() != 3 || k_cache.ndim() != 3 || v_cache.ndim() != 3 || page_table.ndim() != 2 ||
@@ -80,6 +82,9 @@ mx::array flash_prefill(
   if (num_partitions < 1) {
     throw std::invalid_argument("ftmetal fprefill: num_partitions must be >= 1");
   }
+  if (sliding_window < 0) {
+    throw std::invalid_argument("ftmetal fprefill: sliding_window must be >= 0 (0: none)");
+  }
   auto stream = mx::to_stream(s);
   FlashPrefillConfig config{
       head_dim,
@@ -89,7 +94,9 @@ mx::array flash_prefill(
       num_row_groups,
       head_split,
       block_k,
+      kv_shared,
       num_partitions,
+      sliding_window,
       scale};
   return mx::array(
       q.shape(),
@@ -126,7 +133,8 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
   std::string library_name = "ftmetal_fprefill_" + type + "_" + std::to_string(c.head_dim) +
       "_" + std::to_string(c.group) + "_" + std::to_string(c.num_kv_heads) + "_" +
       std::to_string(c.page_size) + "_" + std::to_string(c.num_row_groups) + "_" +
-      std::to_string(c.head_split) + "_" + std::to_string(c.block_k);
+      std::to_string(c.head_split) + "_" + std::to_string(c.block_k) + "_" +
+      std::to_string(c.kv_shared) + "_" + std::to_string(c.sliding_window);
 
   auto s = stream();
   auto& d = mx::metal::device(s.device);
@@ -140,6 +148,8 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
     replace_all(source, "{{NSG}}", std::to_string(c.num_row_groups * c.head_split));
     replace_all(source, "{{DS}}", std::to_string(c.head_split));
     replace_all(source, "{{BK}}", std::to_string(c.block_k));
+    replace_all(source, "{{W}}", std::to_string(c.sliding_window));
+    replace_all(source, "{{KV_SHARED}}", c.kv_shared ? "true" : "false");
     return source;
   });
 
