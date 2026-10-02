@@ -40,11 +40,12 @@ def scheme_of(config: ModelConfig, checkpoint_module: str) -> AffineScheme | Non
 
 
 def fused_scheme_of(
-    config: ModelConfig, checkpoint_prefix: str, parts: tuple[str, ...]
+    config: ModelConfig, parent_module: str, parts: tuple[str, ...]
 ) -> AffineScheme | None:
+    """The scheme of parts (checkpoint module names under parent_module) fused into one."""
     if config.quant is None:
         return None
-    return config.quant.scheme_for_fused([f"{checkpoint_prefix}.{part}" for part in parts])
+    return config.quant.scheme_for_fused([f"{parent_module}.{part}" for part in parts])
 
 
 @partial(mx.compile, shapeless=True)
