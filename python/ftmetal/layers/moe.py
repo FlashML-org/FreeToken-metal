@@ -1,7 +1,8 @@
 """Resident routed experts over mx.gather_qmm / mx.gather_mm.
 
 Port of FreeToken layers/moe.py (MoELayer). Divergences: the experts live in one
-fused gate_up_proj and one down_proj bank per layer in bf16 or affine quantization;
+fused gate_up_proj and one down_proj bank per layer in bf16 or affine quantization, gated
+by silu or gelu_tanh (FreeToken's activation argument);
 routing is computed by the model and handed to forward; from SORT_MIN_PAIRS pairs up
 the pairs are expert-sorted by the moe_align kernel and un-sorted by moe_combine. The
 offload subclass arrives in round 3.
@@ -9,10 +10,12 @@ offload subclass arrives in round 3.
 
 from __future__ import annotations
 
+from typing import Literal
+
 import mlx.core as mx
 
 from ftmetal.kernel.moe_align import moe_align, moe_combine
-from ftmetal.layers.activation import silu_and_mul
+from ftmetal.layers.activation import gelu_tanh_and_mul, silu_and_mul
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.quantization.config import AffineScheme
 
@@ -72,6 +75,7 @@ class MoELayer(BaseOP):
         intermediate_size: int,
         *,
         scheme: AffineScheme | None = None,
+        activation: Literal["silu", "gelu_tanh"] = "silu",
         dtype: mx.Dtype = mx.bfloat16,
     ) -> None:
         super().__init__()
@@ -79,6 +83,7 @@ class MoELayer(BaseOP):
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
+        self.activation = activation
         self.gate_up_proj = ExpertBank(
             num_experts, hidden_size, 2 * intermediate_size, scheme=scheme, dtype=dtype
         )
@@ -91,16 +96,17 @@ class MoELayer(BaseOP):
     ) -> mx.array:
         """Expert compute for a routing decision (FreeToken's routed_forward): hidden [T, H],
         weights / ids [T, top_k]; the model computes the routing."""
+        act_and_mul = silu_and_mul if self.activation == "silu" else gelu_tanh_and_mul
         if topk_ids.size < SORT_MIN_PAIRS:
             x = mx.expand_dims(hidden_states, (-2, -3))
             gate_up = self.gate_up_proj.forward(x, topk_ids, False)
-            y = self.down_proj.forward(silu_and_mul(gate_up), topk_ids, False)
+            y = self.down_proj.forward(act_and_mul(gate_up), topk_ids, False)
             return (y.squeeze(-2) * topk_weights[..., None]).sum(axis=-2)
         else:
             alignment = moe_align(topk_ids, self.num_experts)
             x = mx.expand_dims(hidden_states, -2)[alignment.sorted_token_indices]
             gate_up = self.gate_up_proj.forward(x, alignment.sorted_expert_ids, True)
-            y = self.down_proj.forward(silu_and_mul(gate_up), alignment.sorted_expert_ids, True)
+            y = self.down_proj.forward(act_and_mul(gate_up), alignment.sorted_expert_ids, True)
             return moe_combine(y, alignment.pair_positions, topk_weights)
 
 
