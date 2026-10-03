@@ -221,27 +221,6 @@ def test_unaligned_finish_keeps_only_the_committed_snapshot() -> None:
     assert match.handle is not None and match.handle.cached_len == 8
 
 
-def test_duplicate_commit_repoints_the_row_off_its_freed_pages() -> None:
-    """Two requests prefilled the same prompt; the later commit dedups, frees its own pages
-    and its row must then name the tree's pages, which the backends read from now on."""
-    manager, pool, page_table = hybrid_manager()
-    prompt = list(range(1, 10))
-    reqs = [prefilled(manager, pool, i, prompt, track_seqlen=8) for i in (0, 1)]
-    own_pages = set(page_table[1, :8].tolist())
-    with manager.lazy_free_region():
-        for req in reqs:
-            manager.cache_req(req, finished=False)
-    free = set((manager.free_slots[:, None] + np.arange(4)).reshape(-1).tolist())
-    assert own_pages <= free
-    assert page_table[1, :8].tolist() == page_table[0, :8].tolist()
-    assert set(page_table[1, :9].tolist()).isdisjoint(free)
-    # The duplicate's frozen slot stays with the request; nothing leaks at finish.
-    with manager.lazy_free_region():
-        for req in reqs:
-            manager.cache_req(req, finished=True)
-    manager.check_integrity()
-
-
 def test_page_pressure_evicts_tree_leaves_and_their_snapshots() -> None:
     manager, pool, _ = hybrid_manager(num_pages=6)
     req = prefilled(manager, pool, 0, list(range(1, 11)), track_seqlen=8)
@@ -399,12 +378,18 @@ def test_radix_finish_keeps_the_aligned_prefix_and_frees_the_tail() -> None:
     assert match.handle is not None and match.handle.cached_len == 12
 
 
-def test_radix_unfinished_commit_repoints_the_row_off_the_freed_pages() -> None:
+@pytest.mark.parametrize("cache_type", ["radix", "hybrid_radix"])
+def test_unfinished_commit_repoints_the_row_off_the_freed_pages(cache_type: str) -> None:
     """Two requests prefilled the same prompt; the later commit dedups, frees its own pages
-    and its row must then name the tree's pages, which the backends read from now on."""
-    manager, page_table = radix_manager()
+    and its row must then name the tree's pages, which the backends read from now on. With a
+    GDN state pool the duplicate's frozen slot stays with the request; nothing leaks."""
+    if cache_type == "radix":
+        (manager, page_table), pool = radix_manager(), None
+    else:
+        manager, pool, page_table = hybrid_manager()
     prompt = list(range(1, 10))
-    reqs = [prefilled(manager, None, i, prompt, track_seqlen=None) for i in (0, 1)]
+    track_seqlen = None if pool is None else 8
+    reqs = [prefilled(manager, pool, i, prompt, track_seqlen) for i in (0, 1)]
     own_pages = set(page_table[1, :8].tolist())
     with manager.lazy_free_region():
         for req in reqs:
