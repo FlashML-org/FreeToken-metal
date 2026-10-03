@@ -8,11 +8,13 @@ frozen track snapshot to the tree and a finish donates the live slot. On a slidi
 model the window slots are the second currency (FreeToken's swa_paged lifecycle): every
 token of a new page gets one, the ones behind a request's window are freed as it slides,
 the rest with the pages on finish. The swa_radix path commits them with the KV to the
-SWARadixCache, which tombstones the slid-out ones; a commit locks one window, a finish
-keeps the prompt's last window live for the next turn, and the tree gives window slots
-back on their own when the pool runs dry. Divergences: host numpy page table and free list
-(page-aligned token slots); naive is refused on a model with linear attention; eviction
-stops at what is evictable and exhaustion raises; no runtime rebuild or tool-call anchor.
+SWARadixCache, which tombstones the slid-out ones; a commit keeps the request's last window
+live and locks it, a finish keeps the prompt's last window live for the next turn, and the
+tree gives window slots back on their own when the pool runs dry. Divergences: host numpy
+page table and free list (page-aligned token slots); naive is refused on a model with
+linear attention; eviction stops at what is evictable and exhaustion raises; no runtime
+rebuild or tool-call anchor; a prefill commit tombstones the prompt before its last window
+at once (FreeToken leaves it live and evictable), so a request's window slots stay bounded.
 lazy_free_region batches the frees of one drained step; the drain itself is the step
 fence, so window slots slide out when the step that last extended a request drains
 (FreeToken frees them when it schedules the next one, every 128 decode forwards, relying
@@ -442,8 +444,8 @@ class CacheManager:
         window slots behind a locked tombstone's full slots) and hands back the full slots to
         free in both pools: the tree's displaced ones and the request's duplicates. A finish
         frees the unaligned tail and keeps only the prompt's last window live, re-stamped for a
-        next turn that cuts there. A prefill commit locks one window: the node boundary a
-        window back keeps the rest of the prompt evictable.
+        next turn that cuts there. A prefill commit keeps only the request's last window live
+        and locks it.
         """
         cache, pool = self.swa_parts()
         window = cache.sliding_window
@@ -481,7 +483,7 @@ class CacheManager:
         else:
             keep_from = align_down(max(insert_len - window - SWA_RETAIN_GAP, 0), self.page_size)
             if keep_from > 0:
-                cache.match_prefix(req.input_ids[:keep_from])
+                pool.free_swa(cache.trim_head_swa(req.input_ids[:insert_len], keep_from))
             match = cache.match_prefix(req.input_ids[:insert_len])
             # Past the match the row would still name the duplicates the insert freed.
             assert match.cached_len == insert_len, (

@@ -345,7 +345,7 @@ PREFIX_CASES = [
         [0, 28],
     ),
     PrefixCase(
-        "a shared head of a one-chunk prompt resumes at a page boundary",
+        "a head within a prompt's last window and gap resumes at a page boundary",
         "metal",
         4,
         64,

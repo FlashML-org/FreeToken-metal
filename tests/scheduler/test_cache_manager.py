@@ -24,7 +24,12 @@ import pytest
 from ftmetal.attention.metadata import AttnType
 from ftmetal.core import Batch, Req, SamplingParams
 from ftmetal.kvcache.linear_state_pool import LinearStatePool, linear_pool_num_slots
-from ftmetal.kvcache.swa_pool import SENTINEL_SLOT, SWAKVCache, swa_radix_floor_tokens
+from ftmetal.kvcache.swa_pool import (
+    SENTINEL_SLOT,
+    SWA_RETAIN_GAP,
+    SWAKVCache,
+    swa_radix_floor_tokens,
+)
 from ftmetal.models.config import KVCacheGroupSpec
 from ftmetal.scheduler.cache import CacheManager, MatchResult, resolve_cache_type
 from ftmetal.scheduler.decode import DecodeManager
@@ -610,13 +615,13 @@ SWA_CASES = [
         cached_lens=[[0], [39]],
     ),
     SWACase(
-        "a one-chunk prompt keeps its whole window live for a shared head",
+        "a finish keeps only the prompt's last window and gap live: a head before them misses",
         page_size=1,
         num_swa_tokens=64,
         max_extend_tokens=64,
         output_len=4,
-        rounds=[[run(1, 20)], [run(1, 15) + run(100, 10)]],
-        cached_lens=[[0], [15]],
+        rounds=[[run(1, 40)], [run(1, 15) + run(100, 10)], [run(1, 30) + run(200, 10)]],
+        cached_lens=[[0], [0], [30]],
     ),
     SWACase(
         "a head inside the slid-out part of a chunked prompt is not resumable",
@@ -653,6 +658,16 @@ SWA_CASES = [
         output_len=40,
         rounds=[[run(1, 60), run(500, 50)]],
         cached_lens=[[0, 0]],
+    ),
+    SWACase(
+        "two long chunked prompts fit a pool at the floor and a few slots",
+        page_size=1,
+        num_swa_tokens=swa_radix_floor_tokens(WINDOW, 1, 2) + 1 + 8,
+        max_extend_tokens=64,
+        output_len=40,
+        rounds=[[run(1, 120), run(500, 110)]],
+        cached_lens=[[0, 0]],
+        num_pages=512,
     ),
     SWACase(
         "a dry window pool takes the oldest windows of the tree",
@@ -723,3 +738,22 @@ def test_swa_radix_serves_and_resumes_prompts_and_leaks_nothing() -> None:
             for round_idx, prompts in enumerate(case.rounds)
         ]
         assert cached_lens == case.cached_lens, case.label
+
+
+def test_swa_radix_commit_keeps_only_the_last_window() -> None:
+    """A prefill commit tombstones the prompt before its last window and the retain gap and
+    gives their window slots back at once; it locks what is left."""
+    manager, _ = swa_manager(1, 128, 64, "swa_radix")
+    cache, pool = manager.swa_parts()
+    req = prefilled(manager, None, 0, run(1, 40), track_seqlen=None)
+    with manager.lazy_free_region():
+        manager.cache_req(req, finished=False)
+    kept = WINDOW + SWA_RETAIN_GAP
+    assert (cache.swa_evictable, cache.swa_protected) == (0, kept)
+    assert pool.swa_available_size == 63 - kept
+    assert manager.match_req(np.array(run(1, 15) + run(100, 10))) == MatchResult(None, None)
+    hit = manager.match_req(np.array(run(1, 30) + run(200, 10))).handle
+    assert hit is not None and hit.cached_len == 30
+    with manager.lazy_free_region():
+        manager.cache_req(req, finished=True)
+    manager.check_integrity()
