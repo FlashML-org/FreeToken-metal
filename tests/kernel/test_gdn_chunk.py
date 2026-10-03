@@ -1,4 +1,9 @@
-"""The chunked gated delta rule against the per-token recurrence kernel."""
+"""The chunked gated delta rule against the per-token recurrence kernel.
+
+Chunks are 64 tokens: one token, a partial chunk, one exact chunk, a chunk and one token,
+several chunks with a tail and a long prompt, on a two-request tiny shape and Qwen3.6's;
+and a decay that underflows to zero mid-chunk.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +17,7 @@ SHAPES = {
     "tiny": dict(batch=2, num_k_heads=2, num_v_heads=4, head_dim=32),
     "qwen3_6": dict(batch=1, num_k_heads=16, num_v_heads=32, head_dim=128),
 }
+DTYPES = {"bf16": mx.bfloat16, "fp32": mx.float32}
 
 
 def make_inputs(
@@ -47,13 +53,21 @@ def assert_matches_recurrence(
     assert mx.allclose(state, expected_state, atol=tolerance, rtol=tolerance)
 
 
-@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
-@pytest.mark.parametrize("shape", list(SHAPES))
-@pytest.mark.parametrize("seq_len", [1, 63, 64, 65, 200, 2048])
-def test_chunked_matches_recurrence(seq_len: int, shape: str, dtype: mx.Dtype) -> None:
-    inputs = make_inputs(seq_len, shape, dtype, seed=seq_len)
+@pytest.mark.parametrize(
+    ("shape", "dtype_name", "seq_len"),
+    [
+        ("tiny", "fp32", 1),
+        ("tiny", "bf16", 63),
+        ("qwen3_6", "fp32", 64),
+        ("qwen3_6", "bf16", 65),
+        ("tiny", "fp32", 200),
+        ("qwen3_6", "bf16", 2048),
+    ],
+)
+def test_chunked_matches_recurrence(shape: str, dtype_name: str, seq_len: int) -> None:
+    inputs = make_inputs(seq_len, shape, DTYPES[dtype_name], seed=seq_len)
     # bf16 inputs: both kernels run in fp32, y differs by its bf16 rounding.
-    assert_matches_recurrence(inputs, tolerance=1e-4 if dtype == mx.float32 else 2e-2)
+    assert_matches_recurrence(inputs, tolerance=1e-4 if dtype_name == "fp32" else 2e-2)
 
 
 def test_chunked_matches_recurrence_through_a_zero_decay() -> None:

@@ -70,13 +70,17 @@ def test_greedy_decode_matches_mlx_lm(
     scheduler.cache_manager.check_integrity()
 
 
-def test_prefill_logits_match_mlx_lm(tmp_path: Path) -> None:
-    model = build_reference(seed=1)
+# A short prefill runs the per-token GDN path, a long one the chunked path.
+@pytest.mark.parametrize(("prompt_len", "max_extend_tokens"), [(21, 64), (200, 256)])
+def test_prefill_logits_match_mlx_lm(
+    tmp_path: Path, prompt_len: int, max_extend_tokens: int
+) -> None:
+    model = build_reference(seed=prompt_len)
     save_checkpoint(model, tmp_path, quantization=None)
-    prompt = [int(t) for t in np.random.default_rng(1).integers(1, 120, size=21)]
+    prompt = [int(t) for t in np.random.default_rng(prompt_len).integers(1, 120, size=prompt_len)]
     expected_logits, _ = reference_greedy(model, prompt, 1)
 
-    scheduler = make_scheduler(tmp_path, page_size=4)
+    scheduler = make_scheduler(tmp_path, page_size=4, max_extend_tokens=max_extend_tokens)
     scheduler.add_request(0, np.array(prompt, dtype=np.int32), SamplingParams(max_tokens=1))
     forward_input = scheduler.schedule_next_batch()
     assert forward_input is not None
@@ -95,20 +99,6 @@ def test_chunked_prefill_matches_full_prefill(tmp_path: Path) -> None:
     params = SamplingParams(temperature=0.0, max_tokens=steps, ignore_eos=True)
     tokens = scheduler.generate(np.array(prompt, dtype=np.int32), params)
     assert tokens == expected
-
-
-def test_long_prefill_logits_match_mlx_lm(tmp_path: Path) -> None:
-    model = build_reference(seed=6)
-    save_checkpoint(model, tmp_path, quantization=None)
-    prompt = [int(t) for t in np.random.default_rng(6).integers(1, 120, size=200)]
-    expected_logits, _ = reference_greedy(model, prompt, 1)
-
-    scheduler = make_scheduler(tmp_path, page_size=4, max_extend_tokens=256)
-    scheduler.add_request(0, np.array(prompt, dtype=np.int32), SamplingParams(max_tokens=1))
-    forward_input = scheduler.schedule_next_batch()
-    assert forward_input is not None
-    logits = scheduler.engine.model.forward(forward_input.batch)
-    assert mx.allclose(logits[0], expected_logits[-1], atol=1e-4, rtol=1e-4)
 
 
 # One 200-token prefill (chunked GDN path, ragged last chunk), or 160 chunked then 40

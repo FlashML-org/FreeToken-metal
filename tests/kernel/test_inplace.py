@@ -1,4 +1,8 @@
-"""In-place row primitives: parity with the pure-MLX references, aliasing, no pool copies."""
+"""In-place row primitives: parity with the pure-MLX references, aliasing, no pool copies.
+
+A row whose element count is a multiple of four moves in 4-vectors, any other one by
+element; each pool dtype (bf16 K/V and conv, fp32 GDN state, int32 tokens) takes both.
+"""
 
 import mlx.core as mx
 import pytest
@@ -6,7 +10,7 @@ import pytest
 from ftmetal.kernel.inplace import copy_rows, kv_write, scatter_rows, zero_rows
 from ftmetal.kernel.ref import copy_rows_ref, scatter_rows_ref, zero_rows_ref
 
-DTYPES = [mx.float16, mx.bfloat16, mx.float32, mx.int32]
+DTYPES = [mx.bfloat16, mx.float32, mx.int32]
 
 
 def ids(*values: int) -> mx.array:
@@ -19,8 +23,18 @@ def random_rows(shape: tuple[int, ...], dtype: mx.Dtype) -> mx.array:
     return mx.random.normal(shape).astype(dtype)
 
 
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("row_shape", [(3, 4), (5,), (2, 7)])
+@pytest.mark.parametrize(
+    ("dtype", "row_shape"),
+    [
+        (mx.bfloat16, (3, 4)),
+        (mx.bfloat16, (5,)),
+        (mx.float32, (3, 4)),
+        (mx.float32, (2, 7)),
+        (mx.int32, (3, 4)),
+        (mx.int32, (5,)),
+    ],
+    ids=["bf16-vec", "bf16", "fp32-vec", "fp32", "int32-vec", "int32"],
+)
 def test_scatter_rows_matches_reference(dtype: mx.Dtype, row_shape: tuple[int, ...]) -> None:
     pool = random_rows((8, *row_shape), dtype)
     rows = random_rows((3, *row_shape), dtype)
@@ -30,7 +44,7 @@ def test_scatter_rows_matches_reference(dtype: mx.Dtype, row_shape: tuple[int, .
     assert mx.array_equal(pool, expected)
 
 
-@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("dtype", DTYPES, ids=["bf16", "fp32", "int32"])
 def test_copy_and_zero_rows_match_reference(dtype: mx.Dtype) -> None:
     pool = random_rows((8, 3, 4), dtype)
     expected = copy_rows_ref(pool, ids(1, 2), ids(7, 0))

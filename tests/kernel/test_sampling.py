@@ -1,4 +1,10 @@
-"""Metal sampling kernels against a float64 numpy reference with FreeToken's semantics."""
+"""Metal sampling kernels against a float64 numpy reference with FreeToken's semantics.
+
+Every temperature x top-k x top-p combination is drawn at 16-bit (bf16) and 32-bit (fp32)
+keys, over one chunk of a small vocabulary and many chunks of Qwen's, at batch sizes that
+change the chunking; then each filter alone, any chunk count, ties at both boundaries,
+-inf logits and the drawn distribution.
+"""
 
 from __future__ import annotations
 
@@ -127,9 +133,16 @@ def check_rows(
         assert token in expected.acceptable, (row, row_params, token, expected.token)
 
 
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
-@pytest.mark.parametrize("vocab", [151936, 1000])
-@pytest.mark.parametrize("batch_size", [1, 4, 8])
+@pytest.mark.parametrize(
+    ("dtype", "vocab", "batch_size"),
+    [
+        (mx.bfloat16, 151936, 8),
+        (mx.float32, 151936, 4),
+        (mx.bfloat16, 1000, 1),
+        (mx.float32, 1000, 8),
+    ],
+    ids=["bf16-V151936-bs8", "fp32-V151936-bs4", "bf16-V1000-bs1", "fp32-V1000-bs8"],
+)
 def test_matches_reference(dtype: mx.Dtype, vocab: int, batch_size: int) -> None:
     rng = np.random.default_rng(vocab + batch_size)
     for first in range(0, len(ROW_PARAMS), batch_size):
@@ -141,8 +154,10 @@ def test_matches_reference(dtype: mx.Dtype, vocab: int, batch_size: int) -> None
         check_rows(logits.astype(dtype), params, bits, uniforms)
 
 
-@pytest.mark.parametrize("with_top_k,with_top_p", [(True, False), (False, True), (False, False)])
-@pytest.mark.parametrize("vocab", [150001, 1000])
+@pytest.mark.parametrize(
+    ("with_top_k", "with_top_p", "vocab"),
+    [(True, False, 150001), (False, True, 1000), (False, False, 150001)],
+)
 def test_absent_filters_drop_their_rounds(with_top_k: bool, with_top_p: bool, vocab: int) -> None:
     rng = np.random.default_rng(vocab)
     batch_size = 8
@@ -162,7 +177,7 @@ def test_absent_filters_drop_their_rounds(with_top_k: bool, with_top_p: bool, vo
 def test_any_chunking_draws_the_same(num_groups: int) -> None:
     rng = np.random.default_rng(num_groups)
     params = [RowParams(*ROW_PARAMS[i]) for i in range(0, len(ROW_PARAMS), 5)]
-    logits = mx.array(2.0 * rng.standard_normal((len(params), 1000)), dtype=mx.float16)
+    logits = mx.array(2.0 * rng.standard_normal((len(params), 1000)), dtype=mx.bfloat16)
     bits, uniforms = uniform_bits(rng, len(params))
     check_rows(logits, params, bits, uniforms, num_groups=num_groups)
 

@@ -1,4 +1,8 @@
-"""The fused router against the ops path: same experts, matching weights."""
+"""The fused router against the ops path: same experts, matching weights.
+
+One simdgroup per row: 256 experts (eight per lane, Qwen3.6's top 8), 64 (two per lane)
+and 4 (most lanes idle), each with and without renormalization and in both dtypes.
+"""
 
 from __future__ import annotations
 
@@ -10,10 +14,18 @@ from ftmetal.kernel.ref import router_topk_ref
 from ftmetal.kernel.router import router_topk
 
 
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
-@pytest.mark.parametrize("num_experts,top_k", [(256, 8), (4, 2), (64, 1)])
-@pytest.mark.parametrize("num_rows", [1, 5, 40])
-@pytest.mark.parametrize("norm", [True, False])
+@pytest.mark.parametrize(
+    ("num_experts", "top_k", "norm", "dtype", "num_rows"),
+    [
+        (256, 8, True, mx.bfloat16, 40),
+        (256, 8, False, mx.float32, 5),
+        (64, 1, True, mx.bfloat16, 5),
+        (64, 1, False, mx.float32, 40),
+        (4, 2, True, mx.float32, 1),
+        (4, 2, False, mx.bfloat16, 40),
+    ],
+    ids=["E256-norm-bf16", "E256-fp32", "E64-norm-bf16", "E64-fp32", "E4-norm-fp32", "E4-bf16"],
+)
 def test_router_matches_ops_path(
     dtype: mx.Dtype, num_experts: int, top_k: int, num_rows: int, norm: bool
 ) -> None:

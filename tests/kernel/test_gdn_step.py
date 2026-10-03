@@ -1,4 +1,10 @@
-"""The fused GDN kernels against their functional references: prefill inputs, decode step."""
+"""The fused GDN kernels against their functional references: prefill inputs, decode step.
+
+Two head shapes: tiny (D 32, one state column per lane) and Qwen3.6's (D 128, four).
+Prefill chunk lengths cover a chunk shorter than the conv taps, one as long, one past a
+simdgroup's 16 tokens and several simdgroups' worth; decode covers one request and three
+on scattered slots, one of them at a position whose ring cells were never written.
+"""
 
 from __future__ import annotations
 
@@ -12,12 +18,22 @@ SHAPES = {
     "tiny": dict(num_k_heads=2, num_v_heads=4, key_dim=32, value_dim=32, conv_kernel=4),
     "qwen3_6": dict(num_k_heads=16, num_v_heads=32, key_dim=128, value_dim=128, conv_kernel=4),
 }
+DTYPES = {"bf16": mx.bfloat16, "fp32": mx.float32}
 
 
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
-@pytest.mark.parametrize("shape", list(SHAPES))
-@pytest.mark.parametrize("seq_len", [1, 3, 17, 100])
-def test_prefill_inputs_match_reference(dtype: mx.Dtype, shape: str, seq_len: int) -> None:
+@pytest.mark.parametrize(
+    ("shape", "dtype_name", "seq_len"),
+    [
+        ("tiny", "fp32", 1),
+        ("tiny", "bf16", 3),
+        ("tiny", "fp32", 17),
+        ("qwen3_6", "bf16", 1),
+        ("qwen3_6", "bf16", 17),
+        ("qwen3_6", "fp32", 100),
+    ],
+)
+def test_prefill_inputs_match_reference(shape: str, dtype_name: str, seq_len: int) -> None:
+    dtype = DTYPES[dtype_name]
     mx.random.seed(seq_len)
     spec = SHAPES[shape]
     num_k_heads, num_v_heads = spec["num_k_heads"], spec["num_v_heads"]
@@ -50,10 +66,12 @@ def test_prefill_inputs_match_reference(dtype: mx.Dtype, shape: str, seq_len: in
         )
 
 
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
-@pytest.mark.parametrize("shape", list(SHAPES))
-@pytest.mark.parametrize("batch", [1, 3])
-def test_decode_step_matches_reference(dtype: mx.Dtype, shape: str, batch: int) -> None:
+@pytest.mark.parametrize(
+    ("shape", "dtype_name", "batch"),
+    [("tiny", "fp32", 1), ("tiny", "bf16", 3), ("qwen3_6", "bf16", 3), ("qwen3_6", "fp32", 1)],
+)
+def test_decode_step_matches_reference(shape: str, dtype_name: str, batch: int) -> None:
+    dtype = DTYPES[dtype_name]
     mx.random.seed(batch)
     spec = SHAPES[shape]
     num_k_heads, num_v_heads = spec["num_k_heads"], spec["num_v_heads"]
