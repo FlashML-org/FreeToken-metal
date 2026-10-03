@@ -35,13 +35,6 @@ def positive_int(value: str) -> int:
     return number
 
 
-def unit_fraction(value: str) -> float:
-    number = float(value)
-    if not 0.0 < number <= 1.0:
-        raise argparse.ArgumentTypeError(f"expected a number in (0, 1], got {value}")
-    return number
-
-
 def parse_args(argv: list[str], prog: str) -> ServerArgs:
     parser = argparse.ArgumentParser(prog=prog, description="Serve a model over the OpenAI API.")
     parser.add_argument(
@@ -123,12 +116,12 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         "linear attention); naive reuses nothing and needs a model without linear attention",
     )
     parser.add_argument(
-        "--swa-full-tokens-ratio",
-        type=unit_fraction,
-        metavar="R",
-        default=ServerArgs.swa_full_tokens_ratio,
-        help="window slots of the radix cache on a sliding-window model, as a share of the "
-        "KV pages' tokens",
+        "--swa-windows",
+        type=positive_int,
+        metavar="N",
+        default=ServerArgs.swa_windows,
+        help="window pool of the radix cache on a sliding-window model, in sliding windows "
+        "(default: two per running request and 8 more)",
     )
     parser.add_argument(
         "--attention-backend",
@@ -159,10 +152,10 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         num_page_override=namespace.num_page_override,
         page_size=namespace.page_size,
         cache_type=namespace.cache_type,
-        swa_full_tokens_ratio=namespace.swa_full_tokens_ratio,
+        swa_windows=namespace.swa_windows,
         attention_backend=namespace.attention_backend,
         command_graph=not namespace.disable_command_graph and command_graph_from_env(),
     )
 
 
-__all__ = ["ServerArgs", "parse_args", "positive_int", "unit_fraction"]
+__all__ = ["ServerArgs", "parse_args", "positive_int"]

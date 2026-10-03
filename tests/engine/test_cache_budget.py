@@ -1,6 +1,6 @@
 """Memory budget on the Qwen3.6-35B-A3B geometry: report lines, page and GDN slot counts;
-and Gemma4-26B-A4B's window pool, a fixed cost for naive and a share of every page plus a
-floor for the SWA radix cache.
+and Gemma4-26B-A4B's window pool, a fixed cost beside the global pages for naive and for the
+SWA radix cache.
 
 The expected numbers were computed by the engine's sizing before pools were created per
 attention type; the dispatch must reproduce them exactly from the same fixed budget.
@@ -210,17 +210,16 @@ WINDOW_BUDGET_CASES = [
             "kv pages       20.48 GiB",
         ],
     ),
-    # 0.2 of a slot per global token, and the floor, 4 x (1024 + 16 + 1024 + 3) slots, fixed.
+    # The default 2 x 4 + 8 windows of 1024 and the sentinel, fixed.
     WindowBudgetCase(
         "radix",
-        PoolCost(40 * 1024, 8268 * 200 * 1024),
+        PoolCost(0, 16385 * 200 * 1024),
         [
             "budget         36.44 GiB",
             "weights        13.00 GiB",
-            "swa window      1.58 GiB",
+            "swa window      3.13 GiB",
             "activations     0.00 GiB",
-            "kv pages        7.29 GiB",
-            "swa window     14.58 GiB",
+            "kv pages       20.31 GiB",
         ],
     ),
 ]

@@ -1,6 +1,6 @@
 """Window pool contracts: full slots map to window slots of their own, frees return them
-once, the sentinel backs everything else, and kv_cost prices what from_spec allocates: the
-naive pool exactly, the SWA radix cache's ratio-sized pool from above."""
+once, the sentinel backs everything else, kv_cost prices exactly what from_spec allocates,
+and the SWA radix cache's pool of whole windows refuses to drop below the running floor."""
 
 from __future__ import annotations
 
@@ -72,45 +72,55 @@ class SizingCase(NamedTuple):
     label: str
     cache_type: Literal["naive", "radix"]
     page_size: int
-    num_pages: int
-    swa_full_tokens_ratio: float
+    swa_windows: int | None
     num_swa_tokens: int
 
 
-# Window 16, 3 running requests, 64-token forwards. Naive: 4 x align32(16 + 64 + 1). Radix
-# floor: 3 x (page_ceil(16 + 16) + 16 + 3 pages), and the sentinel.
+def sizing_config(
+    cache_type: Literal["naive", "radix"], page_size: int, swa_windows: int | None
+) -> EngineConfig:
+    return EngineConfig(
+        model_path="unused",
+        dtype=mx.float16,
+        page_size=page_size,
+        max_running_req=3,
+        max_extend_tokens=64,
+        cache_type=cache_type,
+        swa_windows=swa_windows,
+    )
+
+
+# Window 16, 3 running requests, 64-token forwards. Naive: 4 x align32(16 + 64 + 1). Radix:
+# whole windows and the sentinel, by default 2 x 3 + 8; the floor is 3 x (page_ceil(16 + 16)
+# + 16 + 3 pages), 153 slots in token pages and 180 in 4-token pages.
 SIZING_CASES = [
-    SizingCase("naive, token pages", "naive", 1, 10, 0.2, 4 * 96),
-    SizingCase("naive, 4-token pages", "naive", 4, 10, 0.2, 4 * 96),
-    SizingCase("radix, the floor of a small pool", "radix", 1, 10, 0.2, 3 * 51 + 1),
-    SizingCase("radix, the floor in 4-token pages", "radix", 4, 10, 0.2, 3 * 60 + 1),
-    SizingCase("radix, the ratio of a large pool", "radix", 4, 1000, 0.2, 800 + 1),
-    SizingCase("radix, half of a large pool", "radix", 1, 1000, 0.5, 500 + 1),
+    SizingCase("naive", "naive", 1, None, 4 * 96),
+    SizingCase("naive ignores the windows", "naive", 4, 12, 4 * 96),
+    SizingCase("radix, the default windows", "radix", 1, None, 14 * 16 + 1),
+    SizingCase("radix, the default in 4-token pages", "radix", 4, None, 14 * 16 + 1),
+    SizingCase("radix, the fewest windows above the floor", "radix", 1, 10, 10 * 16 + 1),
+    SizingCase("radix, the fewest in 4-token pages", "radix", 4, 12, 12 * 16 + 1),
 ]
 
 
 def test_kv_cost_prices_what_from_spec_allocates() -> None:
+    num_pages = 10
     for case in SIZING_CASES:
-        config = EngineConfig(
-            model_path="unused",
-            dtype=mx.float16,
-            page_size=case.page_size,
-            max_running_req=3,
-            max_extend_tokens=64,
-            cache_type=case.cache_type,
-            swa_full_tokens_ratio=case.swa_full_tokens_ratio,
-        )
+        config = sizing_config(case.cache_type, case.page_size, case.swa_windows)
         cost = pool_costs((FULL_SPEC, SPEC), config)[AttnType.SWA]
-        pools = create_pools((FULL_SPEC, SPEC), config, case.num_pages)
+        pools = create_pools((FULL_SPEC, SPEC), config, num_pages)
         swa_pool, full_pool = pools[AttnType.SWA], pools[AttnType.FULL]
         assert isinstance(swa_pool, SWAKVCache) and isinstance(full_pool, MHAKVCache)
         assert swa_pool.swa_num_tokens == case.num_swa_tokens, case.label
         allocated = sum(array.nbytes for array in swa_pool.arrays())
-        priced = cost.fixed_bytes + case.num_pages * cost.bytes_per_page
-        if case.cache_type == "naive":
-            assert (cost.bytes_per_page, priced) == (0, allocated), case.label
-        else:
-            assert allocated <= priced, case.label
+        assert cost == (0, allocated), case.label
         # The mapping covers the FULL pool's slots, dummy page included.
         assert len(swa_pool.full_to_swa) == full_pool.num_tokens
-        assert full_pool.num_tokens == (case.num_pages + 1) * case.page_size
+        assert full_pool.num_tokens == (num_pages + 1) * case.page_size
+
+
+def test_too_few_windows_name_the_fewest_that_hold_the_floor() -> None:
+    for page_size, swa_windows, fewest in [(1, 9, 10), (4, 11, 12)]:
+        config = sizing_config("radix", page_size, swa_windows)
+        with pytest.raises(ValueError, match=f"--swa-windows {fewest} or more"):
+            pool_costs((FULL_SPEC, SPEC), config)
