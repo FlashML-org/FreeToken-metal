@@ -1,6 +1,6 @@
-"""Memory budget on the Qwen3.6-35B-A3B geometry: report lines, page and GDN slot counts;
-and Gemma4-26B-A4B's window pool, a fixed cost beside the global pages for naive and for the
-SWA radix cache.
+"""Memory budget on the Qwen3.6-35B-A3B geometry: report lines, page and GDN slot counts,
+for the hybrid radix cache and naive; and Gemma4-26B-A4B's window pool, a fixed cost beside
+the global pages for naive and for the SWA radix cache.
 
 The expected numbers were computed by the engine's sizing before pools were created per
 attention type; the dispatch must reproduce them exactly from the same fixed budget.
@@ -63,6 +63,7 @@ class BudgetCase(NamedTuple):
     num_slots: int
     lines: list[str]
     pages_line: str
+    cache_type: Literal["naive", "radix"] = "radix"
 
 
 CASES = [
@@ -117,10 +118,30 @@ CASES = [
         ],
         pages_line="KV cache: 1000 pages x 16 tokens, 0.31 GiB",
     ),
+    # Naive: a live slot per running request and the padding slot; the 20 hybrid radix slots
+    # it drops go to the pages.
+    BudgetCase(
+        page_size=1,
+        max_running_req=4,
+        linear_state_cache_ratio=2.0,
+        max_extend_tokens=2048,
+        num_page_override=None,
+        num_pages=570838,
+        num_slots=5,
+        lines=[
+            "budget         36.44 GiB",
+            "weights        20.00 GiB",
+            "gdn slots       0.30 GiB",
+            "activations     5.25 GiB",
+            "kv pages       10.89 GiB",
+        ],
+        pages_line="KV cache: 570838 pages x 1 tokens, 10.89 GiB",
+        cache_type="naive",
+    ),
 ]
 
 
-@pytest.mark.parametrize("case", CASES, ids=["page1", "page32", "override"])
+@pytest.mark.parametrize("case", CASES, ids=["page1", "page32", "override", "naive"])
 def test_qwen3_6_budget_reproduces_pages_and_slots(
     case: BudgetCase, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -132,6 +153,7 @@ def test_qwen3_6_budget_reproduces_pages_and_slots(
         linear_state_cache_ratio=case.linear_state_cache_ratio,
         max_extend_tokens=case.max_extend_tokens,
         num_page_override=case.num_page_override,
+        cache_type=case.cache_type,
     )
     costs = pool_costs(model_config.kv_cache_group_specs(), config)
     assert costs[AttnType.LINEAR] == PoolCost(0, case.num_slots * GDN_SLOT_BYTES)

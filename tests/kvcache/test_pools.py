@@ -1,7 +1,10 @@
 """Pool contracts: in-place stores land where the page table says, slots recycle cleanly,
-and every pool family's kv_cost prices exactly what its from_spec allocates."""
+the GDN state pool holds the slots its cache type needs, and every pool family's kv_cost
+prices exactly what its from_spec allocates."""
 
 from __future__ import annotations
+
+from typing import Literal, NamedTuple
 
 import mlx.core as mx
 import pytest
@@ -61,18 +64,50 @@ def test_linear_state_pool_alloc_clear_copy_free() -> None:
         pool.alloc(4)
 
 
+class SlotCase(NamedTuple):
+    label: str
+    cache_type: Literal["naive", "radix"]
+    max_running_req: int
+    linear_state_cache_ratio: float
+    num_slots: int
+
+
+# Radix (the hybrid radix cache): 4 slots per running request (live, ping-pong pair, locked
+# snapshot), a snapshot cache of int(ratio x max_running_req) slots, at least 4, and the
+# padding slot. Naive: one live slot per running request and the padding slot.
+SLOT_CASES = [
+    SlotCase("radix", "radix", 2, 2.0, 4 * 2 + 4 + 1),
+    SlotCase("radix, the ratio's snapshot cache", "radix", 4, 2.0, 4 * 4 + 8 + 1),
+    SlotCase("radix, the snapshot cache floor", "radix", 8, 0.1, 4 * 8 + 4 + 1),
+    SlotCase("naive", "naive", 2, 2.0, 2 + 1),
+    SlotCase("naive ignores the ratio", "naive", 8, 0.1, 8 + 1),
+]
+
+
 def test_kv_cost_prices_what_from_spec_allocates() -> None:
     specs = parse_config(TINY_TEXT_CONFIG).kv_cache_group_specs()
-    config = EngineConfig(model_path="unused", dtype=mx.float16, page_size=4, max_running_req=2)
     num_pages = 10
-    costs = pool_costs(specs, config)
-    allocated = {
-        attn_type: sum(array.nbytes for array in pool.arrays())
-        for attn_type, pool in create_pools(specs, config, num_pages).items()
-    }
-    # The paged pool also holds the dummy page; the state pool is all fixed cost.
-    assert allocated == {
-        AttnType.FULL: (num_pages + 1) * costs[AttnType.FULL].bytes_per_page,
-        AttnType.LINEAR: costs[AttnType.LINEAR].fixed_bytes,
-    }
-    assert costs[AttnType.FULL].fixed_bytes == costs[AttnType.LINEAR].bytes_per_page == 0
+    for case in SLOT_CASES:
+        config = EngineConfig(
+            model_path="unused",
+            dtype=mx.float16,
+            page_size=4,
+            max_running_req=case.max_running_req,
+            linear_state_cache_ratio=case.linear_state_cache_ratio,
+            cache_type=case.cache_type,
+        )
+        costs = pool_costs(specs, config)
+        pools = create_pools(specs, config, num_pages)
+        linear_pool = pools[AttnType.LINEAR]
+        assert isinstance(linear_pool, LinearStatePool)
+        assert linear_pool.num_slots == case.num_slots, case.label
+        allocated = {
+            attn_type: sum(array.nbytes for array in pool.arrays())
+            for attn_type, pool in pools.items()
+        }
+        # The paged pool also holds the dummy page; the state pool is all fixed cost.
+        assert allocated == {
+            AttnType.FULL: (num_pages + 1) * costs[AttnType.FULL].bytes_per_page,
+            AttnType.LINEAR: costs[AttnType.LINEAR].fixed_bytes,
+        }, case.label
+        assert costs[AttnType.FULL].fixed_bytes == costs[AttnType.LINEAR].bytes_per_page == 0

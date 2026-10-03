@@ -10,7 +10,10 @@ update it in the same launch that reads it (a shift register would race). A pref
 snapshot for the hybrid radix cache is a whole slot, written into a request's
 ping-pong slot at the deepest page boundary inside its chunk. The pool is built from
 the LINEAR group's spec and prices itself (FreeToken's engine adds state_pool_bytes to
-the KV family's fixed cost instead).
+the KV family's fixed cost instead). Naive holds only each running request's live slot
+and the padding slot, FreeToken's naive size; the live slot is a free-list slot the
+request takes at admission and returns at its finish or abort (SGLang's
+HybridReqToTokenPool), where FreeToken's naive keys it by table_idx.
 """
 
 from __future__ import annotations
@@ -24,16 +27,28 @@ from ftmetal.kvcache.base import BasePool, PoolConfig, PoolCost
 from ftmetal.models.config import KVCacheGroupSpec
 
 PADDING_SLOT = 0
-# Slots a running request can hold unevictably: its live slot, two ping-pong track slots
-# and the committed snapshot its cache handle locks through decode.
-SLOTS_PER_RUNNING_REQ = 4
+# Slots a running request can hold unevictably: its live slot under every cache type; under
+# the hybrid radix cache also two ping-pong track slots and the committed snapshot its cache
+# handle locks through decode.
+LIVE_SLOTS = 1
+TRACK_SLOTS = 2
+LOCKED_SNAPSHOT_SLOTS = 1
 MIN_SNAPSHOT_CACHE_SLOTS = 4
 
 
-def linear_pool_num_slots(max_running_req: int, linear_state_cache_ratio: float) -> int:
-    """The running requests' slots, a cross-request snapshot cache and the padding slot."""
-    snapshot_cache = max(MIN_SNAPSHOT_CACHE_SLOTS, int(linear_state_cache_ratio * max_running_req))
-    return SLOTS_PER_RUNNING_REQ * max_running_req + snapshot_cache + 1
+def linear_pool_num_slots(config: PoolConfig) -> int:
+    """The running requests' slots and the padding slot; radix (the hybrid radix cache) adds
+    a cross-request snapshot cache."""
+    max_running_req = config.max_running_req
+    if config.cache_type == "naive":
+        # Enough for the decode graph captures too: they borrow their max_running_req scratch
+        # slots at startup and return them before the first admission.
+        return LIVE_SLOTS * max_running_req + 1
+    else:
+        slots_per_req = LIVE_SLOTS + TRACK_SLOTS + LOCKED_SNAPSHOT_SLOTS
+        ratio_slots = int(config.linear_state_cache_ratio * max_running_req)
+        snapshot_cache = max(MIN_SNAPSHOT_CACHE_SLOTS, ratio_slots)
+        return slots_per_req * max_running_req + snapshot_cache + 1
 
 
 class LinearStatePool(BasePool):
@@ -54,14 +69,12 @@ class LinearStatePool(BasePool):
 
     @classmethod
     def kv_cost(cls, spec: KVCacheGroupSpec, config: PoolConfig) -> PoolCost:
-        num_slots = linear_pool_num_slots(config.max_running_req, config.linear_state_cache_ratio)
-        return PoolCost(0, num_slots * spec.slot_bytes(config.dtype))
+        return PoolCost(0, linear_pool_num_slots(config) * spec.slot_bytes(config.dtype))
 
     @classmethod
     def from_spec(cls, spec: KVCacheGroupSpec, config: PoolConfig, num_pages: int) -> Self:
         # Slots follow the concurrency, not the page count.
-        num_slots = linear_pool_num_slots(config.max_running_req, config.linear_state_cache_ratio)
-        return cls(spec, num_slots, config.dtype)
+        return cls(spec, linear_pool_num_slots(config), config.dtype)
 
     @property
     def num_free_slots(self) -> int:
@@ -121,9 +134,11 @@ class LinearStatePool(BasePool):
 
 
 __all__ = [
+    "LIVE_SLOTS",
+    "LOCKED_SNAPSHOT_SLOTS",
     "MIN_SNAPSHOT_CACHE_SLOTS",
     "PADDING_SLOT",
-    "SLOTS_PER_RUNNING_REQ",
+    "TRACK_SLOTS",
     "LinearStatePool",
     "linear_pool_num_slots",
 ]

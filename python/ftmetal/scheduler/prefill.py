@@ -1,16 +1,18 @@
 """Admission of pending prompts into prefill batches, chunked by a token budget.
 
 Port of FreeToken scheduler/prefill.py. Admission matches the prefix cache, locks the
-match and reserves the GDN slots (1 live + 2 ping-pong, evicting tree snapshots if short);
+match and reserves the GDN slots (1 live + 2 ping-pong, evicting tree snapshots if short;
+naive takes only the live slot, of which the pool keeps one per table row, and zeroes it);
 on a sliding-window model it needs window slots for the first chunk, up to one window, and
 every chunk is capped by the window slots left this pass. A hit carries the snapshot slot
 to restore from; a continuation chunk inherits the window frontier the chunk before it
 reaches. Divergences: no multimodal currency; the window cap credits none of the request's
 own out-of-window slots (they come back when its step in flight drains, after this
 allocation), so a continuation it leaves empty waits for that drain; a miss zeroes its live
-slot here; the cached part of the token pool row is not written (only the extended tokens
-are ever gathered); a continuation chunk inherits the pending track snapshot of the chunk
-before it.
+slot here; naive allocates its live slot here too (SGLang's HybridReqToTokenPool.alloc)
+where FreeToken's naive keys it by table_idx; the cached part of the token pool row is not
+written (only the extended tokens are ever gathered); a continuation chunk inherits the
+pending track snapshot of the chunk before it.
 """
 
 from __future__ import annotations
@@ -20,13 +22,14 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from ftmetal.core import Batch, CacheHandle, Req, SamplingParams
+from ftmetal.kvcache.linear_state_pool import LIVE_SLOTS, TRACK_SLOTS
 from ftmetal.kvcache.radix_cache import align_down
 from ftmetal.scheduler.cache import CacheManager, div_ceil
 from ftmetal.scheduler.decode import DecodeManager
 from ftmetal.scheduler.table import TableManager
 
-# GDN slots a request takes at admission: the live slot and the two ping-pong track slots.
-ADMISSION_LINEAR_SLOTS = 3
+# GDN slots a hybrid radix request takes at admission: the live slot and the ping-pong pair.
+HYBRID_ADMISSION_SLOTS = LIVE_SLOTS + TRACK_SLOTS
 
 
 @dataclass
@@ -102,10 +105,10 @@ class PrefillAdder:
             self.cache_manager.unlock(handle)
             return None
         pool = self.cache_manager.linear_state_pool
-        if pool is not None:
-            if pool.num_free_slots < ADMISSION_LINEAR_SLOTS:
-                self.cache_manager.ensure_mamba_slots(ADMISSION_LINEAR_SLOTS)
-            if pool.num_free_slots < ADMISSION_LINEAR_SLOTS:
+        if pool is not None and self.cache_manager.is_hybrid:
+            if pool.num_free_slots < HYBRID_ADMISSION_SLOTS:
+                self.cache_manager.ensure_mamba_slots(HYBRID_ADMISSION_SLOTS)
+            if pool.num_free_slots < HYBRID_ADMISSION_SLOTS:
                 self.cache_manager.unlock(handle)
                 return None
         swa_pool = self.cache_manager.swa_pool
@@ -122,9 +125,11 @@ class PrefillAdder:
             self.table_manager.page_table[table_idx, :cached_len] = handle.kv_indices
         linear_slot_idx = ping_pong = None
         if pool is not None:
-            linear_slot_idx = pool.alloc(1)[0]
-            first, second = pool.alloc(2)
-            ping_pong = (first, second)
+            # Naive: the pool holds a live slot per table row, so the alloc cannot run dry.
+            linear_slot_idx = pool.alloc(LIVE_SLOTS)[0]
+            if self.cache_manager.is_hybrid:
+                first, second = pool.alloc(TRACK_SLOTS)
+                ping_pong = (first, second)
             if match.mamba_value is None:
                 pool.clear_slots([linear_slot_idx])
         return AdmittedResources(handle, table_idx, linear_slot_idx, ping_pong, match.mamba_value)
@@ -281,7 +286,7 @@ class PrefillManager:
 
 
 __all__ = [
-    "ADMISSION_LINEAR_SLOTS",
+    "HYBRID_ADMISSION_SLOTS",
     "AdmittedResources",
     "ChunkedReq",
     "PendingReq",
