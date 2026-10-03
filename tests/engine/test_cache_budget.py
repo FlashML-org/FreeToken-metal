@@ -210,16 +210,17 @@ WINDOW_BUDGET_CASES = [
             "kv pages       20.48 GiB",
         ],
     ),
-    # The default 2 x 4 + 8 windows of 1024 and the sentinel, fixed.
+    # The floor, 4 x (1040 + 1024 + 3) + 2 x 2048 slots, in 13 windows of 1024, 8 windows more
+    # and the sentinel, fixed.
     WindowBudgetCase(
         "radix",
-        PoolCost(0, 16385 * 200 * 1024),
+        PoolCost(0, 21505 * 200 * 1024),
         [
             "budget         36.44 GiB",
             "weights        13.00 GiB",
-            "swa window      3.13 GiB",
+            "swa window      4.10 GiB",
             "activations     0.00 GiB",
-            "kv pages       20.31 GiB",
+            "kv pages       19.34 GiB",
         ],
     ),
 ]

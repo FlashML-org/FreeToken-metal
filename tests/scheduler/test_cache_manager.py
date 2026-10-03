@@ -480,12 +480,16 @@ SAMPLED = 999
 
 
 def swa_manager(
-    page_size: int, num_pages: int, num_swa_tokens: int, cache_type: Literal["naive", "swa_radix"]
+    page_size: int,
+    num_pages: int,
+    num_swa_tokens: int,
+    cache_type: Literal["naive", "swa_radix"],
+    max_running_req: int = 2,
 ) -> tuple[CacheManager, TableManager]:
     pool = make_window_pool(WINDOW, num_swa_tokens, (num_pages + 1) * page_size)
-    page_table = np.zeros((3, 256), dtype=np.int32)
+    page_table = np.zeros((max_running_req + 1, 256), dtype=np.int32)
     manager = CacheManager(num_pages, page_size, page_table, cache_type, swa_pool=pool)
-    return manager, TableManager(max_running_reqs=2, page_table=page_table)
+    return manager, TableManager(max_running_reqs=max_running_req, page_table=page_table)
 
 
 def check_window_live(manager: CacheManager, steps: list[tuple[Req, int, int]]) -> None:
@@ -498,6 +502,13 @@ def check_window_live(manager: CacheManager, steps: list[tuple[Req, int, int]]) 
         assert SENTINEL_SLOT not in window, f"{req} reads a freed window slot in [{start}, {stop})"
 
 
+class Served(NamedTuple):
+    # The prefix each admission found cached.
+    cached_lens: list[int]
+    # Each prompt's prefill chunk lengths.
+    chunk_lens: list[list[int]]
+
+
 def serve(
     manager: CacheManager,
     table: TableManager,
@@ -505,26 +516,31 @@ def serve(
     output_len: int,
     max_extend_tokens: int,
     abort_at: int | None,
-) -> list[int]:
-    """Prompts admitted together and served to completion in the scheduler's order: step N + 1
-    is allocated before step N drains, and a drain slides the window slots, commits a
-    prompt's last chunk and frees a finished request. The first prompt is aborted before
-    iteration abort_at. Returns the prefix each admission found cached."""
+    arrive_at: list[int] | None = None,
+) -> Served:
+    """Prompts served to completion in the scheduler's order: step N + 1 is allocated before
+    step N drains, and a drain slides the window slots, commits a prompt's last chunk and
+    frees a finished request. Prompt i arrives before iteration arrive_at[i] (all before the
+    first by default); the first prompt is aborted before iteration abort_at."""
     pool = manager.swa_pool
     assert pool is not None
     decode = DecodeManager(manager.page_size)
     prefill = PrefillManager(manager, table, decode)
     params = SamplingParams(max_tokens=output_len, ignore_eos=True)
-    for uid, prompt in enumerate(prompts):
-        prefill.add_one_req(uid, np.array(prompt, dtype=np.int32), params)
+    arrivals = [1] * len(prompts) if arrive_at is None else arrive_at
     cached_lens: dict[int, int] = {}
+    chunk_lens: list[list[int]] = [[] for _ in prompts]
     finished: set[Req] = set()
     in_flight: Batch | None = None
     steps: list[tuple[Req, int, int]] = []
     iterations = 0
-    while prefill.runnable or decode.runnable or in_flight is not None:
+    last_arrival = max(arrivals)
+    while iterations < last_arrival or prefill.runnable or decode.runnable or in_flight is not None:
         iterations += 1
         assert iterations < 1000, "the requests stopped making progress"
+        for uid, prompt in enumerate(prompts):
+            if arrivals[uid] == iterations:
+                prefill.add_one_req(uid, np.array(prompt, dtype=np.int32), params)
         aborted = prefill.abort_req(0) or decode.abort_req(0) if iterations == abort_at else None
         if aborted is not None:
             aborted.aborted = True
@@ -542,6 +558,8 @@ def serve(
             check_window_live(manager, steps)
             for req in batch.reqs:
                 cached_lens.setdefault(req.uid, req.cached_len)
+                if batch.is_prefill:
+                    chunk_lens[req.uid].append(req.extend_len)
                 req.complete_one()
             decode.filter_reqs(batch.reqs)
         if in_flight is not None:
@@ -571,7 +589,7 @@ def serve(
             check_window_live(manager, [step for step in steps if step[0] not in finished])
         in_flight = batch
     manager.check_integrity()
-    return [cached_lens[uid] for uid in range(len(prompts))]
+    return Served([cached_lens[uid] for uid in range(len(prompts))], chunk_lens)
 
 
 def run(first: int, length: int) -> list[int]:
@@ -653,16 +671,16 @@ SWA_CASES = [
     SWACase(
         "two requests decode together on a pool at the floor",
         page_size=4,
-        num_swa_tokens=swa_radix_floor_tokens(WINDOW, 4, 2) + 1,
+        num_swa_tokens=swa_radix_floor_tokens(WINDOW, 4, 2, 16) + 1,
         max_extend_tokens=16,
         output_len=40,
         rounds=[[run(1, 60), run(500, 50)]],
         cached_lens=[[0, 0]],
     ),
     SWACase(
-        "two long chunked prompts fit a pool at the floor and a few slots",
+        "two long chunked prompts fit a pool at the floor",
         page_size=1,
-        num_swa_tokens=swa_radix_floor_tokens(WINDOW, 1, 2) + 1 + 8,
+        num_swa_tokens=swa_radix_floor_tokens(WINDOW, 1, 2, 64) + 1,
         max_extend_tokens=64,
         output_len=40,
         rounds=[[run(1, 120), run(500, 110)]],
@@ -734,7 +752,7 @@ def test_swa_radix_serves_and_resumes_prompts_and_leaks_nothing() -> None:
                 case.output_len,
                 case.max_extend_tokens,
                 case.abort_at if round_idx == 0 else None,
-            )
+            ).cached_lens
             for round_idx, prompts in enumerate(case.rounds)
         ]
         assert cached_lens == case.cached_lens, case.label
@@ -757,3 +775,14 @@ def test_swa_radix_commit_keeps_only_the_last_window() -> None:
     with manager.lazy_free_region():
         manager.cache_req(req, finished=True)
     manager.check_integrity()
+
+
+def test_four_running_requests_and_a_full_chunk_fit_at_the_floor() -> None:
+    """Three requests decode with their tails grown when a long fourth prompt arrives: on a
+    pool at exactly the floor, every chunk but its last still runs at full size."""
+    chunk = 16
+    floor = swa_radix_floor_tokens(WINDOW, 1, 4, chunk)
+    manager, table = swa_manager(1, 512, floor + 1, "swa_radix", max_running_req=4)
+    prompts = [run(1, 40), run(100, 40), run(200, 40), run(300, 100)]
+    served = serve(manager, table, prompts, 60, chunk, None, arrive_at=[1, 1, 1, 30])
+    assert served.chunk_lens[3] == [chunk] * 6 + [4]

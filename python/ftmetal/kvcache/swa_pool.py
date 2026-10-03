@@ -12,7 +12,8 @@ which the scheduler's out-of-window frees during prefill keep sufficient; the SW
 cache's pool is a number of whole windows, a fixed cost refused below the floor, where
 FreeToken takes a share of the full pool's tokens raised to the floor; the floor's decode
 tail counts the page the next step writes where FreeToken counts its 128-forward free
-interval (the frees here run at every drain).
+interval (the frees here run at every drain), and it holds two full-size prefill chunks
+on top, so a chunk always runs whole.
 """
 
 from __future__ import annotations
@@ -33,8 +34,8 @@ WINDOW_ALIGN = 32
 # FreeToken parity: the SWA radix commit keeps this many tokens before a request's last window
 # live too, for a next turn whose re-rendered prompt diverges a few tokens before the end.
 SWA_RETAIN_GAP = 16
-# The SWA radix window pool's default: two windows per running request (about its floor) and
-# these on top, for about four finished conversations to stay resumable. 8 is arbitrary.
+# The SWA radix window pool's default: the fewest windows that hold the floor and these on
+# top, for about four finished conversations to stay resumable. 8 is arbitrary.
 EXTRA_DEFAULT_WINDOWS = 8
 
 
@@ -46,39 +47,53 @@ def naive_swa_num_tokens(sliding_window: int, max_extend_tokens: int, max_runnin
     return (max_running_req + 1) * width
 
 
-def swa_radix_floor_tokens(sliding_window: int, page_size: int, max_running_req: int) -> int:
-    """Window slots no eviction reaches while max_running_req requests decode (FreeToken's
-    _swa_pool_floor): each one's committed window, locked with the retain gap in whole
-    pages, and its own tail up to its next free (a window, the page of margin, the page the
-    step in flight writes and the one the next step takes)."""
+def swa_radix_floor_tokens(
+    sliding_window: int, page_size: int, max_running_req: int, max_extend_tokens: int
+) -> int:
+    """Window slots no eviction reaches (FreeToken's _swa_pool_floor, and a prefill): each
+    running request's committed window, locked with the retain gap in whole pages, and its
+    own decode tail up to its next free (a window, the page of margin, the page the step in
+    flight writes and the one the next step takes); and the two full-size chunks a request
+    in chunked prefill holds, the one draining and the next."""
     locked = -(-(sliding_window + SWA_RETAIN_GAP) // page_size) * page_size
-    return max_running_req * (locked + sliding_window + 3 * page_size)
+    chunk = -(-max_extend_tokens // page_size) * page_size
+    return max_running_req * (locked + sliding_window + 3 * page_size) + 2 * chunk
 
 
 def swa_radix_num_windows(
-    sliding_window: int, page_size: int, max_running_req: int, swa_windows: int | None
+    sliding_window: int,
+    page_size: int,
+    max_running_req: int,
+    max_extend_tokens: int,
+    swa_windows: int | None,
 ) -> int:
-    """Windows of the SWA radix cache's pool: swa_windows, by default two per running request
-    and EXTRA_DEFAULT_WINDOWS; fewer than hold the floor are refused."""
+    """Windows of the SWA radix cache's pool: swa_windows, by default the fewest that hold the
+    floor and EXTRA_DEFAULT_WINDOWS; fewer than hold the floor are refused."""
+    floor = swa_radix_floor_tokens(sliding_window, page_size, max_running_req, max_extend_tokens)
+    fewest = -(-floor // sliding_window)
     if swa_windows is None:
-        num_windows = 2 * max_running_req + EXTRA_DEFAULT_WINDOWS
-    else:
-        num_windows = swa_windows
-    floor = swa_radix_floor_tokens(sliding_window, page_size, max_running_req)
-    if num_windows * sliding_window < floor:
+        return fewest + EXTRA_DEFAULT_WINDOWS
+    elif swa_windows < fewest:
         raise ValueError(
-            f"{num_windows} windows of {sliding_window} tokens hold fewer than the {floor} "
-            f"window slots {max_running_req} running requests need: pass --swa-windows "
-            f"{-(-floor // sliding_window)} or more"
+            f"--swa-windows {swa_windows} holds fewer than the {floor} window slots "
+            f"{max_running_req} running requests and {max_extend_tokens}-token prefill chunks "
+            f"need: pass --swa-windows {fewest} or more"
         )
-    return num_windows
+    else:
+        return swa_windows
 
 
 def swa_radix_num_tokens(
-    sliding_window: int, page_size: int, max_running_req: int, swa_windows: int | None
+    sliding_window: int,
+    page_size: int,
+    max_running_req: int,
+    max_extend_tokens: int,
+    swa_windows: int | None,
 ) -> int:
     """The SWA radix cache's window pool slots: whole windows and the sentinel."""
-    num_windows = swa_radix_num_windows(sliding_window, page_size, max_running_req, swa_windows)
+    num_windows = swa_radix_num_windows(
+        sliding_window, page_size, max_running_req, max_extend_tokens, swa_windows
+    )
     return num_windows * sliding_window + 1
 
 
@@ -113,7 +128,11 @@ class SWAKVCache(MHAKVCache):
             )
         else:
             return swa_radix_num_tokens(
-                spec.sliding_window, config.page_size, config.max_running_req, config.swa_windows
+                spec.sliding_window,
+                config.page_size,
+                config.max_running_req,
+                config.max_extend_tokens,
+                config.swa_windows,
             )
 
     @classmethod

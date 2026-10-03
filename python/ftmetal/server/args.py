@@ -121,7 +121,7 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         metavar="N",
         default=ServerArgs.swa_windows,
         help="window pool of the radix cache on a sliding-window model, in sliding windows "
-        "(default: two per running request and 8 more)",
+        "(default: the fewest that hold the running requests and a prefill, and 8 more)",
     )
     parser.add_argument(
         "--attention-backend",

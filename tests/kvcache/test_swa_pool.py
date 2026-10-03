@@ -90,16 +90,17 @@ def sizing_config(
     )
 
 
-# Window 16, 3 running requests, 64-token forwards. Naive: 4 x align32(16 + 64 + 1). Radix:
-# whole windows and the sentinel, by default 2 x 3 + 8; the floor is 3 x (page_ceil(16 + 16)
-# + 16 + 3 pages), 153 slots in token pages and 180 in 4-token pages.
+# Window 16, 3 running requests, 64-token chunks. Naive: 4 x align32(16 + 64 + 1). Radix:
+# whole windows and the sentinel; the floor is 3 x (page_ceil(16 + 16) + 16 + 3 pages) + 2 x
+# 64, 281 slots (18 windows) in token pages and 308 (20 windows) in 4-token pages; the
+# default is 8 windows more.
 SIZING_CASES = [
     SizingCase("naive", "naive", 1, None, 4 * 96),
     SizingCase("naive ignores the windows", "naive", 4, 12, 4 * 96),
-    SizingCase("radix, the default windows", "radix", 1, None, 14 * 16 + 1),
-    SizingCase("radix, the default in 4-token pages", "radix", 4, None, 14 * 16 + 1),
-    SizingCase("radix, the fewest windows above the floor", "radix", 1, 10, 10 * 16 + 1),
-    SizingCase("radix, the fewest in 4-token pages", "radix", 4, 12, 12 * 16 + 1),
+    SizingCase("radix, the default windows", "radix", 1, None, 26 * 16 + 1),
+    SizingCase("radix, the default in 4-token pages", "radix", 4, None, 28 * 16 + 1),
+    SizingCase("radix, the fewest windows that hold the floor", "radix", 1, 18, 18 * 16 + 1),
+    SizingCase("radix, the fewest in 4-token pages", "radix", 4, 20, 20 * 16 + 1),
 ]
 
 
@@ -120,7 +121,7 @@ def test_kv_cost_prices_what_from_spec_allocates() -> None:
 
 
 def test_too_few_windows_name_the_fewest_that_hold_the_floor() -> None:
-    for page_size, swa_windows, fewest in [(1, 9, 10), (4, 11, 12)]:
+    for page_size, swa_windows, fewest in [(1, 17, 18), (4, 19, 20)]:
         config = sizing_config("radix", page_size, swa_windows)
         with pytest.raises(ValueError, match=f"--swa-windows {fewest} or more"):
             pool_costs((FULL_SPEC, SPEC), config)

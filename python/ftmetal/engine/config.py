@@ -63,7 +63,7 @@ class EngineConfig:
     # least 4) on top of the running requests' own slots.
     linear_state_cache_ratio: float = 2.0
     # Window pool of the SWA radix cache, in sliding windows, at least what the running
-    # requests hold; None: kvcache.swa_pool's default, two per running request and 8 more.
+    # requests and a prefill hold; None: kvcache.swa_pool's default, that floor and 8 more.
     swa_windows: int | None = None
     # Capture a decode graph per batch-size bucket at startup and replay decode from it.
     command_graph: bool = field(default_factory=command_graph_from_env)
