@@ -2,6 +2,7 @@
 
     uv run python tools/bench_fprefill.py [--shapes 0:2048,30720:64] [--repeats 5]
         [--num-heads 16 --num-kv-heads 2 --head-dim 256] [--sliding-window 1024]
+        [--mma simdgroup|mpp]
 
 One call is one full-attention layer of a one-request prefill chunk: bf16 q [extend, Hq,
 D] over a [slots, Hkv, D] K/V pool at page size 1, the request's keys on shuffled slots.
@@ -13,7 +14,8 @@ best mean time per call over the repeats, with the achieved K/V read bandwidth (
 a query can see read once) and the TFLOP/s of the visible QK^T and PV products. With a
 sliding window the page-table row starts at the chunk's oldest visible key, as the SWA
 backend builds it. Gemma4-26B-A4B: global layers --head-dim 512, window layers
---num-kv-heads 8 --head-dim 256 --sliding-window 1024.
+--num-kv-heads 8 --head-dim 256 --sliding-window 1024. --mma picks the kernel's GEMMs
+(default: the engine's choice for this GPU).
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 import numpy as np
 
-from ftmetal.kernel.fprefill import flash_prefill, prefill_tiles
+from ftmetal.kernel.fprefill import FprefillMma, default_mma, flash_prefill, prefill_tiles
 
 PAGE_SIZE = 1
 CALLS_PER_RUN = 20
@@ -38,6 +40,7 @@ class AttentionShape:
     num_kv_heads: int
     head_dim: int
     sliding_window: int | None
+    mma: FprefillMma
 
 
 class PrefillCall:
@@ -82,6 +85,7 @@ class PrefillCall:
             PAGE_SIZE,
             self.shape.head_dim**-0.5,
             self.shape.sliding_window,
+            self.shape.mma,
         )
 
     def sdpa(self, q: mx.array) -> mx.array:
@@ -123,11 +127,16 @@ def main() -> int:
     parser.add_argument("--num-kv-heads", type=int, default=2)
     parser.add_argument("--head-dim", type=int, default=256)
     parser.add_argument("--sliding-window", type=int, default=None)
+    parser.add_argument("--mma", choices=["simdgroup", "mpp"], default=None)
     args = parser.parse_args()
-    shape = AttentionShape(args.num_heads, args.num_kv_heads, args.head_dim, args.sliding_window)
+    mma = default_mma() if args.mma is None else args.mma
+    shape = AttentionShape(
+        args.num_heads, args.num_kv_heads, args.head_dim, args.sliding_window, mma
+    )
     window = shape.sliding_window
     rng = np.random.default_rng(0)
     mx.random.seed(0)
+    print(f"kernel GEMMs: {mma}")
     print("cached:extend  kernel us (GB/s, TFLOP/s)  sdpa+gather us (GB/s, TFLOP/s)  speedup")
     for shape_text in args.shapes.split(","):
         cached_len, extend_len = (int(part) for part in shape_text.split(":"))

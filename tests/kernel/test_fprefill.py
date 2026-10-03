@@ -9,18 +9,20 @@ across the causal diagonal, a cached prefix ending inside a key block, a partial
 tile, a group whose heads leave padding rows, each staging plan of the head dim and
 dtype, the split-KV rule split and not, forced partitions with nothing to read. Under a
 sliding window, the keys before the batch's oldest window hold huge keys and values too,
-so a key the window should hide shows up in the output.
+so a key the window should hide shows up in the output. Every case runs on both GEMM
+paths.
 """
 
 from __future__ import annotations
 
+import platform
 from dataclasses import dataclass, replace
 
 import mlx.core as mx
 import numpy as np
 import pytest
 
-from ftmetal.kernel.fprefill import MAX_BLOCK_K, flash_prefill, prefill_tiles
+from ftmetal.kernel.fprefill import MAX_BLOCK_K, FprefillMma, flash_prefill, prefill_tiles
 from ftmetal.kernel.ref import flash_prefill_ref
 
 NUM_KV_HEADS = 2
@@ -30,6 +32,16 @@ UNREAD_VALUE = 1e3
 # rounds only its bf16 output, half an ulp at the row's top binade (2^-8); one ulp leaves
 # room for the fp32 summation order. fp32 inputs differ by summation order alone.
 TOLERANCE = {mx.bfloat16: 2**-7, mx.float32: 1e-5}
+# matmul2d needs Metal 4 (macOS 26).
+MMAS = [
+    "simdgroup",
+    pytest.param(
+        "mpp",
+        marks=pytest.mark.skipif(
+            int(platform.mac_ver()[0].split(".")[0]) < 26, reason="matmul2d needs macOS 26"
+        ),
+    ),
+]
 
 
 @dataclass(frozen=True)
@@ -86,8 +98,9 @@ CASES = [
     Case((37,), (11,), head_dim=128, group=3, page_size=16),
     Case((37,), (3,), head_dim=128, group=12, page_size=16),  # a padding-only row group
     # Every staging plan, one batch each: D 128 (one simdgroup per row group), D 256 (head
-    # split; fp32 stages K and V in one buffer), D 512 (one buffer; fp32 8-key blocks).
-    # Page 4 puts a key block across pages, page 64 a page across key blocks.
+    # split; fp32 stages K and V in one buffer), D 512 (one buffer; fp32 8-key blocks, or
+    # with matmul2d 16-key blocks in two column passes). Page 4 puts a key block across
+    # pages, page 64 a page across key blocks.
     Case(*UNEQUAL, head_dim=128, page_size=4),
     Case(*SHORT_AND_LONG, head_dim=128, group=1, page_size=4, dtype=mx.float32),
     Case(*UNEQUAL, group=3, page_size=64),
@@ -152,8 +165,9 @@ def filled_pool(
     return k_cache, v_cache, page_table
 
 
+@pytest.mark.parametrize("mma", MMAS)
 @pytest.mark.parametrize("case", CASES, ids=str)
-def test_matches_sdpa(case: Case) -> None:
+def test_matches_sdpa(case: Case, mma: FprefillMma) -> None:
     cached_lens, extend_lens = list(case.cached_lens), list(case.extend_lens)
     window = case.window
     seq_lens = [c + e for c, e in zip(cached_lens, extend_lens)]
@@ -168,7 +182,7 @@ def test_matches_sdpa(case: Case) -> None:
         tiles = replace(tiles, num_partitions=case.num_partitions)
     table = mx.array(page_table)
     scale = case.head_dim**-0.5
-    out = flash_prefill(q, k_cache, v_cache, table, tiles, case.page_size, scale, window)
+    out = flash_prefill(q, k_cache, v_cache, table, tiles, case.page_size, scale, window, mma)
     expected = flash_prefill_ref(
         q, k_cache, v_cache, table, extend_lens, cached_lens, case.page_size, scale, window
     )
@@ -177,8 +191,11 @@ def test_matches_sdpa(case: Case) -> None:
     assert float((error / mx.abs(expected).max(axis=2)).max()) < TOLERANCE[case.dtype]
 
 
+@pytest.mark.parametrize("mma", MMAS)
 @pytest.mark.parametrize("num_partitions", [None, 3])
-def test_donated_query_buffer_keeps_the_output(num_partitions: int | None) -> None:
+def test_donated_query_buffer_keeps_the_output(
+    num_partitions: int | None, mma: FprefillMma
+) -> None:
     """The output may take q's buffer when nothing else holds q; it must not change."""
     cached_lens, extend_lens = list(UNEQUAL[0]), list(UNEQUAL[1])
     seq_lens = [c + e for c, e in zip(cached_lens, extend_lens)]
@@ -188,7 +205,7 @@ def test_donated_query_buffer_keeps_the_output(num_partitions: int | None) -> No
     tiles = prefill_tiles(extend_lens, cached_lens, NUM_KV_HEADS * group, NUM_KV_HEADS)
     if num_partitions is not None:
         tiles = replace(tiles, num_partitions=num_partitions)
-    args = (k_cache, v_cache, mx.array(page_table), tiles, 1, head_dim**-0.5)
+    args = (k_cache, v_cache, mx.array(page_table), tiles, 1, head_dim**-0.5, None, mma)
     mx.eval(q)
     kept = flash_prefill(q, *args)
     # q * 1 is q bit for bit, held by nothing but the call.
