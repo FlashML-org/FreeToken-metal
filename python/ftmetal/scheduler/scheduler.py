@@ -329,8 +329,12 @@ class Scheduler:
                     continue
                 if req in self.finished_reqs:
                     continue
-                if self.cache_manager.swa_pool is not None:
-                    # This step has drained: its keys behind the window are read no more.
+                if self.cache_manager.swa_pool is not None and (
+                    batch.is_decode or isinstance(req, ChunkedReq)
+                ):
+                    # This step has drained: its keys behind the window are read no more. A
+                    # prompt's last chunk commits with the frontier of the chunks before it,
+                    # as FreeToken's does; its own slots slide out from the next drain.
                     self.cache_manager.free_swa_out_of_window(req)
                 if isinstance(req, ChunkedReq):
                     continue

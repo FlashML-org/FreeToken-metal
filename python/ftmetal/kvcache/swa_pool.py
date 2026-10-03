@@ -26,6 +26,9 @@ from ftmetal.models.config import KVCacheGroupSpec
 SENTINEL_SLOT = 0
 # FreeToken's alignment of one request's share of the naive window pool.
 WINDOW_ALIGN = 32
+# FreeToken parity: the SWA radix commit keeps this many tokens before a request's last window
+# live too, for a next turn whose re-rendered prompt diverges a few tokens before the end.
+SWA_RETAIN_GAP = 16
 
 
 def naive_swa_num_tokens(sliding_window: int, max_extend_tokens: int, max_running_req: int) -> int:
@@ -103,4 +106,4 @@ class SWAKVCache(MHAKVCache):
         return self.num_tokens
 
 
-__all__ = ["SENTINEL_SLOT", "SWAKVCache", "naive_swa_num_tokens"]
+__all__ = ["SENTINEL_SLOT", "SWAKVCache", "SWA_RETAIN_GAP", "naive_swa_num_tokens"]
