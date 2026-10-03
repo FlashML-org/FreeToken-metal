@@ -438,11 +438,12 @@ class CacheManager:
         """Commit the KV of [0, cached_len) with its window slots.
 
         The insert tombstones what slid out of the request's window (below
-        swa_evicted_seqlen), revives tombstones with the request's live slots and hands back
-        the full slots to free in both pools: the tree's displaced ones and the request's
-        duplicates. A finish frees the unaligned tail and keeps only the prompt's last window
-        live, re-stamped for a next turn that cuts there. A prefill commit locks one window:
-        the node boundary a window back keeps the rest of the prompt evictable.
+        swa_evicted_seqlen), revives tombstones with the request's live window (moving its
+        window slots behind a locked tombstone's full slots) and hands back the full slots to
+        free in both pools: the tree's displaced ones and the request's duplicates. A finish
+        frees the unaligned tail and keeps only the prompt's last window live, re-stamped for a
+        next turn that cuts there. A prefill commit locks one window: the node boundary a
+        window back keeps the rest of the prompt evictable.
         """
         cache, pool = self.swa_parts()
         window = cache.sliding_window
@@ -452,12 +453,15 @@ class CacheManager:
         insert_len = align_down(req.cached_len, self.page_size)
         freed = EMPTY_IDS
         if insert_len > 0:
-            _, freed = cache.insert(
+            inserted = cache.insert(
                 req.input_ids[:insert_len],
                 page_indices[:insert_len],
                 swa_evicted_seqlen=req.swa_evicted_seqlen,
                 update_kv_after_len=old_cached_len,
             )
+            # Before the free: the moved window slots are the tree's now.
+            pool.move_swa(inserted.swa_targets, inserted.swa_sources)
+            freed = inserted.freed
         self.unlock(old_handle)
         pool.free_swa(freed)
         self.free_pages(freed)
@@ -479,6 +483,10 @@ class CacheManager:
             if keep_from > 0:
                 cache.match_prefix(req.input_ids[:keep_from])
             match = cache.match_prefix(req.input_ids[:insert_len])
+            # Past the match the row would still name the duplicates the insert freed.
+            assert match.cached_len == insert_len, (
+                f"the commit's match stops at {match.cached_len}, short of {insert_len}"
+            )
             # The insert gave the duplicates' window slots back: the row must name the tree's.
             self.page_table[req.table_idx, : match.cached_len] = match.kv_indices
             if match.cached_len > 0:

@@ -135,6 +135,13 @@ class SWAKVCache(MHAKVCache):
         self.full_to_swa[full_slots] = self.free_swa_slots[:count]
         self.free_swa_slots = self.free_swa_slots[count:]
 
+    def move_swa(self, target_full_slots: np.ndarray, source_full_slots: np.ndarray) -> None:
+        """Hand the window slots behind the source full slots over to the target ones, which
+        have none."""
+        assert np.all(self.full_to_swa[target_full_slots] == SENTINEL_SLOT)
+        self.full_to_swa[target_full_slots] = self.full_to_swa[source_full_slots]
+        self.full_to_swa[source_full_slots] = SENTINEL_SLOT
+
     def free_swa(self, full_slots: np.ndarray) -> None:
         """Return the window slots behind full_slots; slots already on the sentinel are skipped."""
         swa_slots = self.full_to_swa[full_slots]

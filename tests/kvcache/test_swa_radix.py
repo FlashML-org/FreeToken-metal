@@ -19,27 +19,35 @@ from ftmetal.kvcache.swa_radix_cache import SWARadixCache
 
 PAGE = 4
 WINDOW = 8
+# A new full slot's window slot is this plus the full slot.
+WINDOW_BASE = 1_000_000
 
 
 @dataclass
 class Ledger:
-    """The pools behind the cache: full slots handed out and freed, and the full slots whose
-    window slot is live."""
+    """The pools behind the cache: full slots handed out and freed, and the window slot behind
+    each full slot that has one."""
 
     next_slot: int = 0
     freed: list[int] = field(default_factory=list)
-    window_live: set[int] = field(default_factory=set)
+    window: dict[int, int] = field(default_factory=dict)
 
     def take(self, count: int, live_from: int = 0) -> np.ndarray:
         """count new full slots; the request freed the window slots of the first live_from."""
         slots = np.arange(self.next_slot, self.next_slot + count, dtype=np.int32)
         self.next_slot += count
-        self.window_live.update(slots[live_from:].tolist())
+        self.window.update((slot, WINDOW_BASE + slot) for slot in slots[live_from:].tolist())
         return slots
+
+    def move(self, targets: np.ndarray, sources: np.ndarray) -> None:
+        for target, source in zip(targets.tolist(), sources.tolist()):
+            assert target not in self.window, f"full slot {target} already has a window slot"
+            self.window[target] = self.window.pop(source)
 
     def free(self, full: np.ndarray, window: np.ndarray) -> None:
         self.freed.extend(full.tolist())
-        self.window_live.difference_update(window.tolist())
+        for slot in window.tolist():
+            self.window.pop(slot, None)
 
 
 def tokens(num_pages: int, first_page: int = 0, page_size: int = PAGE) -> np.ndarray:
@@ -80,7 +88,7 @@ def check(cache: SWARadixCache, ledger: Ledger) -> None:
     assert len(set(ledger.freed)) == len(ledger.freed), "a full slot was freed twice"
     assert sorted(tree + ledger.freed) == list(range(ledger.next_slot)), "full slots leaked"
     live = {slot for node in nodes(cache) if not node.swa_tombstone for slot in node.value}
-    assert live == ledger.window_live, "the live nodes' slots are not the live window slots"
+    assert live == set(ledger.window), "the live nodes' slots are not the ones with a window"
 
 
 def insert(
@@ -95,8 +103,9 @@ def insert(
     own_from = 0 if reused is None else len(reused)
     own = ledger.take(len(ids) - own_from, max(0, swa_evicted_seqlen - own_from))
     slots = own if reused is None else np.concatenate([reused, own])
-    _, freed = cache.insert(ids, slots, swa_evicted_seqlen, update_kv_after_len=own_from)
-    ledger.free(freed, freed)
+    inserted = cache.insert(ids, slots, swa_evicted_seqlen, update_kv_after_len=own_from)
+    ledger.move(inserted.swa_targets, inserted.swa_sources)
+    ledger.free(inserted.freed, inserted.freed)
     check(cache, ledger)
     return slots
 
@@ -197,24 +206,55 @@ def test_insert_revives_a_tombstone_whole_or_from_the_frontier() -> None:
     assert set(first[2 * PAGE : 3 * PAGE].tolist()) <= set(ledger.freed)
 
 
-def test_a_tombstone_below_the_frontier_or_full_locked_is_not_revived() -> None:
+def test_a_tombstone_below_the_frontier_is_not_revived() -> None:
+    cache, ledger = SWARadixCache(PAGE, WINDOW), Ledger()
+    ids = chain(cache, ledger, 4)
+    cache.match_prefix(ids)
+    ledger.free(*cache.evict_swa(2 * PAGE))
+    assert tombstones(cache) == [PAGE, PAGE]
+    stale = node_at(cache, ids, PAGE).value.tolist()
+    fresh = insert(cache, ledger, ids, swa_evicted_seqlen=PAGE)  # page 0 is below it
+    assert tombstones(cache) == [PAGE]
+    assert node_at(cache, ids, PAGE).value.tolist() == stale
+    assert set(fresh[:PAGE].tolist()) <= set(ledger.freed)
+
+
+def test_a_full_locked_tombstone_keeps_its_full_slots_and_takes_the_window() -> None:
+    """A running request reads the tombstones' full slots: the insert revives them with the
+    request's window slots moved behind them and frees only the request's full copies."""
     cache, ledger = SWARadixCache(PAGE, WINDOW), Ledger()
     ids = chain(cache, ledger, 4)
     held = cache.match_prefix(ids)
     swa_uuid = cache.inc_lock(held.node)  # swa-locks the last two pages, full-locks all four
     ledger.free(*cache.evict_swa(10 * PAGE))
     assert tombstones(cache) == [PAGE, PAGE]
-    locked = node_at(cache, ids, PAGE).value.tolist()
-    fresh = insert(cache, ledger, ids, swa_evicted_seqlen=0)
-    assert tombstones(cache) == [PAGE, PAGE]
-    assert node_at(cache, ids, PAGE).value.tolist() == locked
+    locked = node_at(cache, ids, 2 * PAGE).value.tolist()
+    fresh = insert(cache, ledger, ids, swa_evicted_seqlen=PAGE)
+    assert tombstones(cache) == [PAGE]  # page 0 is behind the request's frontier
+    assert node_at(cache, ids, 2 * PAGE).value.tolist() == locked
+    assert [ledger.window[slot] for slot in locked] == (
+        WINDOW_BASE + fresh[PAGE : 2 * PAGE]
+    ).tolist()
     assert set(fresh.tolist()) <= set(ledger.freed)
-
     cache.dec_lock(held.node, swa_uuid)
-    insert(cache, ledger, ids, swa_evicted_seqlen=PAGE)  # page 0 is below this frontier
+    check(cache, ledger)
+
+    # The request's frontier inside a locked tombstone: the head stays one, the tail keeps
+    # its full slots and takes the window.
+    cache, ledger = SWARadixCache(PAGE, WINDOW), Ledger()
+    ids = tokens(4)
+    first = insert(cache, ledger, ids, swa_evicted_seqlen=3 * PAGE)
+    leaf = node_at(cache, ids, 4 * PAGE)
+    swa_uuid = cache.inc_lock(leaf)  # a reader whose window is past the tombstone
+    second = insert(cache, ledger, ids, swa_evicted_seqlen=PAGE)
     assert tombstones(cache) == [PAGE]
-    insert(cache, ledger, ids, swa_evicted_seqlen=0)
-    assert tombstones(cache) == []
+    tail = node_at(cache, ids, 3 * PAGE)
+    assert tail.value.tolist() == first[PAGE : 3 * PAGE].tolist()
+    window = [ledger.window[slot] for slot in tail.value.tolist()]
+    assert window == (WINDOW_BASE + second[PAGE : 3 * PAGE]).tolist()
+    assert set(second.tolist()) <= set(ledger.freed)
+    cache.dec_lock(leaf, swa_uuid)
+    check(cache, ledger)
 
 
 def test_insert_within_the_reused_prefix_frees_nothing() -> None:
@@ -222,8 +262,8 @@ def test_insert_within_the_reused_prefix_frees_nothing() -> None:
     ids = chain(cache, ledger, 3)
     match = cache.match_prefix(ids)
     swa_uuid = cache.inc_lock(match.node)
-    prefix_len, freed = cache.insert(ids, match.kv_indices, 0, update_kv_after_len=len(ids))
-    assert (prefix_len, freed.tolist()) == (len(ids), [])
+    inserted = cache.insert(ids, match.kv_indices, 0, update_kv_after_len=len(ids))
+    assert (inserted.prefix_len, inserted.freed.tolist()) == (len(ids), [])
     cache.dec_lock(match.node, swa_uuid)
     check(cache, ledger)
 
@@ -351,4 +391,4 @@ def test_pressure_returns_every_slot_exactly_once() -> None:
             break
         ledger.free(*cache.evict_full(PAGE))
         check(cache, ledger)
-    assert nodes(cache) == [] and ledger.window_live == set()
+    assert nodes(cache) == [] and ledger.window == {}

@@ -11,7 +11,10 @@ internal ones tombstoned in place, a leaf always live). A match stamps its path 
 timestamps decreasing toward the root, so the swa pass takes root-side nodes first. The
 cache stores slot ids only; the caller frees them in the pools. Divergences: host numpy
 arrays; dec_lock has no skip_swa and there is no revive counter (neither has a caller);
-check_integrity recomputes the size counters.
+check_integrity recomputes the size counters; a tombstone whose full KV a running request
+locks is revived too, keeping its full slots and taking over the incoming request's window
+slots (SGLang's _recover_tombstone_keeping_locked_full), where FreeToken leaves it a
+tombstone and a commit's windowed match can then stop short of the request's own prefix.
 """
 
 from __future__ import annotations
@@ -48,6 +51,18 @@ class SWAMatch(NamedTuple):
     cached_len: int
     # The matched node (lock target); the root on a miss.
     node: RadixTreeNode
+
+
+class SWAInsertResult(NamedTuple):
+    # Length already cached before the insert.
+    prefix_len: int
+    # Full slots the caller frees in both pools: the tree's displaced slots and the request's
+    # duplicates.
+    freed: np.ndarray
+    # The caller first moves the window slots behind swa_sources (request slots, among freed)
+    # to swa_targets (the tree's full slots of a locked tombstone the insert revived).
+    swa_targets: np.ndarray
+    swa_sources: np.ndarray
 
 
 class SWAEvictResult(NamedTuple):
@@ -114,21 +129,21 @@ class SWARadixCache:
         kv_indices: np.ndarray,
         swa_evicted_seqlen: int = 0,
         update_kv_after_len: int = 0,
-    ) -> tuple[int, np.ndarray]:
+    ) -> SWAInsertResult:
         """Insert the page-aligned prefix with the request's full slots kv_indices.
 
         Nodes past update_kv_after_len (the request's reused prefix) meet the request's own
         slots, whose window slots are live from swa_evicted_seqlen on (the request freed the
-        ones below). A tombstone there is revived by adopting the request's live slots, whole
-        or from that frontier on; under a full lock it is left alone. The new suffix is a
-        tombstone below swa_evicted_seqlen and a live leaf after it.
-
-        Returns (length already cached before the insert, the full slots the caller frees in
-        both pools: the tree's displaced slots and the request's duplicates).
+        ones below). A tombstone there is revived from that frontier on (split at it) with
+        the request's live window: by adopting the request's slots, or, while a running
+        request reads the node's full slots, by moving the request's window slots behind
+        them. The new suffix is a tombstone below swa_evicted_seqlen and a live leaf after it.
         """
         insert_len = align_down(len(input_ids), self.page_size)
         input_ids, kv_indices = input_ids[:insert_len], kv_indices[:insert_len]
         freed: list[np.ndarray] = []
+        swa_targets: list[np.ndarray] = []
+        swa_sources: list[np.ndarray] = []
         node = self.root
         total = 0
         while total < insert_len:
@@ -141,25 +156,25 @@ class SWARadixCache:
                 child = child.split_at(match_len)
             segment = kv_indices[total : total + match_len]
             if update_kv_after_len < total + match_len:
-                if not child.swa_tombstone or child.ref_count > 0:
-                    # The tree's slots are canonical, or a full-locked reader still gathers
-                    # this tombstone's slots through its own row: drop the request's copy.
+                if not child.swa_tombstone or swa_evicted_seqlen >= total + match_len:
+                    # The tree's slots are canonical, or the node is wholly behind the
+                    # request's window: drop the request's copy.
                     freed.append(segment.copy())
-                elif swa_evicted_seqlen <= total:
-                    # Live in the request over the whole node: revive it with the request's
-                    # slots and free the tree's, whose window slots are gone.
-                    freed.append(child.value)
-                    self.revive(child, segment.copy())
-                elif swa_evicted_seqlen < total + match_len:
-                    # The request's frontier falls inside: the head stays a tombstone, the tail
-                    # past the frontier is revived.
-                    start = swa_evicted_seqlen - total
-                    child.split_at(start)
-                    freed.append(child.value)
-                    freed.append(segment[:start].copy())
-                    self.revive(child, segment[start:].copy())
                 else:
-                    freed.append(segment.copy())
+                    start = max(swa_evicted_seqlen - total, 0)
+                    if start > 0:
+                        # The head behind the request's frontier stays a tombstone.
+                        child.split_at(start)
+                        freed.append(segment[:start].copy())
+                    incoming = segment[start:].copy()
+                    if child.ref_count > 0:
+                        swa_targets.append(child.value)
+                        swa_sources.append(incoming)
+                        freed.append(incoming)
+                    else:
+                        freed.append(child.value)
+                        child.set_key_value(child.key, incoming)
+                    self.revive(child)
             total += match_len
             node = child
             if partial:
@@ -175,11 +190,15 @@ class SWARadixCache:
                 )
                 suffix_ids, suffix_kv = suffix_ids[boundary:], suffix_kv[boundary:]
             self.add_child(node, suffix_ids.copy(), suffix_kv, tombstone=False)
-        return total, np.concatenate(freed) if freed else EMPTY_IDS
+        return SWAInsertResult(
+            total,
+            np.concatenate(freed) if freed else EMPTY_IDS,
+            np.concatenate(swa_targets) if swa_targets else EMPTY_IDS,
+            np.concatenate(swa_sources) if swa_sources else EMPTY_IDS,
+        )
 
-    def revive(self, node: RadixTreeNode, kv_indices: np.ndarray) -> None:
+    def revive(self, node: RadixTreeNode) -> None:
         assert node.swa_ref_count == 0, "a tombstone holds no window lock"
-        node.set_key_value(node.key, kv_indices)
         node.swa_tombstone = False
         node.timestamp = self.tick()
         self.swa_evictable += node.length
@@ -409,4 +428,11 @@ class SWARadixCache:
         return out
 
 
-__all__ = ["EVENT_STRIDE", "SWACacheHandle", "SWAEvictResult", "SWAMatch", "SWARadixCache"]
+__all__ = [
+    "EVENT_STRIDE",
+    "SWACacheHandle",
+    "SWAEvictResult",
+    "SWAInsertResult",
+    "SWAMatch",
+    "SWARadixCache",
+]

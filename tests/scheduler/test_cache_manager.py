@@ -674,6 +674,16 @@ SWA_CASES = [
         num_pages=16,
     ),
     SWACase(
+        "a prompt recomputing a tombstone a running request locks revives it for its window",
+        page_size=1,
+        num_swa_tokens=200,
+        max_extend_tokens=12,
+        output_len=30,
+        rounds=[[PROMPT], [PROMPT, PROMPT[:30] + run(500, 3)]],
+        cached_lens=[[0], [39, 0]],
+        num_pages=256,
+    ),
+    SWACase(
         "an aborted chunk in flight commits only what its window kept",
         page_size=1,
         num_swa_tokens=64,
