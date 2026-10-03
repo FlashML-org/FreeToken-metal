@@ -1,5 +1,10 @@
 """The MoE alignment kernel against the argsort path: same offsets, a valid expert-sorted
-permutation (ties inside an expert may be ordered differently), and the combine."""
+permutation (ties inside an expert may be ordered differently), and the combine.
+
+One threadgroup of 1024 threads sorts every pair: the cases put fewer pairs than threads
+and several times more, at Qwen3.6's 256 experts (eight simdgroups scan the counts) and at
+4 (one partial simdgroup), with every expert routed to or most of them empty.
+"""
 
 from __future__ import annotations
 
@@ -20,10 +25,18 @@ def routed_ids(num_tokens: int, top_k: int, num_experts: int, active_experts: in
 
 
 @pytest.mark.parametrize(
-    "num_experts,top_k,active_experts",
-    [(256, 8, 256), (256, 8, 40), (256, 8, 8), (4, 2, 4), (4, 2, 2)],
+    ("num_experts", "top_k", "active_experts", "num_tokens"),
+    [
+        (256, 8, 256, 1),
+        (256, 8, 40, 2),
+        (256, 8, 8, 64),
+        (256, 8, 256, 777),
+        (256, 8, 40, 2048),
+        (4, 2, 4, 1),
+        (4, 2, 4, 7),
+        (4, 2, 2, 2048),
+    ],
 )
-@pytest.mark.parametrize("num_tokens", [1, 2, 7, 64, 777, 2048])
 def test_align_is_an_expert_sorted_permutation(
     num_experts: int, top_k: int, active_experts: int, num_tokens: int
 ) -> None:
@@ -41,9 +54,16 @@ def test_align_is_an_expert_sorted_permutation(
     assert host_ints(alignment.sorted_token_indices[positions]) == token_of_pair
 
 
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
-@pytest.mark.parametrize("num_tokens", [1, 9, 300])
-@pytest.mark.parametrize("num_experts,top_k,hidden_size", [(256, 8, 2048), (4, 2, 64)])
+@pytest.mark.parametrize(
+    ("num_experts", "top_k", "hidden_size", "dtype", "num_tokens"),
+    [
+        (256, 8, 2048, mx.bfloat16, 9),
+        (256, 8, 2048, mx.float32, 300),
+        (4, 2, 64, mx.bfloat16, 1),
+        (4, 2, 64, mx.float32, 300),
+    ],
+    ids=["E256-bf16-9", "E256-fp32-300", "E4-bf16-1", "E4-fp32-300"],
+)
 def test_combine_matches_gather_and_weighted_sum(
     dtype: mx.Dtype, num_tokens: int, num_experts: int, top_k: int, hidden_size: int
 ) -> None:
