@@ -6,16 +6,12 @@ import random
 import mlx.core as mx
 import pytest
 
-from ftmetal.command_graph import (
-    _C,
+from ftmetal.command_graph import _C, begin_capture, check_same_graph, end_capture, replay
+from ftmetal.command_graph.arena import (
     ARENA_ALIGNMENT,
-    begin_capture,
-    check_same_graph,
-    end_capture,
     place_blocks,
     plan_arena,
     plan_graph_arena,
-    replay,
 )
 from ftmetal.kernel.custom import metal_kernel
 from ftmetal.kernel.inplace import scatter_rows

@@ -35,12 +35,12 @@ import numpy as np
 import ftmetal
 from ftmetal.command_graph import (
     _C,
-    ArenaPlan,
     begin_count,
     check_same_graph,
     end_count,
     wait_until_available,
 )
+from ftmetal.command_graph.arena import ArenaPlan
 from ftmetal.core import Batch, Req, SamplingParams, host_ints
 from ftmetal.engine.config import EngineConfig
 from ftmetal.scheduler.scheduler import Scheduler
@@ -301,9 +301,10 @@ def main() -> int:
         scheduler, req, token, args.timing_steps, replayed=True
     )
 
-    print_graph(runner.graphs[1], runner.plans[1], engine.model_config.hidden_size)
+    graph = runner.graphs[1]
+    print_graph(graph, runner.arena.plans[graph], engine.model_config.hidden_size)
     try:
-        check_same_graph(runner.graphs[1], captured)
+        check_same_graph(graph, captured)
     except RuntimeError as error:
         same_graph = False
         print(f"double-capture check FAILED: {error}", flush=True)
