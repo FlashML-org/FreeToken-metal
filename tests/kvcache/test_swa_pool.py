@@ -1,7 +1,10 @@
 """Window pool contracts: full slots map to window slots of their own, frees return them
-once, the sentinel backs everything else, and kv_cost prices what from_spec allocates."""
+once, the sentinel backs everything else, and kv_cost prices what from_spec allocates: the
+naive pool exactly, the SWA radix cache's ratio-sized pool from above."""
 
 from __future__ import annotations
+
+from typing import Literal, NamedTuple
 
 import mlx.core as mx
 import numpy as np
@@ -11,7 +14,7 @@ from ftmetal.attention.metadata import AttnType
 from ftmetal.engine.config import EngineConfig
 from ftmetal.kvcache import create_pools, pool_costs
 from ftmetal.kvcache.mha_pool import MHAKVCache
-from ftmetal.kvcache.swa_pool import SENTINEL_SLOT, SWAKVCache, naive_swa_num_tokens
+from ftmetal.kvcache.swa_pool import SENTINEL_SLOT, SWAKVCache
 from ftmetal.models.config import KVCacheGroupSpec
 
 SPEC = KVCacheGroupSpec(
@@ -65,25 +68,49 @@ def test_store_kv_writes_the_translated_window_slots() -> None:
         pool.k_cache(1)
 
 
-@pytest.mark.parametrize("page_size", [1, 4])
-def test_kv_cost_prices_what_from_spec_allocates(page_size: int) -> None:
-    config = EngineConfig(
-        model_path="unused",
-        dtype=mx.float16,
-        page_size=page_size,
-        max_running_req=3,
-        max_extend_tokens=64,
-    )
-    num_pages = 10
-    costs = pool_costs((FULL_SPEC, SPEC), config)
-    pools = create_pools((FULL_SPEC, SPEC), config, num_pages)
-    swa_pool, full_pool = pools[AttnType.SWA], pools[AttnType.FULL]
-    assert isinstance(swa_pool, SWAKVCache) and isinstance(full_pool, MHAKVCache)
-    num_swa_tokens = naive_swa_num_tokens(16, 64, 3)
-    assert num_swa_tokens == 4 * 96
-    assert swa_pool.swa_num_tokens == num_swa_tokens
-    # The window pool is all fixed cost; its mapping covers the FULL pool's slots, dummy page
-    # included.
-    assert costs[AttnType.SWA].bytes_per_page == 0
-    assert sum(array.nbytes for array in swa_pool.arrays()) == costs[AttnType.SWA].fixed_bytes
-    assert len(swa_pool.full_to_swa) == full_pool.num_tokens == (num_pages + 1) * page_size
+class SizingCase(NamedTuple):
+    label: str
+    cache_type: Literal["naive", "radix"]
+    page_size: int
+    num_pages: int
+    swa_full_tokens_ratio: float
+    num_swa_tokens: int
+
+
+# Window 16, 3 running requests, 64-token forwards. Naive: 4 x align32(16 + 64 + 1). Radix
+# floor: 3 x (page_ceil(16 + 16) + 16 + 3 pages), and the sentinel.
+SIZING_CASES = [
+    SizingCase("naive, token pages", "naive", 1, 10, 0.2, 4 * 96),
+    SizingCase("naive, 4-token pages", "naive", 4, 10, 0.2, 4 * 96),
+    SizingCase("radix, the floor of a small pool", "radix", 1, 10, 0.2, 3 * 51 + 1),
+    SizingCase("radix, the floor in 4-token pages", "radix", 4, 10, 0.2, 3 * 60 + 1),
+    SizingCase("radix, the ratio of a large pool", "radix", 4, 1000, 0.2, 800 + 1),
+    SizingCase("radix, half of a large pool", "radix", 1, 1000, 0.5, 500 + 1),
+]
+
+
+def test_kv_cost_prices_what_from_spec_allocates() -> None:
+    for case in SIZING_CASES:
+        config = EngineConfig(
+            model_path="unused",
+            dtype=mx.float16,
+            page_size=case.page_size,
+            max_running_req=3,
+            max_extend_tokens=64,
+            cache_type=case.cache_type,
+            swa_full_tokens_ratio=case.swa_full_tokens_ratio,
+        )
+        cost = pool_costs((FULL_SPEC, SPEC), config)[AttnType.SWA]
+        pools = create_pools((FULL_SPEC, SPEC), config, case.num_pages)
+        swa_pool, full_pool = pools[AttnType.SWA], pools[AttnType.FULL]
+        assert isinstance(swa_pool, SWAKVCache) and isinstance(full_pool, MHAKVCache)
+        assert swa_pool.swa_num_tokens == case.num_swa_tokens, case.label
+        allocated = sum(array.nbytes for array in swa_pool.arrays())
+        priced = cost.fixed_bytes + case.num_pages * cost.bytes_per_page
+        if case.cache_type == "naive":
+            assert (cost.bytes_per_page, priced) == (0, allocated), case.label
+        else:
+            assert allocated <= priced, case.label
+        # The mapping covers the FULL pool's slots, dummy page included.
+        assert len(swa_pool.full_to_swa) == full_pool.num_tokens
+        assert full_pool.num_tokens == (case.num_pages + 1) * case.page_size

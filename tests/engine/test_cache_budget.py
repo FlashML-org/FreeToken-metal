@@ -1,5 +1,6 @@
 """Memory budget on the Qwen3.6-35B-A3B geometry: report lines, page and GDN slot counts;
-and Gemma4-26B-A4B's window pool as a fixed cost.
+and Gemma4-26B-A4B's window pool, a fixed cost for naive and a share of every page plus a
+floor for the SWA radix cache.
 
 The expected numbers were computed by the engine's sizing before pools were created per
 attention type; the dispatch must reproduce them exactly from the same fixed budget.
@@ -8,7 +9,7 @@ attention type; the dispatch must reproduce them exactly from the same fixed bud
 from __future__ import annotations
 
 import logging
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import pytest
 
@@ -188,15 +189,53 @@ GEMMA4_26B_TEXT_CONFIG: dict[str, object] = {
 }
 
 
-def test_gemma4_window_pool_is_a_fixed_cost_beside_the_global_pages() -> None:
+class WindowBudgetCase(NamedTuple):
+    cache_type: Literal["naive", "radix"]
+    window_cost: PoolCost
+    lines: list[str]
+
+
+# 5 global layers x 2 x 2 heads x 512 x bf16 per token; 25 window layers x 2 x 8 heads x 256
+# x bf16 per window slot.
+WINDOW_BUDGET_CASES = [
+    # 5 x align32(1024 + 2048 + 1) slots, fixed.
+    WindowBudgetCase(
+        "naive",
+        PoolCost(0, 15520 * 200 * 1024),
+        [
+            "budget         36.44 GiB",
+            "weights        13.00 GiB",
+            "swa window      2.96 GiB",
+            "activations     0.00 GiB",
+            "kv pages       20.48 GiB",
+        ],
+    ),
+    # 0.2 of a slot per global token, and the floor, 4 x (1024 + 16 + 1024 + 3) slots, fixed.
+    WindowBudgetCase(
+        "radix",
+        PoolCost(40 * 1024, 8268 * 200 * 1024),
+        [
+            "budget         36.44 GiB",
+            "weights        13.00 GiB",
+            "swa window      1.58 GiB",
+            "activations     0.00 GiB",
+            "kv pages        7.29 GiB",
+            "swa window     14.58 GiB",
+        ],
+    ),
+]
+
+
+def test_gemma4_window_pool_beside_the_global_pages() -> None:
     model_config = parse_gemma4_config(GEMMA4_26B_TEXT_CONFIG)
-    config = EngineConfig(model_path="unused", max_running_req=4, max_extend_tokens=2048)
-    costs = pool_costs(model_config.kv_cache_group_specs(), config)
-    # 5 global layers x 2 x 2 heads x 512 x bf16 per token; 25 window layers x 2 x 8 heads
-    # x 256 x bf16 per slot, for 5 x align32(1024 + 2048 + 1) slots.
-    assert costs == {
-        AttnType.FULL: PoolCost(20 * 1024, 0),
-        AttnType.SWA: PoolCost(0, 15520 * 200 * 1024),
-    }
-    report = plan_budget(memory_budget_bytes(WORKING_SET_BYTES), 13 * GIB, 0, 0, costs)
-    assert "swa window      2.96 GiB" in report.lines()
+    for case in WINDOW_BUDGET_CASES:
+        config = EngineConfig(
+            model_path="unused",
+            max_running_req=4,
+            max_extend_tokens=2048,
+            cache_type=case.cache_type,
+        )
+        costs = pool_costs(model_config.kv_cache_group_specs(), config)
+        assert costs == {AttnType.FULL: PoolCost(20 * 1024, 0), AttnType.SWA: case.window_cost}
+        report = plan_budget(memory_budget_bytes(WORKING_SET_BYTES), 13 * GIB, 0, 0, costs)
+        assert report.lines() == case.lines, case.cache_type

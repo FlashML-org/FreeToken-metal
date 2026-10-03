@@ -370,6 +370,16 @@ def test_cache_type_flag_defaults_to_radix(tiny_model_dir: Path) -> None:
     assert args.cache_type == "naive"
 
 
+def test_swa_full_tokens_ratio_flag_takes_a_share(tiny_model_dir: Path) -> None:
+    flags = ["--model", str(tiny_model_dir)]
+    assert parse_args(flags, prog="ftm serve").swa_full_tokens_ratio == 0.2
+    args = parse_args([*flags, "--swa-full-tokens-ratio", "0.5"], prog="ftm serve")
+    assert args.swa_full_tokens_ratio == 0.5
+    for value in ("0", "1.5"):
+        with pytest.raises(SystemExit):
+            parse_args([*flags, "--swa-full-tokens-ratio", value], prog="ftm serve")
+
+
 @pytest.mark.skipif(MODEL_PATH is None, reason="FTMETAL_TEST_MODEL_PATH is not set")
 def test_real_model_answers_over_http() -> None:
     assert MODEL_PATH is not None

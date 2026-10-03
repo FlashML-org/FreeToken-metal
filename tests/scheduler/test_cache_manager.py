@@ -24,7 +24,7 @@ import pytest
 from ftmetal.attention.metadata import AttnType
 from ftmetal.core import Batch, Req, SamplingParams
 from ftmetal.kvcache.linear_state_pool import LinearStatePool, linear_pool_num_slots
-from ftmetal.kvcache.swa_pool import SENTINEL_SLOT, SWAKVCache
+from ftmetal.kvcache.swa_pool import SENTINEL_SLOT, SWAKVCache, swa_radix_floor_tokens
 from ftmetal.models.config import KVCacheGroupSpec
 from ftmetal.scheduler.cache import CacheManager, MatchResult, resolve_cache_type
 from ftmetal.scheduler.decode import DecodeManager
@@ -643,6 +643,15 @@ SWA_CASES = [
         max_extend_tokens=64,
         output_len=8,
         rounds=[[run(1, 30), run(300, 30)]],
+        cached_lens=[[0, 0]],
+    ),
+    SWACase(
+        "two requests decode together on a pool at the floor",
+        page_size=4,
+        num_swa_tokens=swa_radix_floor_tokens(WINDOW, 4, 2) + 1,
+        max_extend_tokens=16,
+        output_len=40,
+        rounds=[[run(1, 60), run(500, 50)]],
         cached_lens=[[0, 0]],
     ),
     SWACase(

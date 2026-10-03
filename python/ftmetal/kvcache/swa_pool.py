@@ -1,14 +1,17 @@
 """Window pool for sliding-window layers: K/V slots reached through a full->swa mapping.
 
 Port of the window half of FreeToken kvcache/hybrid_swa_pool.py (HybridSWAKVCache's swa
-group, translate_loc_from_full_to_swa, alloc_swa / free_swa, the slot-0 sentinel and
-_naive_swa_num_tokens). Divergences: the full-attention layers live in the FULL type's
-own MHAKVCache, so this pool holds only the window layers, token-granular (page size 1);
-the mapping and the free list are host numpy, translated when the metadata is built (the
-page table is host-side too), so the budget does not price them; the naive window is
-sized from the per-forward token budget where FreeToken reads max_seq_len (a whole
-262k-token context per request would not fit), which the scheduler's out-of-window frees
-during prefill keep sufficient.
+group, translate_loc_from_full_to_swa, alloc_swa / free_swa, the slot-0 sentinel,
+_naive_swa_num_tokens and, for the SWA radix cache, _swa_paged_num_tokens: a share of the
+full pool's tokens, at least what the running requests hold beyond eviction). Divergences:
+the full-attention layers live in the FULL type's own MHAKVCache, so this pool holds only
+the window layers, token-granular (page size 1); the mapping and the free list are host
+numpy, translated when the metadata is built (the page table is host-side too), so the
+budget does not price them; the naive window is sized from the per-forward token budget
+where FreeToken reads max_seq_len (a whole 262k-token context per request would not fit),
+which the scheduler's out-of-window frees during prefill keep sufficient; the radix floor's
+decode tail counts the page the next step writes where FreeToken counts its 128-forward
+free interval (the frees here run at every drain); no absolute window override.
 """
 
 from __future__ import annotations
@@ -39,6 +42,29 @@ def naive_swa_num_tokens(sliding_window: int, max_extend_tokens: int, max_runnin
     return (max_running_req + 1) * width
 
 
+def swa_radix_floor_tokens(sliding_window: int, page_size: int, max_running_req: int) -> int:
+    """Window slots no eviction reaches while max_running_req requests decode (FreeToken's
+    _swa_pool_floor): each one's committed window, locked with the retain gap in whole
+    pages, and its own tail up to its next free (a window, the page of margin, the page the
+    step in flight writes and the one the next step takes)."""
+    locked = -(-(sliding_window + SWA_RETAIN_GAP) // page_size) * page_size
+    return max_running_req * (locked + sliding_window + 3 * page_size)
+
+
+def swa_radix_num_tokens(
+    sliding_window: int,
+    page_size: int,
+    max_running_req: int,
+    swa_full_tokens_ratio: float,
+    num_full_tokens: int,
+) -> int:
+    """The SWA radix cache's window pool: swa_full_tokens_ratio of the full pool's tokens,
+    at least the floor, and the sentinel (FreeToken's _swa_paged_num_tokens)."""
+    assert 0.0 < swa_full_tokens_ratio <= 1.0, "swa_full_tokens_ratio must be in (0, 1]"
+    floor = swa_radix_floor_tokens(sliding_window, page_size, max_running_req)
+    return max(floor, int(swa_full_tokens_ratio * num_full_tokens)) + 1
+
+
 class SWAKVCache(MHAKVCache):
     def __init__(
         self, spec: KVCacheGroupSpec, num_swa_tokens: int, num_full_tokens: int, dtype: mx.Dtype
@@ -61,20 +87,41 @@ class SWAKVCache(MHAKVCache):
 
     @classmethod
     def kv_cost(cls, spec: KVCacheGroupSpec, config: PoolConfig) -> PoolCost:
+        """Naive: the whole pool, fixed. Radix (the SWA radix cache on a sliding-window
+        model): the ratio's share of every page plus the floor, an upper bound on what
+        from_spec allocates, as FreeToken prices it."""
         assert spec.sliding_window is not None
-        num_swa_tokens = naive_swa_num_tokens(
-            spec.sliding_window, config.max_extend_tokens, config.max_running_req
-        )
-        return PoolCost(0, num_swa_tokens * spec.token_bytes(config.dtype))
+        token_bytes = spec.token_bytes(config.dtype)
+        if config.cache_type == "naive":
+            num_swa_tokens = naive_swa_num_tokens(
+                spec.sliding_window, config.max_extend_tokens, config.max_running_req
+            )
+            return PoolCost(0, num_swa_tokens * token_bytes)
+        else:
+            floor = swa_radix_floor_tokens(
+                spec.sliding_window, config.page_size, config.max_running_req
+            )
+            page_bytes = int(token_bytes * config.page_size * config.swa_full_tokens_ratio)
+            return PoolCost(page_bytes, floor * token_bytes)
 
     @classmethod
     def from_spec(cls, spec: KVCacheGroupSpec, config: PoolConfig, num_pages: int) -> Self:
         assert spec.sliding_window is not None
-        num_swa_tokens = naive_swa_num_tokens(
-            spec.sliding_window, config.max_extend_tokens, config.max_running_req
-        )
         # + 1: the FULL pool's dummy page, whose slots stay on the sentinel.
-        return cls(spec, num_swa_tokens, (num_pages + 1) * config.page_size, config.dtype)
+        num_full_tokens = (num_pages + 1) * config.page_size
+        if config.cache_type == "naive":
+            num_swa_tokens = naive_swa_num_tokens(
+                spec.sliding_window, config.max_extend_tokens, config.max_running_req
+            )
+        else:
+            num_swa_tokens = swa_radix_num_tokens(
+                spec.sliding_window,
+                config.page_size,
+                config.max_running_req,
+                config.swa_full_tokens_ratio,
+                num_full_tokens,
+            )
+        return cls(spec, num_swa_tokens, num_full_tokens, config.dtype)
 
     def translate(self, full_slots: np.ndarray) -> np.ndarray:
         """Full-pool token slots -> window slots (the sentinel where none is live)."""
@@ -106,4 +153,11 @@ class SWAKVCache(MHAKVCache):
         return self.num_tokens
 
 
-__all__ = ["SENTINEL_SLOT", "SWAKVCache", "SWA_RETAIN_GAP", "naive_swa_num_tokens"]
+__all__ = [
+    "SENTINEL_SLOT",
+    "SWAKVCache",
+    "SWA_RETAIN_GAP",
+    "naive_swa_num_tokens",
+    "swa_radix_floor_tokens",
+    "swa_radix_num_tokens",
+]
