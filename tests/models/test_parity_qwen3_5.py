@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 
 from ftmetal.core import SamplingParams
-from ftmetal.engine.config import EngineConfig
+from ftmetal.engine.config import CacheTypeChoice, EngineConfig
 from ftmetal.scheduler.scheduler import Scheduler
 from tiny_model import build_reference, reference_greedy, save_checkpoint
 
@@ -27,6 +27,7 @@ def make_scheduler(
     attention_backend: str = "mlx",
     num_pages: int = 64,
     max_seq_len: int | None = None,
+    cache_type: CacheTypeChoice = "radix",
 ) -> Scheduler:
     config = EngineConfig(
         model_path=str(path),
@@ -37,6 +38,7 @@ def make_scheduler(
         max_seq_len_override=max_seq_len,
         num_page_override=num_pages,
         max_extend_tokens=max_extend_tokens,
+        cache_type=cache_type,
     )
     return Scheduler(config, eos_token_ids={127})
 
@@ -166,6 +168,35 @@ def test_two_requests_batched_match_single(tmp_path: Path, attention_backend: st
     got = [[e.token for e in events if e.uid == uid] for uid in range(len(prompts))]
     assert got == expected
     scheduler.cache_manager.check_integrity()
+
+
+def test_naive_cache_matches_mlx_lm(tmp_path: Path) -> None:
+    """--cache-type naive: one live GDN slot per request and no prefix reuse. Two prompts
+    decode together on the pool's two live slots; a chunked third prompt then prefills on a
+    slot a finished request left dirty, and its logits must still be mlx-lm's."""
+    model = build_reference(seed=6)
+    save_checkpoint(model, tmp_path, quantization=None)
+    rng = np.random.default_rng(6)
+    prompts = [[int(t) for t in rng.integers(1, 120, size=n)] for n in (13, 29)]
+    steps = 12
+    expected = [reference_greedy(model, prompt, steps)[1] for prompt in prompts]
+
+    scheduler = make_scheduler(tmp_path, page_size=4, attention_backend="metal", cache_type="naive")
+    pool = scheduler.engine.ctx.linear_state_pool
+    assert scheduler.cache_manager.cache_type == "naive"
+    assert pool is not None and pool.num_slots == 3
+    for uid, prompt in enumerate(prompts):
+        params = SamplingParams(temperature=0.0, max_tokens=steps, ignore_eos=True)
+        scheduler.add_request(uid, np.array(prompt, dtype=np.int32), params)
+    events = scheduler.run_until_idle()
+    got = [[e.token for e in events if e.uid == uid] for uid in range(len(prompts))]
+    assert got == expected
+    scheduler.cache_manager.check_integrity()
+
+    third = prompts[1] + [int(t) for t in rng.integers(1, 120, size=70)]
+    logits = last_chunk_logits(scheduler, third)
+    expected_logits, _ = reference_greedy(model, third, 1)
+    assert mx.allclose(logits[0], expected_logits[-1], atol=1e-4, rtol=1e-4)
 
 
 @pytest.mark.parametrize("attention_backend", ["mlx", "metal"])
