@@ -64,6 +64,7 @@ def replay(
     return logits, updated
 
 
+# Diagnostics: the double-capture check, run by tests and tools rather than the engine.
 def check_same_graph(first: _C.Graph, second: _C.Graph) -> None:
     """The double-capture check: two captures of one shape with different step inputs must
     record the same dispatches, bindings and setBytes payloads, and every leaf whose
@@ -73,27 +74,11 @@ def check_same_graph(first: _C.Graph, second: _C.Graph) -> None:
         raise RuntimeError("the two captures differ:\n  " + "\n  ".join(differences))
 
 
-def begin_count() -> None:
-    """Count encoder and command-buffer calls on this thread without recording them."""
-    _C.begin_count()
-
-
-def end_count() -> _C.CallCounts:
-    return _C.end_count()
-
-
-def wait_until_available(arrays: list[mx.array]) -> None:
-    """Busy-wait for evaluated arrays: no sleep, so timing loops keep CPU and GPU clocks up."""
-    _C.wait_until_available(arrays)
-
-
 __all__ = [
     "begin_capture",
-    "begin_count",
     "capture",
-    "check_same_graph",
     "end_capture",
-    "end_count",
     "replay",
-    "wait_until_available",
+    # Diagnostics.
+    "check_same_graph",
 ]

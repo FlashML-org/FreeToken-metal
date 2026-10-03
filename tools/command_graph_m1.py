@@ -33,13 +33,7 @@ import mlx.core as mx
 import numpy as np
 
 import ftmetal
-from ftmetal.command_graph import (
-    _C,
-    begin_count,
-    check_same_graph,
-    end_count,
-    wait_until_available,
-)
+from ftmetal.command_graph import _C, check_same_graph
 from ftmetal.command_graph.arena import ArenaPlan
 from ftmetal.core import Batch, Req, SamplingParams, host_ints
 from ftmetal.engine.config import EngineConfig
@@ -138,7 +132,7 @@ def timed_steps(
     timings: list[StepTiming] = []
     tokens: list[int] = []
     for _ in range(num_steps):
-        begin_count()
+        _C.begin_count()
         started_wall, started_cpu = time.perf_counter(), time.thread_time()
         batch = decode_batch(scheduler, req, token, allocate=not replayed)
         if replayed:
@@ -148,9 +142,9 @@ def timed_steps(
         token = greedy(logits)
         mx.async_eval(token, *engine.pool_arrays())
         launched_wall, launched_cpu = time.perf_counter(), time.thread_time()
-        wait_until_available([token])
+        _C.wait_until_available([token])
         finished_wall = time.perf_counter()
-        counts = end_count()
+        counts = _C.end_count()
         timings.append(
             StepTiming(
                 launch_wall=launched_wall - started_wall,
