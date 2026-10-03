@@ -70,8 +70,7 @@ class TokenEvent:
 
 class Scheduler:
     def __init__(self, config: EngineConfig, eos_token_ids: set[int]) -> None:
-        # Before the engine loads anything: an unsupported --cache-type or too few
-        # --swa-windows fails fast.
+        # Before the engine loads anything: too few --swa-windows fails fast.
         swa_group = config.model_config.swa_attention_group()
         cache_type = resolve_cache_type(
             config.cache_type,

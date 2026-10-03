@@ -7,7 +7,8 @@ prefix at its prefill and its finish, frees and re-points duplicates and evicts 
 leaves under pressure; with a GDN state pool the hybrid radix commit donates the track
 snapshot, a finish donates its live slot, and both currencies evict under pressure; with a
 window pool the SWA radix commit keeps the windows a next prompt can resume from, and the
-window slots evict on their own. Parts port FreeToken
+window slots evict on their own; naive with a GDN state pool holds one zeroed live slot per
+running request and gives it back on finish and abort. Parts port FreeToken
 tests/scheduler/test_hybrid_cache_manager.py, test_commit_repoints_page_table.py,
 test_swa_commit_lock_and_floor.py and test_swa_pagesize.py, on tiny real pools.
 """
@@ -23,7 +24,7 @@ import pytest
 
 from ftmetal.attention.metadata import AttnType
 from ftmetal.core import Batch, Req, SamplingParams
-from ftmetal.kvcache.linear_state_pool import LinearStatePool
+from ftmetal.kvcache.linear_state_pool import PADDING_SLOT, LinearStatePool
 from ftmetal.kvcache.swa_pool import (
     SENTINEL_SLOT,
     SWA_RETAIN_GAP,
@@ -325,8 +326,7 @@ def test_cache_type_resolves_radix_to_the_hybrid_radix_on_a_gdn_model() -> None:
     assert resolve("radix", has_linear_attention=False) == "radix"
     assert resolve("naive", has_linear_attention=False) == "naive"
     assert resolve("radix", has_linear_attention=True) == "hybrid_radix"
-    with pytest.raises(ValueError):
-        resolve("naive", has_linear_attention=True)
+    assert resolve("naive", has_linear_attention=True) == "naive"
 
 
 def test_cache_type_resolves_radix_to_the_swa_radix_on_a_sliding_window_model() -> None:
@@ -494,11 +494,27 @@ def check_window_live(manager: CacheManager, steps: list[tuple[Req, int, int]]) 
         assert SENTINEL_SLOT not in window, f"{req} reads a freed window slot in [{start}, {stop})"
 
 
+def check_live_slots(pool: LinearStatePool, batch: Batch) -> None:
+    """Every request of a step runs on a live slot of its own, off the free list; a new one
+    starts from a zero state."""
+    slots = [req.linear_slot_idx for req in batch.reqs]
+    assert None not in slots and PADDING_SLOT not in slots, f"{batch.reqs} hold no live slot"
+    assert len(set(slots)) == len(slots), f"{batch.reqs} share a live slot"
+    assert set(slots).isdisjoint(pool.free_slots), f"{batch.reqs} run on a freed slot"
+    for req in batch.reqs:
+        if req.cached_len == 0:
+            assert req.linear_slot_idx is not None
+            state = pool.recurrent_states[0][req.linear_slot_idx]
+            assert not mx.any(state).item(), f"{req} starts from a stale state"
+
+
 class Served(NamedTuple):
     # The prefix each admission found cached.
     cached_lens: list[int]
     # Each prompt's prefill chunk lengths.
     chunk_lens: list[list[int]]
+    # The most GDN slots the requests held at once.
+    peak_live_slots: int
 
 
 def serve(
@@ -511,11 +527,14 @@ def serve(
     arrive_at: list[int] | None = None,
 ) -> Served:
     """Prompts served to completion in the scheduler's order: step N + 1 is allocated before
-    step N drains, and a drain slides the window slots, commits a prompt's last chunk and
-    frees a finished request. Prompt i arrives before iteration arrive_at[i] (all before the
-    first by default); the first prompt is aborted before iteration abort_at."""
+    step N drains, and a drain slides the window slots of a sliding-window model, commits a
+    prompt's last chunk and frees a finished request. With a GDN state pool every step checks
+    its live slots and then dirties every slot, as a forward advances the states. Prompt i
+    arrives before iteration arrive_at[i] (all before the first by default); the first prompt
+    is aborted before iteration abort_at."""
     pool = manager.swa_pool
-    assert pool is not None
+    gdn_pool = manager.linear_state_pool
+    peak_live_slots = 0
     decode = DecodeManager(manager.page_size)
     prefill = PrefillManager(manager, table, decode)
     params = SamplingParams(max_tokens=output_len, ignore_eos=True)
@@ -543,11 +562,17 @@ def serve(
         steps = []
         if batch is not None:
             manager.allocate_paged(batch.reqs)
-            steps = [
-                (req, max(0, req.cached_len - pool.sliding_window + 1), req.device_len)
-                for req in batch.reqs
-            ]
-            check_window_live(manager, steps)
+            if pool is not None:
+                steps = [
+                    (req, max(0, req.cached_len - pool.sliding_window + 1), req.device_len)
+                    for req in batch.reqs
+                ]
+                check_window_live(manager, steps)
+            if gdn_pool is not None:
+                check_live_slots(gdn_pool, batch)
+                held_slots = gdn_pool.num_slots - 1 - gdn_pool.num_free_slots
+                peak_live_slots = max(peak_live_slots, held_slots)
+                gdn_pool.recurrent_states[0] = gdn_pool.recurrent_states[0] + 1
             for req in batch.reqs:
                 cached_lens.setdefault(req.uid, req.cached_len)
                 if batch.is_prefill:
@@ -564,7 +589,7 @@ def serve(
                         continue
                     if req in finished:
                         continue
-                    if in_flight.is_decode or isinstance(req, ChunkedReq):
+                    if pool is not None and (in_flight.is_decode or isinstance(req, ChunkedReq)):
                         manager.free_swa_out_of_window(req)
                     if isinstance(req, ChunkedReq):
                         continue
@@ -577,11 +602,12 @@ def serve(
                     elif in_flight.is_prefill:
                         manager.cache_req(req, finished=False)
             finished = new_finished
-            # The drain freed nothing the step in flight reads.
-            check_window_live(manager, [step for step in steps if step[0] not in finished])
+            if pool is not None:
+                # The drain freed nothing the step in flight reads.
+                check_window_live(manager, [step for step in steps if step[0] not in finished])
         in_flight = batch
     manager.check_integrity()
-    return Served([cached_lens[uid] for uid in range(len(prompts))], chunk_lens)
+    return Served([cached_lens[uid] for uid in range(len(prompts))], chunk_lens, peak_live_slots)
 
 
 def run(first: int, length: int) -> list[int]:
@@ -778,3 +804,92 @@ def test_four_running_requests_and_a_full_chunk_fit_at_the_floor() -> None:
     prompts = [run(1, 40), run(100, 40), run(200, 40), run(300, 100)]
     served = serve(manager, table, prompts, 60, chunk, None, arrive_at=[1, 1, 1, 30])
     assert served.chunk_lens[3] == [chunk] * 6 + [4]
+
+
+class NaiveGDNCase(NamedTuple):
+    label: str
+    max_running_req: int
+    max_extend_tokens: int
+    output_len: int
+    prompts: list[list[int]]
+    # Each prompt's prefill chunk lengths.
+    chunk_lens: list[list[int]]
+    # The most live slots held at once.
+    peak_live_slots: int
+    arrive_at: list[int] | None = None
+    # The driver iteration the first prompt is aborted at.
+    abort_at: int | None = None
+
+
+NAIVE_GDN_CASES = [
+    NaiveGDNCase(
+        "a chunked prompt prefills in unaligned chunks on its live slot",
+        max_running_req=1,
+        max_extend_tokens=10,
+        output_len=6,
+        prompts=[run(1, 25)],
+        chunk_lens=[[10, 10, 5]],
+        peak_live_slots=1,
+    ),
+    NaiveGDNCase(
+        "max_running_req requests run together on max_running_req + 1 slots",
+        max_running_req=3,
+        max_extend_tokens=64,
+        output_len=8,
+        prompts=[run(1, 20), run(100, 20), run(200, 20)],
+        chunk_lens=[[20], [20], [20]],
+        peak_live_slots=3,
+    ),
+    NaiveGDNCase(
+        "the prompts beyond max_running_req run on the finished ones' slots, zeroed",
+        max_running_req=2,
+        max_extend_tokens=64,
+        output_len=5,
+        prompts=[run(1, 15), run(100, 15), run(200, 15), run(300, 15)],
+        chunk_lens=[[15], [15], [15], [15]],
+        peak_live_slots=2,
+    ),
+    NaiveGDNCase(
+        "an aborted chunk in flight returns its live slot at its drain",
+        max_running_req=1,
+        max_extend_tokens=12,
+        output_len=4,
+        prompts=[run(1, 40), run(1, 40)],
+        chunk_lens=[[12, 12], [12, 12, 12, 4]],
+        peak_live_slots=1,
+        abort_at=3,
+    ),
+    NaiveGDNCase(
+        "a request aborted in decode with no step in flight returns its live slot at once",
+        max_running_req=2,
+        max_extend_tokens=12,
+        output_len=20,
+        prompts=[run(1, 10), run(100, 30)],
+        chunk_lens=[[10], [12, 12, 6]],
+        peak_live_slots=2,
+        arrive_at=[1, 4],
+        abort_at=5,
+    ),
+]
+
+
+def test_naive_gdn_holds_one_live_slot_per_running_request() -> None:
+    """Naive on a model with linear attention: admission takes a live slot, a finish or an
+    abort gives it back, and nothing is reused, on a pool of max_running_req + 1 slots."""
+    for case in NAIVE_GDN_CASES:
+        page_table = np.zeros((case.max_running_req + 1, 256), dtype=np.int32)
+        pool = make_pool(case.max_running_req + 1)
+        manager = CacheManager(128, 4, page_table, "naive", linear_state_pool=pool)
+        table = TableManager(max_running_reqs=case.max_running_req, page_table=page_table)
+        served = serve(
+            manager,
+            table,
+            case.prompts,
+            case.output_len,
+            case.max_extend_tokens,
+            case.abort_at,
+            case.arrive_at,
+        )
+        assert served.cached_lens == [0] * len(case.prompts), case.label
+        assert served.chunk_lens == case.chunk_lens, case.label
+        assert served.peak_live_slots == case.peak_live_slots, case.label

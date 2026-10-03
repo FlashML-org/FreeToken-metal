@@ -113,7 +113,7 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         choices=get_args(CacheTypeChoice),
         default=ServerArgs.cache_type,
         help="radix reuses cached prompt prefixes (with GDN state snapshots on a model with "
-        "linear attention); naive reuses nothing and needs a model without linear attention",
+        "linear attention); naive reuses nothing",
     )
     parser.add_argument(
         "--swa-windows",

@@ -10,11 +10,14 @@ token of a new page gets one, the ones behind a request's window are freed as it
 the rest with the pages on finish. The swa_radix path commits them with the KV to the
 SWARadixCache, which tombstones the slid-out ones; a commit keeps the request's last window
 live and locks it, a finish keeps the prompt's last window live for the next turn, and the
-tree gives window slots back on their own when the pool runs dry. Divergences: host numpy
-page table and free list (page-aligned token slots); naive is refused on a model with
-linear attention; eviction stops at what is evictable and exhaustion raises; no runtime
-rebuild or tool-call anchor; a prefill commit tombstones the prompt before its last window
-at once (FreeToken leaves it live and evictable), so a request's window slots stay bounded.
+tree gives window slots back on their own when the pool runs dry. Naive on a model with
+linear attention holds only the live slot, which a finish or an abort returns to the pool.
+Divergences: host numpy page table and free list (page-aligned token slots); naive's live
+slot comes from the pool's free list at admission (SGLang's HybridReqToTokenPool.alloc and
+free) where FreeToken's naive keys it by table_idx; eviction stops at what is evictable
+and exhaustion raises; no runtime rebuild or tool-call anchor; a prefill commit tombstones
+the prompt before its last window at once (FreeToken leaves it live and evictable), so a
+request's window slots stay bounded.
 lazy_free_region batches the frees of one drained step; the drain itself is the step
 fence, so window slots slide out when the step that last extended a request drains
 (FreeToken frees them when it schedules the next one, every 128 decode forwards, relying
@@ -49,10 +52,8 @@ def resolve_cache_type(
 ) -> CacheType:
     """Radix is the radix cache that matches the model: on a model with linear attention the
     hybrid radix, the only tree that can resume a GDN state; on a sliding-window model the
-    SWA radix, the only tree that knows which window slots are live."""
-    if has_linear_attention and requested == "naive":
-        raise ValueError("--cache-type naive is not supported on a model with linear attention")
-    elif has_linear_attention:
+    SWA radix, the only tree that knows which window slots are live. Naive stays naive."""
+    if has_linear_attention and requested == "radix":
         return "hybrid_radix"
     elif has_sliding_window and requested == "radix":
         return "swa_radix"
@@ -83,8 +84,8 @@ class CacheManager:
         self.cache_type = cache_type
         self.is_hybrid = cache_type == "hybrid_radix"
         self.is_swa = cache_type == "swa_radix"
-        assert self.is_hybrid == (linear_state_pool is not None), (
-            "the hybrid radix cache, and only it, drives a GDN state pool"
+        assert self.is_hybrid == (linear_state_pool is not None) or cache_type == "naive", (
+            f"the hybrid radix cache, or naive, drives a GDN state pool, not {cache_type}"
         )
         assert self.is_swa == (swa_pool is not None) or cache_type == "naive", (
             f"the SWA radix cache, or naive, drives a window pool, not {cache_type}"
@@ -125,9 +126,11 @@ class CacheManager:
 
     @property
     def mamba_available_size(self) -> int:
-        """GDN slots allocatable now: free slots plus unlocked tree snapshots."""
-        cache, pool = self.hybrid_parts()
-        return pool.num_free_slots + cache.mamba_evictable_size
+        """GDN slots allocatable now: free slots plus the tree's unlocked snapshots."""
+        pool = self.linear_state_pool
+        assert pool is not None
+        tree_slots = self.hybrid_parts()[0].mamba_evictable_size if self.is_hybrid else 0
+        return pool.num_free_slots + tree_slots
 
     @property
     def swa_available_size(self) -> int:
@@ -297,6 +300,8 @@ class CacheManager:
             token_slots = self.page_table[req.table_idx, :stop]
             if self.swa_pool is not None:
                 self.swa_pool.free_swa(token_slots)
+            if self.linear_state_pool is not None:
+                self.free_req_slots(req)
             self.free_pages(token_slots)
 
     def swa_free_range(self, req: Req) -> tuple[int, int]:
@@ -498,8 +503,10 @@ class CacheManager:
             self.lock(req.cache_handle)
 
     def free_req_slots(self, req: Req, *, keep_live: bool = False) -> None:
-        """Free a finished request's ping-pong pair and, unless donated, its live slot."""
-        _, pool = self.hybrid_parts()
+        """Free a finished request's ping-pong pair, if it has one, and, unless donated, its
+        live slot."""
+        pool = self.linear_state_pool
+        assert pool is not None
         slots = list(req.mamba_ping_pong) if req.mamba_ping_pong is not None else []
         if not keep_live and req.linear_slot_idx is not None:
             slots.append(req.linear_slot_idx)
@@ -532,20 +539,17 @@ class CacheManager:
         cache."""
         cache_pages = 0
         tree_swa_slots = 0
+        tree_mamba_slots = 0
         if self.is_swa:
             cache = self.swa_parts()[0]
             cache.check_integrity()
             cache_pages = (cache.full_evictable + cache.full_protected) // self.page_size
             tree_swa_slots = cache.swa_evictable + cache.swa_protected
         elif self.is_hybrid:
-            cache, pool = self.hybrid_parts()
+            cache = self.hybrid_parts()[0]
             cache.check_integrity()
             cache_pages = (cache.full_evictable + cache.full_protected) // self.page_size
-            tree_slots = cache.mamba_evictable + cache.mamba_protected
-            assert pool.num_free_slots + tree_slots == pool.num_slots - 1, (
-                f"GDN slots leaked or double freed: free {pool.num_free_slots} + tree "
-                f"{tree_slots} != {pool.num_slots - 1}"
-            )
+            tree_mamba_slots = cache.mamba_evictable + cache.mamba_protected
         elif self.cache_type == "radix":
             radix = self.radix_cache()
             radix.check_integrity()
@@ -555,6 +559,13 @@ class CacheManager:
             f"!= {self.num_pages}"
         )
         assert np.all(self.free_slots % self.page_size == 0)
+        if self.linear_state_pool is not None:
+            # Every GDN slot but the padding slot is free or held by the tree.
+            pool = self.linear_state_pool
+            assert pool.num_free_slots + tree_mamba_slots == pool.num_slots - 1, (
+                f"GDN slots leaked or double freed: free {pool.num_free_slots} + tree "
+                f"{tree_mamba_slots} != {pool.num_slots - 1}"
+            )
         if self.swa_pool is not None:
             # Every window slot but the sentinel is free or held by a live tree node.
             free_swa_slots = self.swa_pool.swa_available_size
