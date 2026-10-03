@@ -1,40 +1,43 @@
 """Page allocation over the host page table, and the prefix cache of the configured type.
 
-Port of FreeToken scheduler/cache.py (CacheManager: the radix, hybrid_radix and naive
-paths). The radix path commits a request's KV prefix to a RadixPrefixCache. The hybrid
-path owns both currencies of the HybridRadixCache, KV pages and GDN state slots: a request
-holds a live slot and two ping-pong track slots, a prefill commit donates the frozen track
-snapshot to the tree and a finish donates the live slot. On the naive path a
-sliding-window model's window slots are the second currency (FreeToken's swa_paged
-lifecycle): every token of a new page gets one, the ones behind a request's window are
-freed as it slides, the rest with the pages on finish. Divergences: host numpy page table
-and free list (page-aligned token slots); naive is refused on a model with linear
-attention; radix on a sliding-window model runs naive, as there is no SWA radix cache;
-eviction stops at what is evictable and exhaustion raises; no runtime rebuild or
-tool-call anchor. lazy_free_region batches the frees of one drained step; the drain
-itself is the step fence, so window slots slide out when the step that last extended a
-request drains (FreeToken frees them when it schedules the next one, every 128 decode
-forwards, relying on stream order).
+Port of FreeToken scheduler/cache.py (CacheManager: the radix, hybrid_radix, swa_radix
+and naive paths). The radix path commits a request's KV prefix to a RadixPrefixCache. The
+hybrid path owns both currencies of the HybridRadixCache, KV pages and GDN state slots: a
+request holds a live slot and two ping-pong track slots, a prefill commit donates the
+frozen track snapshot to the tree and a finish donates the live slot. On a sliding-window
+model the window slots are the second currency (FreeToken's swa_paged lifecycle): every
+token of a new page gets one, the ones behind a request's window are freed as it slides,
+the rest with the pages on finish. The swa_radix path commits them with the KV to the
+SWARadixCache, which tombstones the slid-out ones; a commit keeps the request's last window
+live and locks it, a finish keeps the prompt's last window live for the next turn, and the
+tree gives window slots back on their own when the pool runs dry. Divergences: host numpy
+page table and free list (page-aligned token slots); naive is refused on a model with
+linear attention; eviction stops at what is evictable and exhaustion raises; no runtime
+rebuild or tool-call anchor; a prefill commit tombstones the prompt before its last window
+at once (FreeToken leaves it live and evictable), so a request's window slots stay bounded.
+lazy_free_region batches the frees of one drained step; the drain itself is the step
+fence, so window slots slide out when the step that last extended a request drains
+(FreeToken frees them when it schedules the next one, every 128 decode forwards, relying
+on stream order); a prompt's last chunk frees nothing at its drain, so its commit keeps
+the window FreeToken's does.
 """
 
 from __future__ import annotations
 
-import logging
 from contextlib import contextmanager
 from typing import Iterator, Literal, NamedTuple
 
 import numpy as np
 
-from ftmetal.core import Req
+from ftmetal.core import CacheHandle, Req
 from ftmetal.engine.config import CacheTypeChoice
 from ftmetal.kvcache.hybrid_radix_cache import HybridCacheHandle, HybridRadixCache
 from ftmetal.kvcache.linear_state_pool import LinearStatePool
-from ftmetal.kvcache.radix_cache import RadixCacheHandle, RadixPrefixCache, align_down
-from ftmetal.kvcache.swa_pool import SWAKVCache
+from ftmetal.kvcache.radix_cache import EMPTY_IDS, RadixCacheHandle, RadixPrefixCache, align_down
+from ftmetal.kvcache.swa_pool import SWA_RETAIN_GAP, SWAKVCache
+from ftmetal.kvcache.swa_radix_cache import SWACacheHandle, SWARadixCache
 
-CacheType = Literal["naive", "radix", "hybrid_radix"]
-
-logger = logging.getLogger(__name__)
+CacheType = Literal["naive", "radix", "hybrid_radix", "swa_radix"]
 
 
 def div_ceil(a: int, b: int) -> int:
@@ -45,25 +48,21 @@ def resolve_cache_type(
     requested: CacheTypeChoice, *, has_linear_attention: bool, has_sliding_window: bool
 ) -> CacheType:
     """Radix is the radix cache that matches the model: on a model with linear attention the
-    hybrid radix, the only tree that can resume a GDN state."""
+    hybrid radix, the only tree that can resume a GDN state; on a sliding-window model the
+    SWA radix, the only tree that knows which window slots are live."""
     if has_linear_attention and requested == "naive":
         raise ValueError("--cache-type naive is not supported on a model with linear attention")
     elif has_linear_attention:
         return "hybrid_radix"
     elif has_sliding_window and requested == "radix":
-        # Resolves to swa_radix once the SWA radix cache lands.
-        logger.warning(
-            "the SWA radix cache is not implemented yet: --cache-type radix runs naive and "
-            "prefix reuse is off for this sliding-window model"
-        )
-        return "naive"
+        return "swa_radix"
     else:
         return requested
 
 
 class MatchResult(NamedTuple):
     # The prefix to lock; None on a miss.
-    handle: RadixCacheHandle | HybridCacheHandle | None
+    handle: CacheHandle | None
     # The GDN snapshot slot to restore the live slot from; None on a miss or without one.
     mamba_value: int | None
 
@@ -83,17 +82,20 @@ class CacheManager:
         self.page_table = page_table
         self.cache_type = cache_type
         self.is_hybrid = cache_type == "hybrid_radix"
+        self.is_swa = cache_type == "swa_radix"
         assert self.is_hybrid == (linear_state_pool is not None), (
             "the hybrid radix cache, and only it, drives a GDN state pool"
         )
-        assert swa_pool is None or cache_type == "naive", (
-            f"window slots ride the naive cache only, not {cache_type}"
+        assert self.is_swa == (swa_pool is not None) or cache_type == "naive", (
+            f"the SWA radix cache, or naive, drives a window pool, not {cache_type}"
         )
         self.linear_state_pool = linear_state_pool
         self.swa_pool = swa_pool
-        self.prefix_cache: RadixPrefixCache | HybridRadixCache | None = None
+        self.prefix_cache: RadixPrefixCache | HybridRadixCache | SWARadixCache | None = None
         if self.is_hybrid:
             self.prefix_cache = HybridRadixCache(page_size)
+        elif swa_pool is not None and self.is_swa:
+            self.prefix_cache = SWARadixCache(page_size, swa_pool.sliding_window)
         elif cache_type == "radix":
             self.prefix_cache = RadixPrefixCache(page_size)
         self.free_slots = np.arange(num_pages, dtype=np.int32) * page_size
@@ -109,6 +111,8 @@ class CacheManager:
         """Tokens the prefix cache would give back to eviction."""
         if self.is_hybrid:
             return self.hybrid_parts()[0].full_evictable_size
+        elif self.is_swa:
+            return self.swa_parts()[0].full_evictable_size
         elif self.cache_type == "radix":
             return self.radix_cache().evictable_size
         else:
@@ -125,6 +129,14 @@ class CacheManager:
         cache, pool = self.hybrid_parts()
         return pool.num_free_slots + cache.mamba_evictable_size
 
+    @property
+    def swa_available_size(self) -> int:
+        """Window slots allocatable now: free slots plus the tree's unlocked live ones."""
+        pool = self.swa_pool
+        assert pool is not None
+        tree_slots = self.swa_parts()[0].swa_evictable_size if self.is_swa else 0
+        return pool.swa_available_size + tree_slots
+
     def page_usage(self) -> tuple[int, int]:
         """(used, total) pages; evictable prefix-cache pages count as free."""
         used = self.num_pages - len(self.free_slots) - self.evictable_size // self.page_size
@@ -134,6 +146,13 @@ class CacheManager:
         cache, pool = self.prefix_cache, self.linear_state_pool
         assert isinstance(cache, HybridRadixCache) and pool is not None, (
             "the prefix cache needs a GDN state pool"
+        )
+        return cache, pool
+
+    def swa_parts(self) -> tuple[SWARadixCache, SWAKVCache]:
+        cache, pool = self.prefix_cache, self.swa_pool
+        assert isinstance(cache, SWARadixCache) and pool is not None, (
+            "the prefix cache needs a window pool"
         )
         return cache, pool
 
@@ -154,6 +173,11 @@ class CacheManager:
                 HybridCacheHandle(match.cached_len, match.node, match.kv_indices),
                 match.mamba_value,
             )
+        elif self.is_swa:
+            match = self.swa_parts()[0].match_prefix(prefix)
+            if match.cached_len == 0:
+                return MatchResult(None, None)
+            return MatchResult(SWACacheHandle(match.cached_len, match.node, match.kv_indices), None)
         elif self.cache_type == "radix":
             match = self.radix_cache().match_prefix(prefix)
             if match.cached_len == 0:
@@ -164,19 +188,26 @@ class CacheManager:
         else:
             return MatchResult(None, None)
 
-    def lock(self, handle: RadixCacheHandle | HybridCacheHandle | None) -> None:
+    def lock(self, handle: CacheHandle | None) -> None:
         if handle is None:
             return
         elif self.is_hybrid:
             self.hybrid_parts()[0].inc_lock(handle.node)
+        elif self.is_swa:
+            assert isinstance(handle, SWACacheHandle)
+            # The unlock stops releasing window locks at this boundary.
+            handle.swa_uuid = self.swa_parts()[0].inc_lock(handle.node)
         else:
             self.radix_cache().inc_lock(handle.node)
 
-    def unlock(self, handle: RadixCacheHandle | HybridCacheHandle | None) -> None:
+    def unlock(self, handle: CacheHandle | None) -> None:
         if handle is None:
             return
         elif self.is_hybrid:
             self.hybrid_parts()[0].dec_lock(handle.node)
+        elif self.is_swa:
+            assert isinstance(handle, SWACacheHandle)
+            self.swa_parts()[0].dec_lock(handle.node, handle.swa_uuid)
         else:
             self.radix_cache().dec_lock(handle.node)
 
@@ -188,6 +219,16 @@ class CacheManager:
             if not evicted.mamba_slots:
                 break
             pool.free(evicted.mamba_slots)
+            self.free_pages(evicted.kv_indices)
+
+    def ensure_swa_slots(self, num_slots: int) -> None:
+        """Tombstone LRU tree window slots until num_slots are free (or nothing is evictable)."""
+        cache, pool = self.swa_parts()
+        while pool.swa_available_size < num_slots:
+            evicted = cache.evict_swa(num_slots - pool.swa_available_size)
+            if len(evicted.swa_indices) == 0:
+                break
+            pool.free_swa(evicted.swa_indices)
             self.free_pages(evicted.kv_indices)
 
     def allocate_paged(self, reqs: list[Req]) -> None:
@@ -210,6 +251,14 @@ class CacheManager:
                 [self.free_slots, evicted.kv_indices[:: self.page_size]]
             )
             pool.free(evicted.mamba_slots)
+        elif short_tokens > 0 and self.is_swa:
+            # Evicting KV leaves frees their live window slots too.
+            cache, pool = self.swa_parts()
+            evicted = cache.evict_full(short_tokens)
+            self.free_slots = np.concatenate(
+                [self.free_slots, evicted.kv_indices[:: self.page_size]]
+            )
+            pool.free_swa(evicted.swa_indices)
         elif short_tokens > 0 and self.cache_type == "radix":
             # Clamped to what is evictable: a shortfall left after it raises below.
             cache = self.radix_cache()
@@ -222,7 +271,10 @@ class CacheManager:
         if self.swa_pool is not None:
             # Whole pages, as FreeToken: the finish frees the page's every slot.
             page_offsets = np.arange(self.page_size, dtype=np.int32)
-            self.swa_pool.alloc_swa((pages[:, None] + page_offsets).reshape(-1))
+            token_slots = (pages[:, None] + page_offsets).reshape(-1)
+            if self.is_swa:
+                self.ensure_swa_slots(len(token_slots))
+            self.swa_pool.alloc_swa(token_slots)
         offset = 0
         for table_idx, first_page, last_page in allocation:
             count = last_page - first_page
@@ -236,6 +288,8 @@ class CacheManager:
         """Commit a request's prefix to the prefix cache and, on finish, free what it owns."""
         if self.is_hybrid:
             self.cache_req_hybrid(req, finished=finished)
+        elif self.is_swa:
+            self.cache_req_swa(req, finished=finished)
         elif self.cache_type == "radix":
             self.cache_req_radix(req, finished=finished)
         elif finished:
@@ -245,17 +299,28 @@ class CacheManager:
                 self.swa_pool.free_swa(token_slots)
             self.free_pages(token_slots)
 
+    def swa_free_range(self, req: Req) -> tuple[int, int]:
+        """The tokens [start, stop) whose window slots free_swa_out_of_window frees; empty
+        when stop <= start. Behind the window of the step in flight, which reads no key below
+        cached_len - window, with FreeToken's page of margin; from the prefix req locks on,
+        as the tree owns that prefix's window slots."""
+        pool = self.swa_pool
+        assert pool is not None
+        floor = 0 if req.cache_handle is None else req.cache_handle.cached_len
+        start = max(req.swa_evicted_seqlen, floor)
+        stop = align_down(req.cached_len - pool.sliding_window - self.page_size, self.page_size)
+        return start, stop
+
     def free_swa_out_of_window(self, req: Req) -> None:
         """Free the window slots of the tokens no later query of req sees, once the step
         that last extended req has drained (FreeToken's maybe_free_swa_out_of_window and
-        free_swa_out_of_window_extend, with their window + page margin): the step in flight
-        reads no key below cached_len - window."""
+        free_swa_out_of_window_extend)."""
         pool = self.swa_pool
         assert pool is not None
-        frontier = align_down(req.cached_len - pool.sliding_window - self.page_size, self.page_size)
-        if frontier > req.swa_evicted_seqlen:
-            pool.free_swa(self.page_table[req.table_idx, req.swa_evicted_seqlen : frontier])
-            req.swa_evicted_seqlen = frontier
+        start, stop = self.swa_free_range(req)
+        if stop > start:
+            pool.free_swa(self.page_table[req.table_idx, start:stop])
+            req.swa_evicted_seqlen = stop
 
     def cache_req_radix(self, req: Req, *, finished: bool) -> None:
         """Commit the KV of [0, cached_len) to the radix tree.
@@ -371,6 +436,67 @@ class CacheManager:
             req.mamba_ping_pong = (ping_pong[0], ping_pong[1])
         req.mamba_last_track_seqlen = None
 
+    def cache_req_swa(self, req: Req, *, finished: bool) -> None:
+        """Commit the KV of [0, cached_len) with its window slots.
+
+        The insert tombstones what slid out of the request's window (below
+        swa_evicted_seqlen), revives tombstones with the request's live window (moving its
+        window slots behind a locked tombstone's full slots) and hands back the full slots to
+        free in both pools: the tree's displaced ones and the request's duplicates. A finish
+        frees the unaligned tail and keeps only the prompt's last window live, re-stamped for a
+        next turn that cuts there. A prefill commit keeps only the request's last window live
+        and locks it.
+        """
+        cache, pool = self.swa_parts()
+        window = cache.sliding_window
+        old_handle = req.cache_handle
+        old_cached_len = 0 if old_handle is None else old_handle.cached_len
+        page_indices = self.page_table[req.table_idx, : req.cached_len]
+        insert_len = align_down(req.cached_len, self.page_size)
+        freed = EMPTY_IDS
+        if insert_len > 0:
+            inserted = cache.insert(
+                req.input_ids[:insert_len],
+                page_indices[:insert_len],
+                swa_evicted_seqlen=req.swa_evicted_seqlen,
+                update_kv_after_len=old_cached_len,
+            )
+            # Before the free: the moved window slots are the tree's now.
+            pool.move_swa(inserted.swa_targets, inserted.swa_sources)
+            freed = inserted.freed
+        self.unlock(old_handle)
+        pool.free_swa(freed)
+        self.free_pages(freed)
+        if finished:
+            # Through the page ceiling: allocate_paged gave every slot of the last page a
+            # window slot.
+            stop = div_ceil(req.cached_len, self.page_size) * self.page_size
+            tail = self.page_table[req.table_idx, insert_len:stop]
+            pool.free_swa(tail)
+            self.free_pages(tail)
+            prompt_len = align_down(req.prompt_len, self.page_size)
+            if prompt_len > 0:
+                keep_from = align_down(max(prompt_len - window - SWA_RETAIN_GAP, 0), self.page_size)
+                if keep_from > 0:
+                    pool.free_swa(cache.trim_head_swa(req.input_ids[:prompt_len], keep_from))
+                cache.match_prefix(req.input_ids[:prompt_len])
+        else:
+            keep_from = align_down(max(insert_len - window - SWA_RETAIN_GAP, 0), self.page_size)
+            if keep_from > 0:
+                pool.free_swa(cache.trim_head_swa(req.input_ids[:insert_len], keep_from))
+            match = cache.match_prefix(req.input_ids[:insert_len])
+            # Past the match the row would still name the duplicates the insert freed.
+            assert match.cached_len == insert_len, (
+                f"the commit's match stops at {match.cached_len}, short of {insert_len}"
+            )
+            # The insert gave the duplicates' window slots back: the row must name the tree's.
+            self.page_table[req.table_idx, : match.cached_len] = match.kv_indices
+            if match.cached_len > 0:
+                req.cache_handle = SWACacheHandle(match.cached_len, match.node, match.kv_indices)
+            else:
+                req.cache_handle = None
+            self.lock(req.cache_handle)
+
     def free_req_slots(self, req: Req, *, keep_live: bool = False) -> None:
         """Free a finished request's ping-pong pair and, unless donated, its live slot."""
         _, pool = self.hybrid_parts()
@@ -405,7 +531,13 @@ class CacheManager:
         """Idle only: every page, GDN slot and window slot is free or owned by the prefix
         cache."""
         cache_pages = 0
-        if self.is_hybrid:
+        tree_swa_slots = 0
+        if self.is_swa:
+            cache = self.swa_parts()[0]
+            cache.check_integrity()
+            cache_pages = (cache.full_evictable + cache.full_protected) // self.page_size
+            tree_swa_slots = cache.swa_evictable + cache.swa_protected
+        elif self.is_hybrid:
             cache, pool = self.hybrid_parts()
             cache.check_integrity()
             cache_pages = (cache.full_evictable + cache.full_protected) // self.page_size
@@ -424,10 +556,11 @@ class CacheManager:
         )
         assert np.all(self.free_slots % self.page_size == 0)
         if self.swa_pool is not None:
-            # Every window slot but the sentinel is free.
-            assert self.swa_pool.swa_available_size == self.swa_pool.swa_num_tokens - 1, (
-                f"window slots leaked or double freed: free {self.swa_pool.swa_available_size} "
-                f"!= {self.swa_pool.swa_num_tokens - 1}"
+            # Every window slot but the sentinel is free or held by a live tree node.
+            free_swa_slots = self.swa_pool.swa_available_size
+            assert free_swa_slots + tree_swa_slots == self.swa_pool.swa_num_tokens - 1, (
+                f"window slots leaked or double freed: free {free_swa_slots} + tree "
+                f"{tree_swa_slots} != {self.swa_pool.swa_num_tokens - 1}"
             )
 
 

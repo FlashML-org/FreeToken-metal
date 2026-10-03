@@ -2,12 +2,15 @@
 
 Port of FreeToken scheduler/prefill.py. Admission matches the prefix cache, locks the
 match and reserves the GDN slots (1 live + 2 ping-pong, evicting tree snapshots if short);
-a hit carries the snapshot slot to restore from; a continuation chunk inherits the window
-slots freed so far. Divergences: no multimodal currency, and no window-slot admission
-check or chunk cap (the naive window pool holds every running request's window and one
-step's tokens); a miss zeroes its live slot here; the cached part of the token pool row
-is not written (only the extended tokens are ever gathered); a continuation chunk
-inherits the pending track snapshot of the chunk before it.
+on a sliding-window model it needs window slots for the first chunk, up to one window, and
+every chunk is capped by the window slots left this pass. A hit carries the snapshot slot
+to restore from; a continuation chunk inherits the window frontier the chunk before it
+reaches. Divergences: no multimodal currency; the window cap credits none of the request's
+own out-of-window slots (they come back when its step in flight drains, after this
+allocation), so a continuation it leaves empty waits for that drain; a miss zeroes its live
+slot here; the cached part of the token pool row is not written (only the extended tokens
+are ever gathered); a continuation chunk inherits the pending track snapshot of the chunk
+before it.
 """
 
 from __future__ import annotations
@@ -16,9 +19,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from ftmetal.core import Batch, Req, SamplingParams
-from ftmetal.kvcache.hybrid_radix_cache import HybridCacheHandle
-from ftmetal.kvcache.radix_cache import RadixCacheHandle, align_down
+from ftmetal.core import Batch, CacheHandle, Req, SamplingParams
+from ftmetal.kvcache.radix_cache import align_down
 from ftmetal.scheduler.cache import CacheManager, div_ceil
 from ftmetal.scheduler.decode import DecodeManager
 from ftmetal.scheduler.table import TableManager
@@ -61,7 +63,7 @@ class ChunkedReq(Req):
 class AdmittedResources:
     """What a request holds from admission on: its locked match, table row and GDN slots."""
 
-    cache_handle: RadixCacheHandle | HybridCacheHandle | None
+    cache_handle: CacheHandle | None
     table_idx: int
     linear_slot_idx: int | None
     ping_pong: tuple[int, int] | None
@@ -75,6 +77,9 @@ class PrefillAdder:
     reserved_size: int
     cache_manager: CacheManager
     table_manager: TableManager
+    # Window slots of the chunks admitted so far this pass: allocate_paged takes them after
+    # the pass, so the pool's free count does not drop as they are admitted.
+    reserved_swa: int = 0
 
     def kv_reservation_size(self, total_len: int, cached_len: int) -> int:
         page_size = self.cache_manager.page_size
@@ -103,6 +108,15 @@ class PrefillAdder:
             if pool.num_free_slots < ADMISSION_LINEAR_SLOTS:
                 self.cache_manager.unlock(handle)
                 return None
+        swa_pool = self.cache_manager.swa_pool
+        if swa_pool is not None:
+            # The first chunk's window, in the whole pages allocate_paged backs.
+            page_size = self.cache_manager.page_size
+            first_window = min(pending.input_len - cached_len, swa_pool.sliding_window) + 1
+            need_swa = div_ceil(first_window, page_size) * page_size
+            if self.cache_manager.swa_available_size - self.reserved_swa < need_swa:
+                self.cache_manager.unlock(handle)
+                return None
         table_idx = self.table_manager.allocate()
         if handle is not None:
             self.table_manager.page_table[table_idx, :cached_len] = handle.kv_indices
@@ -123,9 +137,19 @@ class PrefillAdder:
         next_track_idx: int,
         last_track_seqlen: int | None,
         swa_evicted_seqlen: int,
-    ) -> Req:
+    ) -> Req | None:
+        """The next chunk of pending; None when no window slot is left for it this pass."""
+        page_size = self.cache_manager.page_size
         remain_len = pending.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
+        has_window = self.cache_manager.swa_pool is not None
+        if has_window:
+            # The chunk's new pages must fit the window slots left this pass.
+            budget = max(self.cache_manager.swa_available_size - self.reserved_swa, 0)
+            max_end = (div_ceil(cached_len, page_size) + budget // page_size) * page_size
+            chunk_size = min(chunk_size, max_end - cached_len)
+            if chunk_size <= 0:
+                return None
         align = self.cache_manager.prefill_chunk_align
         if align > 1 and 0 < chunk_size < remain_len:
             # An unaligned end only loses this prompt's snapshot boundaries: keep it when the
@@ -134,6 +158,8 @@ class PrefillAdder:
             chunk_size = aligned if aligned > 0 else chunk_size
         is_chunked = chunk_size < remain_len
         self.token_budget -= chunk_size
+        if has_window:
+            self.reserved_swa += self.kv_reservation_size(cached_len + chunk_size, cached_len)
         self.reserved_size += self.kv_reservation_size(
             pending.input_len + pending.output_len, cached_len
         )
@@ -165,6 +191,12 @@ class PrefillAdder:
             return None
         chunked = pending.chunked_req
         if chunked is not None:
+            swa_evicted_seqlen = chunked.swa_evicted_seqlen
+            if self.cache_manager.swa_pool is not None:
+                # The chunk before may still be in flight: its drain frees this range before
+                # anything reads this chunk's frontier, so the chunk inherits it already.
+                start, stop = self.cache_manager.swa_free_range(chunked)
+                swa_evicted_seqlen = stop if stop > start else swa_evicted_seqlen
             # A continuation already holds its live state: nothing to restore.
             resources = AdmittedResources(
                 cache_handle=chunked.cache_handle,
@@ -181,13 +213,13 @@ class PrefillAdder:
                 resources,
                 chunked.mamba_next_track_idx,
                 chunked.mamba_last_track_seqlen,
-                chunked.swa_evicted_seqlen,
+                swa_evicted_seqlen,
             )
         resources = self.try_allocate_one(pending)
         if resources is None:
             return None
         cached_len = 0 if resources.cache_handle is None else resources.cache_handle.cached_len
-        return self.add_one_req(
+        req = self.add_one_req(
             pending,
             cached_len,
             resources,
@@ -195,6 +227,8 @@ class PrefillAdder:
             last_track_seqlen=None,
             swa_evicted_seqlen=0,
         )
+        assert req is not None, "admission seats the first chunk's window slots"
+        return req
 
 
 @dataclass

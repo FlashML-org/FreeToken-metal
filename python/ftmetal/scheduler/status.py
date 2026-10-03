@@ -47,6 +47,7 @@ class SchedulerStatusReporter:
         kv_total_pages: int,
         page_size: int,
         linear_slots: tuple[int, int] | None = None,
+        swa_tokens: tuple[int, int] | None = None,
     ) -> None:
         now = self.clock()
         if self._burst_start is None:
@@ -63,6 +64,7 @@ class SchedulerStatusReporter:
                 kv_used_pages=kv_used_pages,
                 kv_total_pages=kv_total_pages,
                 linear_slots=linear_slots,
+                swa_tokens=swa_tokens,
             )
         else:
             # Decode step time is the gap between consecutive decode schedules.
@@ -79,6 +81,7 @@ class SchedulerStatusReporter:
                 kv_total_pages=kv_total_pages,
                 page_size=page_size,
                 linear_slots=linear_slots,
+                swa_tokens=swa_tokens,
             )
 
     def report_idle(self) -> None:
@@ -112,6 +115,7 @@ class SchedulerStatusReporter:
         kv_used_pages: int,
         kv_total_pages: int,
         linear_slots: tuple[int, int] | None,
+        swa_tokens: tuple[int, int] | None,
     ) -> None:
         gap = now - self._last_prefill_time
         self._last_prefill_time = now
@@ -123,6 +127,7 @@ class SchedulerStatusReporter:
             f"#new-token: {new_tokens}, "
             f"#cached-token: {cached_tokens}, "
             f"token usage: {_usage_ratio(kv_used_pages, kv_total_pages):.2f}, "
+            f"{_swa_msg(swa_tokens)}"
             f"{_linear_msg(linear_slots)}"
             f"#running-req: {running_reqs}, "
             f"#queue-req: {queue_reqs}, "
@@ -140,6 +145,7 @@ class SchedulerStatusReporter:
         kv_total_pages: int,
         page_size: int,
         linear_slots: tuple[int, int] | None,
+        swa_tokens: tuple[int, int] | None,
     ) -> None:
         self._decode_forward_count += 1
         self._decode_generated_tokens += batch.size
@@ -154,6 +160,7 @@ class SchedulerStatusReporter:
             f"#running-req: {running_reqs}, "
             f"#token: {kv_used_pages * page_size}, "
             f"token usage: {_usage_ratio(kv_used_pages, kv_total_pages):.2f}, "
+            f"{_swa_msg(swa_tokens)}"
             f"{_linear_msg(linear_slots)}"
             f"gen throughput (token/s): {gen_throughput:.2f}, "
             f"#queue-req: {queue_reqs}"
@@ -170,6 +177,14 @@ def _linear_msg(linear_slots: tuple[int, int] | None) -> str:
         return ""
     used, total = linear_slots
     return f"gdn slots: {used}/{total}, "
+
+
+def _swa_msg(swa_tokens: tuple[int, int] | None) -> str:
+    """Window slot occupancy for sliding-window models; empty for the rest."""
+    if swa_tokens is None:
+        return ""
+    used, total = swa_tokens
+    return f"swa tokens: {used}/{total}, "
 
 
 __all__ = ["SchedulerStatusReporter"]

@@ -2,10 +2,9 @@
 
 Port of FreeToken kvcache/radix_cache.py (RadixTreeNode, the tree walk, the key per page
 size, RadixPrefixCache). Divergences: keys and values are host numpy int32 arrays; a child
-is keyed by the tuple of its first page's tokens at every page size; the node carries no
-SWA fields; RadixPrefixCache takes HybridRadixCache's shapes (a match carries its KV slots,
-inc_lock/dec_lock take the node, insert returns the end node), has no reset and
-check_integrity recomputes its size counters.
+is keyed by the tuple of its first page's tokens at every page size; RadixPrefixCache takes
+HybridRadixCache's shapes (a match carries its KV slots, inc_lock/dec_lock take the node,
+insert returns the end node), has no reset and check_integrity recomputes its size counters.
 """
 
 from __future__ import annotations
@@ -42,6 +41,12 @@ class RadixTreeNode:
         # node's end boundary, with its own lock count. split_at leaves it on the suffix.
         self.mamba_value: int | None = None
         self.mamba_ref_count = 0
+        # The SWA cache's second currency is the window slots behind value: a tombstone's were
+        # freed (its full KV stays), swa_ref_count locks the trailing window and swa_uuid marks
+        # the node a window lock stops at.
+        self.swa_tombstone = False
+        self.swa_ref_count = 0
+        self.swa_uuid: int | None = None
         self.key = EMPTY_IDS
         self.value = EMPTY_IDS
 
@@ -83,6 +88,12 @@ class RadixTreeNode:
         new_node.set_key_value(self.key[:pos], self.value[:pos])
         new_node.set_parent(parent)
         new_node.ref_count = self.ref_count
+        # Both halves keep the tombstone and the window lock; the lock boundary moves to the
+        # root-side half, which an unlock walking up reaches last.
+        new_node.swa_tombstone = self.swa_tombstone
+        new_node.swa_ref_count = self.swa_ref_count
+        new_node.swa_uuid = self.swa_uuid
+        self.swa_uuid = None
         self.set_key_value(self.key[pos:], self.value[pos:])
         self.set_parent(new_node)
         return new_node

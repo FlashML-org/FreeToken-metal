@@ -5,28 +5,35 @@ Every page returns and rows hold page-aligned slots; a window pool backs every n
 and keeps only a request's window live as it slides. The radix type commits a request's
 prefix at its prefill and its finish, frees and re-points duplicates and evicts unlocked
 leaves under pressure; with a GDN state pool the hybrid radix commit donates the track
-snapshot, a finish donates its live slot, and both currencies evict under pressure. Parts
-port FreeToken tests/scheduler/test_hybrid_cache_manager.py and
-test_commit_repoints_page_table.py, on a tiny real LinearStatePool.
+snapshot, a finish donates its live slot, and both currencies evict under pressure; with a
+window pool the SWA radix commit keeps the windows a next prompt can resume from, and the
+window slots evict on their own. Parts port FreeToken
+tests/scheduler/test_hybrid_cache_manager.py, test_commit_repoints_page_table.py,
+test_swa_commit_lock_and_floor.py and test_swa_pagesize.py, on tiny real pools.
 """
 
 from __future__ import annotations
 
-import logging
 from functools import partial
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import mlx.core as mx
 import numpy as np
 import pytest
 
 from ftmetal.attention.metadata import AttnType
-from ftmetal.core import Req, SamplingParams
+from ftmetal.core import Batch, Req, SamplingParams
 from ftmetal.kvcache.linear_state_pool import LinearStatePool, linear_pool_num_slots
-from ftmetal.kvcache.swa_pool import SENTINEL_SLOT, SWAKVCache
+from ftmetal.kvcache.swa_pool import (
+    SENTINEL_SLOT,
+    SWA_RETAIN_GAP,
+    SWAKVCache,
+    swa_radix_floor_tokens,
+)
 from ftmetal.models.config import KVCacheGroupSpec
 from ftmetal.scheduler.cache import CacheManager, MatchResult, resolve_cache_type
-from ftmetal.scheduler.prefill import ChunkedReq, PendingReq, PrefillAdder
+from ftmetal.scheduler.decode import DecodeManager
+from ftmetal.scheduler.prefill import ChunkedReq, PendingReq, PrefillAdder, PrefillManager
 from ftmetal.scheduler.table import TableManager
 
 
@@ -83,9 +90,7 @@ def test_pages_exhausted_raises(cache_type: Literal["naive", "radix"]) -> None:
         manager.allocate_paged([make_req(0, 12, 1)])
 
 
-@pytest.mark.parametrize("page_size", [1, 4])
-def test_window_slots_slide_with_the_request_and_return_on_finish(page_size: int) -> None:
-    window, num_pages = 8, 32
+def make_window_pool(window: int, num_swa_tokens: int, num_full_tokens: int) -> SWAKVCache:
     spec = KVCacheGroupSpec(
         name="swa",
         attn_type=AttnType.SWA,
@@ -94,7 +99,13 @@ def test_window_slots_slide_with_the_request_and_return_on_finish(page_size: int
         head_dim=8,
         sliding_window=window,
     )
-    pool = SWAKVCache(spec, 48, (num_pages + 1) * page_size, mx.float16)
+    return SWAKVCache(spec, num_swa_tokens, num_full_tokens, mx.float16)
+
+
+@pytest.mark.parametrize("page_size", [1, 4])
+def test_window_slots_slide_with_the_request_and_return_on_finish(page_size: int) -> None:
+    window, num_pages = 8, 32
+    pool = make_window_pool(window, 48, (num_pages + 1) * page_size)
     page_table = np.zeros((1, 64), dtype=np.int32)
     manager = CacheManager(num_pages, page_size, page_table, "naive", swa_pool=pool)
     req = make_req(0, 20, 12)
@@ -326,18 +337,10 @@ def test_cache_type_resolves_radix_to_the_hybrid_radix_on_a_gdn_model() -> None:
         resolve("naive", has_linear_attention=True)
 
 
-def test_cache_type_resolves_radix_to_naive_on_a_sliding_window_model(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    with caplog.at_level(logging.WARNING, logger="ftmetal.scheduler.cache"):
-        resolved = resolve_cache_type("radix", has_linear_attention=False, has_sliding_window=True)
-    assert resolved == "naive"
-    assert len(caplog.records) == 1 and "SWA radix cache" in caplog.text
-    caplog.clear()
-    assert resolve_cache_type("naive", has_linear_attention=False, has_sliding_window=True) == (
-        "naive"
-    )
-    assert not caplog.records
+def test_cache_type_resolves_radix_to_the_swa_radix_on_a_sliding_window_model() -> None:
+    resolve = partial(resolve_cache_type, has_linear_attention=False, has_sliding_window=True)
+    assert resolve("radix") == "swa_radix"
+    assert resolve("naive") == "naive"
 
 
 def test_radix_prefill_commit_publishes_the_prompt_and_a_shared_prefix_hits() -> None:
@@ -469,3 +472,317 @@ def test_radix_admission_writes_the_cached_row_and_keeps_unaligned_chunks() -> N
     assert isinstance(req, ChunkedReq) and (req.cached_len, req.extend_len) == (40, 10)
     assert req.cache_handle is not None
     assert page_table[req.table_idx, :40].tolist() == req.cache_handle.kv_indices.tolist()
+
+
+WINDOW = 8
+# A token no prompt holds: what the driver samples.
+SAMPLED = 999
+
+
+def swa_manager(
+    page_size: int,
+    num_pages: int,
+    num_swa_tokens: int,
+    cache_type: Literal["naive", "swa_radix"],
+    max_running_req: int = 2,
+) -> tuple[CacheManager, TableManager]:
+    pool = make_window_pool(WINDOW, num_swa_tokens, (num_pages + 1) * page_size)
+    page_table = np.zeros((max_running_req + 1, 256), dtype=np.int32)
+    manager = CacheManager(num_pages, page_size, page_table, cache_type, swa_pool=pool)
+    return manager, TableManager(max_running_reqs=max_running_req, page_table=page_table)
+
+
+def check_window_live(manager: CacheManager, steps: list[tuple[Req, int, int]]) -> None:
+    """Every window slot a step reads, [cached_len - window + 1, device_len) at its launch,
+    is live."""
+    pool = manager.swa_pool
+    assert pool is not None
+    for req, start, stop in steps:
+        window = pool.translate(manager.page_table[req.table_idx, start:stop])
+        assert SENTINEL_SLOT not in window, f"{req} reads a freed window slot in [{start}, {stop})"
+
+
+class Served(NamedTuple):
+    # The prefix each admission found cached.
+    cached_lens: list[int]
+    # Each prompt's prefill chunk lengths.
+    chunk_lens: list[list[int]]
+
+
+def serve(
+    manager: CacheManager,
+    table: TableManager,
+    prompts: list[list[int]],
+    output_len: int,
+    max_extend_tokens: int,
+    abort_at: int | None,
+    arrive_at: list[int] | None = None,
+) -> Served:
+    """Prompts served to completion in the scheduler's order: step N + 1 is allocated before
+    step N drains, and a drain slides the window slots, commits a prompt's last chunk and
+    frees a finished request. Prompt i arrives before iteration arrive_at[i] (all before the
+    first by default); the first prompt is aborted before iteration abort_at."""
+    pool = manager.swa_pool
+    assert pool is not None
+    decode = DecodeManager(manager.page_size)
+    prefill = PrefillManager(manager, table, decode)
+    params = SamplingParams(max_tokens=output_len, ignore_eos=True)
+    arrivals = [1] * len(prompts) if arrive_at is None else arrive_at
+    cached_lens: dict[int, int] = {}
+    chunk_lens: list[list[int]] = [[] for _ in prompts]
+    finished: set[Req] = set()
+    in_flight: Batch | None = None
+    steps: list[tuple[Req, int, int]] = []
+    iterations = 0
+    last_arrival = max(arrivals)
+    while iterations < last_arrival or prefill.runnable or decode.runnable or in_flight is not None:
+        iterations += 1
+        assert iterations < 1000, "the requests stopped making progress"
+        for uid, prompt in enumerate(prompts):
+            if arrivals[uid] == iterations:
+                prefill.add_one_req(uid, np.array(prompt, dtype=np.int32), params)
+        aborted = prefill.abort_req(0) or decode.abort_req(0) if iterations == abort_at else None
+        if aborted is not None:
+            aborted.aborted = True
+            if in_flight is None or aborted not in in_flight.reqs:
+                manager.cache_req(aborted, finished=True)
+                table.free(aborted.table_idx)
+        batch = prefill.schedule_next_batch(max_extend_tokens) or decode.schedule_next_batch()
+        steps = []
+        if batch is not None:
+            manager.allocate_paged(batch.reqs)
+            steps = [
+                (req, max(0, req.cached_len - pool.sliding_window + 1), req.device_len)
+                for req in batch.reqs
+            ]
+            check_window_live(manager, steps)
+            for req in batch.reqs:
+                cached_lens.setdefault(req.uid, req.cached_len)
+                if batch.is_prefill:
+                    chunk_lens[req.uid].append(req.extend_len)
+                req.complete_one()
+            decode.filter_reqs(batch.reqs)
+        if in_flight is not None:
+            new_finished: set[Req] = set()
+            with manager.lazy_free_region():
+                for req in in_flight.reqs:
+                    if req.aborted:
+                        manager.cache_req(req, finished=True)
+                        table.free(req.table_idx)
+                        continue
+                    if req in finished:
+                        continue
+                    if in_flight.is_decode or isinstance(req, ChunkedReq):
+                        manager.free_swa_out_of_window(req)
+                    if isinstance(req, ChunkedReq):
+                        continue
+                    req.append_host(SAMPLED)
+                    if req.generated_len >= req.output_len:
+                        decode.remove_req(req)
+                        manager.cache_req(req, finished=True)
+                        table.free(req.table_idx)
+                        new_finished.add(req)
+                    elif in_flight.is_prefill:
+                        manager.cache_req(req, finished=False)
+            finished = new_finished
+            # The drain freed nothing the step in flight reads.
+            check_window_live(manager, [step for step in steps if step[0] not in finished])
+        in_flight = batch
+    manager.check_integrity()
+    return Served([cached_lens[uid] for uid in range(len(prompts))], chunk_lens)
+
+
+def run(first: int, length: int) -> list[int]:
+    return list(range(first, first + length))
+
+
+class SWACase(NamedTuple):
+    label: str
+    page_size: int
+    num_swa_tokens: int
+    max_extend_tokens: int
+    output_len: int
+    # Prompt rounds: a round's prompts are served together, to completion, before the next.
+    rounds: list[list[list[int]]]
+    # The prefix each admission found cached, round by round.
+    cached_lens: list[list[int]]
+    cache_type: Literal["naive", "swa_radix"] = "swa_radix"
+    num_pages: int = 128
+    # The driver iteration the first round's first prompt is aborted at.
+    abort_at: int | None = None
+
+
+PROMPT = run(1, 40)
+SWA_CASES = [
+    SWACase(
+        "a chunked prompt and its decode run on a pool smaller than their tokens",
+        page_size=1,
+        num_swa_tokens=48,
+        max_extend_tokens=12,
+        output_len=20,
+        rounds=[[PROMPT]],
+        cached_lens=[[0]],
+    ),
+    SWACase(
+        "the same prompt again resumes from the tree",
+        page_size=1,
+        num_swa_tokens=64,
+        max_extend_tokens=12,
+        output_len=6,
+        rounds=[[PROMPT], [PROMPT]],
+        cached_lens=[[0], [39]],
+    ),
+    SWACase(
+        "a finish keeps only the prompt's last window and gap live: a head before them misses",
+        page_size=1,
+        num_swa_tokens=64,
+        max_extend_tokens=64,
+        output_len=4,
+        rounds=[[run(1, 40)], [run(1, 15) + run(100, 10)], [run(1, 30) + run(200, 10)]],
+        cached_lens=[[0], [0], [30]],
+    ),
+    SWACase(
+        "a head inside the slid-out part of a chunked prompt is not resumable",
+        page_size=1,
+        num_swa_tokens=64,
+        max_extend_tokens=12,
+        output_len=4,
+        rounds=[[PROMPT], [run(1, 15) + run(100, 10)]],
+        cached_lens=[[0], [0]],
+    ),
+    SWACase(
+        "the next turn resumes past the decoded tokens",
+        page_size=4,
+        num_swa_tokens=96,
+        max_extend_tokens=12,
+        output_len=12,
+        rounds=[[PROMPT], [PROMPT + [SAMPLED] * 12 + run(200, 9)]],
+        cached_lens=[[0], [48]],
+    ),
+    SWACase(
+        "a second prompt waits for window slots the first one's chunk reserved",
+        page_size=4,
+        num_swa_tokens=40,
+        max_extend_tokens=64,
+        output_len=8,
+        rounds=[[run(1, 30), run(300, 30)]],
+        cached_lens=[[0, 0]],
+    ),
+    SWACase(
+        "two requests decode together on a pool at the floor",
+        page_size=4,
+        num_swa_tokens=swa_radix_floor_tokens(WINDOW, 4, 2, 16) + 1,
+        max_extend_tokens=16,
+        output_len=40,
+        rounds=[[run(1, 60), run(500, 50)]],
+        cached_lens=[[0, 0]],
+    ),
+    SWACase(
+        "two long chunked prompts fit a pool at the floor",
+        page_size=1,
+        num_swa_tokens=swa_radix_floor_tokens(WINDOW, 1, 2, 64) + 1,
+        max_extend_tokens=64,
+        output_len=40,
+        rounds=[[run(1, 120), run(500, 110)]],
+        cached_lens=[[0, 0]],
+        num_pages=512,
+    ),
+    SWACase(
+        "a dry window pool takes the oldest windows of the tree",
+        page_size=1,
+        num_swa_tokens=40,
+        max_extend_tokens=16,
+        output_len=4,
+        rounds=[[run(1, 20)], [run(100, 20)], [run(200, 20)], [run(1, 20), run(200, 20)]],
+        cached_lens=[[0], [0], [0], [0, 19]],
+    ),
+    SWACase(
+        "page pressure evicts the tree's KV with its window slots",
+        page_size=4,
+        num_swa_tokens=96,
+        max_extend_tokens=32,
+        output_len=4,
+        rounds=[[run(1, 40)], [run(100, 40)], [run(1, 40)]],
+        cached_lens=[[0], [0], [0]],
+        num_pages=16,
+    ),
+    SWACase(
+        "a prompt recomputing a tombstone a running request locks revives it for its window",
+        page_size=1,
+        num_swa_tokens=200,
+        max_extend_tokens=12,
+        output_len=30,
+        rounds=[[PROMPT], [PROMPT, PROMPT[:30] + run(500, 3)]],
+        cached_lens=[[0], [39, 0]],
+        num_pages=256,
+    ),
+    SWACase(
+        "an aborted chunk in flight commits only what its window kept",
+        page_size=1,
+        num_swa_tokens=64,
+        max_extend_tokens=12,
+        output_len=4,
+        rounds=[[PROMPT], [PROMPT]],
+        cached_lens=[[0], [24]],
+        abort_at=3,
+    ),
+    SWACase(
+        "naive frees every window slot it took",
+        page_size=4,
+        num_swa_tokens=96,
+        max_extend_tokens=12,
+        output_len=12,
+        rounds=[[PROMPT], [PROMPT]],
+        cached_lens=[[0], [0]],
+        cache_type="naive",
+    ),
+]
+
+
+def test_swa_radix_serves_and_resumes_prompts_and_leaks_nothing() -> None:
+    for case in SWA_CASES:
+        manager, table = swa_manager(
+            case.page_size, case.num_pages, case.num_swa_tokens, case.cache_type
+        )
+        cached_lens = [
+            serve(
+                manager,
+                table,
+                prompts,
+                case.output_len,
+                case.max_extend_tokens,
+                case.abort_at if round_idx == 0 else None,
+            ).cached_lens
+            for round_idx, prompts in enumerate(case.rounds)
+        ]
+        assert cached_lens == case.cached_lens, case.label
+
+
+def test_swa_radix_commit_keeps_only_the_last_window() -> None:
+    """A prefill commit tombstones the prompt before its last window and the retain gap and
+    gives their window slots back at once; it locks what is left."""
+    manager, _ = swa_manager(1, 128, 64, "swa_radix")
+    cache, pool = manager.swa_parts()
+    req = prefilled(manager, None, 0, run(1, 40), track_seqlen=None)
+    with manager.lazy_free_region():
+        manager.cache_req(req, finished=False)
+    kept = WINDOW + SWA_RETAIN_GAP
+    assert (cache.swa_evictable, cache.swa_protected) == (0, kept)
+    assert pool.swa_available_size == 63 - kept
+    assert manager.match_req(np.array(run(1, 15) + run(100, 10))) == MatchResult(None, None)
+    hit = manager.match_req(np.array(run(1, 30) + run(200, 10))).handle
+    assert hit is not None and hit.cached_len == 30
+    with manager.lazy_free_region():
+        manager.cache_req(req, finished=True)
+    manager.check_integrity()
+
+
+def test_four_running_requests_and_a_full_chunk_fit_at_the_floor() -> None:
+    """Three requests decode with their tails grown when a long fourth prompt arrives: on a
+    pool at exactly the floor, every chunk but its last still runs at full size."""
+    chunk = 16
+    floor = swa_radix_floor_tokens(WINDOW, 1, 4, chunk)
+    manager, table = swa_manager(1, 512, floor + 1, "swa_radix", max_running_req=4)
+    prompts = [run(1, 40), run(100, 40), run(200, 40), run(300, 100)]
+    served = serve(manager, table, prompts, 60, chunk, None, arrive_at=[1, 1, 1, 30])
+    assert served.chunk_lens[3] == [chunk] * 6 + [4]

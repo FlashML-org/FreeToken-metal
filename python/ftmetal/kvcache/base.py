@@ -12,7 +12,7 @@ types live with the radix caches and the CacheManager; runtime rebuild is droppe
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import NamedTuple, Protocol, Self
+from typing import Literal, NamedTuple, Protocol, Self
 
 import mlx.core as mx
 
@@ -37,6 +37,12 @@ class PoolConfig(Protocol):
 
     @property
     def linear_state_cache_ratio(self) -> float: ...
+
+    @property
+    def cache_type(self) -> Literal["naive", "radix"]: ...
+
+    @property
+    def swa_windows(self) -> int | None: ...
 
 
 class PoolCost(NamedTuple):

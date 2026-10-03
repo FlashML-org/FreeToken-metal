@@ -116,6 +116,14 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         "linear attention); naive reuses nothing and needs a model without linear attention",
     )
     parser.add_argument(
+        "--swa-windows",
+        type=positive_int,
+        metavar="N",
+        default=ServerArgs.swa_windows,
+        help="window pool of the radix cache on a sliding-window model, in sliding windows "
+        "(default: the fewest that hold the running requests and a prefill, and 8 more)",
+    )
+    parser.add_argument(
         "--attention-backend",
         "--attn",
         choices=SUPPORTED_ATTENTION_BACKENDS.supported_names(),
@@ -144,6 +152,7 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         num_page_override=namespace.num_page_override,
         page_size=namespace.page_size,
         cache_type=namespace.cache_type,
+        swa_windows=namespace.swa_windows,
         attention_backend=namespace.attention_backend,
         command_graph=not namespace.disable_command_graph and command_graph_from_env(),
     )

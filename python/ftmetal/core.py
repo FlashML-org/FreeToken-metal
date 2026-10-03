@@ -19,6 +19,10 @@ import numpy as np
 from ftmetal.attention.metadata import AttnType, BaseAttnMetadata
 from ftmetal.kvcache.hybrid_radix_cache import HybridCacheHandle
 from ftmetal.kvcache.radix_cache import RadixCacheHandle
+from ftmetal.kvcache.swa_radix_cache import SWACacheHandle
+
+# A locked prefix-cache match, of the cache type's own handle.
+CacheHandle = RadixCacheHandle | HybridCacheHandle | SWACacheHandle
 
 
 @dataclass
@@ -44,7 +48,7 @@ class Req:
     uid: int
     sampling_params: SamplingParams
     # The locked prefix-cache match; None when nothing is locked (a miss, or no prefix cache).
-    cache_handle: RadixCacheHandle | HybridCacheHandle | None = None
+    cache_handle: CacheHandle | None = None
     # GDN state slots; None for models without linear attention.
     linear_slot_idx: int | None = None
     # Two track slots that take the prefill snapshots in turn (chunk N + 1 launches before
@@ -166,4 +170,4 @@ def host_floats(values: mx.array) -> list[float]:
     return floats
 
 
-__all__ = ["Batch", "Req", "SamplingParams", "host_floats", "host_ints"]
+__all__ = ["Batch", "CacheHandle", "Req", "SamplingParams", "host_floats", "host_ints"]

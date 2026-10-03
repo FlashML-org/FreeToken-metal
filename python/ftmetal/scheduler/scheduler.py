@@ -24,6 +24,7 @@ from ftmetal.core import Batch, Req, SamplingParams, host_ints
 from ftmetal.engine.config import EngineConfig
 from ftmetal.engine.engine import Engine, ForwardOutput
 from ftmetal.engine.sample import BatchSamplingArgs
+from ftmetal.kvcache.swa_pool import swa_radix_num_windows
 from ftmetal.message.backend import (
     AbortBackendMsg,
     BaseBackendMsg,
@@ -69,12 +70,28 @@ class TokenEvent:
 
 class Scheduler:
     def __init__(self, config: EngineConfig, eos_token_ids: set[int]) -> None:
-        # Before the engine loads anything: an unsupported --cache-type fails fast.
+        # Before the engine loads anything: an unsupported --cache-type or too few
+        # --swa-windows fails fast.
+        swa_group = config.model_config.swa_attention_group()
         cache_type = resolve_cache_type(
             config.cache_type,
             has_linear_attention=config.model_config.has_linear_attention,
-            has_sliding_window=config.model_config.swa_attention_group() is not None,
+            has_sliding_window=swa_group is not None,
         )
+        if cache_type == "swa_radix" and swa_group is not None:
+            num_windows = swa_radix_num_windows(
+                swa_group.sliding_window,
+                config.page_size,
+                config.max_running_req,
+                config.max_extend_tokens,
+                config.swa_windows,
+            )
+            logger.info(f"window pool: {num_windows} windows of {swa_group.sliding_window}")
+        elif config.swa_windows is not None:
+            logger.warning(
+                f"--swa-windows sizes the SWA radix cache's window pool: ignored with the "
+                f"{cache_type} cache"
+            )
         self.engine = Engine(config)
         self.config = config
         self.eos_token_ids = eos_token_ids
@@ -159,6 +176,7 @@ class Scheduler:
             kv_total_pages=kv_total_pages,
             page_size=self.config.page_size,
             linear_slots=self.mamba_slot_usage(),
+            swa_tokens=self.swa_token_usage(),
         )
 
     def mamba_slot_usage(self) -> tuple[int, int] | None:
@@ -168,6 +186,15 @@ class Scheduler:
             return None
         total = pool.num_slots - 1
         return total - self.cache_manager.mamba_available_size, total
+
+    def swa_token_usage(self) -> tuple[int, int] | None:
+        """(used, total) window slots; free slots and the tree's unlocked live ones are not
+        used."""
+        pool = self.engine.ctx.swa_pool
+        if pool is None:
+            return None
+        total = pool.swa_num_tokens - 1
+        return total - self.cache_manager.swa_available_size, total
 
     def run_forever(
         self,
@@ -329,8 +356,12 @@ class Scheduler:
                     continue
                 if req in self.finished_reqs:
                     continue
-                if self.cache_manager.swa_pool is not None:
-                    # This step has drained: its keys behind the window are read no more.
+                if self.cache_manager.swa_pool is not None and (
+                    batch.is_decode or isinstance(req, ChunkedReq)
+                ):
+                    # This step has drained: its keys behind the window are read no more. A
+                    # prompt's last chunk commits with the frontier of the chunks before it,
+                    # as FreeToken's does; its own slots slide out from the next drain.
                     self.cache_manager.free_swa_out_of_window(req)
                 if isinstance(req, ChunkedReq):
                     continue
