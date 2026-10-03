@@ -33,16 +33,16 @@ import mlx.core as mx
 import numpy as np
 
 import ftmetal
-from ftmetal.core import Batch, Req, SamplingParams, host_ints
-from ftmetal.engine.config import EngineConfig
-from ftmetal.kernel._ext import _C
-from ftmetal.kernel.command_graph import (
+from ftmetal.command_graph import (
+    _C,
     ArenaPlan,
     begin_count,
     check_same_graph,
     end_count,
     wait_until_available,
 )
+from ftmetal.core import Batch, Req, SamplingParams, host_ints
+from ftmetal.engine.config import EngineConfig
 from ftmetal.scheduler.scheduler import Scheduler
 from ftmetal.tokenizer import TokenizeManager
 

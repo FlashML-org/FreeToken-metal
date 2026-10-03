@@ -13,13 +13,12 @@ import numpy as np
 import pytest
 
 from ftmetal.attention.linear import LinearAttnBackend
+from ftmetal.command_graph import _C, check_same_graph
 from ftmetal.core import Batch, SamplingParams
 from ftmetal.engine import engine, graph
 from ftmetal.engine.config import EngineConfig
 from ftmetal.engine.engine import Engine
 from ftmetal.engine.graph import GraphRunner, determine_graph_bs
-from ftmetal.kernel._ext import _C
-from ftmetal.kernel.command_graph import check_same_graph
 from ftmetal.scheduler.scheduler import Scheduler, TokenEvent
 from tiny_model import build_reference, reference_greedy, save_checkpoint
 

@@ -18,7 +18,9 @@ from typing import NamedTuple
 import mlx.core as mx
 import numpy as np
 
-from ftmetal.kernel._ext import _C
+# mlx.core must be imported first: _C resolves libmlx symbols from the loaded module.
+# The kernels' loader (ftmetal.kernel._ext) checks the pinned mlx version.
+from ftmetal.command_graph import _C
 
 # Arena offsets and sizes are multiples of this: Metal buffer offsets and the vector
 # loads of MLX's kernels are aligned at it.

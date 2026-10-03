@@ -6,8 +6,8 @@ import random
 import mlx.core as mx
 import pytest
 
-from ftmetal.kernel._ext import _C
-from ftmetal.kernel.command_graph import (
+from ftmetal.command_graph import (
+    _C,
     ARENA_ALIGNMENT,
     begin_capture,
     check_same_graph,

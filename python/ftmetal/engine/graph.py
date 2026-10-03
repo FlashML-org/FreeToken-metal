@@ -1,7 +1,7 @@
 """GraphRunner: decode steps replayed from one CommandGraph capture per batch-size bucket.
 
 Port of FreeToken engine/graph.py. Divergences: a graph is a CommandGraph capture
-(kernel/command_graph.py) instead of a CUDA graph, so there is no GraphCaptureBuffer:
+(ftmetal.command_graph) instead of a CUDA graph, so there is no GraphCaptureBuffer:
 the step inputs (input_ids, positions, out_loc and the metadata arrays a backend's
 prepare_for_replay leaves at the bucket's fixed shapes) are rebound by every replay,
 and so are the pools, which the replay takes and returns; the bs ladder ends at
@@ -24,15 +24,15 @@ from mlx.utils import tree_flatten
 
 from ftmetal.attention.base import BaseAttnBackend
 from ftmetal.attention.metadata import AttnType
-from ftmetal.core import Batch, Req
-from ftmetal.kernel._ext import _C
-from ftmetal.kernel.command_graph import (
+from ftmetal.command_graph import (
+    _C,
     ArenaPlan,
     capture,
     place_blocks,
     plan_graph_arena,
     replay,
 )
+from ftmetal.core import Batch, Req
 from ftmetal.kvcache import pool_arrays, set_pool_arrays
 from ftmetal.kvcache.base import BasePool
 from ftmetal.models.blocks import BaseLLMModel
