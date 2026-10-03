@@ -18,6 +18,7 @@ import numpy as np
 
 from ftmetal.attention.metadata import AttnType, BaseAttnMetadata
 from ftmetal.kvcache.hybrid_radix_cache import HybridCacheHandle
+from ftmetal.kvcache.radix_cache import RadixCacheHandle
 
 
 @dataclass
@@ -43,7 +44,7 @@ class Req:
     uid: int
     sampling_params: SamplingParams
     # The locked prefix-cache match; None when nothing is locked (a miss, or no prefix cache).
-    cache_handle: HybridCacheHandle | None = None
+    cache_handle: RadixCacheHandle | HybridCacheHandle | None = None
     # GDN state slots; None for models without linear attention.
     linear_slot_idx: int | None = None
     # Two track slots that take the prefill snapshots in turn (chunk N + 1 launches before

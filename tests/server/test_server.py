@@ -364,6 +364,12 @@ def test_disable_command_graph_flag_overrides_the_environment(
     assert args.command_graph is command_graph
 
 
+def test_cache_type_flag_defaults_to_radix(tiny_model_dir: Path) -> None:
+    assert parse_args(["--model", str(tiny_model_dir)], prog="ftm serve").cache_type == "radix"
+    args = parse_args(["--model", str(tiny_model_dir), "--cache-type", "naive"], prog="ftm serve")
+    assert args.cache_type == "naive"
+
+
 @pytest.mark.skipif(MODEL_PATH is None, reason="FTMETAL_TEST_MODEL_PATH is not set")
 def test_real_model_answers_over_http() -> None:
     assert MODEL_PATH is not None

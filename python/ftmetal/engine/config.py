@@ -11,6 +11,7 @@ import os
 import struct
 from dataclasses import dataclass, field
 from functools import cached_property
+from typing import Literal
 
 import mlx.core as mx
 
@@ -19,6 +20,9 @@ from ftmetal.layers.quantization.config import QuantConfig
 from ftmetal.models.config import ModelConfig
 from ftmetal.models.loader import config_dict, config_str_list, read_model_config, weight_files
 from ftmetal.models.register import parse_model_config
+
+# Prefix reuse: radix (the hybrid radix on a model with linear attention) or naive (none).
+CacheTypeChoice = Literal["naive", "radix"]
 
 
 def checkpoint_tensor_names(model_path: str) -> list[str]:
@@ -54,6 +58,7 @@ class EngineConfig:
     max_extend_tokens: int = 2048
     # Decode steps between status log lines.
     decode_log_interval: int = 40
+    cache_type: CacheTypeChoice = "radix"
     # GDN snapshot cache of the hybrid radix cache: int(ratio * max_running_req) slots (at
     # least 4) on top of the running requests' own slots.
     linear_state_cache_ratio: float = 2.0
@@ -88,4 +93,4 @@ class EngineConfig:
         return os.path.basename(os.path.normpath(self.model_path))
 
 
-__all__ = ["EngineConfig", "checkpoint_tensor_names", "command_graph_from_env"]
+__all__ = ["CacheTypeChoice", "EngineConfig", "checkpoint_tensor_names", "command_graph_from_env"]

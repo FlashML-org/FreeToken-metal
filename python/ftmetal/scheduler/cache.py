@@ -1,36 +1,51 @@
-"""Page allocation over the host page table, and the hybrid radix prefix cache.
+"""Page allocation over the host page table, and the prefix cache of the configured type.
 
-Port of FreeToken scheduler/cache.py (CacheManager: the hybrid_radix path, and the naive
-one for a model without linear attention). The manager owns both currencies of the hybrid
-cache, KV pages and GDN state slots: a request holds a live slot and two ping-pong track
-slots, a prefill commit donates the frozen track snapshot to the tree and a finish donates
-the live slot. Divergences: host numpy page table and free list (page-aligned token
-slots); the cache type follows the model (hybrid radix with a GDN state pool, no prefix
-cache without one); no SWA currency, runtime rebuild or tool-call anchor. lazy_free_region
-batches the frees of one drained step; the drain itself is the step fence.
+Port of FreeToken scheduler/cache.py (CacheManager: the radix, hybrid_radix and naive
+paths). The radix path commits a request's KV prefix to a RadixPrefixCache. The hybrid
+path owns both currencies of the HybridRadixCache, KV pages and GDN state slots: a request
+holds a live slot and two ping-pong track slots, a prefill commit donates the frozen track
+snapshot to the tree and a finish donates the live slot. Divergences: host numpy page
+table and free list (page-aligned token slots); naive is refused on a model with linear
+attention; eviction stops at what is evictable and exhaustion raises; no SWA currency,
+runtime rebuild or tool-call anchor. lazy_free_region batches the frees of one drained
+step; the drain itself is the step fence.
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Iterator, NamedTuple
+from typing import Iterator, Literal, NamedTuple
 
 import numpy as np
 
 from ftmetal.core import Req
+from ftmetal.engine.config import CacheTypeChoice
 from ftmetal.kvcache.hybrid_radix_cache import HybridCacheHandle, HybridRadixCache
 from ftmetal.kvcache.linear_state_pool import LinearStatePool
-from ftmetal.kvcache.radix_cache import align_down
+from ftmetal.kvcache.radix_cache import RadixCacheHandle, RadixPrefixCache, align_down
+
+CacheType = Literal["naive", "radix", "hybrid_radix"]
 
 
 def div_ceil(a: int, b: int) -> int:
     return -(-a // b)
 
 
+def resolve_cache_type(requested: CacheTypeChoice, has_linear_attention: bool) -> CacheType:
+    """Radix on a model with linear attention is the hybrid radix, the only tree that can
+    resume a GDN state."""
+    if not has_linear_attention:
+        return requested
+    elif requested == "naive":
+        raise ValueError("--cache-type naive is not supported on a model with linear attention")
+    else:
+        return "hybrid_radix"
+
+
 class MatchResult(NamedTuple):
     # The prefix to lock; None on a miss.
-    handle: HybridCacheHandle | None
-    # The GDN snapshot slot to restore the live slot from; None on a miss.
+    handle: RadixCacheHandle | HybridCacheHandle | None
+    # The GDN snapshot slot to restore the live slot from; None on a miss or without one.
     mamba_value: int | None
 
 
@@ -40,28 +55,45 @@ class CacheManager:
         num_pages: int,
         page_size: int,
         page_table: np.ndarray,
+        cache_type: CacheType,
         linear_state_pool: LinearStatePool | None = None,
     ) -> None:
         self.num_pages = num_pages
         self.page_size = page_size
         self.page_table = page_table
+        self.cache_type = cache_type
+        self.is_hybrid = cache_type == "hybrid_radix"
+        assert self.is_hybrid == (linear_state_pool is not None), (
+            "the hybrid radix cache, and only it, drives a GDN state pool"
+        )
         self.linear_state_pool = linear_state_pool
-        self.prefix_cache: HybridRadixCache | None = None
-        if linear_state_pool is not None:
+        self.prefix_cache: RadixPrefixCache | HybridRadixCache | None = None
+        if self.is_hybrid:
             self.prefix_cache = HybridRadixCache(page_size)
+        elif cache_type == "radix":
+            self.prefix_cache = RadixPrefixCache(page_size)
         self.free_slots = np.arange(num_pages, dtype=np.int32) * page_size
         self.deferred_frees: list[np.ndarray] | None = None
 
     @property
     def prefill_chunk_align(self) -> int:
         """A snapshot commits only at a page-aligned boundary, so non-final chunks end on one."""
-        return self.page_size if self.prefix_cache is not None else 1
+        return self.page_size if self.is_hybrid else 1
+
+    @property
+    def evictable_size(self) -> int:
+        """Tokens the prefix cache would give back to eviction."""
+        if self.is_hybrid:
+            return self.hybrid_parts()[0].full_evictable_size
+        elif self.cache_type == "radix":
+            return self.radix_cache().evictable_size
+        else:
+            return 0
 
     @property
     def available_size(self) -> int:
         """Tokens allocatable now: free pages plus the prefix cache's evictable ones."""
-        evictable = 0 if self.prefix_cache is None else self.prefix_cache.full_evictable_size
-        return evictable + len(self.free_slots) * self.page_size
+        return self.evictable_size + len(self.free_slots) * self.page_size
 
     @property
     def mamba_available_size(self) -> int:
@@ -71,34 +103,58 @@ class CacheManager:
 
     def page_usage(self) -> tuple[int, int]:
         """(used, total) pages; evictable prefix-cache pages count as free."""
-        evictable = 0 if self.prefix_cache is None else self.prefix_cache.full_evictable_size
-        used = self.num_pages - len(self.free_slots) - evictable // self.page_size
+        used = self.num_pages - len(self.free_slots) - self.evictable_size // self.page_size
         return used, self.num_pages
 
     def hybrid_parts(self) -> tuple[HybridRadixCache, LinearStatePool]:
         cache, pool = self.prefix_cache, self.linear_state_pool
-        assert cache is not None and pool is not None, "the prefix cache needs a GDN state pool"
+        assert isinstance(cache, HybridRadixCache) and pool is not None, (
+            "the prefix cache needs a GDN state pool"
+        )
         return cache, pool
+
+    def radix_cache(self) -> RadixPrefixCache:
+        cache = self.prefix_cache
+        assert isinstance(cache, RadixPrefixCache), f"cache type {self.cache_type} has no radix"
+        return cache
 
     def match_req(self, input_ids: np.ndarray) -> MatchResult:
         """The cached prefix of a prompt, leaving at least its last token to extend."""
         assert len(input_ids) > 0
-        if self.prefix_cache is None:
+        prefix = input_ids[: len(input_ids) - 1]
+        if self.is_hybrid:
+            match = self.hybrid_parts()[0].match_prefix(prefix)
+            if match.cached_len == 0:
+                return MatchResult(None, None)
+            return MatchResult(
+                HybridCacheHandle(match.cached_len, match.node, match.kv_indices),
+                match.mamba_value,
+            )
+        elif self.cache_type == "radix":
+            match = self.radix_cache().match_prefix(prefix)
+            if match.cached_len == 0:
+                return MatchResult(None, None)
+            return MatchResult(
+                RadixCacheHandle(match.cached_len, match.node, match.kv_indices), None
+            )
+        else:
             return MatchResult(None, None)
-        match = self.prefix_cache.match_prefix(input_ids[: len(input_ids) - 1])
-        if match.cached_len == 0:
-            return MatchResult(None, None)
-        return MatchResult(
-            HybridCacheHandle(match.cached_len, match.node, match.kv_indices), match.mamba_value
-        )
 
-    def lock(self, handle: HybridCacheHandle | None) -> None:
-        if handle is not None:
+    def lock(self, handle: RadixCacheHandle | HybridCacheHandle | None) -> None:
+        if handle is None:
+            return
+        elif self.is_hybrid:
             self.hybrid_parts()[0].inc_lock(handle.node)
+        else:
+            self.radix_cache().inc_lock(handle.node)
 
-    def unlock(self, handle: HybridCacheHandle | None) -> None:
-        if handle is not None:
+    def unlock(self, handle: RadixCacheHandle | HybridCacheHandle | None) -> None:
+        if handle is None:
+            return
+        elif self.is_hybrid:
             self.hybrid_parts()[0].dec_lock(handle.node)
+        else:
+            self.radix_cache().dec_lock(handle.node)
 
     def ensure_mamba_slots(self, num_slots: int) -> None:
         """Evict LRU tree snapshots until num_slots GDN slots are free (or nothing is evictable)."""
@@ -121,14 +177,20 @@ class CacheManager:
                 allocation.append((req.table_idx, first_page, last_page))
         if needed_pages == 0:
             return
-        if needed_pages > len(self.free_slots) and self.prefix_cache is not None:
+        short_tokens = (needed_pages - len(self.free_slots)) * self.page_size
+        if short_tokens > 0 and self.is_hybrid:
             # Evicting KV leaves drops their snapshots too: return both currencies.
             cache, pool = self.hybrid_parts()
-            evicted = cache.evict_full((needed_pages - len(self.free_slots)) * self.page_size)
+            evicted = cache.evict_full(short_tokens)
             self.free_slots = np.concatenate(
                 [self.free_slots, evicted.kv_indices[:: self.page_size]]
             )
             pool.free(evicted.mamba_slots)
+        elif short_tokens > 0 and self.cache_type == "radix":
+            # Clamped to what is evictable: a shortfall left after it raises below.
+            cache = self.radix_cache()
+            evicted_slots = cache.evict(min(short_tokens, cache.evictable_size))
+            self.free_slots = np.concatenate([self.free_slots, evicted_slots[:: self.page_size]])
         if needed_pages > len(self.free_slots):
             raise RuntimeError("KV pages exhausted")
         pages = self.free_slots[:needed_pages]
@@ -143,12 +205,45 @@ class CacheManager:
             offset += count
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
-        """Commit a request's prefill snapshot, or on finish its prefix, and free what it owns."""
-        if self.prefix_cache is not None:
+        """Commit a request's prefix to the prefix cache and, on finish, free what it owns."""
+        if self.is_hybrid:
             self.cache_req_hybrid(req, finished=finished)
+        elif self.cache_type == "radix":
+            self.cache_req_radix(req, finished=finished)
         elif finished:
             stop = div_ceil(req.cached_len, self.page_size) * self.page_size
             self.free_pages(self.page_table[req.table_idx, :stop])
+
+    def cache_req_radix(self, req: Req, *, finished: bool) -> None:
+        """Commit the KV of [0, cached_len) to the radix tree.
+
+        [0, old) is the tree's own, locked since admission; [old, prefix_len) was cached by
+        another request meanwhile, so the request's copies are freed; the rest of the aligned
+        prefix is donated; the unaligned tail stays with the request until it finishes.
+        """
+        cache = self.radix_cache()
+        old_handle = req.cache_handle
+        old_cached_len = 0 if old_handle is None else old_handle.cached_len
+        page_indices = self.page_table[req.table_idx, : req.cached_len]
+        prefix_len, node = cache.insert(req.input_ids[: req.cached_len], page_indices)
+        insert_len = align_down(req.cached_len, self.page_size)
+        self.unlock(old_handle)
+        self.free_pages(page_indices[old_cached_len:prefix_len])
+        if finished:
+            self.free_pages(page_indices[insert_len:])
+        else:
+            kv_indices = cache.collect_kv(node)
+            if prefix_len > old_cached_len:
+                # The dedup free above returned this request's own pages for the shared span;
+                # the row must name the tree's pages the backends read from now on.
+                self.page_table[req.table_idx, old_cached_len:prefix_len] = kv_indices[
+                    old_cached_len:prefix_len
+                ]
+            if insert_len > 0:
+                req.cache_handle = RadixCacheHandle(insert_len, node, kv_indices)
+            else:
+                req.cache_handle = None
+            self.lock(req.cache_handle)
 
     def cache_req_hybrid(self, req: Req, *, finished: bool) -> None:
         """Commit KV and the GDN snapshot of a request.
@@ -266,7 +361,7 @@ class CacheManager:
     def check_integrity(self) -> None:
         """Idle only: every page and GDN slot is free or owned by the prefix cache."""
         cache_pages = 0
-        if self.prefix_cache is not None:
+        if self.is_hybrid:
             cache, pool = self.hybrid_parts()
             cache.check_integrity()
             cache_pages = (cache.full_evictable + cache.full_protected) // self.page_size
@@ -275,6 +370,10 @@ class CacheManager:
                 f"GDN slots leaked or double freed: free {pool.num_free_slots} + tree "
                 f"{tree_slots} != {pool.num_slots - 1}"
             )
+        elif self.cache_type == "radix":
+            radix = self.radix_cache()
+            radix.check_integrity()
+            cache_pages = (radix.evictable_size + radix.protected_size) // self.page_size
         assert len(self.free_slots) + cache_pages == self.num_pages, (
             f"pages leaked or double freed: free {len(self.free_slots)} + cache {cache_pages} "
             f"!= {self.num_pages}"
@@ -282,4 +381,4 @@ class CacheManager:
         assert np.all(self.free_slots % self.page_size == 0)
 
 
-__all__ = ["CacheManager", "MatchResult", "div_ceil"]
+__all__ = ["CacheManager", "CacheType", "MatchResult", "div_ceil", "resolve_cache_type"]

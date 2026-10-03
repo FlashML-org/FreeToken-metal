@@ -38,7 +38,7 @@ from ftmetal.message.tokenizer import (
     ErrorReplyMsg,
     PromptAdmittedMsg,
 )
-from ftmetal.scheduler.cache import CacheManager
+from ftmetal.scheduler.cache import CacheManager, resolve_cache_type
 from ftmetal.scheduler.decode import DecodeManager
 from ftmetal.scheduler.prefill import ChunkedReq, PrefillManager
 from ftmetal.scheduler.status import SchedulerStatusReporter
@@ -69,6 +69,8 @@ class TokenEvent:
 
 class Scheduler:
     def __init__(self, config: EngineConfig, eos_token_ids: set[int]) -> None:
+        # Before the engine loads anything: an unsupported --cache-type fails fast.
+        cache_type = resolve_cache_type(config.cache_type, config.model_config.has_linear_attention)
         self.engine = Engine(config)
         self.config = config
         self.eos_token_ids = eos_token_ids
@@ -78,6 +80,7 @@ class Scheduler:
             self.engine.num_pages,
             config.page_size,
             self.engine.page_table,
+            cache_type,
             self.engine.ctx.linear_state_pool,
         )
         self.decode_manager = DecodeManager(config.page_size)

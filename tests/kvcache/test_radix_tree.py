@@ -1,6 +1,6 @@
 """The shared tree machinery, and a self-test of the radix harness.
 
-Port of FreeToken tests/kvcache/radix/test_tree_and_harness.py (hybrid cache only):
+Port of FreeToken tests/kvcache/radix/test_tree_and_harness.py (plain and hybrid caches):
 split_at identity semantics, the page key, get_match_len and the page-aligned walk; then a
 cache broken on purpose must be caught by the check whose name says so.
 """
@@ -13,7 +13,14 @@ import numpy as np
 import pytest
 
 from ftmetal.kvcache.hybrid_radix_cache import EvictResult, HybridMatch, HybridRadixCache
-from ftmetal.kvcache.radix_cache import RadixTreeNode, align_down, page_key, tree_walk
+from ftmetal.kvcache.radix_cache import (
+    RadixMatch,
+    RadixPrefixCache,
+    RadixTreeNode,
+    align_down,
+    page_key,
+    tree_walk,
+)
 from radix_harness import HarnessFailure, Session, node_path_slots, page_ids
 
 
@@ -76,12 +83,13 @@ def test_page_key_buckets_a_whole_page_not_a_token() -> None:
 
     left = (1, 3, 1, 5) + (3, 2, 2, 9)
     right = (1, 3, 1, 6) + (0, 0, 0, 0)
-    session = Session(4)
-    session.do_insert(left)
-    got, _ = session.do_insert(right)
-    session.check()
-    assert got[0] == 0, "two distinct pages shared a prefix"
-    assert len(session.adapter.nodes()) == 2
+    for cache in (RadixPrefixCache(4), HybridRadixCache(4)):
+        session = Session(4, cache)
+        session.do_insert(left)
+        got, _ = session.do_insert(right)
+        session.check()
+        assert got.matched_len == 0, f"{type(cache).__name__} shared a prefix of two pages"
+        assert len(session.adapter.nodes()) == 2
 
 
 @pytest.mark.parametrize("page_size", [1, 4, 32])
@@ -101,6 +109,58 @@ def test_match_len_and_walk_reuse_whole_pages_only(page_size: int) -> None:
     walked, prefix_len = tree_walk(root, ragged)
     assert prefix_len == align_down(len(ragged), page_size) == page_size
     assert walked.length == page_size and walked.value.tolist() == list(range(page_size))
+
+
+class BreakablePlainCache(RadixPrefixCache):
+    """Behaves until broken is set; subclasses then break exactly one thing."""
+
+    broken = False
+
+
+class ForgetfulPlainInsert(BreakablePlainCache):
+    """insert links the new node but forgets to grow evictable_size."""
+
+    def insert(self, input_ids: np.ndarray, kv_indices: np.ndarray) -> tuple[int, RadixTreeNode]:
+        before = self.evictable_size
+        result = super().insert(input_ids, kv_indices)
+        if self.broken:
+            self.evictable_size = before
+        return result
+
+
+class LeakyPlainEvict(BreakablePlainCache):
+    """evict also unlinks one more leaf without returning its slots."""
+
+    def evict(self, num_tokens: int) -> np.ndarray:
+        result = super().evict(num_tokens)
+        if self.broken:
+            leaf = next(leaf for leaf in self.leaves() if leaf.ref_count == 0)
+            leaf.parent.children.pop(page_key(leaf.key, self.page_size))
+            self.evictable_size -= leaf.length
+        return result
+
+
+class NewestFirstPlainEvict(BreakablePlainCache):
+    """evict takes the most recently used leaf: every counter and slot stays conserved."""
+
+    def evict(self, num_tokens: int) -> np.ndarray:
+        if not self.broken:
+            return super().evict(num_tokens)
+        victim = max(self.leaves(), key=lambda leaf: leaf.timestamp)
+        victim.parent.children.pop(page_key(victim.key, self.page_size))
+        self.evictable_size -= victim.length
+        return victim.value
+
+
+class ShortPlainMatch(BreakablePlainCache):
+    """match_prefix stops one node early: a silent loss of prefix reuse."""
+
+    def match_prefix(self, input_ids: np.ndarray) -> RadixMatch:
+        match = super().match_prefix(input_ids)
+        if not self.broken or match.node.is_root():
+            return match
+        parent = match.node.parent
+        return RadixMatch(self.collect_kv(parent), match.cached_len - match.node.length, parent)
 
 
 class BreakableCache(HybridRadixCache):
@@ -165,7 +225,11 @@ class ShortMatch(BreakableCache):
         )
 
 
-BROKEN: list[tuple[type[BreakableCache], str, str]] = [
+BROKEN: list[tuple[type[BreakablePlainCache] | type[BreakableCache], str, str]] = [
+    (ForgetfulPlainInsert, "insert", "counters"),
+    (LeakyPlainEvict, "evict", "conservation.kv"),
+    (NewestFirstPlainEvict, "evict", "model.evict"),
+    (ShortPlainMatch, "match", "match.cached_len"),
     (ForgetfulInsert, "insert", "counters"),
     (LeakyEvict, "evict", "conservation.kv"),
     (NewestFirstEvict, "evict", "model.evict"),
@@ -177,7 +241,7 @@ BROKEN: list[tuple[type[BreakableCache], str, str]] = [
     "cache_class, trigger, tag", BROKEN, ids=[entry[0].__name__ for entry in BROKEN]
 )
 def test_harness_catches_a_broken_implementation(
-    cache_class: type[BreakableCache], trigger: str, tag: str
+    cache_class: type[BreakablePlainCache] | type[BreakableCache], trigger: str, tag: str
 ) -> None:
     """Each break must be caught by the check named for it, not by a downstream avalanche."""
     page_size = 4

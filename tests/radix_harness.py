@@ -1,9 +1,9 @@
-"""Hybrid radix cache harness: a page-keyed reference model, an invariant battery, a Session.
+"""Radix cache harness: a page-keyed reference model, an invariant battery, a Session.
 
-Port of FreeToken tests/kvcache/radix/{model,adapters,driver}.py, reduced to the hybrid
-cache. Every op is asked of the cache and of the reference model and the answers are
-compared field by field; Session.check() then runs the battery: counters recomputed from
-raw node fields, slot conservation per currency, prefix closure, the cache's own
+Port of FreeToken tests/kvcache/radix/{model,adapters,driver}.py, reduced to the plain and
+the hybrid cache. Every op is asked of the cache and of the reference model and the answers
+are compared field by field; Session.check() then runs the battery: counters recomputed
+from raw node fields, slot conservation per currency, prefix closure, the cache's own
 check_integrity and node-for-node agreement with the model.
 
 The model is keyed by page, not by token: the tree's reuse unit is a whole page and two
@@ -19,11 +19,12 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import numpy as np
 
 from ftmetal.kvcache.hybrid_radix_cache import HybridRadixCache
-from ftmetal.kvcache.radix_cache import RadixTreeNode, page_key
+from ftmetal.kvcache.radix_cache import RadixPrefixCache, RadixTreeNode, page_key
 
 Path = tuple[int, ...]
 
@@ -54,15 +55,17 @@ class NodeRecord:
     mamba_ref: int
 
 
-def sizes(records: Sequence[NodeRecord]) -> dict[str, int]:
+def sizes(records: Sequence[NodeRecord], has_snapshots: bool) -> dict[str, int]:
     """The cache's running sizes, recomputed from per-node records."""
-    live = [record for record in records if record.mamba is not None]
-    return {
+    out = {
         "full_evictable": sum(record.length for record in records if record.ref == 0),
         "full_protected": sum(record.length for record in records if record.ref > 0),
-        "mamba_evictable": sum(1 for record in live if record.mamba_ref == 0),
-        "mamba_protected": sum(1 for record in live if record.mamba_ref > 0),
     }
+    if has_snapshots:
+        live = [record for record in records if record.mamba is not None]
+        out["mamba_evictable"] = sum(1 for record in live if record.mamba_ref == 0)
+        out["mamba_protected"] = sum(1 for record in live if record.mamba_ref > 0)
+    return out
 
 
 # ------------------------------------------------------------------------ reference model
@@ -200,11 +203,15 @@ class ExpInsert:
     dups: list[int]
     # Supplied slots the tree took ownership of.
     adopted: list[int]
-    second_exists: bool
+    # The hybrid cache's dedup flag; None for the plain cache.
+    second_exists: bool | None
 
 
-class HybridModel:
-    """HybridRadixCache's semantics at page granularity."""
+class RadixModel:
+    """RadixPrefixCache's semantics at page granularity: the trie, the commit and the leaf
+    eviction HybridModel extends with the snapshot currency."""
+
+    has_snapshots = False
 
     def __init__(self, page_size: int) -> None:
         self.page_size = page_size
@@ -243,17 +250,19 @@ class HybridModel:
 
     def match(self, ids: Sequence[int]) -> ExpMatch:
         groups = self.cover(ids)
-        for depth, group in enumerate(reversed(groups)):
-            if group.mamba is not None:
-                if depth:
-                    self.events["match.snapshot_truncation"] += 1
-                return ExpMatch(len(group.end), self.trie.path_slots(group), group, group.mamba)
-        self.events["match.no_snapshot"] += 1
-        return ExpMatch(0, [], None, None)
+        if not groups:
+            return ExpMatch(0, [], None, None)
+        last = groups[-1]
+        return ExpMatch(len(last.end), self.trie.path_slots(last), last, None)
 
-    def insert(
-        self, ids: Sequence[int], slots: Sequence[int], reused_len: int, mamba: int
-    ) -> ExpInsert:
+    def commit(
+        self, ids: Sequence[int], slots: Sequence[int], reused_len: int
+    ) -> tuple[MGroup | None, ExpInsert]:
+        """Walk, then append the missing page-aligned suffix; returns the end node too.
+
+        The tree stores nothing for the already cached prefix: the caller owns, and frees,
+        its supplied slots for [reused_len, matched).
+        """
         insert_len = len(ids) // self.page_size * self.page_size
         ids, slots = list(ids[:insert_len]), list(slots[:insert_len])
         groups = self.cover(ids)
@@ -263,25 +272,20 @@ class HybridModel:
             node = self.trie.add_group(
                 node, self.pages_of(ids, matched, insert_len), slots[matched:], self.tick()
             )
-        exists = node is None or node.mamba is not None
-        if exists:
-            self.events["insert.snapshot_dedup"] += 1
-        else:
-            assert node is not None
-            self.events["insert.snapshot_attach"] += 1
-            node.mamba = mamba
-        return ExpInsert(matched, slots[reused_len:matched], slots[matched:], exists)
+        return node, ExpInsert(matched, slots[reused_len:matched], slots[matched:], None)
+
+    def insert(
+        self, ids: Sequence[int], slots: Sequence[int], reused_len: int, mamba: int | None
+    ) -> ExpInsert:
+        assert mamba is None, "the plain cache takes no snapshot"
+        return self.commit(ids, slots, reused_len)[1]
 
     def inc_lock(self, group: MGroup | None) -> None:
-        if group is not None and group.mamba is not None:
-            group.mamba_ref += 1
         while group is not None:
             group.ref += 1
             group = self.trie.parent_group(group)
 
     def dec_lock(self, group: MGroup | None) -> None:
-        if group is not None and group.mamba is not None and group.mamba_ref > 0:
-            group.mamba_ref -= 1
         while group is not None:
             if group.ref <= 0:
                 raise ModelMismatch("model.dec_lock", f"full ref underflow at node end={group.end}")
@@ -292,7 +296,7 @@ class HybridModel:
         return [(group.end, group.record()) for group in self.trie.group_list]
 
     def counters(self) -> dict[str, int]:
-        return sizes([record for _, record in self.records()])
+        return sizes([record for _, record in self.records()], self.has_snapshots)
 
     # -- eviction: the model follows the cache's reported victims and checks each is legal
     def owner(self, slot: int, tag: str) -> MGroup:
@@ -331,6 +335,11 @@ class HybridModel:
         if pos != len(observed):
             raise ModelMismatch(tag, f"returned unpredicted slots {list(observed[pos:])}")
 
+    def cascadable(self, group: MGroup) -> bool:
+        """Whether an exposed unlocked leaf is reclaimed at once instead of queued as a
+        candidate: never in the plain cache."""
+        return False
+
     def cascade(
         self,
         parent: MGroup | None,
@@ -340,13 +349,13 @@ class HybridModel:
         tag: str,
         label: str,
     ) -> tuple[MGroup | None, int, int]:
-        """Reclaim exposed unlocked snapshot-less leaves upward."""
+        """Reclaim exposed unlocked cascadable leaves upward."""
         freed = 0
         while (
             parent is not None
             and parent.ref == 0
             and self.trie.is_leaf(parent)
-            and parent.mamba is None
+            and self.cascadable(parent)
         ):
             self.events[f"{label}.cascade"] += 1
             pos = self.take(observed_kv, pos, parent, tag)
@@ -383,9 +392,54 @@ class HybridModel:
                 and self.trie.is_leaf(parent)
                 and parent not in candidates
             ):
+                self.events["evict.parent_exposed"] += 1
                 candidates.append(parent)
         self.drained(observed_kv, kv_pos, tag)
         self.drained(observed_mamba, mamba_pos, tag)
+
+
+class HybridModel(RadixModel):
+    """HybridRadixCache's semantics at page granularity: an optional snapshot slot at a node's
+    end boundary, which a match truncates to and an insert attaches or dedups."""
+
+    has_snapshots = True
+
+    def match(self, ids: Sequence[int]) -> ExpMatch:
+        groups = self.cover(ids)
+        for depth, group in enumerate(reversed(groups)):
+            if group.mamba is not None:
+                if depth:
+                    self.events["match.snapshot_truncation"] += 1
+                return ExpMatch(len(group.end), self.trie.path_slots(group), group, group.mamba)
+        self.events["match.no_snapshot"] += 1
+        return ExpMatch(0, [], None, None)
+
+    def insert(
+        self, ids: Sequence[int], slots: Sequence[int], reused_len: int, mamba: int | None
+    ) -> ExpInsert:
+        assert mamba is not None, "the hybrid cache takes a snapshot with every insert"
+        node, expected = self.commit(ids, slots, reused_len)
+        expected.second_exists = node is None or node.mamba is not None
+        if expected.second_exists:
+            self.events["insert.snapshot_dedup"] += 1
+        else:
+            assert node is not None
+            self.events["insert.snapshot_attach"] += 1
+            node.mamba = mamba
+        return expected
+
+    def inc_lock(self, group: MGroup | None) -> None:
+        if group is not None and group.mamba is not None:
+            group.mamba_ref += 1
+        super().inc_lock(group)
+
+    def dec_lock(self, group: MGroup | None) -> None:
+        if group is not None and group.mamba is not None and group.mamba_ref > 0:
+            group.mamba_ref -= 1
+        super().dec_lock(group)
+
+    def cascadable(self, group: MGroup) -> bool:
+        return group.mamba is None
 
     def evict_mamba(
         self, num_snapshots: int, observed_kv: Sequence[int], observed_mamba: Sequence[int]
@@ -430,6 +484,12 @@ class MatchOut:
     second: int | None
 
 
+class InsertOut(NamedTuple):
+    matched_len: int
+    # The hybrid cache's mamba_exist; None for the plain cache.
+    second_exists: bool | None
+
+
 @dataclass
 class EvictOut:
     kv: list[int]
@@ -468,8 +528,61 @@ def ids_array(ids: Sequence[int]) -> np.ndarray:
     return np.asarray(list(ids), dtype=np.int32)
 
 
+def tree_records(root: RadixTreeNode) -> list[tuple[Path, NodeRecord]]:
+    """One record per node, keyed by its end boundary: the shape the model also emits."""
+    return [
+        (
+            node_end_path(node),
+            NodeRecord(
+                node.length,
+                tuple(node.value.tolist()),
+                node.ref_count,
+                node.mamba_value,
+                node.mamba_ref_count,
+            ),
+        )
+        for node, _ in iter_nodes(root)
+    ]
+
+
+class PlainAdapter:
+    """The plain cache under test, asked in plain lists."""
+
+    has_snapshots = False
+
+    def __init__(self, cache: RadixPrefixCache) -> None:
+        self.cache = cache
+        self.page_size = cache.page_size
+
+    def match(self, ids: Sequence[int]) -> MatchOut:
+        match = self.cache.match_prefix(ids_array(ids))
+        return MatchOut(match.cached_len, match.kv_indices.tolist(), match.node, None)
+
+    def insert(self, ids: Sequence[int], slots: Sequence[int], mamba: int | None) -> InsertOut:
+        assert mamba is None, "the plain cache takes no snapshot"
+        prefix_len, _ = self.cache.insert(ids_array(ids), ids_array(slots))
+        return InsertOut(prefix_len, None)
+
+    def evict_full(self, num_tokens: int) -> EvictOut:
+        return EvictOut(self.cache.evict(num_tokens).tolist(), [])
+
+    def counters(self) -> dict[str, int]:
+        return {
+            "full_evictable": self.cache.evictable_size,
+            "full_protected": self.cache.protected_size,
+        }
+
+    def nodes(self) -> list[RadixTreeNode]:
+        return [node for node, _ in iter_nodes(self.cache.root)]
+
+    def records(self) -> list[tuple[Path, NodeRecord]]:
+        return tree_records(self.cache.root)
+
+
 class HybridAdapter:
-    """The cache under test, asked in plain lists."""
+    """The hybrid cache under test, asked in plain lists."""
+
+    has_snapshots = True
 
     def __init__(self, cache: HybridRadixCache) -> None:
         self.cache = cache
@@ -479,8 +592,9 @@ class HybridAdapter:
         match = self.cache.match_prefix(ids_array(ids))
         return MatchOut(match.cached_len, match.kv_indices.tolist(), match.node, match.mamba_value)
 
-    def insert(self, ids: Sequence[int], slots: Sequence[int], mamba: int) -> tuple[int, bool]:
-        return self.cache.insert(ids_array(ids), ids_array(slots), mamba)
+    def insert(self, ids: Sequence[int], slots: Sequence[int], mamba: int | None) -> InsertOut:
+        assert mamba is not None, "the hybrid cache takes a snapshot with every insert"
+        return InsertOut(*self.cache.insert(ids_array(ids), ids_array(slots), mamba))
 
     def evict_full(self, num_tokens: int) -> EvictOut:
         evicted = self.cache.evict_full(num_tokens)
@@ -503,19 +617,7 @@ class HybridAdapter:
         return [node for node, _ in iter_nodes(self.cache.root)]
 
     def records(self) -> list[tuple[Path, NodeRecord]]:
-        return [
-            (
-                node_end_path(node),
-                NodeRecord(
-                    node.length,
-                    tuple(node.value.tolist()),
-                    node.ref_count,
-                    node.mamba_value,
-                    node.mamba_ref_count,
-                ),
-            )
-            for node in self.nodes()
-        ]
+        return tree_records(self.cache.root)
 
 
 class SlotLedger:
@@ -561,7 +663,7 @@ def check_conservation(name: str, live: Sequence[int], ledger: SlotLedger) -> No
             raise InvariantViolation(f"conservation.{name}{suffix}", f"slots {bad[:8]} are {why}")
 
 
-def check_prefix_closure(adapter: HybridAdapter) -> None:
+def check_prefix_closure(adapter: PlainAdapter | HybridAdapter) -> None:
     seen: set[int] = set()
     for node, parent in iter_nodes(adapter.cache.root):
         checks = (
@@ -582,11 +684,11 @@ def check_prefix_closure(adapter: HybridAdapter) -> None:
 
 
 def check_all(
-    adapter: HybridAdapter, model: HybridModel, kv: SlotLedger, mamba: SlotLedger
+    adapter: PlainAdapter | HybridAdapter, model: RadixModel, kv: SlotLedger, mamba: SlotLedger
 ) -> None:
     records = adapter.records()
     check_prefix_closure(adapter)
-    recomputed = sizes([record for _, record in records])
+    recomputed = sizes([record for _, record in records], adapter.has_snapshots)
     if adapter.counters() != recomputed:
         raise InvariantViolation(
             "counters", f"maintained {adapter.counters()} vs raw nodes {recomputed}"
@@ -627,12 +729,23 @@ def page_ids(page_size: int, *labels: int) -> tuple[int, ...]:
 
 
 class Session:
-    """One cache and its reference model driven op by op; check() runs the battery."""
+    """One cache and its reference model driven op by op; check() runs the battery.
 
-    def __init__(self, page_size: int, cache: HybridRadixCache | None = None) -> None:
+    The cache is a hybrid one unless a RadixPrefixCache is passed in.
+    """
+
+    def __init__(
+        self, page_size: int, cache: RadixPrefixCache | HybridRadixCache | None = None
+    ) -> None:
         self.page_size = page_size
-        self.adapter = HybridAdapter(HybridRadixCache(page_size) if cache is None else cache)
-        self.model = HybridModel(page_size)
+        self.adapter: PlainAdapter | HybridAdapter
+        self.model: RadixModel
+        if isinstance(cache, RadixPrefixCache):
+            self.adapter = PlainAdapter(cache)
+            self.model = RadixModel(page_size)
+        else:
+            self.adapter = HybridAdapter(HybridRadixCache(page_size) if cache is None else cache)
+            self.model = HybridModel(page_size)
         self.kv = SlotLedger(1_000_000, "kv")
         self.mamba = SlotLedger(9_000_000, "mamba")
 
@@ -656,19 +769,19 @@ class Session:
 
     def do_insert(
         self, ids: Sequence[int], *, slots: Sequence[int] | None = None, reused_len: int = 0
-    ) -> tuple[tuple[int, bool], ExpInsert]:
+    ) -> tuple[InsertOut, ExpInsert]:
         if slots is None:
             slots = self.kv.take(len(ids))
-        mamba = self.mamba.take(1)[0]
+        mamba = self.mamba.take(1)[0] if self.model.has_snapshots else None
         expected = self.model.insert(ids, slots, reused_len, mamba)
         got = self.adapter.insert(ids, slots, mamba)
         query = f"insert({tuple(ids)})"
-        self.same("insert.matched_len", query, got[0], expected.matched_len)
-        self.same("insert.second_exists", query, got[1], expected.second_exists)
+        self.same("insert.matched_len", query, got.matched_len, expected.matched_len)
+        self.same("insert.second_exists", query, got.second_exists, expected.second_exists)
         # Everything the caller keeps goes back to the ledgers.
         aligned = len(ids) // self.page_size * self.page_size
         self.kv.release(expected.dups + list(slots[aligned:]))
-        if expected.second_exists:
+        if mamba is not None and expected.second_exists:
             self.mamba.release([mamba])
         return got, expected
 
@@ -686,12 +799,16 @@ class Session:
             self.model.dec_lock(held[1])
 
     def do_evict_full(self, num_tokens: int) -> None:
+        if isinstance(self.adapter, PlainAdapter):
+            # RadixPrefixCache.evict asserts it is asked for no more than is evictable.
+            num_tokens = min(num_tokens, self.adapter.cache.evictable_size)
         got = self.adapter.evict_full(num_tokens)
         self.model.evict_full(num_tokens, got.kv, got.mamba)
         self.kv.release(got.kv)
         self.mamba.release(got.mamba)
 
     def do_evict_mamba(self, num_snapshots: int) -> None:
+        assert isinstance(self.adapter, HybridAdapter) and isinstance(self.model, HybridModel)
         got = self.adapter.evict_mamba(num_snapshots)
         self.model.evict_mamba(num_snapshots, got.kv, got.mamba)
         self.kv.release(got.kv)
@@ -715,11 +832,15 @@ __all__ = [
     "HarnessFailure",
     "HybridAdapter",
     "HybridModel",
+    "InsertOut",
     "InvariantViolation",
     "ModelMismatch",
     "NodeRecord",
+    "PlainAdapter",
+    "RadixModel",
     "Session",
     "SlotLedger",
+    "node_end_path",
     "node_path_slots",
     "page_ids",
 ]

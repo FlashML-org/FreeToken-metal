@@ -16,7 +16,7 @@ import numpy as np
 
 from ftmetal.core import Batch, Req, SamplingParams
 from ftmetal.kvcache.hybrid_radix_cache import HybridCacheHandle
-from ftmetal.kvcache.radix_cache import align_down
+from ftmetal.kvcache.radix_cache import RadixCacheHandle, align_down
 from ftmetal.scheduler.cache import CacheManager, div_ceil
 from ftmetal.scheduler.decode import DecodeManager
 from ftmetal.scheduler.table import TableManager
@@ -59,7 +59,7 @@ class ChunkedReq(Req):
 class AdmittedResources:
     """What a request holds from admission on: its locked match, table row and GDN slots."""
 
-    cache_handle: HybridCacheHandle | None
+    cache_handle: RadixCacheHandle | HybridCacheHandle | None
     table_idx: int
     linear_slot_idx: int | None
     ping_pong: tuple[int, int] | None
