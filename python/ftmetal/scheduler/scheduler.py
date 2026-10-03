@@ -159,6 +159,7 @@ class Scheduler:
             kv_total_pages=kv_total_pages,
             page_size=self.config.page_size,
             linear_slots=self.mamba_slot_usage(),
+            swa_tokens=self.swa_token_usage(),
         )
 
     def mamba_slot_usage(self) -> tuple[int, int] | None:
@@ -168,6 +169,15 @@ class Scheduler:
             return None
         total = pool.num_slots - 1
         return total - self.cache_manager.mamba_available_size, total
+
+    def swa_token_usage(self) -> tuple[int, int] | None:
+        """(used, total) window slots; free slots and the tree's unlocked live ones are not
+        used."""
+        pool = self.engine.ctx.swa_pool
+        if pool is None:
+            return None
+        total = pool.swa_num_tokens - 1
+        return total - self.cache_manager.swa_available_size, total
 
     def run_forever(
         self,

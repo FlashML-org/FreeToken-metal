@@ -37,6 +37,7 @@ def report(reporter: SchedulerStatusReporter, batch: Batch, new_tokens: int) -> 
         kv_total_pages=20,
         page_size=32,
         linear_slots=(3, 12),
+        swa_tokens=(40, 100),
     )
 
 
@@ -51,6 +52,7 @@ def test_prefill_decode_and_idle_lines() -> None:
     assert len(lines) == 1
     assert "#new-seq: 2, #new-token: 96, #cached-token: 64" in lines[0]
     assert "token usage: 0.25" in lines[0] and "gdn slots: 3/12" in lines[0]
+    assert "swa tokens: 40/100" in lines[0]
     assert "input throughput (token/s): 192.00" in lines[0]
 
     decode = Batch(reqs=[make_req(0, 128, 129), make_req(1, 32, 33)], phase="decode")
