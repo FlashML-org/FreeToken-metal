@@ -2,17 +2,19 @@
 
 The reference (mlx-lm, a contiguous cache for the global layers and a rotating one for
 the window layers) and ftmetal (the FULL pool, the window pool behind its full-to-window
-mapping, both attention backends, the scheduler with overlap and decode graphs) run the
-same random weights: prefill logits must match and greedy decode must agree token for
-token, with the window crossed in prefill, in decode and at chunk seams. Dense (31B
-shape) and MoE (26B shape) variants: 2:1 window:global layers, k_eq_v global layers with
-proportional rope, logit softcap, per-expert-scale router; fp32 throughout.
+mapping, both attention backends, the scheduler with overlap and decode graphs, the SWA
+radix cache) run the same random weights: prefill logits must match and greedy decode must
+agree token for token, with the window crossed in prefill, in decode and at chunk seams,
+and on prompts that resume a cached prefix. Dense (31B shape) and MoE (26B shape)
+variants: 2:1 window:global layers, k_eq_v global layers with proportional rope, logit
+softcap, per-expert-scale router; fp32 throughout.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Literal, NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -155,7 +157,12 @@ def reference_greedy(
 
 
 def make_scheduler(
-    path: Path, page_size: int, attention_backend: str, max_extend_tokens: int = 64
+    path: Path,
+    page_size: int,
+    attention_backend: str,
+    max_extend_tokens: int = 64,
+    cache_type: Literal["naive", "radix"] = "radix",
+    num_pages: int = 64,
 ) -> Scheduler:
     config = EngineConfig(
         model_path=str(path),
@@ -163,8 +170,9 @@ def make_scheduler(
         max_running_req=2,
         page_size=page_size,
         attention_backend=attention_backend,
-        num_page_override=64,
+        num_page_override=num_pages,
         max_extend_tokens=max_extend_tokens,
+        cache_type=cache_type,
     )
     return Scheduler(config, eos_token_ids={EOS})
 
@@ -275,3 +283,132 @@ def test_engine_builds_a_pool_and_a_backend_per_attention_type(tmp_path: Path) -
     assert (full_backend.sliding_window, swa_backend.sliding_window) == (None, WINDOW)
     assert full_backend.scale == swa_backend.scale == 1.0
     assert engine.graph_runner.graphs, "decode graphs captured over both pools"
+
+
+def run_alone(
+    scheduler: Scheduler, uid: int, prompt: list[int], steps: int
+) -> tuple[int, list[int]]:
+    """One prompt to completion; returns the prefix its admission found cached and its tokens."""
+    params = SamplingParams(temperature=0.0, max_tokens=steps, ignore_eos=True)
+    scheduler.add_request(uid, np.array(prompt, dtype=np.int32), params)
+    forward_input = scheduler.schedule_next_batch()
+    assert forward_input is not None
+    cached_len = forward_input.batch.reqs[0].cached_len
+    data = scheduler.forward(forward_input)
+    while scheduler.runnable or data is not None:
+        data = scheduler.overlap_loop(data)
+    scheduler.cache_manager.check_integrity()
+    return cached_len, [event.token for event in scheduler.take_results()]
+
+
+def hit_prefill_logits(scheduler: Scheduler, prompt: list[int]) -> tuple[int, mx.array]:
+    """Admit prompt and run its prefill forward alone; returns the prefix its admission found
+    cached and the last position's logits. Leaves the scheduler mid-request."""
+    scheduler.add_request(99, np.array(prompt, dtype=np.int32), SamplingParams(max_tokens=1))
+    forward_input = scheduler.schedule_next_batch()
+    assert forward_input is not None
+    req = forward_input.batch.reqs[0]
+    assert req.device_len == len(prompt), "the rest of the prompt must fit one chunk"
+    return req.cached_len, scheduler.engine.model.forward(forward_input.batch)[0]
+
+
+class PrefixCase(NamedTuple):
+    label: str
+    attention_backend: str
+    page_size: int
+    max_extend_tokens: int
+    # Served alone, one after another; then the last one again, whose prefill on the tree's
+    # prefix is held to mlx-lm's logits.
+    prompts: list[list[int]]
+    # The prefix each admission finds cached.
+    cached_lens: list[int]
+    cache_type: Literal["naive", "radix"] = "radix"
+    num_pages: int = 64
+
+
+HEAD = random_prompt(8, 29)
+PREFIX_CASES = [
+    PrefixCase(
+        "the same one-chunk prompt resumes all but its last token",
+        "mlx",
+        1,
+        64,
+        [HEAD[:23], HEAD[:23]],
+        [0, 22],
+    ),
+    PrefixCase(
+        "a chunked prompt resumes from the live window of its last chunk",
+        "metal",
+        1,
+        12,
+        [HEAD, HEAD],
+        [0, 28],
+    ),
+    PrefixCase(
+        "a shared head of a one-chunk prompt resumes at a page boundary",
+        "metal",
+        4,
+        64,
+        [HEAD[:23], HEAD[:17] + random_prompt(9, 10)],
+        [0, 16],
+    ),
+    PrefixCase(
+        "a head behind the window is recomputed, revived and served to the next prompt",
+        "metal",
+        1,
+        12,
+        [
+            HEAD,
+            HEAD[:10] + random_prompt(10, 5),
+            HEAD[:10] + random_prompt(10, 5) + random_prompt(11, 8),
+        ],
+        [0, 0, 15],
+    ),
+    PrefixCase(
+        "naive resumes nothing",
+        "metal",
+        4,
+        64,
+        [HEAD, HEAD],
+        [0, 0],
+        cache_type="naive",
+    ),
+]
+
+
+@pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
+def test_prompts_resuming_a_cached_prefix_match_mlx_lm(tmp_path: Path, moe: bool) -> None:
+    model = build_reference(seed=17, moe=moe)
+    save_checkpoint(model, tmp_path, moe, quantization=None)
+    steps = 6
+    for case in PREFIX_CASES:
+        scheduler = make_scheduler(
+            tmp_path,
+            case.page_size,
+            case.attention_backend,
+            case.max_extend_tokens,
+            case.cache_type,
+            case.num_pages,
+        )
+        assert scheduler.cache_manager.cache_type == (
+            "swa_radix" if case.cache_type == "radix" else "naive"
+        )
+        for uid, (prompt, cached_len) in enumerate(zip(case.prompts, case.cached_lens)):
+            expected = reference_greedy(model, prompt, steps)[1]
+            assert run_alone(scheduler, uid, prompt, steps) == (cached_len, expected), case.label
+        hit_len, logits = hit_prefill_logits(scheduler, case.prompts[-1])
+        assert (hit_len > 0) == (case.cache_type == "radix"), case.label
+        expected_logits = reference_greedy(model, case.prompts[-1], 1)[0][-1]
+        assert mx.allclose(logits, expected_logits, atol=1e-4, rtol=1e-4), case.label
+
+
+def test_next_turn_resumes_past_the_decoded_tokens(tmp_path: Path) -> None:
+    model = build_reference(seed=18, moe=True)
+    save_checkpoint(model, tmp_path, moe=True, quantization=None)
+    scheduler = make_scheduler(tmp_path, 1, "metal", max_extend_tokens=12)
+    first = random_prompt(12, 23)
+    _, tokens = run_alone(scheduler, 0, first, 6)
+    assert tokens == reference_greedy(model, first, 6)[1]
+    second = first + tokens[:5] + random_prompt(13, 7)
+    expected = reference_greedy(model, second, 6)[1]
+    assert run_alone(scheduler, 1, second, 6) == (28, expected)
