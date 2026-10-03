@@ -24,6 +24,7 @@ from ftmetal.core import Batch, Req, SamplingParams, host_ints
 from ftmetal.engine.config import EngineConfig
 from ftmetal.engine.engine import Engine, ForwardOutput
 from ftmetal.engine.sample import BatchSamplingArgs
+from ftmetal.kvcache.swa_pool import swa_radix_num_windows
 from ftmetal.message.backend import (
     AbortBackendMsg,
     BaseBackendMsg,
@@ -69,12 +70,28 @@ class TokenEvent:
 
 class Scheduler:
     def __init__(self, config: EngineConfig, eos_token_ids: set[int]) -> None:
-        # Before the engine loads anything: an unsupported --cache-type fails fast.
+        # Before the engine loads anything: an unsupported --cache-type or too few
+        # --swa-windows fails fast.
+        swa_group = config.model_config.swa_attention_group()
         cache_type = resolve_cache_type(
             config.cache_type,
             has_linear_attention=config.model_config.has_linear_attention,
-            has_sliding_window=config.model_config.swa_attention_group() is not None,
+            has_sliding_window=swa_group is not None,
         )
+        if cache_type == "swa_radix" and swa_group is not None:
+            num_windows = swa_radix_num_windows(
+                swa_group.sliding_window,
+                config.page_size,
+                config.max_running_req,
+                config.max_extend_tokens,
+                config.swa_windows,
+            )
+            logger.info(f"window pool: {num_windows} windows of {swa_group.sliding_window}")
+        elif config.swa_windows is not None:
+            logger.warning(
+                f"--swa-windows sizes the SWA radix cache's window pool: ignored with the "
+                f"{cache_type} cache"
+            )
         self.engine = Engine(config)
         self.config = config
         self.eos_token_ids = eos_token_ids

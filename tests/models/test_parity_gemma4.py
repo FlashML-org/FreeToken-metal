@@ -13,6 +13,8 @@ softcap, per-expert-scale router; fp32 throughout.
 from __future__ import annotations
 
 import json
+import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal, NamedTuple
 
@@ -283,6 +285,29 @@ def test_engine_builds_a_pool_and_a_backend_per_attention_type(tmp_path: Path) -
     assert (full_backend.sliding_window, swa_backend.sliding_window) == (None, WINDOW)
     assert full_backend.scale == swa_backend.scale == 1.0
     assert engine.graph_runner.graphs, "decode graphs captured over both pools"
+
+
+def test_too_few_windows_fail_at_startup_and_naive_ignores_the_count(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    save_checkpoint(build_reference(seed=19, moe=False), tmp_path, moe=False, quantization=None)
+    config = EngineConfig(
+        model_path=str(tmp_path),
+        dtype=mx.float32,
+        max_running_req=2,
+        num_page_override=64,
+        max_extend_tokens=64,
+        swa_windows=24,
+    )
+    # Two running requests and two chunks hold 2 x (8 + 16 + 8 + 3) + 2 x 64 = 198 window
+    # slots: 25 windows of 8.
+    with pytest.raises(ValueError, match="--swa-windows 25 or more"):
+        Scheduler(config, eos_token_ids={EOS})
+    with caplog.at_level(logging.WARNING, logger="ftmetal.scheduler.scheduler"):
+        scheduler = Scheduler(replace(config, cache_type="naive"), eos_token_ids={EOS})
+    assert "--swa-windows" in caplog.text
+    pool = scheduler.engine.ctx.swa_pool
+    assert pool is not None and pool.swa_num_tokens == 3 * 96  # 3 x align32(8 + 64 + 1)
 
 
 def run_alone(
