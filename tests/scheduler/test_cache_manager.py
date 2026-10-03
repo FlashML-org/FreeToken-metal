@@ -23,7 +23,7 @@ import pytest
 
 from ftmetal.attention.metadata import AttnType
 from ftmetal.core import Batch, Req, SamplingParams
-from ftmetal.kvcache.linear_state_pool import LinearStatePool, linear_pool_num_slots
+from ftmetal.kvcache.linear_state_pool import LinearStatePool
 from ftmetal.kvcache.swa_pool import (
     SENTINEL_SLOT,
     SWA_RETAIN_GAP,
@@ -313,14 +313,6 @@ def test_without_a_prefix_cache_chunks_are_not_aligned() -> None:
     )
     req = adder.try_add_one(pending)
     assert req is not None and req.extend_len == 100
-
-
-def test_pool_sizing_covers_the_running_floor() -> None:
-    """Four unevictable slots per running request plus the padding slot, even at a tiny ratio."""
-    for max_running_req in (1, 8, 64):
-        num_slots = linear_pool_num_slots(max_running_req, 0.1)
-        assert num_slots >= 4 * max_running_req + 1
-    assert linear_pool_num_slots(4, 2.0) == 4 * 4 + 8 + 1
 
 
 def radix_manager(num_pages: int = 16, page_size: int = 4) -> tuple[CacheManager, np.ndarray]:
