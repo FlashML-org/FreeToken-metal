@@ -104,8 +104,9 @@ std::vector<mx::array> gdn_step(
   GDNStepShape shape{num_k_heads, num_v_heads, key_dim, value_dim, conv_kernel};
   std::vector<mx::array> inputs = {
       conv_pool, state_pool, conv_in, conv_weight, a, b, A_log, dt_bias, slots, positions};
-  for (auto& input : inputs) {
-    input = mx::contiguous(input, false, stream);
+  // The pools stay as they are (see rows.h); eval_gpu checks they are row contiguous.
+  for (size_t i = 2; i < inputs.size(); ++i) {
+    inputs[i] = mx::contiguous(inputs[i], false, stream);
   }
   return mx::array::make_arrays(
       {conv_pool.shape(), state_pool.shape(), {batch, num_v_heads, value_dim}},

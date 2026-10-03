@@ -2,7 +2,9 @@
 
 Random paged pools with shuffled pages. Every pool row outside a request's keys (page
 tails, spare pages and the dummy page that pads short page-table rows) holds huge keys
-and values, so reading one shows up in the output.
+and values, so reading one shows up in the output. Replay metadata (a page table as wide
+as the longest context, so flash-decode's grid holds the most partitions) must give the
+per-length metadata's results.
 """
 
 from __future__ import annotations
@@ -33,6 +35,18 @@ SEQ_LENS = {
 # Worst |error| over a row relative to the row's largest |value|, against the fp32
 # reference (one bf16 ulp); the MLX backend's own rounding doubles it.
 TOLERANCE = {mx.bfloat16: 2**-7, mx.float32: 1e-5}
+# A replayed graph's page-table width (the engine's default context), and its batches:
+# keys per request and the dummy rows that pad the batch to its graph's size.
+REPLAY_MAX_SEQ_LEN = 262144
+REPLAY_BATCHES = [
+    ([64], 0),
+    ([300], 0),
+    ([2048], 0),
+    ([8192], 0),
+    ([32768], 0),
+    ([5, 300, 32768, 2049], 0),
+    ([2049, 7, 300], 1),
+]
 
 
 def attention_config(num_heads: int, num_kv_heads: int, head_dim: int) -> ModelConfig:
@@ -81,6 +95,37 @@ def decode_batch(seq_lens: list[int], page_table: np.ndarray, num_pages: int) ->
     return Batch(reqs=reqs, phase="decode")
 
 
+def filled_pool(
+    seq_lens: list[int], num_kv_heads: int, head_dim: int, dtype: mx.Dtype, table_width: int
+) -> tuple[MHAKVCache, np.ndarray, Batch]:
+    """A pool holding random keys and values for each request's slots, UNREAD_VALUE elsewhere.
+
+    The page table has one row per request plus a last row on the dummy page.
+    """
+    num_pages = sum(-(-n // PAGE_SIZE) for n in seq_lens) + SPARE_PAGES
+    kv_cache = MHAKVCache(
+        num_kv_heads=num_kv_heads,
+        num_layers=1,
+        head_dim=head_dim,
+        num_pages=num_pages + 1,
+        page_size=PAGE_SIZE,
+        dtype=dtype,
+    )
+    page_table = np.full((len(seq_lens) + 1, table_width), num_pages * PAGE_SIZE, dtype=np.int32)
+    batch = decode_batch(seq_lens, page_table, num_pages)
+
+    num_tokens = kv_cache.num_tokens
+    is_key = np.zeros((num_tokens, 1, 1), dtype=bool)
+    for i, seq_len in enumerate(seq_lens):
+        is_key[page_table[i, :seq_len]] = True
+    keys = mx.random.normal((num_tokens, num_kv_heads, head_dim))
+    values = mx.random.normal((num_tokens, num_kv_heads, head_dim))
+    keys = mx.where(mx.array(is_key), keys, UNREAD_VALUE).astype(dtype)
+    values = mx.where(mx.array(is_key), values, UNREAD_VALUE).astype(dtype)
+    kv_cache.store_kv(keys, values, mx.arange(num_tokens, dtype=mx.int32), layer_id=0)
+    return kv_cache, page_table, batch
+
+
 def max_row_error(out: mx.array, reference: mx.array) -> float:
     error = mx.abs(out.astype(mx.float32) - reference.astype(mx.float32)).max(axis=(1, 2))
     scale = mx.abs(reference.astype(mx.float32)).max(axis=(1, 2))
@@ -95,29 +140,11 @@ def test_decode_matches_reference_and_mlx_backend(
     batch_size: int, head_dim: int, num_heads: int, num_kv_heads: int, dtype: mx.Dtype
 ) -> None:
     seq_lens = SEQ_LENS[batch_size]
-    num_pages = sum(-(-n // PAGE_SIZE) for n in seq_lens) + SPARE_PAGES
     config = attention_config(num_heads, num_kv_heads, head_dim)
-    kv_cache = MHAKVCache(
-        num_kv_heads=num_kv_heads,
-        num_layers=1,
-        head_dim=head_dim,
-        num_pages=num_pages + 1,
-        page_size=PAGE_SIZE,
-        dtype=dtype,
-    )
-    page_table = np.zeros((batch_size, max(seq_lens) + PAGE_SIZE), dtype=np.int32)
-    batch = decode_batch(seq_lens, page_table, num_pages)
-
-    num_tokens = kv_cache.num_tokens
-    is_key = np.zeros((num_tokens, 1, 1), dtype=bool)
-    for i, seq_len in enumerate(seq_lens):
-        is_key[page_table[i, :seq_len]] = True
     mx.random.seed(batch_size + head_dim + num_heads)
-    keys = mx.random.normal((num_tokens, num_kv_heads, head_dim))
-    values = mx.random.normal((num_tokens, num_kv_heads, head_dim))
-    keys = mx.where(mx.array(is_key), keys, UNREAD_VALUE).astype(dtype)
-    values = mx.where(mx.array(is_key), values, UNREAD_VALUE).astype(dtype)
-    kv_cache.store_kv(keys, values, mx.arange(num_tokens, dtype=mx.int32), layer_id=0)
+    kv_cache, page_table, batch = filled_pool(
+        seq_lens, num_kv_heads, head_dim, dtype, max(seq_lens) + PAGE_SIZE
+    )
 
     (spec,) = config.kv_cache_group_specs()
     metal_backend = FullAttnMetalBackend(config, spec, kv_cache, page_table, PAGE_SIZE)
@@ -144,3 +171,54 @@ def test_decode_matches_reference_and_mlx_backend(
     assert out.shape == q.shape and out.dtype == dtype
     assert max_row_error(out, reference) < TOLERANCE[dtype]
     assert max_row_error(out, expected) < 2 * TOLERANCE[dtype]
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+@pytest.mark.parametrize(("seq_lens", "num_dummies"), REPLAY_BATCHES)
+def test_replay_metadata_matches_reference_and_eager(
+    seq_lens: list[int], num_dummies: int, dtype: mx.Dtype
+) -> None:
+    num_heads, num_kv_heads, head_dim = 16, 2, 256
+    size = len(seq_lens)
+    config = attention_config(num_heads, num_kv_heads, head_dim)
+    mx.random.seed(size + num_dummies)
+    kv_cache, page_table, batch = filled_pool(
+        seq_lens, num_kv_heads, head_dim, dtype, REPLAY_MAX_SEQ_LEN
+    )
+    dummy = Req(
+        input_ids=np.zeros(1, dtype=np.int32),
+        table_idx=size,
+        cached_len=0,
+        output_len=1,
+        uid=-1,
+        sampling_params=SamplingParams(),
+    )
+    (spec,) = config.kv_cache_group_specs()
+    backend = FullAttnMetalBackend(config, spec, kv_cache, page_table, PAGE_SIZE)
+    padded_size = size + num_dummies
+    q = mx.random.normal((padded_size, num_heads, head_dim)).astype(dtype)
+    k = mx.random.normal((padded_size, num_kv_heads, head_dim)).astype(dtype)
+    v = mx.random.normal((padded_size, num_kv_heads, head_dim)).astype(dtype)
+
+    backend.prepare_metadata(batch)
+    metadata = batch.attn_metadata[AttnType.FULL]
+    assert isinstance(metadata, FullAttnMetadata)
+    eager = backend.forward(q[:size], k[:size], v[:size], 0, batch)
+    backend.init_capture_graph(REPLAY_MAX_SEQ_LEN, [padded_size])
+    batch.padded_reqs = batch.reqs + [dummy] * num_dummies
+    backend.prepare_metadata(batch)
+    backend.prepare_for_replay(batch)
+    replayed = backend.forward(q, k, v, 0, batch)[:size]
+    reference = flash_decode_ref(
+        q[:size],
+        kv_cache.k_cache(0),
+        kv_cache.v_cache(0),
+        metadata.page_table,
+        metadata.seq_lens,
+        PAGE_SIZE,
+        config.head_dim**-0.5,
+    )
+    assert max_row_error(replayed, reference) < TOLERANCE[dtype]
+    if num_dummies == 0:
+        # Same batch size, so each request gets the same partitions under either grid.
+        assert mx.array_equal(replayed, eager)

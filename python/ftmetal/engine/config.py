@@ -9,11 +9,12 @@ from __future__ import annotations
 import json
 import os
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 
 import mlx.core as mx
 
+from ftmetal.env import read_env
 from ftmetal.layers.quantization.config import QuantConfig
 from ftmetal.models.config import ModelConfig
 from ftmetal.models.loader import config_dict, config_str_list, read_model_config, weight_files
@@ -28,6 +29,14 @@ def checkpoint_tensor_names(model_path: str) -> list[str]:
             header = json.loads(f.read(header_len))
         names.extend(name for name in header if name != "__metadata__")
     return names
+
+
+def command_graph_from_env() -> bool:
+    """FTMETAL_COMMAND_GRAPH: 1 (default) replays decode steps from captured graphs, 0 not."""
+    value = read_env("COMMAND_GRAPH")
+    if value not in (None, "0", "1"):
+        raise ValueError(f"FTMETAL_COMMAND_GRAPH must be 0 or 1, got {value!r}")
+    return value != "0"
 
 
 @dataclass(frozen=True)
@@ -47,6 +56,8 @@ class EngineConfig:
     # GDN snapshot cache of the hybrid radix cache: int(ratio * max_running_req) slots (at
     # least 4) on top of the running requests' own slots.
     linear_state_cache_ratio: float = 2.0
+    # Capture a decode graph per batch-size bucket at startup and replay decode from it.
+    command_graph: bool = field(default_factory=command_graph_from_env)
 
     @cached_property
     def raw_config(self) -> dict[str, object]:
@@ -76,4 +87,4 @@ class EngineConfig:
         return os.path.basename(os.path.normpath(self.model_path))
 
 
-__all__ = ["EngineConfig", "checkpoint_tensor_names"]
+__all__ = ["EngineConfig", "checkpoint_tensor_names", "command_graph_from_env"]

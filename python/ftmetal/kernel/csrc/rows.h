@@ -1,7 +1,10 @@
 // In-place row writes into preallocated pools (KV pages, GDN state slots,
 // the token pool). Every op returns the pool array itself: the output aliases
 // the input buffer, so MLX orders readers after the write while the pool is
-// never copied. Callers rebind, pool = op(pool, ...).
+// never copied. Callers rebind, pool = op(pool, ...). Pools are taken as they are,
+// never through mx::contiguous: it copies an input whose buffer is more than 16 KiB
+// larger than the array (a buffer reused from MLX's cache can be), and the write would
+// land in the copy.
 #pragma once
 
 #include <string>

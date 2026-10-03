@@ -28,13 +28,14 @@ from tokenizers import Tokenizer
 
 from ftmetal.core import SamplingParams
 from ftmetal.engine.config import EngineConfig
+from ftmetal.env import ENV_PREFIXES
 from ftmetal.message.frontend import BatchFrontendMsg, UserReply
 from ftmetal.message.tokenizer import AbortMsg, BaseTokenizerMsg
 from ftmetal.scheduler.scheduler import ForwardData, Scheduler, TokenEvent
 from ftmetal.scheduler.status import SchedulerStatusReporter
 from ftmetal.server import api_server
 from ftmetal.server.api_server import create_app
-from ftmetal.server.args import ServerArgs
+from ftmetal.server.args import ServerArgs, parse_args
 from ftmetal.server.generation import FrontendManager
 from ftmetal.server.reasoning_parser import ThinkReasoningParser
 
@@ -336,6 +337,31 @@ def test_reasoning_parser_reassembles_split_markers() -> None:
         "still thinking </thi",
         "",
     )
+
+
+@pytest.mark.parametrize(
+    ("flags", "env_value", "command_graph"),
+    [
+        ([], None, True),
+        ([], "0", False),
+        ([], "1", True),
+        (["--disable-command-graph"], None, False),
+        (["--disable-command-graph"], "1", False),
+    ],
+)
+def test_disable_command_graph_flag_overrides_the_environment(
+    tiny_model_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    flags: list[str],
+    env_value: str | None,
+    command_graph: bool,
+) -> None:
+    for prefix in ENV_PREFIXES:
+        monkeypatch.delenv(f"{prefix}COMMAND_GRAPH", raising=False)
+    if env_value is not None:
+        monkeypatch.setenv("FTMETAL_COMMAND_GRAPH", env_value)
+    args = parse_args(["--model", str(tiny_model_dir), *flags], prog="ftm serve")
+    assert args.command_graph is command_graph
 
 
 @pytest.mark.skipif(MODEL_PATH is None, reason="FTMETAL_TEST_MODEL_PATH is not set")

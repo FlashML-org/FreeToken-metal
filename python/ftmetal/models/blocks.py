@@ -17,7 +17,7 @@ from ftmetal.layers.base import BaseOP
 class BaseLLMModel(BaseOP):
     @abstractmethod
     def forward(self, batch: Batch) -> mx.array:
-        """Logits [batch.size, vocab] for the last token of every request."""
+        """Logits [batch.padded_size, vocab] at the last token of each of batch.padded_reqs."""
 
 
 def select_last_rows(x: mx.array, batch: Batch) -> mx.array:

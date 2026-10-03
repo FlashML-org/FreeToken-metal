@@ -99,6 +99,11 @@ class LinearStatePool(BasePool):
     def arrays(self) -> list[mx.array]:
         return [*self.conv_states, *self.recurrent_states]
 
+    def set_arrays(self, arrays: list[mx.array]) -> None:
+        count = len(self.conv_states)
+        assert len(arrays) == 2 * count
+        self.conv_states, self.recurrent_states = arrays[:count], arrays[count:]
+
     @property
     def num_linear_layers(self) -> int:
         return len(self.local_index_map)

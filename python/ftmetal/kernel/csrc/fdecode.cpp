@@ -107,8 +107,9 @@ mx::array flash_decode(
       num_simdgroups,
       scale};
   std::vector<mx::array> inputs = {q, k_cache, v_cache, page_table, seq_lens};
-  for (auto& input : inputs) {
-    input = mx::contiguous(input, false, stream);
+  // The k/v pools (inputs 1 and 2) stay as they are (see rows.h); eval_gpu checks them.
+  for (size_t i : {0, 3, 4}) {
+    inputs[i] = mx::contiguous(inputs[i], false, stream);
   }
   return mx::array(
       q.shape(), q.dtype(), std::make_shared<FlashDecode>(stream, config), std::move(inputs));
@@ -128,6 +129,9 @@ void FlashDecode::eval_cpu(const std::vector<mx::array>&, std::vector<mx::array>
 }
 
 void FlashDecode::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) {
+  if (!inputs[1].flags().row_contiguous || !inputs[2].flags().row_contiguous) {
+    throw std::runtime_error("ftmetal fdecode: k/v cache must be row contiguous");
+  }
   auto& out = outputs[0];
   out.set_data(mx::allocator::malloc(out.nbytes()));
   int batch = inputs[0].shape(0);

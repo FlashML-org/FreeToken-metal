@@ -1,15 +1,18 @@
 """Full (causal GQA) attention over the paged K/V pool: shared metadata and dispatch.
 
 Port of the shared part of FreeToken's full-attention backends (attention/fa.py's
-prepare_metadata and forward). Divergences: the metadata is built from the host page
-table into fresh mx.arrays each step, out_loc is computed here, and the kernel
-implementation is the subclass's attend().
+prepare_metadata, capture hooks and forward). Divergences: the metadata is built from
+the host page table into fresh mx.arrays each step, out_loc is computed here, and the
+kernel implementation is the subclass's attend(). prepare_for_replay swaps a decode
+batch's page table for its requests' whole page-table rows (the graph's width is the
+row width) and max_seqlen_k for the row width, so the flash-decode partition count is
+fixed per graph; entries past a request's keys are stale but in bounds and never read.
 """
 
 from __future__ import annotations
 
 from abc import abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import mlx.core as mx
 import numpy as np
@@ -39,6 +42,9 @@ class FullAttnMetadata(BaseAttnMetadata):
     def get_last_indices(self, bs: int) -> mx.array:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
 
+    def step_inputs(self) -> list[mx.array]:
+        return [self.cu_seqlens_q, self.seq_lens, self.page_table]
+
 
 class FullAttnBackend(BaseAttnBackend):
     def __init__(
@@ -57,9 +63,11 @@ class FullAttnBackend(BaseAttnBackend):
         self.scale = spec.head_dim**-0.5
         # The dummy page fills unused page-table entries so padded reads stay in bounds.
         self.dummy_page = kvcache.num_pages - 1
+        self.capture_max_seq_len = 0
+        self.capture_bs: list[int] = []
 
     def prepare_metadata(self, batch: Batch) -> None:
-        reqs = batch.reqs
+        reqs = batch.padded_reqs
         seq_lens = [req.device_len for req in reqs]
         extend_lens = [req.extend_len for req in reqs]
         cached_lens = [req.cached_len for req in reqs]
@@ -87,6 +95,22 @@ class FullAttnBackend(BaseAttnBackend):
             seq_lens_host=seq_lens,
             extend_lens_host=extend_lens,
             cached_lens_host=cached_lens,
+        )
+
+    def init_capture_graph(self, max_seq_len: int, bs_list: list[int]) -> None:
+        assert max_seq_len == self.page_table_host.shape[1], "a graph spans whole table rows"
+        self.capture_max_seq_len = max_seq_len
+        self.capture_bs = sorted(bs_list)
+
+    def prepare_for_replay(self, batch: Batch) -> None:
+        metadata = batch.attn_metadata[AttnType.FULL]
+        assert isinstance(metadata, FullAttnMetadata)
+        assert batch.is_decode and batch.padded_size in self.capture_bs
+        table = self.page_table_host[[req.table_idx for req in batch.padded_reqs]]
+        if self.page_size > 1:
+            table = table[:, :: self.page_size] // self.page_size
+        batch.attn_metadata[AttnType.FULL] = replace(
+            metadata, page_table=mx.array(table), max_seqlen_k=self.capture_max_seq_len
         )
 
     def forward(

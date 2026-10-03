@@ -2,7 +2,9 @@
 
 Port of FreeToken server/args.py (ServerArgs, parse_args). Divergences: ServerArgs
 extends EngineConfig directly (one process, no scheduler config or TP); only the flags
-this engine has; the shell is a client of a running server, so there is no shell mode.
+this engine has, and --disable-command-graph for FreeToken's --cuda-graph-max-bs (the
+graph ladder always ends at max_running_req); the shell is a client of a running
+server, so there is no shell mode.
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ import os
 from dataclasses import dataclass
 
 from ftmetal.attention import SUPPORTED_ATTENTION_BACKENDS
-from ftmetal.engine.config import EngineConfig
+from ftmetal.engine.config import EngineConfig, command_graph_from_env
 
 
 @dataclass(frozen=True)
@@ -111,6 +113,12 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         choices=SUPPORTED_ATTENTION_BACKENDS.supported_names(),
         default=ServerArgs.attention_backend,
     )
+    parser.add_argument(
+        "--disable-command-graph",
+        action="store_true",
+        help="decode eagerly instead of replaying captured CommandGraphs; without the flag "
+        "FTMETAL_COMMAND_GRAPH=0/1 decides (default 1)",
+    )
     namespace = parser.parse_args(argv)
     model_path = os.path.expanduser(namespace.model_path)
     if not os.path.isdir(model_path):
@@ -127,6 +135,7 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         num_page_override=namespace.num_page_override,
         page_size=namespace.page_size,
         attention_backend=namespace.attention_backend,
+        command_graph=not namespace.disable_command_graph and command_graph_from_env(),
     )
 
 

@@ -4,7 +4,8 @@ Port of FreeToken kvcache/base.py (BaseKVCachePool). Divergences: BasePool is th
 of every pool family, the GDN state pool included; kv_cost prices one spec as (bytes per
 page, fixed bytes) and from_spec builds the pool from it; solve_num_pages is the engine
 budget's (engine/cache_budget.py); pools hold one mx.array per storage layer and expose
-arrays() so the engine can eval them at startup and at every step; the prefix-cache
+arrays() so the engine can eval them at startup and at every step, and set_arrays() so a
+graph replay can rebind them; the prefix-cache
 types live with the radix caches and the CacheManager; runtime rebuild is dropped.
 """
 
@@ -54,6 +55,10 @@ class BasePool(ABC):
     @abstractmethod
     def arrays(self) -> list[mx.array]:
         """Every pool array, for eval."""
+
+    @abstractmethod
+    def set_arrays(self, arrays: list[mx.array]) -> None:
+        """Rebind the pool to arrays, in arrays() order (a replayed step's updated pools)."""
 
 
 class BaseKVCachePool(BasePool):
