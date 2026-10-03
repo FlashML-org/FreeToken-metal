@@ -47,6 +47,9 @@ class FullAttnMetadata(BaseAttnMetadata):
 
 
 class FullAttnBackend(BaseAttnBackend):
+    # The record prepare_metadata builds; a backend whose kernels plan more extends it.
+    metadata_cls: type[FullAttnMetadata] = FullAttnMetadata
+
     def __init__(
         self,
         config: ModelConfig,
@@ -86,7 +89,7 @@ class FullAttnBackend(BaseAttnBackend):
         cu = np.zeros(len(reqs) + 1, dtype=np.int32)
         np.cumsum(extend_lens, out=cu[1:])
         batch.out_loc = mx.array(out_loc)
-        batch.attn_metadata[AttnType.FULL] = FullAttnMetadata(
+        batch.attn_metadata[AttnType.FULL] = self.metadata_cls(
             cu_seqlens_q=mx.array(cu),
             seq_lens=mx.array(np.asarray(seq_lens, dtype=np.int32)),
             page_table=mx.array(page_table),

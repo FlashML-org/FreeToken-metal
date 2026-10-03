@@ -48,7 +48,7 @@ inline uint request_partitions(uint seq_len, uint batch_size, uint grid_partitio
 // Buffers: 0 q [B, HKV * G, D], 1 k_cache / 2 v_cache [num_pages * BS, HKV, D],
 // 3 page_table [B, max_pages] int32, 4 seq_lens [B] int32, 5 part_acc [B, HKV, P, G, D]
 // fp32, 6 part_ml [B, HKV, P, G, 2] fp32, 7 max_pages, 8 scale * log2(e).
-[[kernel]] void fdecode_partials(
+[[kernel, max_total_threads_per_threadgroup(NSG * 32)]] void fdecode_partials(
     device const T* q [[buffer(0)]],
     device const T* k_cache [[buffer(1)]],
     device const T* v_cache [[buffer(2)]],

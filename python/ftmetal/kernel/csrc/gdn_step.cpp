@@ -2,6 +2,7 @@
 
 #include <stdexcept>
 
+#include "metal_primitive.h"
 #include "mlx/allocator.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/utils.h"
@@ -15,27 +16,6 @@ std::string gdn_step_source;
 const int NUM_SIMDGROUPS = 4;
 const int ROWS_PER_THREADGROUP = 32;
 const int SIMD_WIDTH = 32;
-
-std::string metal_type(mx::Dtype dtype) {
-  switch (dtype) {
-    case mx::float16:
-      return "half";
-    case mx::bfloat16:
-      return "bfloat";
-    case mx::float32:
-      return "float";
-    default:
-      throw std::invalid_argument(
-          "ftmetal gdn_step: unsupported dtype " + mx::type_to_name(dtype));
-  }
-}
-
-void replace_all(std::string& text, const std::string& token, const std::string& value) {
-  for (size_t pos = text.find(token); pos != std::string::npos; pos = text.find(token, pos)) {
-    text.replace(pos, token.size(), value);
-    pos += value.size();
-  }
-}
 
 void check_shape(const mx::array& x, const mx::Shape& shape, mx::Dtype dtype, const char* what) {
   if (x.shape() != shape) {
@@ -72,7 +52,7 @@ std::vector<mx::array> gdn_step(
     throw std::invalid_argument("ftmetal gdn_step: state_pool must be float32");
   }
   auto dtype = conv_pool.dtype();
-  metal_type(dtype);
+  metal_type(dtype, "gdn_step");
   int num_slots = conv_pool.shape(0);
   int conv_kernel = conv_pool.shape(1);
   int conv_dim = conv_pool.shape(2);
@@ -137,7 +117,7 @@ void GDNStep::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::arr
   if (batch == 0) {
     return;
   }
-  std::string type = metal_type(outputs[0].dtype());
+  std::string type = metal_type(outputs[0].dtype(), "gdn_step");
   std::string library_name = "ftmetal_gdn_step_" + type + "_" + std::to_string(shape_.num_k_heads) +
       "_" + std::to_string(shape_.num_v_heads) + "_" + std::to_string(shape_.key_dim) + "_" +
       std::to_string(shape_.value_dim) + "_" + std::to_string(shape_.conv_kernel);

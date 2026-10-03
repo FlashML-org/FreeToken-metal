@@ -25,6 +25,8 @@ def make_scheduler(
     page_size: int,
     max_extend_tokens: int = 64,
     attention_backend: str = "mlx",
+    num_pages: int = 64,
+    max_seq_len: int | None = None,
 ) -> Scheduler:
     config = EngineConfig(
         model_path=str(path),
@@ -32,10 +34,22 @@ def make_scheduler(
         max_running_req=2,
         page_size=page_size,
         attention_backend=attention_backend,
-        num_page_override=64,
+        max_seq_len_override=max_seq_len,
+        num_page_override=num_pages,
         max_extend_tokens=max_extend_tokens,
     )
     return Scheduler(config, eos_token_ids={127})
+
+
+def last_chunk_logits(scheduler: Scheduler, prompt: list[int]) -> mx.array:
+    """Logits of the prompt's last prefill chunk; the scheduler runs the chunks before it."""
+    scheduler.add_request(0, np.array(prompt, dtype=np.int32), SamplingParams(max_tokens=1))
+    while True:
+        forward_input = scheduler.schedule_next_batch()
+        assert forward_input is not None
+        if forward_input.batch.reqs[0].can_decode:
+            return scheduler.engine.model.forward(forward_input.batch)
+        scheduler.process_last_data(scheduler.forward(forward_input))
 
 
 @pytest.mark.parametrize("attention_backend", ["mlx", "metal"])
@@ -111,6 +125,38 @@ def test_long_prefill_matches_mlx_lm(tmp_path: Path, max_extend_tokens: int) -> 
     params = SamplingParams(temperature=0.0, max_tokens=steps, ignore_eos=True)
     tokens = scheduler.generate(np.array(prompt, dtype=np.int32), params)
     assert tokens == expected
+
+
+# A prompt past the 2048-token chunk budget: the metal backend's flash-prefill reads each
+# chunk's prefix from the pool, the MLX backend gathers it for SDPA.
+LONG_PROMPT_LEN = 5000
+LONG_PROMPT_CHUNK = 2048
+
+
+def test_chunked_long_prefill_metal_matches_mlx_backend(tmp_path: Path) -> None:
+    model = build_reference(seed=7)
+    save_checkpoint(model, tmp_path, quantization=None)
+    prompt = [int(t) for t in np.random.default_rng(7).integers(1, 120, size=LONG_PROMPT_LEN)]
+    steps = 8
+    params = SamplingParams(temperature=0.0, max_tokens=steps, ignore_eos=True)
+    logits: dict[str, mx.array] = {}
+    tokens: dict[str, list[int]] = {}
+    for backend in ("mlx", "metal"):
+        prefill_scheduler, decode_scheduler = (
+            make_scheduler(
+                tmp_path,
+                page_size=1,
+                max_extend_tokens=LONG_PROMPT_CHUNK,
+                attention_backend=backend,
+                num_pages=LONG_PROMPT_LEN + steps,
+                max_seq_len=LONG_PROMPT_LEN + steps,
+            )
+            for _ in range(2)
+        )
+        logits[backend] = last_chunk_logits(prefill_scheduler, prompt)
+        tokens[backend] = decode_scheduler.generate(np.array(prompt, dtype=np.int32), params)
+    assert mx.allclose(logits["metal"], logits["mlx"], atol=1e-4, rtol=1e-4)
+    assert tokens["metal"] == tokens["mlx"]
 
 
 @pytest.mark.parametrize("attention_backend", ["mlx", "metal"])
