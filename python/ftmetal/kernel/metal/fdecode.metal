@@ -3,12 +3,14 @@
 // The grid holds P partitions per (request, kv head); a request of seq_len keys uses the
 // first request_partitions(seq_len) of them, so a grid fixed at the longest context (a
 // replayed graph) costs a short request only the partitions it would get on its own.
-// fdecode_partials, grid (32 * NSG * P, HKV, B): a threadgroup streams one kv head's
-// keys of one partition once for all G = Hq / Hkv query heads; each simdgroup takes a
-// contiguous slice and keeps an online softmax per query head whose accumulator is the
-// running weighted mean of V (bounded by max |v|, so a half accumulator cannot
-// overflow); the slices merge through threadgroup memory and simdgroup 0 writes the
-// partition's unnormalized [G, D] accumulator and its (max, sum) in the log2 domain.
+// fdecode_partials, grid (32 * NSG * P, HKV * HG, B): a threadgroup streams one kv
+// head's keys of one partition once for GH = G / HG of its G = Hq / Hkv query heads
+// (HG > 1 trades re-reading the keys for fewer registers per lane at a wide head);
+// each simdgroup takes a contiguous slice and keeps an online softmax per query head
+// whose accumulator is the running weighted mean of V (bounded by max |v|, so a half
+// accumulator cannot overflow); the slices merge through threadgroup memory and
+// simdgroup 0 writes the partition's unnormalized [GH, D] accumulator and its (max,
+// sum) in the log2 domain.
 // fdecode_merge, grid (32 * G, HKV, B): one simdgroup per (request, query head) merges
 // the request's partials by log-sum-exp.
 #include <metal_stdlib>
@@ -19,6 +21,8 @@ using namespace metal;
 #define HKV {{HKV}}
 #define BS {{BS}}
 #define NSG {{NSG}}
+#define HG {{HG}}
+#define GH (G / HG)
 #define PARTITION_TOKENS {{PARTITION_TOKENS}}
 #define MIN_PARTITION_TOKENS {{MIN_PARTITION_TOKENS}}
 #define MAX_PARTITIONS {{MAX_PARTITIONS}}
@@ -39,7 +43,8 @@ inline uint request_partitions(uint seq_len, uint batch_size, uint grid_partitio
   uint partitions =
       clamp((seq_len + PARTITION_TOKENS - 1) / PARTITION_TOKENS, 1u, (uint)MAX_PARTITIONS);
   const uint min_partition_limit = (seq_len + MIN_PARTITION_TOKENS - 1) / MIN_PARTITION_TOKENS;
-  while (batch_size * HKV * partitions < MIN_THREADGROUPS && partitions < min_partition_limit) {
+  while (batch_size * HKV * HG * partitions < MIN_THREADGROUPS &&
+         partitions < min_partition_limit) {
     partitions *= 2;
   }
   return min(partitions, grid_partitions);
@@ -63,7 +68,8 @@ inline uint request_partitions(uint seq_len, uint batch_size, uint grid_partitio
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
   const uint partition = tgpig.x;
-  const uint kv_head = tgpig.y;
+  const uint kv_head = tgpig.y / HG;
+  const uint head0 = tgpig.y % HG * GH;
   const uint b = tgpig.z;
   const uint seq_len = seq_lens[b];
   const uint num_partitions = request_partitions(seq_len, tptg.z, tptg.x);
@@ -76,9 +82,9 @@ inline uint request_partitions(uint seq_len, uint batch_size, uint grid_partitio
   const uint t1 = min(seq_len, t0 + per_part);
   if (t0 >= t1) {
     if (sg == 0 && lane == 0) {
-      for (int g = 0; g < G; ++g) {
-        part_ml[(part_row * G + g) * 2] = -INFINITY;
-        part_ml[(part_row * G + g) * 2 + 1] = 0.0f;
+      for (int g = 0; g < GH; ++g) {
+        part_ml[(part_row * G + head0 + g) * 2] = -INFINITY;
+        part_ml[(part_row * G + head0 + g) * 2 + 1] = 0.0f;
       }
     }
     return;
@@ -87,15 +93,15 @@ inline uint request_partitions(uint seq_len, uint batch_size, uint grid_partitio
   const uint s0 = t0 + sg * per_sg;
   const uint s1 = min(t1, s0 + per_sg);
 
-  threadgroup T q_tg[G * D];
-  for (uint i = sg * 32 + lane; i < G * D; i += NSG * 32) {
-    q_tg[i] = q[((size_t)b * HKV + kv_head) * G * D + i];
+  threadgroup T q_tg[GH * D];
+  for (uint i = sg * 32 + lane; i < GH * D; i += NSG * 32) {
+    q_tg[i] = q[(((size_t)b * HKV + kv_head) * G + head0) * D + i];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  float m_g[G], l_g[G];
-  AccVec acc[G][NV];
-  for (int g = 0; g < G; ++g) {
+  float m_g[GH], l_g[GH];
+  AccVec acc[GH][NV];
+  for (int g = 0; g < GH; ++g) {
     m_g[g] = -INFINITY;
     l_g[g] = 0.0f;
     for (int d = 0; d < NV; ++d) acc[g][d] = AccVec(0);
@@ -108,8 +114,8 @@ inline uint request_partitions(uint seq_len, uint batch_size, uint grid_partitio
     const device InVec* k_vec = (const device InVec*)(k_cache + base);
     FloatVec kv[NV];
     for (int d = 0; d < NV; ++d) kv[d] = FloatVec(k_vec[d]);
-    float w[G];
-    for (int g = 0; g < G; ++g) {
+    float w[GH];
+    for (int g = 0; g < GH; ++g) {
       const threadgroup InVec* q_vec = (const threadgroup InVec*)(q_tg + g * D + lane_off);
       FloatVec dot = kv[0] * FloatVec(q_vec[0]);
       for (int d = 1; d < NV; ++d) dot += kv[d] * FloatVec(q_vec[d]);
@@ -119,7 +125,7 @@ inline uint request_partitions(uint seq_len, uint batch_size, uint grid_partitio
     }
     const device InVec* v_vec = (const device InVec*)(v_cache + base);
     for (int d = 0; d < NV; ++d) kv[d] = FloatVec(v_vec[d]);
-    for (int g = 0; g < G; ++g) {
+    for (int g = 0; g < GH; ++g) {
       const float m_new = max(m_g[g], w[g]);
       const float corr = fast::exp2(m_g[g] - m_new);
       const float p = fast::exp2(w[g] - m_new);
@@ -133,38 +139,52 @@ inline uint request_partitions(uint seq_len, uint batch_size, uint grid_partitio
     }
   }
 
-  threadgroup float tg_ml[NSG * G * 2];
-  threadgroup StageT tg_acc[NSG * G * D];
-  for (int g = 0; g < G; ++g) {
+  if (NSG == 1) {
+    // One simdgroup has nothing to merge: its accumulator is the partition's.
+    for (int g = 0; g < GH; ++g) {
+      const size_t out_off = (part_row * G + head0 + g) * D + lane_off;
+      for (int d = 0; d < NV; ++d)
+        for (int j = 0; j < VW; ++j) part_acc[out_off + d * VW + j] = (float)acc[g][d][j] * l_g[g];
+      if (lane == 0) {
+        part_ml[(part_row * G + head0 + g) * 2] = m_g[g];
+        part_ml[(part_row * G + head0 + g) * 2 + 1] = l_g[g];
+      }
+    }
+    return;
+  }
+  threadgroup float tg_ml[NSG * GH * 2];
+  threadgroup StageT tg_acc[NSG > 1 ? NSG * GH * D : 1];
+  for (int g = 0; g < GH; ++g) {
     if (lane == 0) {
-      tg_ml[(sg * G + g) * 2] = m_g[g];
-      tg_ml[(sg * G + g) * 2 + 1] = l_g[g];
+      tg_ml[(sg * GH + g) * 2] = m_g[g];
+      tg_ml[(sg * GH + g) * 2 + 1] = l_g[g];
     }
     for (int d = 0; d < NV; ++d)
       for (int j = 0; j < VW; ++j)
-        tg_acc[(sg * G + g) * D + lane_off + d * VW + j] = (StageT)acc[g][d][j];
+        tg_acc[(sg * GH + g) * D + lane_off + d * VW + j] = (StageT)acc[g][d][j];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   if (sg == 0) {
-    for (int g = 0; g < G; ++g) {
+    for (int g = 0; g < GH; ++g) {
       float m_max = -INFINITY;
-      for (int s = 0; s < NSG; ++s) m_max = max(m_max, tg_ml[(s * G + g) * 2]);
+      for (int s = 0; s < NSG; ++s) m_max = max(m_max, tg_ml[(s * GH + g) * 2]);
       float l_sum = 0.0f, weight[NSG];
       for (int s = 0; s < NSG; ++s) {
-        const float m_s = tg_ml[(s * G + g) * 2];
-        weight[s] = (m_s == -INFINITY) ? 0.0f : fast::exp2(m_s - m_max) * tg_ml[(s * G + g) * 2 + 1];
+        const float m_s = tg_ml[(s * GH + g) * 2];
+        weight[s] =
+            (m_s == -INFINITY) ? 0.0f : fast::exp2(m_s - m_max) * tg_ml[(s * GH + g) * 2 + 1];
         l_sum += weight[s];
       }
-      const size_t out_off = (part_row * G + g) * D + lane_off;
+      const size_t out_off = (part_row * G + head0 + g) * D + lane_off;
       for (int i = 0; i < LPD; ++i) {
         float o = 0.0f;
-        for (int s = 0; s < NSG; ++s) o += (float)tg_acc[(s * G + g) * D + lane_off + i] * weight[s];
+        for (int s = 0; s < NSG; ++s) o += (float)tg_acc[(s * GH + g) * D + lane_off + i] * weight[s];
         part_acc[out_off + i] = o;
       }
       if (lane == 0) {
-        part_ml[(part_row * G + g) * 2] = m_max;
-        part_ml[(part_row * G + g) * 2 + 1] = l_sum;
+        part_ml[(part_row * G + head0 + g) * 2] = m_max;
+        part_ml[(part_row * G + head0 + g) * 2 + 1] = l_sum;
       }
     }
   }

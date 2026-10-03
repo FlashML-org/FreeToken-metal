@@ -70,7 +70,11 @@ class TokenEvent:
 class Scheduler:
     def __init__(self, config: EngineConfig, eos_token_ids: set[int]) -> None:
         # Before the engine loads anything: an unsupported --cache-type fails fast.
-        cache_type = resolve_cache_type(config.cache_type, config.model_config.has_linear_attention)
+        cache_type = resolve_cache_type(
+            config.cache_type,
+            has_linear_attention=config.model_config.has_linear_attention,
+            has_sliding_window=config.model_config.swa_attention_group() is not None,
+        )
         self.engine = Engine(config)
         self.config = config
         self.eos_token_ids = eos_token_ids
@@ -82,6 +86,7 @@ class Scheduler:
             self.engine.page_table,
             cache_type,
             self.engine.ctx.linear_state_pool,
+            self.engine.ctx.swa_pool,
         )
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
@@ -322,9 +327,12 @@ class Scheduler:
                     # request's terminal reply.
                     self.free_req_resources(req)
                     continue
-                if isinstance(req, ChunkedReq):
-                    continue
                 if req in self.finished_reqs:
+                    continue
+                if self.cache_manager.swa_pool is not None:
+                    # This step has drained: its keys behind the window are read no more.
+                    self.cache_manager.free_swa_out_of_window(req)
+                if isinstance(req, ChunkedReq):
                     continue
                 req.append_host(next_token)
                 hit_length = req.generated_len >= req.output_len

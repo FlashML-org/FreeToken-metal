@@ -1,7 +1,7 @@
 """Gated activations and gated adds as compiled elementwise leaves.
 
-Port of FreeToken layers/activation.py; only silu is served. The compiled leaf takes
-the halves separately because a shapeless compile cannot split.
+Port of FreeToken layers/activation.py; silu and gelu_tanh are served. The compiled
+leaves take the halves separately because a shapeless compile cannot split.
 """
 
 from __future__ import annotations
@@ -25,6 +25,18 @@ def silu_and_mul(gate_up: mx.array) -> mx.array:
 
 
 @partial(mx.compile, shapeless=True)
+def gelu_tanh_mul(gate: mx.array, up: mx.array) -> mx.array:
+    """gelu_tanh(gate) * up in fp32, cast back to the input dtype."""
+    return (nn.gelu_approx(gate.astype(mx.float32)) * up.astype(mx.float32)).astype(gate.dtype)
+
+
+def gelu_tanh_and_mul(gate_up: mx.array) -> mx.array:
+    """gelu_tanh(gate) * up over the two halves of the last axis."""
+    gate, up = mx.split(gate_up, 2, axis=-1)
+    return gelu_tanh_mul(gate, up)
+
+
+@partial(mx.compile, shapeless=True)
 def sigmoid_gate(x: mx.array, gate: mx.array) -> mx.array:
     """x * sigmoid(gate), the gate broadcast over the last axis."""
     return (x.astype(mx.float32) * mx.sigmoid(gate.astype(mx.float32))).astype(x.dtype)
@@ -37,4 +49,11 @@ def sigmoid_gated_add(base: mx.array, x: mx.array, gate: mx.array) -> mx.array:
     return out.astype(base.dtype)
 
 
-__all__ = ["sigmoid_gate", "sigmoid_gated_add", "silu_and_mul", "silu_mul"]
+__all__ = [
+    "gelu_tanh_and_mul",
+    "gelu_tanh_mul",
+    "sigmoid_gate",
+    "sigmoid_gated_add",
+    "silu_and_mul",
+    "silu_mul",
+]

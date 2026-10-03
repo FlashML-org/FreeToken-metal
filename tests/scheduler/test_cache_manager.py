@@ -1,6 +1,8 @@
-"""Page allocation and the prefix caches on CacheManager.
+"""Page allocation, the window slots of a sliding-window model, and the prefix caches on
+CacheManager.
 
-Every page returns and rows hold page-aligned slots. The radix type commits a request's
+Every page returns and rows hold page-aligned slots; a window pool backs every new token
+and keeps only a request's window live as it slides. The radix type commits a request's
 prefix at its prefill and its finish, frees and re-points duplicates and evicts unlocked
 leaves under pressure; with a GDN state pool the hybrid radix commit donates the track
 snapshot, a finish donates its live slot, and both currencies evict under pressure. Parts
@@ -10,6 +12,8 @@ test_commit_repoints_page_table.py, on a tiny real LinearStatePool.
 
 from __future__ import annotations
 
+import logging
+from functools import partial
 from typing import Literal
 
 import mlx.core as mx
@@ -19,6 +23,7 @@ import pytest
 from ftmetal.attention.metadata import AttnType
 from ftmetal.core import Req, SamplingParams
 from ftmetal.kvcache.linear_state_pool import LinearStatePool, linear_pool_num_slots
+from ftmetal.kvcache.swa_pool import SENTINEL_SLOT, SWAKVCache
 from ftmetal.models.config import KVCacheGroupSpec
 from ftmetal.scheduler.cache import CacheManager, MatchResult, resolve_cache_type
 from ftmetal.scheduler.prefill import ChunkedReq, PendingReq, PrefillAdder
@@ -76,6 +81,38 @@ def test_pages_exhausted_raises(cache_type: Literal["naive", "radix"]) -> None:
     manager = CacheManager(2, 4, page_table, cache_type)
     with pytest.raises(RuntimeError):
         manager.allocate_paged([make_req(0, 12, 1)])
+
+
+@pytest.mark.parametrize("page_size", [1, 4])
+def test_window_slots_slide_with_the_request_and_return_on_finish(page_size: int) -> None:
+    window, num_pages = 8, 32
+    spec = KVCacheGroupSpec(
+        name="swa",
+        attn_type=AttnType.SWA,
+        layer_ids=(0,),
+        num_kv_heads=1,
+        head_dim=8,
+        sliding_window=window,
+    )
+    pool = SWAKVCache(spec, 48, (num_pages + 1) * page_size, mx.float16)
+    page_table = np.zeros((1, 64), dtype=np.int32)
+    manager = CacheManager(num_pages, page_size, page_table, "naive", swa_pool=pool)
+    req = make_req(0, 20, 12)
+    manager.allocate_paged([req])
+    assert pool.swa_available_size == 47 - -(-20 // page_size) * page_size
+    for step in range(12):
+        req.complete_one()
+        # The step that wrote the keys has drained.
+        manager.free_swa_out_of_window(req)
+        mapped = pool.translate(page_table[0, : req.cached_len])
+        # Every key a later query sees keeps its window slot; nothing far behind does.
+        assert SENTINEL_SLOT not in mapped[req.cached_len - window :]
+        assert np.count_nonzero(mapped) <= window + 2 * page_size
+        if step < 11:
+            manager.allocate_paged([req])
+    with manager.lazy_free_region():
+        manager.cache_req(req, finished=True)
+    manager.check_integrity()
 
 
 def make_pool(num_slots: int = 16) -> LinearStatePool:
@@ -302,11 +339,26 @@ def radix_manager(num_pages: int = 16, page_size: int = 4) -> tuple[CacheManager
 
 
 def test_cache_type_resolves_radix_to_the_hybrid_radix_on_a_gdn_model() -> None:
-    assert resolve_cache_type("radix", has_linear_attention=False) == "radix"
-    assert resolve_cache_type("naive", has_linear_attention=False) == "naive"
-    assert resolve_cache_type("radix", has_linear_attention=True) == "hybrid_radix"
+    resolve = partial(resolve_cache_type, has_sliding_window=False)
+    assert resolve("radix", has_linear_attention=False) == "radix"
+    assert resolve("naive", has_linear_attention=False) == "naive"
+    assert resolve("radix", has_linear_attention=True) == "hybrid_radix"
     with pytest.raises(ValueError):
-        resolve_cache_type("naive", has_linear_attention=True)
+        resolve("naive", has_linear_attention=True)
+
+
+def test_cache_type_resolves_radix_to_naive_on_a_sliding_window_model(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="ftmetal.scheduler.cache"):
+        resolved = resolve_cache_type("radix", has_linear_attention=False, has_sliding_window=True)
+    assert resolved == "naive"
+    assert len(caplog.records) == 1 and "SWA radix cache" in caplog.text
+    caplog.clear()
+    assert resolve_cache_type("naive", has_linear_attention=False, has_sliding_window=True) == (
+        "naive"
+    )
+    assert not caplog.records
 
 
 def test_radix_prefill_commit_publishes_the_prompt_and_a_shared_prefix_hits() -> None:

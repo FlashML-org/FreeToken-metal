@@ -4,8 +4,9 @@ arrays in the one order a CommandGraph capture and its replays take them.
 Port of FreeToken kvcache/__init__.py (resolve_pool_class, create_kv_pool). Divergences:
 every KVCacheGroupSpec gets its own pool, looked up by AttnType in POOL_FAMILIES, so the
 GDN state pool is one of them instead of one KV family per model plus a LinearStatePool
-the engine builds; the "+1 dummy page" is the paged pool's own from_spec rule; the
-prefix caches are built by the scheduler, not registered here.
+the engine builds, and FreeToken's HybridSWAKVCache is the FULL pool plus the SWA one;
+the "+1 dummy page" is the paged pool's own from_spec rule; the prefix caches are built
+by the scheduler, not registered here.
 """
 
 from __future__ import annotations
@@ -16,10 +17,12 @@ from ftmetal.attention.metadata import AttnType
 from ftmetal.kvcache.base import BasePool, PoolConfig, PoolCost
 from ftmetal.kvcache.linear_state_pool import LinearStatePool
 from ftmetal.kvcache.mha_pool import MHAKVCache
+from ftmetal.kvcache.swa_pool import SWAKVCache
 from ftmetal.models.config import KVCacheGroupSpec
 
 POOL_FAMILIES: dict[AttnType, type[BasePool]] = {
     AttnType.FULL: MHAKVCache,
+    AttnType.SWA: SWAKVCache,
     AttnType.LINEAR: LinearStatePool,
 }
 

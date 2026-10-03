@@ -9,7 +9,12 @@
 // time (any page size), K transposed; S = Q K^T and O += P V (P rounded to the input
 // type) run on 8x8 simdgroup matrices with fp32 accumulators, the DS partial products of S
 // summed through threadgroup memory; the online softmax keeps each row's (max, sum) in
-// fp32 in the log2 domain. Only blocks that cross the causal diagonal are masked.
+// fp32 in the log2 domain. Only blocks that cross the causal diagonal are masked. With a
+// sliding window W > 0 a query at position p sees keys (p - W, p]: the blocks before the
+// tile's first window are skipped and only blocks crossing a window start are masked.
+// Positions count from the page table row's first key, so a caller may start the row at
+// the oldest key the batch's windows reach. With KV_SHARED, V is staged into K's buffer
+// once S is computed (a D = 512 block does not fit both).
 // fprefill, grid (32 * NSG * num_tiles, HKV, 1): one pass, writes the output.
 // fprefill_partials, grid (32 * NSG * num_tiles, HKV, P): split-KV, each partition takes
 // an equal share of the tile's key blocks and writes its unnormalized [M, D] accumulator
@@ -27,6 +32,8 @@ using namespace metal;
 #define NSG {{NSG}}
 #define DS {{DS}}
 #define BK {{BK}}
+#define W {{W}}
+#define KV_SHARED {{KV_SHARED}}
 #define M (8 * NSG / DS)
 #define DH (D / DS)
 #define TDH (DH / 8)
@@ -40,6 +47,7 @@ typedef {{T}} T;
 constant constexpr int PAD = 16 / sizeof(T);
 constant constexpr int LDK = BK;
 constant constexpr int LDV = D + PAD;
+constant constexpr int KV_SHARED_SIZE = D * LDK > BK * LDV ? D * LDK : BK * LDV;
 // Staging loads and stores move 16 bytes; KEY_LANES lanes cover 128 bytes of a key's row
 // (64 when D / VEC is not a multiple of 8).
 constant constexpr int VEC = 16 / sizeof(T);
@@ -69,6 +77,25 @@ inline float fragment_row_sum(float x) {
 // Offset of a key's row for one kv head in the [num_pages * BS, HKV, D] pool.
 inline size_t key_row_offset(const device int* page_row, uint key, uint kv_head) {
   return (((size_t)page_row[key / BS] * BS + key % BS) * HKV + kv_head) * D;
+}
+
+// Stage the i-th 16-byte vector of a block's V rows (32 lanes along a key), zero past kv_end.
+inline void stage_value_row(
+    device const T* v_cache,
+    const device int* page_row,
+    uint kv_head,
+    uint k0,
+    uint kv_end,
+    uint i,
+    threadgroup T* v_tg) {
+  const uint v_row = i / (D / VEC);
+  const uint v_column = i % (D / VEC) * VEC;
+  LoadVec v_vec = LoadVec(0);
+  if (k0 + v_row < kv_end) {
+    v_vec = *(const device LoadVec*)(
+        v_cache + key_row_offset(page_row, k0 + v_row, kv_head) + v_column);
+  }
+  *(threadgroup LoadVec*)(v_tg + v_row * LDV + v_column) = v_vec;
 }
 
 // Buffers: 0 q [num_tokens, HKV * G, D], 1 k_cache / 2 v_cache [num_pages * BS, HKV, D],
@@ -103,11 +130,13 @@ inline void fprefill_tile(
   const uint q_pos0 = tile.w;
   const uint kv_end = q_pos0 + q_count;
   const uint num_blocks = (kv_end + BK - 1) / BK;
-  uint block_begin = 0;
+  // The first query's window starts the tile's keys.
+  const uint first_block = W > 0 && q_pos0 + 1 > W ? (q_pos0 + 1 - W) / BK : 0;
+  uint block_begin = first_block;
   uint block_end = num_blocks;
   if (SPLIT) {
-    const uint per_partition = (num_blocks + num_partitions - 1) / num_partitions;
-    block_begin = min(partition * per_partition, num_blocks);
+    const uint per_partition = (num_blocks - first_block + num_partitions - 1) / num_partitions;
+    block_begin = min(first_block + partition * per_partition, num_blocks);
     block_end = min(block_begin + per_partition, num_blocks);
   }
 
@@ -121,6 +150,7 @@ inline void fprefill_tile(
   const uint head = kv_head * G + row % G;
   const uint position = q_pos0 + token;
   const uint group_first_position = q_pos0 + min(row_group * 8 / G, q_count - 1);
+  const uint group_last_position = q_pos0 + min((row_group * 8 + 7) / G, q_count - 1);
   const size_t q_offset = ((size_t)(q_row0 + token) * HKV * G + head) * D + column0 + coord.x;
 
   Vec2 q_frag[TDH];
@@ -139,20 +169,15 @@ inline void fprefill_tile(
     for (uint i = sg * 32 + lane; i < BK * D / VEC; i += NSG * 32) {
       const uint k_row = i / KEY_LANES % BK;
       const uint k_column = i / (KEY_LANES * BK) * (KEY_LANES * VEC) + i % KEY_LANES * VEC;
-      const uint v_row = i / (D / VEC);
-      const uint v_column = i % (D / VEC) * VEC;
       LoadVec k_vec = LoadVec(0);
-      LoadVec v_vec = LoadVec(0);
       if (k0 + k_row < kv_end) {
         k_vec = *(const device LoadVec*)(
             k_cache + key_row_offset(page_row, k0 + k_row, kv_head) + k_column);
       }
-      if (k0 + v_row < kv_end) {
-        v_vec = *(const device LoadVec*)(
-            v_cache + key_row_offset(page_row, k0 + v_row, kv_head) + v_column);
+      if (!KV_SHARED) {
+        stage_value_row(v_cache, page_row, kv_head, k0, kv_end, i, v_tg);
       }
       UNROLL for (int j = 0; j < VEC; ++j) k_tg[(k_column + j) * LDK + k_row] = k_vec[j];
-      *(threadgroup LoadVec*)(v_tg + v_row * LDV + v_column) = v_vec;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -183,12 +208,17 @@ inline void fprefill_tile(
       }
     }
 
-    const bool is_diagonal = k0 + BK - 1 > group_first_position;
+    // Blocks crossing the causal diagonal or a window start are masked.
+    const bool needs_mask =
+        k0 + BK - 1 > group_first_position || (W > 0 && k0 + W <= group_last_position);
     float block_max = -INFINITY;
     UNROLL for (int k = 0; k < TK; ++k) {
       UNROLL for (int j = 0; j < 2; ++j) {
         float score = s[k][j] * scale_log2e;
-        if (is_diagonal && k0 + k * 8 + coord.x + j > position) score = -INFINITY;
+        const uint key = k0 + k * 8 + coord.x + j;
+        if (needs_mask && (key > position || (W > 0 && key + W <= position))) {
+          score = -INFINITY;
+        }
         s[k][j] = score;
         block_max = max(block_max, score);
       }
@@ -206,6 +236,14 @@ inline void fprefill_tile(
     m = m_new;
     UNROLL for (int d = 0; d < TDH; ++d) o[d] *= correction;
 
+    if (KV_SHARED) {
+      // Every simdgroup has read K for S (and for DS > 1 summed S) before V replaces it.
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint i = sg * 32 + lane; i < BK * D / VEC; i += NSG * 32) {
+        stage_value_row(v_cache, page_row, kv_head, k0, kv_end, i, v_tg);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
     UNROLL for (int k = 0; k < TK; ++k) {
       // P in the input type makes PV the same T x T -> fp32 product as Q K^T.
       simdgroup_matrix<T, 8, 8> p_mat;
@@ -251,12 +289,11 @@ inline void fprefill_tile(
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup T k_tg[D * LDK];
-  threadgroup T v_tg[BK * LDV];
+  threadgroup T kv_tg[KV_SHARED ? KV_SHARED_SIZE : D * LDK + BK * LDV];
   threadgroup float2 s_tg[DS > 1 ? NSG * TK * 32 : 1];
   fprefill_tile<false>(
       q, k_cache, v_cache, page_table, tiles, out, nullptr, nullptr, max_pages, scale_log2e,
-      tgpig.x, tgpig.y, 0, 1, sg, lane, k_tg, v_tg, s_tg);
+      tgpig.x, tgpig.y, 0, 1, sg, lane, kv_tg, kv_tg + (KV_SHARED ? 0 : D * LDK), s_tg);
 }
 
 [[kernel, max_total_threads_per_threadgroup(NSG * 32)]] void fprefill_partials(
@@ -273,12 +310,12 @@ inline void fprefill_tile(
     uint3 tptg [[threadgroups_per_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup T k_tg[D * LDK];
-  threadgroup T v_tg[BK * LDV];
+  threadgroup T kv_tg[KV_SHARED ? KV_SHARED_SIZE : D * LDK + BK * LDV];
   threadgroup float2 s_tg[DS > 1 ? NSG * TK * 32 : 1];
   fprefill_tile<true>(
       q, k_cache, v_cache, page_table, tiles, nullptr, part_acc, part_ml, max_pages,
-      scale_log2e, tgpig.x, tgpig.y, tgpig.z, tptg.z, sg, lane, k_tg, v_tg, s_tg);
+      scale_log2e, tgpig.x, tgpig.y, tgpig.z, tptg.z, sg, lane, kv_tg,
+      kv_tg + (KV_SHARED ? 0 : D * LDK), s_tg);
 }
 
 // Buffers: 0 part_acc, 1 part_ml (as above), 2 tiles, 3 out [num_tokens, HKV * G, D],

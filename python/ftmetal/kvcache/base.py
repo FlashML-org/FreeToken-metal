@@ -33,6 +33,9 @@ class PoolConfig(Protocol):
     def max_running_req(self) -> int: ...
 
     @property
+    def max_extend_tokens(self) -> int: ...
+
+    @property
     def linear_state_cache_ratio(self) -> float: ...
 
 

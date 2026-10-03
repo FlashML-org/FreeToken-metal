@@ -16,13 +16,17 @@ from ftmetal.layers.base import BaseOP
 
 
 class RMSNorm(BaseOP):
-    def __init__(self, size: int, eps: float, dtype: mx.Dtype = mx.bfloat16) -> None:
+    def __init__(
+        self, size: int, eps: float, dtype: mx.Dtype = mx.bfloat16, with_scale: bool = True
+    ) -> None:
+        """with_scale=False: no learned weight (Gemma4's v norm)."""
         super().__init__()
         self.eps = eps
-        self.weight = mx.ones((size,), dtype=dtype)
+        if with_scale:
+            self.weight = mx.ones((size,), dtype=dtype)
 
     def forward(self, x: mx.array) -> mx.array:
-        return mx.fast.rms_norm(x, self.weight, self.eps)
+        return mx.fast.rms_norm(x, self.weight if "weight" in self else None, self.eps)
 
 
 @partial(mx.compile, shapeless=True)

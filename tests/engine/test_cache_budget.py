@@ -1,4 +1,5 @@
-"""Memory budget on the Qwen3.6-35B-A3B geometry: report lines, page and GDN slot counts.
+"""Memory budget on the Qwen3.6-35B-A3B geometry: report lines, page and GDN slot counts;
+and Gemma4-26B-A4B's window pool as a fixed cost.
 
 The expected numbers were computed by the engine's sizing before pools were created per
 attention type; the dispatch must reproduce them exactly from the same fixed budget.
@@ -23,6 +24,7 @@ from ftmetal.engine.cache_budget import (
 from ftmetal.engine.config import EngineConfig
 from ftmetal.kvcache import pool_costs
 from ftmetal.kvcache.base import PoolCost
+from ftmetal.models.gemma4.config import parse_config as parse_gemma4_config
 from ftmetal.models.qwen3_5_moe.config import parse_config
 
 # The text_config fields of Qwen3.6-35B-A3B that its attention groups are parsed from.
@@ -156,3 +158,45 @@ def test_graph_reserve_comes_off_the_paged_pools() -> None:
     assert "graphs" not in "".join(without.lines())
     lines = with_graphs.lines()
     assert lines.index("graphs          0.01 GiB") == lines.index("activations     5.25 GiB") + 1
+
+
+# The text_config fields of Gemma4-26B-A4B that its attention groups are parsed from.
+GEMMA4_26B_TEXT_CONFIG: dict[str, object] = {
+    "num_attention_heads": 16,
+    "num_key_value_heads": 8,
+    "num_global_key_value_heads": 2,
+    "attention_k_eq_v": True,
+    "head_dim": 256,
+    "global_head_dim": 512,
+    "hidden_size": 2816,
+    "intermediate_size": 2112,
+    "num_hidden_layers": 30,
+    "sliding_window": 1024,
+    "layer_types": [
+        "full_attention" if (i + 1) % 6 == 0 else "sliding_attention" for i in range(30)
+    ],
+    "vocab_size": 262144,
+    "max_position_embeddings": 262144,
+    "rope_parameters": {
+        "full_attention": {
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 1e6,
+            "rope_type": "proportional",
+        },
+        "sliding_attention": {"rope_theta": 1e4, "rope_type": "default"},
+    },
+}
+
+
+def test_gemma4_window_pool_is_a_fixed_cost_beside_the_global_pages() -> None:
+    model_config = parse_gemma4_config(GEMMA4_26B_TEXT_CONFIG)
+    config = EngineConfig(model_path="unused", max_running_req=4, max_extend_tokens=2048)
+    costs = pool_costs(model_config.kv_cache_group_specs(), config)
+    # 5 global layers x 2 x 2 heads x 512 x bf16 per token; 25 window layers x 2 x 8 heads
+    # x 256 x bf16 per slot, for 5 x align32(1024 + 2048 + 1) slots.
+    assert costs == {
+        AttnType.FULL: PoolCost(20 * 1024, 0),
+        AttnType.SWA: PoolCost(0, 15520 * 200 * 1024),
+    }
+    report = plan_budget(memory_budget_bytes(WORKING_SET_BYTES), 13 * GIB, 0, 0, costs)
+    assert "swa window      2.96 GiB" in report.lines()

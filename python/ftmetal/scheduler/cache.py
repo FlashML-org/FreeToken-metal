@@ -4,15 +4,22 @@ Port of FreeToken scheduler/cache.py (CacheManager: the radix, hybrid_radix and 
 paths). The radix path commits a request's KV prefix to a RadixPrefixCache. The hybrid
 path owns both currencies of the HybridRadixCache, KV pages and GDN state slots: a request
 holds a live slot and two ping-pong track slots, a prefill commit donates the frozen track
-snapshot to the tree and a finish donates the live slot. Divergences: host numpy page
-table and free list (page-aligned token slots); naive is refused on a model with linear
-attention; eviction stops at what is evictable and exhaustion raises; no SWA currency,
-runtime rebuild or tool-call anchor. lazy_free_region batches the frees of one drained
-step; the drain itself is the step fence.
+snapshot to the tree and a finish donates the live slot. On the naive path a
+sliding-window model's window slots are the second currency (FreeToken's swa_paged
+lifecycle): every token of a new page gets one, the ones behind a request's window are
+freed as it slides, the rest with the pages on finish. Divergences: host numpy page table
+and free list (page-aligned token slots); naive is refused on a model with linear
+attention; radix on a sliding-window model runs naive, as there is no SWA radix cache;
+eviction stops at what is evictable and exhaustion raises; no runtime rebuild or
+tool-call anchor. lazy_free_region batches the frees of one drained step; the drain
+itself is the step fence, so window slots slide out when the step that last extended a
+request drains (FreeToken frees them when it schedules the next one, every 128 decode
+forwards, relying on stream order).
 """
 
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from typing import Iterator, Literal, NamedTuple
 
@@ -23,23 +30,35 @@ from ftmetal.engine.config import CacheTypeChoice
 from ftmetal.kvcache.hybrid_radix_cache import HybridCacheHandle, HybridRadixCache
 from ftmetal.kvcache.linear_state_pool import LinearStatePool
 from ftmetal.kvcache.radix_cache import RadixCacheHandle, RadixPrefixCache, align_down
+from ftmetal.kvcache.swa_pool import SWAKVCache
 
 CacheType = Literal["naive", "radix", "hybrid_radix"]
+
+logger = logging.getLogger(__name__)
 
 
 def div_ceil(a: int, b: int) -> int:
     return -(-a // b)
 
 
-def resolve_cache_type(requested: CacheTypeChoice, has_linear_attention: bool) -> CacheType:
-    """Radix on a model with linear attention is the hybrid radix, the only tree that can
-    resume a GDN state."""
-    if not has_linear_attention:
-        return requested
-    elif requested == "naive":
+def resolve_cache_type(
+    requested: CacheTypeChoice, *, has_linear_attention: bool, has_sliding_window: bool
+) -> CacheType:
+    """Radix is the radix cache that matches the model: on a model with linear attention the
+    hybrid radix, the only tree that can resume a GDN state."""
+    if has_linear_attention and requested == "naive":
         raise ValueError("--cache-type naive is not supported on a model with linear attention")
-    else:
+    elif has_linear_attention:
         return "hybrid_radix"
+    elif has_sliding_window and requested == "radix":
+        # Resolves to swa_radix once the SWA radix cache lands.
+        logger.warning(
+            "the SWA radix cache is not implemented yet: --cache-type radix runs naive and "
+            "prefix reuse is off for this sliding-window model"
+        )
+        return "naive"
+    else:
+        return requested
 
 
 class MatchResult(NamedTuple):
@@ -57,6 +76,7 @@ class CacheManager:
         page_table: np.ndarray,
         cache_type: CacheType,
         linear_state_pool: LinearStatePool | None = None,
+        swa_pool: SWAKVCache | None = None,
     ) -> None:
         self.num_pages = num_pages
         self.page_size = page_size
@@ -66,7 +86,11 @@ class CacheManager:
         assert self.is_hybrid == (linear_state_pool is not None), (
             "the hybrid radix cache, and only it, drives a GDN state pool"
         )
+        assert swa_pool is None or cache_type == "naive", (
+            f"window slots ride the naive cache only, not {cache_type}"
+        )
         self.linear_state_pool = linear_state_pool
+        self.swa_pool = swa_pool
         self.prefix_cache: RadixPrefixCache | HybridRadixCache | None = None
         if self.is_hybrid:
             self.prefix_cache = HybridRadixCache(page_size)
@@ -195,6 +219,10 @@ class CacheManager:
             raise RuntimeError("KV pages exhausted")
         pages = self.free_slots[:needed_pages]
         self.free_slots = self.free_slots[needed_pages:]
+        if self.swa_pool is not None:
+            # Whole pages, as FreeToken: the finish frees the page's every slot.
+            page_offsets = np.arange(self.page_size, dtype=np.int32)
+            self.swa_pool.alloc_swa((pages[:, None] + page_offsets).reshape(-1))
         offset = 0
         for table_idx, first_page, last_page in allocation:
             count = last_page - first_page
@@ -212,7 +240,22 @@ class CacheManager:
             self.cache_req_radix(req, finished=finished)
         elif finished:
             stop = div_ceil(req.cached_len, self.page_size) * self.page_size
-            self.free_pages(self.page_table[req.table_idx, :stop])
+            token_slots = self.page_table[req.table_idx, :stop]
+            if self.swa_pool is not None:
+                self.swa_pool.free_swa(token_slots)
+            self.free_pages(token_slots)
+
+    def free_swa_out_of_window(self, req: Req) -> None:
+        """Free the window slots of the tokens no later query of req sees, once the step
+        that last extended req has drained (FreeToken's maybe_free_swa_out_of_window and
+        free_swa_out_of_window_extend, with their window + page margin): the step in flight
+        reads no key below cached_len - window."""
+        pool = self.swa_pool
+        assert pool is not None
+        frontier = align_down(req.cached_len - pool.sliding_window - self.page_size, self.page_size)
+        if frontier > req.swa_evicted_seqlen:
+            pool.free_swa(self.page_table[req.table_idx, req.swa_evicted_seqlen : frontier])
+            req.swa_evicted_seqlen = frontier
 
     def cache_req_radix(self, req: Req, *, finished: bool) -> None:
         """Commit the KV of [0, cached_len) to the radix tree.
@@ -359,7 +402,8 @@ class CacheManager:
             self.free_slots = np.concatenate([self.free_slots, *frees])
 
     def check_integrity(self) -> None:
-        """Idle only: every page and GDN slot is free or owned by the prefix cache."""
+        """Idle only: every page, GDN slot and window slot is free or owned by the prefix
+        cache."""
         cache_pages = 0
         if self.is_hybrid:
             cache, pool = self.hybrid_parts()
@@ -379,6 +423,12 @@ class CacheManager:
             f"!= {self.num_pages}"
         )
         assert np.all(self.free_slots % self.page_size == 0)
+        if self.swa_pool is not None:
+            # Every window slot but the sentinel is free.
+            assert self.swa_pool.swa_available_size == self.swa_pool.swa_num_tokens - 1, (
+                f"window slots leaked or double freed: free {self.swa_pool.swa_available_size} "
+                f"!= {self.swa_pool.swa_num_tokens - 1}"
+            )
 
 
 __all__ = ["CacheManager", "CacheType", "MatchResult", "div_ceil", "resolve_cache_type"]

@@ -30,6 +30,8 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         "ftmetal.models.qwen3_5_moe", "Qwen3_5MoeForCausalLM"
     ),
     "Qwen3_5MoeForCausalLM": ModelSpec("ftmetal.models.qwen3_5_moe", "Qwen3_5MoeForCausalLM"),
+    "Gemma4ForConditionalGeneration": ModelSpec("ftmetal.models.gemma4", "Gemma4ForCausalLM"),
+    "Gemma4ForCausalLM": ModelSpec("ftmetal.models.gemma4", "Gemma4ForCausalLM"),
 }
 
 
