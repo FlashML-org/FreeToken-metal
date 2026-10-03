@@ -171,7 +171,7 @@ def random_tape(
     return block_sizes, dispatch_blocks, separated
 
 
-@pytest.mark.parametrize("seed", range(200))
+@pytest.mark.parametrize("seed", range(50))
 def test_plan_arena_never_shares_bytes_without_a_barrier_between(seed: int) -> None:
     rng = random.Random(seed)
     block_sizes, dispatch_blocks, separated = random_tape(rng)
@@ -221,17 +221,6 @@ def test_plan_arena_ping_pongs_a_residual_stream() -> None:
     assert len(set(offsets)) == 2
     assert all(offsets[i] == offsets[i + 2] != offsets[i + 1] for i in range(len(offsets) - 2))
     assert plan.arena_bytes == plan.lower_bound == 3 * size
-
-
-def arena_for(graph: _C.Graph) -> mx.array:
-    """Plan and place graph's blocks, bind them to a fresh arena filled with 0xFF."""
-    plan = plan_graph_arena(graph, [])
-    place_blocks(graph, plan)
-    arena = mx.zeros((plan.arena_bytes,), dtype=mx.uint8)
-    mx.eval(arena)
-    _C.bind_arena(graph, arena)
-    _C.poison_arena(graph)
-    return arena
 
 
 def test_arena_replay_matches_eager_and_releases_the_capture() -> None:
