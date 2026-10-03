@@ -21,9 +21,11 @@ void init_fprefill_library(const std::string& source);
 // row, query count, position of the first query), each tile at most
 // 8 * num_row_groups / G queries, together covering every query row once. The caller
 // picks the threadgroup's 8-row groups, the simdgroups per row group (each takes
-// D / head_split columns), the key block size, whether K and V share one staging buffer
-// and the split-KV partition count. A sliding_window W > 0 limits a query at position p
-// to keys (p - W, p]; positions count from the page table row's first key.
+// D / head_split columns), the key block size, whether K and V share one staging buffer,
+// the column passes a key block is staged in (num_passes > 1 shares the buffer), the
+// split-KV partition count and whether the GEMMs run as MetalPerformancePrimitives
+// matmul2d (mpp, macOS 26) or on simdgroup matrices. A sliding_window W > 0 limits a query
+// at position p to keys (p - W, p]; positions count from the page table row's first key.
 // Returns [num_tokens, Hq, D].
 mx::array flash_prefill(
     const mx::array& q,
@@ -36,8 +38,10 @@ mx::array flash_prefill(
     int head_split,
     int block_k,
     bool kv_shared,
+    int num_passes,
     int num_partitions,
     int sliding_window,
+    bool mpp,
     float scale,
     mx::StreamOrDevice s = {});
 
@@ -50,8 +54,10 @@ struct FlashPrefillConfig {
   int head_split;
   int block_k;
   bool kv_shared;
+  int num_passes;
   int num_partitions;
   int sliding_window;
+  bool mpp;
   float scale;
 
   bool operator==(const FlashPrefillConfig&) const = default;

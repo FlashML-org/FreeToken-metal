@@ -16,6 +16,9 @@ std::string fprefill_source;
 const int SIMD_WIDTH = 32;
 const int FRAGMENT_SIZE = 8;
 const int MAX_THREADGROUP_THREADS = 1024;
+// matmul2d's inner dimension (Q K^T: the head-dim slice, P V: the key block) and the
+// P V output slices are multiples of 16.
+const int MPP_GRANULE = 16;
 
 } // namespace
 
@@ -34,8 +37,10 @@ mx::array flash_prefill(
     int head_split,
     int block_k,
     bool kv_shared,
+    int num_passes,
     int num_partitions,
     int sliding_window,
+    bool mpp,
     float scale,
     mx::StreamOrDevice s) {
   if (q.ndim() != 3 || k_cache.ndim() != 3 || v_cache.ndim() != 3 || page_table.ndim() != 2 ||
@@ -73,11 +78,17 @@ mx::array flash_prefill(
     throw std::invalid_argument(
         "ftmetal fprefill: a threadgroup's 8 * num_row_groups rows must hold one token's heads");
   }
-  if (head_dim % (FRAGMENT_SIZE * head_split) != 0) {
-    throw std::invalid_argument("ftmetal fprefill: head_split must cut D into 8-column slices");
+  int granule = mpp ? MPP_GRANULE : FRAGMENT_SIZE;
+  if (head_dim % (granule * head_split) != 0) {
+    throw std::invalid_argument(
+        "ftmetal fprefill: head_split must cut D into 8-column slices (16 with mpp)");
   }
-  if (block_k < FRAGMENT_SIZE || block_k % FRAGMENT_SIZE != 0) {
-    throw std::invalid_argument("ftmetal fprefill: block_k must be a multiple of 8");
+  if (block_k < granule || block_k % granule != 0) {
+    throw std::invalid_argument("ftmetal fprefill: block_k must be a multiple of 8 (16 with mpp)");
+  }
+  if (num_passes < 1 || head_split % num_passes != 0 || (num_passes > 1 && !kv_shared)) {
+    throw std::invalid_argument(
+        "ftmetal fprefill: num_passes must divide head_split, and share the K/V buffer");
   }
   if (num_partitions < 1) {
     throw std::invalid_argument("ftmetal fprefill: num_partitions must be >= 1");
@@ -95,8 +106,10 @@ mx::array flash_prefill(
       head_split,
       block_k,
       kv_shared,
+      num_passes,
       num_partitions,
       sliding_window,
+      mpp,
       scale};
   return mx::array(
       q.shape(),
@@ -134,7 +147,8 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
       "_" + std::to_string(c.group) + "_" + std::to_string(c.num_kv_heads) + "_" +
       std::to_string(c.page_size) + "_" + std::to_string(c.num_row_groups) + "_" +
       std::to_string(c.head_split) + "_" + std::to_string(c.block_k) + "_" +
-      std::to_string(c.kv_shared) + "_" + std::to_string(c.sliding_window);
+      std::to_string(c.kv_shared) + "_" + std::to_string(c.num_passes) + "_" +
+      std::to_string(c.sliding_window) + (c.mpp ? "_mpp" : "_simdgroup");
 
   auto s = stream();
   auto& d = mx::metal::device(s.device);
@@ -150,6 +164,8 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
     replace_all(source, "{{BK}}", std::to_string(c.block_k));
     replace_all(source, "{{W}}", std::to_string(c.sliding_window));
     replace_all(source, "{{KV_SHARED}}", c.kv_shared ? "true" : "false");
+    replace_all(source, "{{NPASS}}", std::to_string(c.num_passes));
+    replace_all(source, "{{MMA}}", c.mpp ? "MMA_MPP" : "MMA_SIMDGROUP");
     return source;
   });
 

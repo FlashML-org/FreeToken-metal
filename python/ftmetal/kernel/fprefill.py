@@ -7,18 +7,26 @@ heads (GQA packing), gathering them through the page table; the queries' own key
 already in the pool. Split-KV partitions fill the GPU when the tiles are few (a short
 turn over a long cached prefix), the partials merged by a second pass. This module lists
 the tiles and picks the partitioning, once per batch (prefill_tiles), and launches the
-primitive per layer (flash_prefill).
+primitive per layer (flash_prefill). The kernel's two GEMMs run on simdgroup matrices or
+as MetalPerformancePrimitives matmul2d, which reaches the matrix units of GPUs that have
+them (default_mma).
 """
 
 from __future__ import annotations
 
+import functools
+import platform
 from dataclasses import dataclass
+from typing import Literal
 
 import mlx.core as mx
 import numpy as np
 
+from ftmetal.env import read_env
 from ftmetal.kernel._ext import _C
 from ftmetal.kernel.fdecode import THREADGROUP_MEMORY_BYTES
+
+FprefillMma = Literal["simdgroup", "mpp"]
 
 FRAGMENT_ROWS = 8
 # Tile shape tuned on the M4 Pro at the Qwen3.6 shape (D 256, G 8): 32 query rows (tokens
@@ -38,6 +46,13 @@ MAX_HEAD_DIM = 512
 TARGET_THREADGROUPS = 256
 MIN_PARTITION_TOKENS = 512
 MAX_PARTITIONS = 32
+# matmul2d's inner dimension, P V's key block, is a multiple of 16.
+MPP_BLOCK_K = 16
+# MLX's rule for the GPU matrix units (NAX): macOS 26.2 and Apple GPU generation 17 (18 for
+# the architectures whose name ends in p).
+NAX_MACOS_VERSION = (26, 2)
+NAX_GENERATION = 17
+NAX_P_GENERATION = 18
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -91,31 +106,62 @@ def prefill_tiles(
     return PrefillTiles(table=mx.array(table), num_partitions=num_partitions)
 
 
+def has_matrix_units() -> bool:
+    """Whether the GPU has matrix units (NAX) for matmul2d."""
+    architecture = mx.device_info()["architecture"]
+    assert isinstance(architecture, str)
+    generation = int(architecture[-3:-1]) if architecture[-3:-1].isdigit() else 0
+    macos = tuple(int(part) for part in platform.mac_ver()[0].split(".")[:2])
+    min_generation = NAX_P_GENERATION if architecture.endswith("p") else NAX_GENERATION
+    return macos >= NAX_MACOS_VERSION and generation >= min_generation
+
+
+@functools.cache
+def default_mma() -> FprefillMma:
+    """FTMETAL_FPREFILL_MMA (simdgroup or mpp), else mpp where the GPU has matrix units."""
+    value = read_env("FPREFILL_MMA")
+    if value is None:
+        return "mpp" if has_matrix_units() else "simdgroup"
+    elif value == "simdgroup" or value == "mpp":
+        return value
+    else:
+        raise ValueError(f"FTMETAL_FPREFILL_MMA must be simdgroup or mpp, got {value!r}")
+
+
 def threadgroup_memory_bytes(
-    head_dim: int, block_k: int, head_split: int, itemsize: int, kv_shared: bool
+    head_dim: int, block_k: int, head_split: int, itemsize: int, kv_shared: bool, num_passes: int
 ) -> int:
-    """fprefill.metal's threadgroup arrays: K transposed [D, BK] and V [BK, D] with rows
-    padded by 16 bytes (one buffer for both when kv_shared), and with a head split each
-    simdgroup's [8, BK] fp32 partial scores."""
-    key_bytes = head_dim * block_k * itemsize
-    value_bytes = block_k * (head_dim + 16 // itemsize) * itemsize
+    """fprefill.metal's threadgroup arrays: K transposed [D / num_passes, BK] and V
+    [BK, D / num_passes] with rows padded by 16 bytes (one buffer for both when kv_shared),
+    and with a head split each simdgroup's [8, BK] fp32 partial scores."""
+    columns = head_dim // num_passes
+    key_bytes = columns * block_k * itemsize
+    value_bytes = block_k * (columns + 16 // itemsize) * itemsize
     staged_bytes = max(key_bytes, value_bytes) if kv_shared else key_bytes + value_bytes
     num_simdgroups = THREADGROUP_ROWS // FRAGMENT_ROWS * head_split
     score_bytes = num_simdgroups * FRAGMENT_ROWS * block_k * 4 if head_split > 1 else 0
     return staged_bytes + score_bytes
 
 
-def staging_plan(head_dim: int, itemsize: int) -> tuple[int, int, bool]:
-    """(head_split, block_k, kv_shared): the largest key block whose staging fits, in
-    separate K and V buffers when both fit."""
+def staging_plan(head_dim: int, itemsize: int, mma: FprefillMma) -> tuple[int, int, bool, int]:
+    """(head_split, block_k, kv_shared, num_passes): the largest key block whose staging
+    fits, in separate K and V buffers when both fit; matmul2d keeps 16-key blocks and
+    stages them in column passes instead."""
     head_split = 2 if head_dim >= SPLIT_HEAD_DIM else 1
-    block_k = MAX_BLOCK_K
-    while block_k >= FRAGMENT_ROWS:
-        for kv_shared in (False, True):
-            staged = threadgroup_memory_bytes(head_dim, block_k, head_split, itemsize, kv_shared)
-            if staged <= THREADGROUP_MEMORY_BYTES:
-                return head_split, block_k, kv_shared
-        block_k //= 2
+    if mma == "mpp":
+        options = [(MPP_BLOCK_K, False, 1), (MPP_BLOCK_K, True, 1), (MPP_BLOCK_K, True, head_split)]
+    else:
+        options = [
+            (block_k, kv_shared, 1)
+            for block_k in (MAX_BLOCK_K, FRAGMENT_ROWS)
+            for kv_shared in (False, True)
+        ]
+    for block_k, kv_shared, num_passes in options:
+        staged = threadgroup_memory_bytes(
+            head_dim, block_k, head_split, itemsize, kv_shared, num_passes
+        )
+        if staged <= THREADGROUP_MEMORY_BYTES:
+            return head_split, block_k, kv_shared, num_passes
     raise ValueError(f"flash_prefill cannot stage head_dim {head_dim} at {itemsize}-byte items")
 
 
@@ -128,6 +174,7 @@ def flash_prefill(
     page_size: int,
     scale: float,
     sliding_window: int | None = None,
+    mma: FprefillMma | None = None,
 ) -> mx.array:
     """Causal attention of each request's queries over its paged keys.
 
@@ -135,13 +182,15 @@ def flash_prefill(
     prefill_tiles; page_table [B, max_pages] int32 page ids, k_cache / v_cache
     [num_pages * page_size, Hkv, D] in q's dtype, already holding the queries' own keys.
     A sliding_window W limits a query at position p to keys (p - W, p], positions counted
-    from each page-table row's first key. Returns [T, Hq, D].
+    from each page-table row's first key. mma picks the GEMMs (default_mma when None).
+    Returns [T, Hq, D].
     """
     num_heads, head_dim = q.shape[1:]
     num_kv_heads = k_cache.shape[1]
     assert num_heads % num_kv_heads == 0 and num_heads // num_kv_heads <= THREADGROUP_ROWS
     assert head_dim <= MAX_HEAD_DIM
-    head_split, block_k, kv_shared = staging_plan(head_dim, q.dtype.size)
+    mma = default_mma() if mma is None else mma
+    head_split, block_k, kv_shared, num_passes = staging_plan(head_dim, q.dtype.size, mma)
     return _C.flash_prefill(
         q,
         k_cache,
@@ -153,10 +202,12 @@ def flash_prefill(
         head_split,
         block_k,
         kv_shared,
+        num_passes,
         tiles.num_partitions,
         0 if sliding_window is None else sliding_window,
+        mma == "mpp",
         scale,
     )
 
 
-__all__ = ["PrefillTiles", "flash_prefill", "prefill_tiles"]
+__all__ = ["FprefillMma", "PrefillTiles", "default_mma", "flash_prefill", "prefill_tiles"]
