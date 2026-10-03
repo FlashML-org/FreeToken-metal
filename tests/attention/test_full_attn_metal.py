@@ -2,16 +2,21 @@
 
 Random paged pools with shuffled pages. Every pool row outside a request's keys (page
 tails, spare pages and the dummy page that pads short page-table rows) holds huge keys
-and values, so reading one shows up in the output. Replay metadata (a page table as wide
+and values, so reading one shows up in the output. Decode runs flash-decode, whose only
+numeric test this is: the decode cases cover each decode plan (head groups and
+simdgroups per head dim and dtype) and partition regime once. Prefill runs flash-prefill
+(its numeric cases are in kernel/test_fprefill.py) on the backend's metadata, one batch of
+unequal requests or one long prompt chunk by chunk. Replay metadata (a page table as wide
 as the longest context, so flash-decode's grid holds the most partitions) must give the
-per-length metadata's results. Prefill runs flash-prefill over the same pools, one batch
-of unequal requests or one long prompt chunk by chunk. Sliding-window attention runs on
-a window pool whose slots back only the keys a step's windows reach; every other full
-slot maps to the sentinel, which holds huge keys and values like every unused window
-slot, and the reference attends over the whole row under the window mask.
+per-length metadata's results. Sliding-window attention runs on a window pool whose slots
+back only the keys a step's windows reach; every other full slot maps to the sentinel,
+which holds huge keys and values like every unused window slot, and the reference attends
+over the whole row under the window mask.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import mlx.core as mx
 import numpy as np
@@ -30,26 +35,13 @@ from ftmetal.models.qwen3_5_moe.config import parse_config
 PAGE_SIZE = 32
 SPARE_PAGES = 5
 UNREAD_VALUE = 1e3
-# Keys per request, current token included: single keys, page-boundary neighbours, long rows.
-SEQ_LENS = {
-    1: [3001],
-    3: [1, 33, 1000],
-    8: [1, 31, 32, 33, 700, 2049, 3001, 4096],
-}
 # Worst |error| over a row relative to the row's largest |value|, against the fp32
-# reference (one bf16 ulp); the MLX backend's own rounding doubles it.
+# reference (one bf16 ulp); in decode the MLX backend's own rounding doubles it.
 TOLERANCE = {mx.bfloat16: 2**-7, mx.float32: 1e-5}
 # Prefill against the MLX backend: at D 256 its SDPA runs unfused, rounding the scores and
 # probabilities to bf16, which alone costs up to ~2 ulps (1.7e-2 measured against the fp32
 # reference, where flash-prefill stays within one ulp).
 PREFILL_MLX_TOLERANCE = {mx.bfloat16: 2**-5, mx.float32: 2e-5}
-# Prefill batches: cached prefix and new tokens per request.
-PREFILL_BATCHES = [
-    ([0], [37]),
-    ([300], [2]),
-    ([0, 2049, 7], [100, 33, 1]),
-    ([5000, 0], [64, 2048]),
-]
 # One prompt prefilled in chunks of at most PREFILL_CHUNK tokens.
 CHUNKED_PROMPT_LEN = 5000
 PREFILL_CHUNK = 2048
@@ -64,6 +56,79 @@ REPLAY_BATCHES = [
     ([32768], 0),
     ([5, 300, 32768, 2049], 0),
     ([2049, 7, 300], 1),
+]
+WINDOW_FULL_SLOTS = 16384
+
+
+@dataclass(frozen=True)
+class Case:
+    """One step: request b has cached_lens[b] keys before extend_lens[b] new tokens."""
+
+    cached_lens: tuple[int, ...]
+    extend_lens: tuple[int, ...]
+    head_dim: int
+    num_heads: int = 16
+    num_kv_heads: int = 2
+    dtype: mx.Dtype = mx.bfloat16
+    window: int | None = None
+
+    def __str__(self) -> str:
+        lens = "+".join(f"{c}:{e}" for c, e in zip(self.cached_lens, self.extend_lens))
+        label = f"{lens}-D{self.head_dim}-heads{self.num_heads}:{self.num_kv_heads}"
+        label += "-bf16" if self.dtype == mx.bfloat16 else "-fp32"
+        return label if self.window is None else f"{label}-W{self.window}"
+
+
+def decode_lens(seq_lens: tuple[int, ...]) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """(cached_lens, extend_lens) of a decode step over seq_lens keys, current token included."""
+    return tuple(n - 1 for n in seq_lens), (1,) * len(seq_lens)
+
+
+# Decode batches: one long row; one key, a page's end and a long row; single keys,
+# page-boundary neighbours and long rows across the partition counts.
+ONE_LONG = decode_lens((3001,))
+SHORT_MIX = decode_lens((1, 33, 1000))
+EIGHT = decode_lens((1, 31, 32, 33, 700, 2049, 3001, 4096))
+# Window decode batches around a window of 7 and of 1024.
+AROUND_SEVEN = decode_lens((7, 8, 9))
+AROUND_1024 = decode_lens((1, 1024, 1025, 3001))
+# Window prefill batches: requests starting inside, at and before a window; a chunk from an
+# empty prefix; a short turn far past the window.
+ACROSS = ((1023, 0, 6), (2, 1100, 3))
+FROM_EMPTY = ((0,), (2048,))
+FAR_TURN = ((5000,), (64,))
+
+FULL_CASES = [
+    # Decode. D 128: one head group, 8 simdgroups at bf16 and 4 at fp32.
+    Case(*ONE_LONG, 128),
+    Case(*EIGHT, 128, dtype=mx.float32),
+    # D 256 (Qwen3.6): two head groups; one kv head doubles the partitions the most.
+    Case(*EIGHT, 256),
+    Case(*SHORT_MIX, 256, dtype=mx.float32),
+    Case(*ONE_LONG, 256, num_heads=8, num_kv_heads=1),
+    # D 512 (Gemma4 global): four head groups.
+    Case(*SHORT_MIX, 512),
+    Case(*ONE_LONG, 512, dtype=mx.float32),
+    Case(*EIGHT, 512, num_heads=8, num_kv_heads=1),
+    # Prefill: one prompt, a short turn, unequal requests, a long chunk beside a long prefix.
+    Case((0,), (37,), 128),
+    Case((300,), (2,), 256, dtype=mx.float32),
+    Case((0, 2049, 7), (100, 33, 1), 256),
+    Case((5000, 0), (64, 2048), 512),
+]
+# Gemma4's window layers: D 256, 16 query heads over 8 kv heads.
+WINDOW_CASES = [
+    Case(*AROUND_1024, 256, num_kv_heads=8, window=1),
+    Case(*AROUND_SEVEN, 256, num_kv_heads=8, dtype=mx.float32, window=7),
+    Case(*decode_lens((1,)), 128, num_heads=8, num_kv_heads=1, window=7),
+    Case(*AROUND_1024, 256, num_kv_heads=8, window=1024),
+    Case(*AROUND_SEVEN, 128, num_heads=8, num_kv_heads=1, dtype=mx.float32, window=1024),
+    Case(*ACROSS, 256, num_kv_heads=8, window=1),
+    Case(*FROM_EMPTY, 256, num_kv_heads=8, dtype=mx.float32, window=7),
+    Case(*FAR_TURN, 128, num_heads=8, num_kv_heads=1, window=7),
+    Case(*FROM_EMPTY, 256, num_kv_heads=8, window=1024),
+    Case(*FAR_TURN, 256, num_kv_heads=8, dtype=mx.float32, window=1024),
+    Case(*ACROSS, 128, num_heads=8, num_kv_heads=1, window=1024),
 ]
 
 
@@ -85,6 +150,28 @@ def attention_config(num_heads: int, num_kv_heads: int, head_dim: int) -> ModelC
             "linear_value_head_dim": 32,
             "linear_conv_kernel_dim": 4,
         }
+    )
+
+
+def new_tokens(
+    num_tokens: int, num_heads: int, num_kv_heads: int, head_dim: int, dtype: mx.Dtype
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Random q, k and v of a step's num_tokens new tokens."""
+    q = mx.random.normal((num_tokens, num_heads, head_dim)).astype(dtype)
+    k = mx.random.normal((num_tokens, num_kv_heads, head_dim)).astype(dtype)
+    v = mx.random.normal((num_tokens, num_kv_heads, head_dim)).astype(dtype)
+    return q, k, v
+
+
+def dummy_req(table_idx: int) -> Req:
+    """A one-token request on the page table's dummy row, as the engine pads a batch."""
+    return Req(
+        input_ids=np.zeros(1, dtype=np.int32),
+        table_idx=table_idx,
+        cached_len=0,
+        output_len=1,
+        uid=-1,
+        sampling_params=SamplingParams(),
     )
 
 
@@ -161,20 +248,20 @@ def max_row_error(out: mx.array, reference: mx.array) -> float:
     return float((error / scale).max())
 
 
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
-@pytest.mark.parametrize("num_heads,num_kv_heads", [(16, 2), (8, 1)])
-@pytest.mark.parametrize("head_dim", [128, 256, 512])
-@pytest.mark.parametrize("batch_size", sorted(SEQ_LENS))
-def test_decode_matches_reference_and_mlx_backend(
-    batch_size: int, head_dim: int, num_heads: int, num_kv_heads: int, dtype: mx.Dtype
-) -> None:
-    seq_lens = SEQ_LENS[batch_size]
-    config = attention_config(num_heads, num_kv_heads, head_dim)
-    mx.random.seed(batch_size + head_dim + num_heads)
+@pytest.mark.parametrize("case", FULL_CASES, ids=str)
+def test_step_matches_reference_and_mlx_backend(case: Case) -> None:
+    cached_lens, extend_lens = list(case.cached_lens), list(case.extend_lens)
+    seq_lens = [c + e for c, e in zip(cached_lens, extend_lens)]
+    config = attention_config(case.num_heads, case.num_kv_heads, case.head_dim)
+    mx.random.seed(sum(seq_lens) + case.head_dim)
     kv_cache, page_table, batch = filled_pool(
-        seq_lens, num_kv_heads, head_dim, dtype, max(seq_lens) + PAGE_SIZE
+        seq_lens,
+        case.num_kv_heads,
+        case.head_dim,
+        case.dtype,
+        max(seq_lens) + PAGE_SIZE,
+        extend_lens,
     )
-
     (spec,) = config.kv_cache_group_specs()
     metal_backend = FullAttnMetalBackend(config, spec, kv_cache, page_table, PAGE_SIZE)
     mlx_backend = FullAttnMLXBackend(config, spec, kv_cache, page_table, PAGE_SIZE)
@@ -182,59 +269,45 @@ def test_decode_matches_reference_and_mlx_backend(
     metadata = batch.attn_metadata[AttnType.FULL]
     assert isinstance(metadata, MetalAttnMetadata)
 
-    q = mx.random.normal((batch_size, num_heads, head_dim)).astype(dtype)
-    k = mx.random.normal((batch_size, num_kv_heads, head_dim)).astype(dtype)
-    v = mx.random.normal((batch_size, num_kv_heads, head_dim)).astype(dtype)
+    q, k, v = new_tokens(
+        sum(extend_lens), case.num_heads, case.num_kv_heads, case.head_dim, case.dtype
+    )
     out = metal_backend.forward(q, k, v, 0, batch)
     # The MLX backend stores the same rows again, then reads the same pool.
     expected = mlx_backend.forward(q, k, v, 0, batch)
-    reference = flash_decode_ref(
-        q,
-        kv_cache.k_cache(0),
-        kv_cache.v_cache(0),
-        metadata.page_table,
-        metadata.seq_lens,
-        PAGE_SIZE,
-        config.head_dim**-0.5,
-    )
-    assert out.shape == q.shape and out.dtype == dtype
-    assert max_row_error(out, reference) < TOLERANCE[dtype]
-    assert max_row_error(out, expected) < 2 * TOLERANCE[dtype]
+    pools = (kv_cache.k_cache(0), kv_cache.v_cache(0), metadata.page_table)
+    scale = case.head_dim**-0.5
+    if batch.is_decode:
+        reference = flash_decode_ref(q, *pools, metadata.seq_lens, PAGE_SIZE, scale)
+        mlx_tolerance = 2 * TOLERANCE[case.dtype]
+    else:
+        reference = flash_prefill_ref(q, *pools, extend_lens, cached_lens, PAGE_SIZE, scale)
+        mlx_tolerance = PREFILL_MLX_TOLERANCE[case.dtype]
+    assert out.shape == q.shape and out.dtype == case.dtype
+    assert max_row_error(out, reference) < TOLERANCE[case.dtype]
+    assert max_row_error(out, expected) < mlx_tolerance
 
 
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
 @pytest.mark.parametrize(("seq_lens", "num_dummies"), REPLAY_BATCHES)
-def test_replay_metadata_matches_reference_and_eager(
-    seq_lens: list[int], num_dummies: int, dtype: mx.Dtype
-) -> None:
+def test_replay_metadata_matches_reference_and_eager(seq_lens: list[int], num_dummies: int) -> None:
     num_heads, num_kv_heads, head_dim = 16, 2, 256
     size = len(seq_lens)
     config = attention_config(num_heads, num_kv_heads, head_dim)
     mx.random.seed(size + num_dummies)
     kv_cache, page_table, batch = filled_pool(
-        seq_lens, num_kv_heads, head_dim, dtype, REPLAY_MAX_SEQ_LEN
-    )
-    dummy = Req(
-        input_ids=np.zeros(1, dtype=np.int32),
-        table_idx=size,
-        cached_len=0,
-        output_len=1,
-        uid=-1,
-        sampling_params=SamplingParams(),
+        seq_lens, num_kv_heads, head_dim, mx.bfloat16, REPLAY_MAX_SEQ_LEN
     )
     (spec,) = config.kv_cache_group_specs()
     backend = FullAttnMetalBackend(config, spec, kv_cache, page_table, PAGE_SIZE)
     padded_size = size + num_dummies
-    q = mx.random.normal((padded_size, num_heads, head_dim)).astype(dtype)
-    k = mx.random.normal((padded_size, num_kv_heads, head_dim)).astype(dtype)
-    v = mx.random.normal((padded_size, num_kv_heads, head_dim)).astype(dtype)
+    q, k, v = new_tokens(padded_size, num_heads, num_kv_heads, head_dim, mx.bfloat16)
 
     backend.prepare_metadata(batch)
     metadata = batch.attn_metadata[AttnType.FULL]
     assert isinstance(metadata, MetalAttnMetadata)
     eager = backend.forward(q[:size], k[:size], v[:size], 0, batch)
     backend.init_capture_graph(REPLAY_MAX_SEQ_LEN, [padded_size])
-    batch.padded_reqs = batch.reqs + [dummy] * num_dummies
+    batch.padded_reqs = batch.reqs + [dummy_req(size)] * num_dummies
     backend.prepare_metadata(batch)
     backend.prepare_for_replay(batch)
     replayed = backend.forward(q, k, v, 0, batch)[:size]
@@ -247,65 +320,18 @@ def test_replay_metadata_matches_reference_and_eager(
         PAGE_SIZE,
         config.head_dim**-0.5,
     )
-    assert max_row_error(replayed, reference) < TOLERANCE[dtype]
+    assert max_row_error(replayed, reference) < TOLERANCE[mx.bfloat16]
     if num_dummies == 0:
         # Same batch size, so each request gets the same partitions under either grid.
         assert mx.array_equal(replayed, eager)
 
 
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
-@pytest.mark.parametrize("num_heads,num_kv_heads", [(16, 2), (8, 1)])
-@pytest.mark.parametrize("head_dim", [128, 256, 512])
-@pytest.mark.parametrize(("cached_lens", "extend_lens"), PREFILL_BATCHES)
-def test_prefill_matches_reference_and_mlx_backend(
-    cached_lens: list[int],
-    extend_lens: list[int],
-    head_dim: int,
-    num_heads: int,
-    num_kv_heads: int,
-    dtype: mx.Dtype,
-) -> None:
-    seq_lens = [c + e for c, e in zip(cached_lens, extend_lens)]
-    config = attention_config(num_heads, num_kv_heads, head_dim)
-    mx.random.seed(sum(seq_lens) + head_dim + num_heads)
-    kv_cache, page_table, batch = filled_pool(
-        seq_lens, num_kv_heads, head_dim, dtype, max(seq_lens) + PAGE_SIZE, extend_lens
-    )
-    (spec,) = config.kv_cache_group_specs()
-    metal_backend = FullAttnMetalBackend(config, spec, kv_cache, page_table, PAGE_SIZE)
-    mlx_backend = FullAttnMLXBackend(config, spec, kv_cache, page_table, PAGE_SIZE)
-    metal_backend.prepare_metadata(batch)
-    metadata = batch.attn_metadata[AttnType.FULL]
-    assert isinstance(metadata, MetalAttnMetadata) and metadata.max_seqlen_q > 1
-
-    num_tokens = sum(extend_lens)
-    q = mx.random.normal((num_tokens, num_heads, head_dim)).astype(dtype)
-    k = mx.random.normal((num_tokens, num_kv_heads, head_dim)).astype(dtype)
-    v = mx.random.normal((num_tokens, num_kv_heads, head_dim)).astype(dtype)
-    out = metal_backend.forward(q, k, v, 0, batch)
-    expected = mlx_backend.forward(q, k, v, 0, batch)
-    reference = flash_prefill_ref(
-        q,
-        kv_cache.k_cache(0),
-        kv_cache.v_cache(0),
-        metadata.page_table,
-        extend_lens,
-        cached_lens,
-        PAGE_SIZE,
-        config.head_dim**-0.5,
-    )
-    assert out.shape == q.shape and out.dtype == dtype
-    assert max_row_error(out, reference) < TOLERANCE[dtype]
-    assert max_row_error(out, expected) < PREFILL_MLX_TOLERANCE[dtype]
-
-
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
-def test_chunked_prefill_matches_reference_and_mlx_backend(dtype: mx.Dtype) -> None:
+def test_chunked_prefill_matches_reference_and_mlx_backend() -> None:
     num_heads, num_kv_heads, head_dim = 16, 2, 256
     config = attention_config(num_heads, num_kv_heads, head_dim)
     mx.random.seed(CHUNKED_PROMPT_LEN)
     kv_cache, page_table, _ = filled_pool(
-        [CHUNKED_PROMPT_LEN], num_kv_heads, head_dim, dtype, CHUNKED_PROMPT_LEN + PAGE_SIZE
+        [CHUNKED_PROMPT_LEN], num_kv_heads, head_dim, mx.bfloat16, CHUNKED_PROMPT_LEN + PAGE_SIZE
     )
     (spec,) = config.kv_cache_group_specs()
     metal_backend = FullAttnMetalBackend(config, spec, kv_cache, page_table, PAGE_SIZE)
@@ -325,9 +351,7 @@ def test_chunked_prefill_matches_reference_and_mlx_backend(dtype: mx.Dtype) -> N
         metal_backend.prepare_metadata(batch)
         metadata = batch.attn_metadata[AttnType.FULL]
         assert isinstance(metadata, MetalAttnMetadata)
-        q = mx.random.normal((stop - start, num_heads, head_dim)).astype(dtype)
-        k = mx.random.normal((stop - start, num_kv_heads, head_dim)).astype(dtype)
-        v = mx.random.normal((stop - start, num_kv_heads, head_dim)).astype(dtype)
+        q, k, v = new_tokens(stop - start, num_heads, num_kv_heads, head_dim, mx.bfloat16)
         out = metal_backend.forward(q, k, v, 0, batch)
         expected = mlx_backend.forward(q, k, v, 0, batch)
         reference = flash_prefill_ref(
@@ -340,17 +364,8 @@ def test_chunked_prefill_matches_reference_and_mlx_backend(dtype: mx.Dtype) -> N
             PAGE_SIZE,
             config.head_dim**-0.5,
         )
-        assert max_row_error(out, reference) < TOLERANCE[dtype]
-        assert max_row_error(out, expected) < PREFILL_MLX_TOLERANCE[dtype]
-
-
-# Sliding windows: one key, inside a short row, Gemma4's.
-WINDOWS = [1, 7, 1024]
-# Window decode batches: keys per request, current token included.
-WINDOW_SEQ_LENS = [[1], [7, 8, 9], [1, 1024, 1025, 3001]]
-# Window prefill batches: cached prefix and new tokens per request.
-WINDOW_PREFILL_BATCHES = [([0], [2048]), ([5000], [64]), ([1023, 0, 6], [2, 1100, 3])]
-WINDOW_FULL_SLOTS = 16384
+        assert max_row_error(out, reference) < TOLERANCE[mx.bfloat16]
+        assert max_row_error(out, expected) < PREFILL_MLX_TOLERANCE[mx.bfloat16]
 
 
 def window_pool(
@@ -453,82 +468,33 @@ def window_backends(
     )
 
 
-def check_window_step(
-    cached_lens: list[int],
-    extend_lens: list[int],
-    num_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    dtype: mx.Dtype,
-    window: int,
-) -> None:
-    mx.random.seed(sum(cached_lens) + window + head_dim)
+@pytest.mark.parametrize("case", WINDOW_CASES, ids=str)
+def test_window_step_matches_reference_and_mlx_backend(case: Case) -> None:
+    cached_lens, extend_lens = list(case.cached_lens), list(case.extend_lens)
+    assert case.window is not None
+    mx.random.seed(sum(cached_lens) + case.window + case.head_dim)
     pool, page_table, batch = window_pool(
-        cached_lens, extend_lens, num_kv_heads, head_dim, dtype, window
+        cached_lens, extend_lens, case.num_kv_heads, case.head_dim, case.dtype, case.window
     )
-    metal_backend, mlx_backend = window_backends(pool, page_table, num_heads, head_dim)
+    metal_backend, mlx_backend = window_backends(pool, page_table, case.num_heads, case.head_dim)
     metal_backend.prepare_metadata(batch)
     metadata = batch.attn_metadata[AttnType.SWA]
     assert isinstance(metadata, MetalAttnMetadata)
-    assert max(metadata.seq_lens_host) <= window + max(extend_lens) - 1
-    num_tokens = sum(extend_lens)
-    q = mx.random.normal((num_tokens, num_heads, head_dim)).astype(dtype)
-    k = mx.random.normal((num_tokens, num_kv_heads, head_dim)).astype(dtype)
-    v = mx.random.normal((num_tokens, num_kv_heads, head_dim)).astype(dtype)
+    assert max(metadata.seq_lens_host) <= case.window + max(extend_lens) - 1
+    q, k, v = new_tokens(
+        sum(extend_lens), case.num_heads, case.num_kv_heads, case.head_dim, case.dtype
+    )
     out = metal_backend.forward(q, k, v, 0, batch)
     expected = mlx_backend.forward(q, k, v, 0, batch)
-    reference = window_reference(q, pool, page_table, cached_lens, extend_lens, head_dim**-0.5)
-    assert out.shape == q.shape and out.dtype == dtype
-    assert max_row_error(out, reference) < TOLERANCE[dtype]
-    assert max_row_error(out, expected) < PREFILL_MLX_TOLERANCE[dtype]
+    scale = case.head_dim**-0.5
+    reference = window_reference(q, pool, page_table, cached_lens, extend_lens, scale)
+    assert out.shape == q.shape and out.dtype == case.dtype
+    assert max_row_error(out, reference) < TOLERANCE[case.dtype]
+    assert max_row_error(out, expected) < PREFILL_MLX_TOLERANCE[case.dtype]
 
 
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
-@pytest.mark.parametrize("num_heads,num_kv_heads", [(16, 8), (8, 1)])
-@pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("window", WINDOWS)
-@pytest.mark.parametrize("seq_lens", WINDOW_SEQ_LENS)
-def test_window_decode_matches_reference_and_mlx_backend(
-    seq_lens: list[int],
-    window: int,
-    head_dim: int,
-    num_heads: int,
-    num_kv_heads: int,
-    dtype: mx.Dtype,
-) -> None:
-    check_window_step(
-        [n - 1 for n in seq_lens],
-        [1] * len(seq_lens),
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        dtype,
-        window,
-    )
-
-
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
-@pytest.mark.parametrize("num_heads,num_kv_heads", [(16, 8), (8, 1)])
-@pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("window", WINDOWS)
-@pytest.mark.parametrize(("cached_lens", "extend_lens"), WINDOW_PREFILL_BATCHES)
-def test_window_prefill_matches_reference_and_mlx_backend(
-    cached_lens: list[int],
-    extend_lens: list[int],
-    window: int,
-    head_dim: int,
-    num_heads: int,
-    num_kv_heads: int,
-    dtype: mx.Dtype,
-) -> None:
-    check_window_step(cached_lens, extend_lens, num_heads, num_kv_heads, head_dim, dtype, window)
-
-
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
 @pytest.mark.parametrize("num_dummies", [0, 2])
-def test_window_replay_metadata_matches_reference_and_eager(
-    num_dummies: int, dtype: mx.Dtype
-) -> None:
+def test_window_replay_metadata_matches_reference_and_eager(num_dummies: int) -> None:
     """A replayed window decode step runs on the window-wide row the eager step builds."""
     num_heads, num_kv_heads, head_dim, window = 16, 8, 256, 1024
     seq_lens = [5, 1024, 3001]
@@ -536,26 +502,16 @@ def test_window_replay_metadata_matches_reference_and_eager(
     mx.random.seed(size + num_dummies)
     cached_lens = [n - 1 for n in seq_lens]
     pool, page_table, batch = window_pool(
-        cached_lens, [1] * size, num_kv_heads, head_dim, dtype, window
-    )
-    dummy = Req(
-        input_ids=np.zeros(1, dtype=np.int32),
-        table_idx=size,
-        cached_len=0,
-        output_len=1,
-        uid=-1,
-        sampling_params=SamplingParams(),
+        cached_lens, [1] * size, num_kv_heads, head_dim, mx.bfloat16, window
     )
     backend, _ = window_backends(pool, page_table, num_heads, head_dim)
     padded_size = size + num_dummies
-    q = mx.random.normal((padded_size, num_heads, head_dim)).astype(dtype)
-    k = mx.random.normal((padded_size, num_kv_heads, head_dim)).astype(dtype)
-    v = mx.random.normal((padded_size, num_kv_heads, head_dim)).astype(dtype)
+    q, k, v = new_tokens(padded_size, num_heads, num_kv_heads, head_dim, mx.bfloat16)
 
     backend.prepare_metadata(batch)
     eager = backend.forward(q[:size], k[:size], v[:size], 0, batch)
     backend.init_capture_graph(page_table.shape[1], [padded_size])
-    batch.padded_reqs = batch.reqs + [dummy] * num_dummies
+    batch.padded_reqs = batch.reqs + [dummy_req(size)] * num_dummies
     backend.prepare_metadata(batch)
     backend.prepare_for_replay(batch)
     metadata = batch.attn_metadata[AttnType.SWA]
@@ -572,6 +528,6 @@ def test_window_replay_metadata_matches_reference_and_eager(
     reference = window_reference(
         q[:size], pool, page_table, cached_lens, [1] * size, head_dim**-0.5
     )
-    assert max_row_error(replayed, reference) < TOLERANCE[dtype]
+    assert max_row_error(replayed, reference) < TOLERANCE[mx.bfloat16]
     if num_dummies == 0:
         assert mx.array_equal(replayed, eager)
