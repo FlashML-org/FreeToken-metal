@@ -1,8 +1,7 @@
 """OpenAI routes: /v1 (liveness), POST /v1/chat/completions and /v1/completions, streamed
 or not, and GET /v1/models.
 
-Port of FreeToken server/openai_api.py, verbatim apart from formatting. Divergence: no request
-log.
+Port of FreeToken server/openai_api.py, verbatim apart from formatting.
 """
 
 # Comments and docstrings keep FreeToken's line breaks.
@@ -49,6 +48,7 @@ from .generation import (
     resolve_sampling,
     submit_generation,
 )
+from .request_logger import log_request
 
 #: The wire superset plus "off", DeepSeek's disable synonym that
 #: effort_toggle_kwargs has always honored.
@@ -126,6 +126,7 @@ def register_openai_routes(
 
     @app.post("/v1/chat/completions")
     async def v1_chat_completions(req: ChatCompletionRequest, request: Request):
+        log_request("/v1/chat/completions", req, request)
         state = get_state()
         if (gate := _maintenance_gate(state)) is not None:
             return gate
@@ -133,6 +134,7 @@ def register_openai_routes(
 
     @app.post("/v1/completions")
     async def v1_completions(req: CompletionRequest, request: Request):
+        log_request("/v1/completions", req, request)
         state = get_state()
         if (gate := _maintenance_gate(state)) is not None:
             return gate

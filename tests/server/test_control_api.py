@@ -1,5 +1,6 @@
 """The control plane end to end over the real tokenizer worker and a scripted scheduler:
-/health, /v1/stats, /v1/requests, /v1/cache/status and prepare-stop."""
+/health, /v1/stats, /v1/requests, /v1/cache/status, prepare-stop and the request
+log."""
 
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ from fastapi.testclient import TestClient
 from pydantic import JsonValue
 
 from ftmetal import __version__
+from ftmetal.env import ENV_PREFIXES
 from ftmetal.server.api_server import create_app
 from scripted_server import (
     WAIT_SECONDS,
@@ -261,3 +263,42 @@ def test_prepare_stop_answers_loopback_clients_only(
         response = client.post("/v1/admin/prepare-stop")
         assert client.post("/v1/chat/completions", json=CHAT).status_code == 200
     assert (response.status_code, response.json()) == (403, {"error": "loopback access required"})
+
+
+# (environment variable naming the log directory, None for neither)
+REQUEST_LOG_CASES: list[str | None] = ["FTMETAL_API_LOG_DIR", "FREETOKEN_API_LOG_DIR", None]
+
+
+@pytest.mark.parametrize("variable", REQUEST_LOG_CASES)
+def test_request_log_writes_one_line_per_dispatched_request(
+    tiny_model_dir: Path,
+    scripted: type[ScriptedScheduler],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    variable: str | None,
+) -> None:
+    for prefix in ENV_PREFIXES:
+        monkeypatch.delenv(f"{prefix}API_LOG_DIR", raising=False)
+    log_dir = tmp_path / "requests"
+    if variable is not None:
+        monkeypatch.setenv(variable, str(log_dir))
+    count_body: dict[str, JsonValue] = {**CHAT, "system": "Be brief."}
+    generate_body: dict[str, JsonValue] = {"prompt": "hi", "max_tokens": 4}
+    with TestClient(create_app(tiny_server_args(tiny_model_dir))) as client:
+        client.post("/v1/chat/completions", json=CHAT)
+        client.post("/v1/messages/count_tokens", json=count_body)
+        client.post("/generate", json=generate_body)
+        # Refused by body validation: never dispatched.
+        assert client.post("/v1/chat/completions", json={"model": "tiny"}).status_code == 422
+    if variable is None:
+        assert not log_dir.exists()
+    else:
+        [log_file] = log_dir.iterdir()
+        assert log_file.stat().st_mode & 0o777 == 0o600
+        records = [json.loads(line) for line in log_file.read_text().splitlines()]
+        assert [(record["endpoint"], record["request"]) for record in records] == [
+            ("/v1/chat/completions", CHAT),
+            ("/v1/messages/count_tokens", count_body),
+            ("/generate", generate_body),
+        ]
+        assert all(record["client"] == "testclient" for record in records)

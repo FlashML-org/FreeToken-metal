@@ -1,7 +1,7 @@
 """OpenAI Responses API: POST /v1/responses, streamed or not, and the stateless
 GET /v1/responses/{id} and POST /v1/responses/{id}/cancel -- the endpoint codex talks to.
 
-Port of FreeToken server/responses_api.py. Divergence: no request log. As in FreeToken, a
+Port of FreeToken server/responses_api.py, verbatim apart from formatting. As in FreeToken, a
 STATELESS subset adapted from vLLM's OpenAIServingResponses (simple rail): store and
 background are ignored or refused, previous_response_id is refused, GET and cancel answer
 404; reasoning streams as a reasoning item, and replayed reasoning items fold back into
@@ -75,6 +75,7 @@ from .generation import (
     submit_generation,
     with_keepalive,
 )
+from .request_logger import log_request
 
 # Seconds of event silence before a keep-alive frame is emitted on the stream.
 # codex's stream-idle timeout (default 300s) only resets on a data-bearing SSE
@@ -113,6 +114,7 @@ def register_responses_routes(
 ) -> None:
     @app.post("/v1/responses")
     async def v1_responses(req: ResponsesRequest, request: Request):
+        log_request("/v1/responses", req, request)
         state = get_state()
         mstate = getattr(state, "maintenance_state", "serving")
         if mstate != "serving":

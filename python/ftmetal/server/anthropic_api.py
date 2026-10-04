@@ -1,8 +1,8 @@
 """Anthropic Messages API: POST /v1/messages, streamed or not, and
 /v1/messages/count_tokens -- the endpoint Claude Code talks to.
 
-Port of FreeToken server/anthropic_api.py. Divergence: no request log. FreeToken adapted it
-from vLLM's AnthropicServingMessages.
+Port of FreeToken server/anthropic_api.py, verbatim apart from formatting. FreeToken adapted
+it from vLLM's AnthropicServingMessages.
 """
 
 # Comments and docstrings keep FreeToken's line breaks.
@@ -53,6 +53,7 @@ from .generation import (
     submit_generation,
     with_keepalive,
 )
+from .request_logger import log_request
 
 # Emit a protocol-native `ping` event after this many seconds of stream silence,
 # bridging long queue/prefill/decode gaps for clients with stream-idle timeouts.
@@ -83,6 +84,7 @@ def register_anthropic_routes(
 ) -> None:
     @app.post("/v1/messages")
     async def v1_messages(req: AnthropicMessagesRequest, request: Request):
+        log_request("/v1/messages", req, request)
         state = get_state()
         mstate = getattr(state, "maintenance_state", "serving")
         if mstate != "serving":
@@ -94,6 +96,7 @@ def register_anthropic_routes(
 
     @app.post("/v1/messages/count_tokens")
     async def v1_messages_count_tokens(req: AnthropicCountTokensRequest, request: Request):
+        log_request("/v1/messages/count_tokens", req, request)
         return await handle_anthropic_count_tokens(req, get_state())
 
     @app.exception_handler(RequestValidationError)

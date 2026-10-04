@@ -20,8 +20,7 @@ leaves its reply queue in place, so the scheduler's acknowledgement ends that st
 error where FreeToken leaves the client waiting; /generate leaves its 503 to new_user and
 reports a failed request as an {"error": ...} event before [DONE]; a stop string matched by
 the detokenizer aborts the request; the decode state of an aborted request is dropped when
-the tokenizer worker relays the abort, so tokens that race it are not counted; no CORS and
-no request log.
+the tokenizer worker relays the abort, so tokens that race it are not counted; no CORS.
 """
 
 from __future__ import annotations
@@ -70,6 +69,9 @@ from ftmetal.server.anthropic_api import register_anthropic_routes
 from ftmetal.server.args import ServerArgs
 from ftmetal.server.control_api import register_control_routes
 from ftmetal.server.openai_api import register_openai_routes
+from ftmetal.server.request_logger import init as init_request_logging
+from ftmetal.server.request_logger import log_request
+from ftmetal.server.request_logger import shutdown as shutdown_request_logging
 from ftmetal.server.request_ring import RequestRing
 from ftmetal.server.responses_api import register_responses_routes
 from ftmetal.server.stats import StatsTracker
@@ -351,6 +353,8 @@ def create_app(config: ServerArgs) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # A bad FTMETAL_API_LOG_DIR is reported at boot, not on the first request.
+        init_request_logging()
         engine_thread.start()
         # Both TokenizeManagers probe their template once, before the first request.
         await asyncio.to_thread(tokenize_manager.thinking_profile)
@@ -366,6 +370,7 @@ def create_app(config: ServerArgs) -> FastAPI:
         await asyncio.to_thread(engine_thread.join)
         recv_tokenizer.put(None)
         await asyncio.to_thread(tokenizer_thread.join)
+        shutdown_request_logging()
 
     defaults = load_sampling_defaults(config.model_path)
     model_sampling: dict[str, float | int] = {
@@ -383,6 +388,7 @@ def create_app(config: ServerArgs) -> FastAPI:
     @app.post("/generate", response_model=None)
     async def generate(req: GenerateRequest, request: Request) -> StreamingResponse | JSONResponse:
         """A raw prompt sampled with the framework defaults, streamed as {"text": ...} events."""
+        log_request("/generate", req, request)
         if req.max_tokens < 1:
             return JSONResponse(
                 {"error": f"max_tokens must be at least 1, got {req.max_tokens}"}, status_code=400
