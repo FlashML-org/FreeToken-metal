@@ -1,11 +1,13 @@
 """The control plane end to end over the real tokenizer worker and a scripted scheduler:
-/health, /v1/stats, /v1/requests, /v1/cache/status, prepare-stop and the request
-log."""
+/health, /v1/stats, /v1/requests, /v1/cache/status, prepare-stop, the request log, CORS and
+the access-log filter that hides the polled routes."""
 
 from __future__ import annotations
 
+import dataclasses
 import http.client
 import json
+import logging
 import struct
 import threading
 import time
@@ -17,6 +19,7 @@ from pydantic import JsonValue
 
 from ftmetal import __version__
 from ftmetal.env import ENV_PREFIXES
+from ftmetal.server.access_log_filter import PollingAccessLogFilter
 from ftmetal.server.api_server import create_app
 from scripted_server import (
     WAIT_SECONDS,
@@ -302,3 +305,56 @@ def test_request_log_writes_one_line_per_dispatched_request(
             ("/generate", generate_body),
         ]
         assert all(record["client"] == "testclient" for record in records)
+
+
+# (--cors-origins, the request's Origin, the access-control-allow-origin it gets back)
+CORS_CASES: list[tuple[str, str, str | None]] = [
+    ("tauri://localhost,http://localhost:1420", "http://localhost:1420", "http://localhost:1420"),
+    ("tauri://localhost,http://localhost:1420", "https://example.org", None),
+    ("*", "https://example.org", "*"),
+    ("", "http://localhost:1420", None),
+]
+
+
+@pytest.mark.parametrize(("cors_origins", "origin", "allowed"), CORS_CASES)
+def test_cors_headers_follow_the_allow_list(
+    tiny_model_dir: Path,
+    scripted: type[ScriptedScheduler],
+    cors_origins: str,
+    origin: str,
+    allowed: str | None,
+) -> None:
+    args = dataclasses.replace(tiny_server_args(tiny_model_dir), cors_origins=cors_origins)
+    with TestClient(create_app(args)) as client:
+        response = client.get("/v1/models", headers={"Origin": origin})
+    assert response.headers.get("access-control-allow-origin") == allowed
+
+
+# (request path as uvicorn logs it, whether ftmetal logs at DEBUG, whether the line is shown)
+ACCESS_LOG_CASES: list[tuple[str, bool, bool]] = [
+    ("/health", False, False),
+    ("/v1/stats", False, False),
+    ("/v1/requests?since=3&limit=50", False, False),
+    ("/v1/cache/status", False, False),
+    ("/v1", False, False),
+    ("/v1/models", False, True),
+    ("/v1/chat/completions", False, True),
+    ("/v1/stats", True, True),
+]
+
+
+@pytest.mark.parametrize(("path", "debug", "shown"), ACCESS_LOG_CASES)
+def test_access_log_hides_the_polled_routes(
+    caplog: pytest.LogCaptureFixture, path: str, debug: bool, shown: bool
+) -> None:
+    record = logging.LogRecord(
+        "uvicorn.access",
+        logging.INFO,
+        __file__,
+        0,
+        '%s - "%s %s HTTP/%s" %d',
+        ("127.0.0.1:50000", "GET", path, "1.1", 200),
+        None,
+    )
+    with caplog.at_level(logging.DEBUG if debug else logging.INFO, logger="ftmetal"):
+        assert PollingAccessLogFilter().filter(record) is shown

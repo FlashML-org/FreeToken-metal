@@ -67,6 +67,9 @@ class ServerArgs(EngineConfig):
     # prompt_tokens_details.cached_tokens, Anthropic cache_read_input_tokens, Responses
     # input_tokens_details.cached_tokens).
     enable_cache_report: bool = False
+    # Comma-separated CORS allow-list for browser and webview clients; empty disables the
+    # CORS headers, "*" allows any origin. Parity: FreeToken's desktop-app origins.
+    cors_origins: str = "tauri://localhost,http://tauri.localhost,http://localhost:1420"
 
 
 def positive_int(value: str) -> int:
@@ -277,6 +280,13 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         help="splits the chain-of-thought into reasoning_content; auto picks the model "
         "family's (<think> for qwen3, the thought channel for gemma4), off disables it",
     )
+    parser.add_argument(
+        "--cors-origins",
+        default=ServerArgs.cors_origins,
+        metavar="ORIGINS",
+        help="comma-separated CORS allow-list for browser and webview clients (default: the "
+        "local desktop-app origins); '' disables it, '*' allows any origin",
+    )
     namespace = parser.parse_args(argv)
     model_path = os.path.expanduser(namespace.model_path)
     if not os.path.isdir(model_path):
@@ -299,6 +309,7 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         tool_call_parser=tool_call_parser,
         reasoning_parser=reasoning_parser,
         enable_cache_report=namespace.enable_cache_report,
+        cors_origins=namespace.cors_origins,
         server_host=namespace.server_host,
         server_port=namespace.server_port,
         max_running_req=namespace.max_running_req,

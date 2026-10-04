@@ -1,8 +1,8 @@
 """The FastAPI app, the frontend state its routes share, and the two threads behind it: the
 tokenizer worker and the scheduler.
 
-Port of FreeToken server/api_server.py (FrontendManager, app, lifespan, run_api_server,
-/generate), with the message loops of tokenizer/server.py (tokenize_worker)
+Port of FreeToken server/api_server.py (FrontendManager, app, lifespan, install_cors,
+run_api_server, /generate), with the message loops of tokenizer/server.py (tokenize_worker)
 and of scheduler/scheduler.py (run_forever and its message handling). Divergences: one
 process; the tokenizer worker and the scheduler are threads fed by queue.Queue instead of
 processes over ZMQ, and the scheduler thread is the only MLX caller; replies reach the event
@@ -20,7 +20,7 @@ leaves its reply queue in place, so the scheduler's acknowledgement ends that st
 error where FreeToken leaves the client waiting; /generate leaves its 503 to new_user and
 reports a failed request as an {"error": ...} event before [DONE]; a stop string matched by
 the detokenizer aborts the request; the decode state of an aborted request is dropped when
-the tokenizer worker relays the abort, so tokens that race it are not counted; no CORS.
+the tokenizer worker relays the abort, so tokens that race it are not counted.
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ from typing import Literal
 
 import uvicorn
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from jinja2 import TemplateError
 from pydantic import BaseModel, JsonValue
@@ -64,6 +65,7 @@ from ftmetal.message.tokenizer import (
     TokenizeMsg,
 )
 from ftmetal.scheduler.scheduler import Scheduler
+from ftmetal.server.access_log_filter import install_polling_access_log_filter
 from ftmetal.server.accounting import AdmissionClosedError, register_accounting_routes
 from ftmetal.server.anthropic_api import register_anthropic_routes
 from ftmetal.server.args import ServerArgs
@@ -384,6 +386,17 @@ def create_app(config: ServerArgs) -> FastAPI:
     register_responses_routes(app, lambda: frontend, lambda: model_sampling)
     register_control_routes(app, lambda: frontend, lambda: model_sampling)
     register_accounting_routes(app, lambda: frontend)
+
+    # CORS headers for browser and webview clients; an empty allow-list sends none.
+    cors_origins = [origin.strip() for origin in config.cors_origins.split(",") if origin.strip()]
+    if cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"] if "*" in cors_origins else cors_origins,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+    install_polling_access_log_filter()
 
     @app.post("/generate", response_model=None)
     async def generate(req: GenerateRequest, request: Request) -> StreamingResponse | JSONResponse:
