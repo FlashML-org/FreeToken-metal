@@ -56,6 +56,7 @@ from ftmetal.message.tokenizer import (
     TokenizeMsg,
 )
 from ftmetal.scheduler.scheduler import Scheduler
+from ftmetal.server.anthropic_api import register_anthropic_routes
 from ftmetal.server.args import ServerArgs
 from ftmetal.server.openai_api import register_openai_routes
 from ftmetal.tokenizer import (
@@ -327,6 +328,7 @@ def create_app(config: ServerArgs) -> FastAPI:
     }
     app = FastAPI(title="ftmetal", version=__version__, lifespan=lifespan)
     register_openai_routes(app, lambda: frontend, lambda: model_sampling)
+    register_anthropic_routes(app, lambda: frontend, lambda: model_sampling)
 
     @app.exception_handler(EngineUnavailableError)
     async def engine_unavailable(request: Request, exc: EngineUnavailableError) -> JSONResponse:
