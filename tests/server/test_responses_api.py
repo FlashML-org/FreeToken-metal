@@ -236,13 +236,6 @@ REFUSED_CASES: list[tuple[str, str, dict[str, JsonValue] | None, int, str]] = [
     (
         "POST",
         "/v1/responses",
-        {"model": "tiny", "input": "hi", "reasoning": {"effort": "high"}},
-        400,
-        "reasoning.effort is not supported",
-    ),
-    (
-        "POST",
-        "/v1/responses",
         {"model": "tiny", "input": "hi", "max_output_tokens": 0},
         400,
         "max_output_tokens must be a positive integer",

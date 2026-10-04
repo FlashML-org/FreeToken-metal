@@ -1,4 +1,5 @@
-"""Chat-template rendering and encoding, incremental detokenization and stop strings.
+"""Chat-template rendering and encoding, incremental detokenization and stop strings; a
+conversation's reasoning_effort is quantized onto the vocabulary probed from its template.
 
 Port of FreeToken tokenizer/tokenize.py and tokenizer/detokenize.py. Divergences: the
 tokenizers library and a jinja2 environment that mirrors apply_chat_template replace
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, NoReturn
@@ -33,6 +35,13 @@ from pydantic import JsonValue
 from tokenizers import Tokenizer
 
 from ftmetal.core import SamplingParams
+from ftmetal.effort import (
+    EffortProfile,
+    ThinkingProfile,
+    probe_effort_profile,
+    probe_thinking_profile,
+    quantize_effort,
+)
 from ftmetal.message.backend import UserMsg
 from ftmetal.message.frontend import UserReply
 from ftmetal.message.tokenizer import DetokenizeMsg, TokenizeMsg
@@ -48,6 +57,8 @@ GENERATION_CONFIG_FILE = "generation_config.json"
 TEMPLATE_SPECIAL_TOKENS = ("bos_token", "eos_token", "pad_token", "unk_token")
 # What a byte-level decode yields for a UTF-8 sequence the last token left incomplete.
 REPLACEMENT_CHARACTER = "�"
+# The conversation the reasoning-effort and thinking probes render.
+EFFORT_PROBE_MESSAGES: list[dict[str, JsonValue]] = [{"role": "user", "content": "ping"}]
 
 
 def read_json_object(path: Path) -> dict[str, object]:
@@ -146,18 +157,99 @@ class TokenizeManager:
             if isinstance(token, str):
                 self.special_tokens[name] = token
         self.has_warned_unstable_template = False
+        # The template's effort and thinking controls, probed on first use.
+        self.probed_effort_profile: EffortProfile | None = None
+        self.probed_thinking_profile: ThinkingProfile | None = None
+        self.effort_lock = threading.Lock()
+        # (requested effort, the gear it was served as) pairs already logged.
+        self.logged_effort_maps: set[tuple[str, str | None]] = set()
 
     def render_prompt(self, msg: TokenizeMsg, add_generation_prompt: bool = True) -> str:
+        """The prompt text. A conversation's reasoning_effort is quantized first: every render
+        path (worker, frontend check, count_tokens) must agree."""
         if isinstance(msg.text, str):
             return msg.text
         else:
-            return self.chat_template.render(
-                messages=msg.text,
-                tools=msg.tools,
-                add_generation_prompt=add_generation_prompt,
-                **self.special_tokens,
-                **msg.chat_template_kwargs,
+            return self.render_template(
+                msg.text,
+                msg.tools,
+                self.sanitize_effort(msg.chat_template_kwargs),
+                add_generation_prompt,
             )
+
+    def render_template(
+        self,
+        messages: list[dict[str, JsonValue]],
+        tools: list[dict[str, JsonValue]] | None,
+        chat_template_kwargs: dict[str, JsonValue],
+        add_generation_prompt: bool = True,
+    ) -> str:
+        """Raw render, no effort sanitation: the probes need unsupported values to reach the
+        template so that a rejection is observable."""
+        if "reasoning_effort" in chat_template_kwargs:
+            # Broadcast in every spelling templates read (muse-glimmer grades
+            # reasoning_strength); one the caller spelled out wins.
+            chat_template_kwargs = {
+                "reasoning_strength": chat_template_kwargs["reasoning_effort"],
+                **chat_template_kwargs,
+            }
+        return self.chat_template.render(
+            messages=messages,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            **self.special_tokens,
+            **chat_template_kwargs,
+        )
+
+    def effort_profile(self) -> EffortProfile:
+        """The template's reasoning-effort vocabulary, probed once and cached."""
+        with self.effort_lock:
+            if self.probed_effort_profile is None:
+                profile = probe_effort_profile(self.probe_render)
+                supported = sorted(profile.supported) or "(none)"
+                logger.info(
+                    f"reasoning-effort profile: supported={supported} default={profile.default}"
+                )
+                self.probed_effort_profile = profile
+            return self.probed_effort_profile
+
+    def thinking_profile(self) -> ThinkingProfile:
+        """The template's thinking toggles and effort vocabulary, probed once and cached."""
+        efforts = self.effort_profile()
+        with self.effort_lock:
+            if self.probed_thinking_profile is None:
+                self.probed_thinking_profile = probe_thinking_profile(self.probe_render, efforts)
+            return self.probed_thinking_profile
+
+    def probe_render(
+        self, chat_template_kwargs: dict[str, JsonValue], tools: list[dict[str, JsonValue]] | None
+    ) -> str:
+        """The probe conversation rendered with one probe's kwargs and tools."""
+        return self.render_template(EFFORT_PROBE_MESSAGES, tools, chat_template_kwargs)
+
+    def sanitize_effort(self, chat_template_kwargs: dict[str, JsonValue]) -> dict[str, JsonValue]:
+        """chat_template_kwargs with reasoning_effort quantized onto the template's vocabulary,
+        or dropped when nothing in it is close enough."""
+        if "reasoning_effort" not in chat_template_kwargs:
+            return chat_template_kwargs
+        raw = chat_template_kwargs["reasoning_effort"]
+        mapped = quantize_effort(raw, self.effort_profile())
+        if mapped == raw:
+            return chat_template_kwargs
+        # raw is client-controlled and may be unhashable (a JSON list or object).
+        key = (raw if isinstance(raw, str) else repr(raw), mapped)
+        if key not in self.logged_effort_maps:
+            self.logged_effort_maps.add(key)
+            served = mapped if mapped is not None else "the template default"
+            logger.info(
+                f"reasoning_effort {raw!r} is not supported by this checkpoint; using {served}"
+            )
+        sanitized = dict(chat_template_kwargs)
+        if mapped is None:
+            sanitized.pop("reasoning_effort")
+        else:
+            sanitized["reasoning_effort"] = mapped
+        return sanitized
 
     def tokenize(self, msg: TokenizeMsg) -> UserMsg:
         if isinstance(msg.text, str):
@@ -250,39 +342,36 @@ class DetokenizeManager:
         text = status.unsent_str
         found = [(text.find(stop), stop) for stop in status.stop_strs]
         matches = [(position, stop) for position, stop in found if position >= 0]
+        finished = msg.finished or bool(matches)
         if matches:
             emit_end, matched_stop = min(matches, key=lambda match: match[0])
-            reply = UserReply(
-                uid=msg.uid,
-                incremental_output=text[:emit_end],
-                finished=True,
-                completion_tokens_delta=1,
-                finish_reason="stop",
-                matched_stop=matched_stop,
-            )
+            finish_reason = "stop"
         elif msg.finished:
-            reply = UserReply(
-                uid=msg.uid,
-                incremental_output=text,
-                finished=True,
-                completion_tokens_delta=1,
-                finish_reason=msg.finish_reason,
-            )
+            emit_end, matched_stop, finish_reason = len(text), None, msg.finish_reason
         else:
             emit_end = len(text) - stop_prefix_holdback(text, status.stop_strs)
-            reply = UserReply(
-                uid=msg.uid,
-                incremental_output=text[:emit_end],
-                finished=False,
-                completion_tokens_delta=1,
-            )
-            status.unsent_str = text[emit_end:]
-        if reply.finished:
+            matched_stop, finish_reason = None, None
+        status.unsent_str = text[emit_end:]
+        if finished:
             self.decode_map.pop(msg.uid)
-        return reply
+        return UserReply(
+            uid=msg.uid,
+            incremental_output=text[:emit_end],
+            finished=finished,
+            completion_tokens_delta=1,
+            finish_reason=finish_reason,
+            matched_stop=matched_stop,
+            kv_used_pages=msg.kv_used_pages,
+            kv_total_pages=msg.kv_total_pages,
+            mamba_used_slots=msg.mamba_used_slots,
+            mamba_total_slots=msg.mamba_total_slots,
+            swa_used_tokens=msg.swa_used_tokens,
+            swa_total_tokens=msg.swa_total_tokens,
+        )
 
 
 __all__ = [
+    "EFFORT_PROBE_MESSAGES",
     "TEMPLATE_SPECIAL_TOKENS",
     "DecodeStatus",
     "DetokenizeManager",

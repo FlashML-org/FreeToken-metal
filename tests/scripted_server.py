@@ -9,11 +9,16 @@ completion streams character by character and every marker arrives split across 
 from __future__ import annotations
 
 import json
+import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import ClassVar, Literal
 
 import numpy as np
+import uvicorn
+from fastapi import FastAPI
 from pydantic import JsonValue
 from tokenizers import Tokenizer
 
@@ -40,6 +45,10 @@ class ScriptedScheduler(Scheduler):
     cached_tokens: ClassVar[int] = 0
     # Whether a step raises, which kills the scheduler thread.
     fails: ClassVar[bool] = False
+    # The pools each step reports: used KV pages are the requests admitted so far, used GDN
+    # slots the running ones; no GDN pool when its total is 0.
+    kv_total_pages: ClassVar[int] = 64
+    mamba_total_slots: ClassVar[int] = 0
     instances: ClassVar[list[ScriptedScheduler]] = []
 
     def __init__(self, config: EngineConfig, eos_token_ids: set[int]) -> None:
@@ -89,6 +98,15 @@ class ScriptedScheduler(Scheduler):
     def runnable(self) -> bool:
         return len(self.running) > 0
 
+    def kv_page_usage(self) -> tuple[int, int]:
+        return len(self.admitted), self.kv_total_pages
+
+    def mamba_slot_usage(self) -> tuple[int, int] | None:
+        return (len(self.running), self.mamba_total_slots) if self.mamba_total_slots else None
+
+    def swa_token_usage(self) -> tuple[int, int] | None:
+        return None
+
     def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
         time.sleep(self.step_seconds)
         if self.fails and self.running:
@@ -112,6 +130,24 @@ def wait_for_abort(scheduler: ScriptedScheduler, uid: int) -> None:
     while uid not in scheduler.aborted:
         assert time.monotonic() < deadline, f"request {uid} was never aborted"
         time.sleep(0.01)
+
+
+@contextmanager
+def running_server(app: FastAPI) -> Iterator[int]:
+    """app served over HTTP on a free loopback port, for clients that need a real socket;
+    yields the port."""
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + WAIT_SECONDS
+    while not server.started:
+        assert time.monotonic() < deadline, "the server did not start"
+        time.sleep(0.01)
+    try:
+        yield server.servers[0].sockets[0].getsockname()[1]
+    finally:
+        server.should_exit = True
+        thread.join()
 
 
 def tiny_server_args(

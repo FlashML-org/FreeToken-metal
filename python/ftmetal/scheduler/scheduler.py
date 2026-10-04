@@ -184,7 +184,7 @@ class Scheduler:
         return ongoing_data
 
     def report_status(self, forward_input: ForwardInput) -> None:
-        kv_used_pages, kv_total_pages = self.cache_manager.page_usage()
+        kv_used_pages, kv_total_pages = self.kv_page_usage()
         self.status_reporter.report_batch(
             forward_input.batch,
             new_tokens=forward_input.num_tokens,
@@ -196,6 +196,10 @@ class Scheduler:
             linear_slots=self.mamba_slot_usage(),
             swa_tokens=self.swa_token_usage(),
         )
+
+    def kv_page_usage(self) -> tuple[int, int]:
+        """(used, total) KV pages; evictable prefix-cache pages are not used."""
+        return self.cache_manager.page_usage()
 
     def mamba_slot_usage(self) -> tuple[int, int] | None:
         """(used, total) GDN slots; free slots and evictable snapshots are not used."""
@@ -222,7 +226,9 @@ class Scheduler:
         """Serve backend messages until ExitMsg: admit, abort, step, and emit detokenize messages.
 
         Blocks on the queue when idle. live_uids are the requests whose tokens may still
-        come; the caller reports them if this loop dies.
+        come; the caller reports them if this loop dies. Every abort is acknowledged with an
+        ErrorReplyMsg after the step's tokens, the terminal reply the frontend's accounting
+        waits for.
         """
         self.live_uids.clear()
         data: ForwardData | None = None
@@ -236,6 +242,7 @@ class Scheduler:
                 msgs.extend(msg.data if isinstance(msg, BatchBackendMsg) else [msg])
 
             replies: list[BaseTokenizerMsg] = []
+            abort_acks: list[BaseTokenizerMsg] = []
             for msg in msgs:
                 if isinstance(msg, ExitMsg):
                     return
@@ -253,12 +260,16 @@ class Scheduler:
                 elif isinstance(msg, AbortBackendMsg):
                     self.abort_request(msg.uid)
                     self.live_uids.discard(msg.uid)
+                    abort_acks.append(ErrorReplyMsg(uid=msg.uid, error="request aborted"))
                 else:
                     raise NotImplementedError(f"unexpected backend message {msg!r}")
 
             data = self.overlap_loop(data)
             replies.extend(self.prompt_admissions)
             self.prompt_admissions = []
+            kv_used_pages, kv_total_pages = self.kv_page_usage()
+            mamba_used_slots, mamba_total_slots = self.mamba_slot_usage() or (0, 0)
+            swa_used_tokens, swa_total_tokens = self.swa_token_usage() or (0, 0)
             for event in self.take_results():
                 replies.append(
                     DetokenizeMsg(
@@ -266,10 +277,17 @@ class Scheduler:
                         next_token=event.token,
                         finished=event.finished,
                         finish_reason=event.finish_reason,
+                        kv_used_pages=kv_used_pages,
+                        kv_total_pages=kv_total_pages,
+                        mamba_used_slots=mamba_used_slots,
+                        mamba_total_slots=mamba_total_slots,
+                        swa_used_tokens=swa_used_tokens,
+                        swa_total_tokens=swa_total_tokens,
                     )
                 )
                 if event.finished:
                     self.live_uids.discard(event.uid)
+            replies.extend(abort_acks)
             if replies:
                 send_tokenizer.put(BatchTokenizerMsg(data=replies))
 
