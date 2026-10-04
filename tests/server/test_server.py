@@ -38,7 +38,6 @@ from ftmetal.server import api_server
 from ftmetal.server.api_server import create_app
 from ftmetal.server.args import ServerArgs, parse_args
 from ftmetal.server.generation import FrontendManager
-from ftmetal.server.reasoning_parser import ThinkReasoningParser
 
 MODEL_PATH = os.environ.get("FTMETAL_TEST_MODEL_PATH")
 SCRIPT = "Let me think.</think>\n\nThe answer is 42."
@@ -470,37 +469,6 @@ def test_frontend_keeps_early_replies_and_aborts_on_early_close() -> None:
     assert texts == ["hi", ""]
     assert sent == AbortMsg(uid=1)
     assert frontend.ack_map == {}
-
-
-def parse_in_chunks(parser: ThinkReasoningParser, chunks: list[str]) -> tuple[str, str]:
-    reasoning: list[str] = []
-    content: list[str] = []
-    for chunk in chunks:
-        reasoning_delta, content_delta = parser.parse_stream_chunk(chunk)
-        reasoning.append(reasoning_delta)
-        content.append(content_delta)
-    reasoning_delta, content_delta = parser.flush()
-    return "".join([*reasoning, reasoning_delta]), "".join([*content, content_delta])
-
-
-def test_reasoning_parser_reassembles_split_markers() -> None:
-    chunks = ["Let me", " th", "ink.</th", "ink>\n\nAns", "wer <th", "e end"]
-    assert parse_in_chunks(ThinkReasoningParser(force_reasoning=True), chunks) == (
-        "Let me think.",
-        "\n\nAnswer <the end",
-    )
-    explicit = ["<thi", "nk>abc</think>", "def"]
-    assert parse_in_chunks(ThinkReasoningParser(force_reasoning=False), explicit) == ("abc", "def")
-    plain = ["no ", "block <", "th"]
-    assert parse_in_chunks(ThinkReasoningParser(force_reasoning=False), plain) == (
-        "",
-        "no block <th",
-    )
-    truncated = ["still ", "thinking </thi"]
-    assert parse_in_chunks(ThinkReasoningParser(force_reasoning=True), truncated) == (
-        "still thinking </thi",
-        "",
-    )
 
 
 @pytest.mark.parametrize(

@@ -32,7 +32,7 @@ from ftmetal.message.tokenizer import (
     FinishReason,
     TokenizeMsg,
 )
-from ftmetal.server.reasoning_parser import ThinkReasoningParser
+from ftmetal.server.reasoning_parser import ReasoningParser
 
 
 class EngineUnavailableError(RuntimeError):
@@ -201,7 +201,7 @@ async def generate_events(
     uid: int, spec: GenSpec, frontend: FrontendManager
 ) -> AsyncGenerator[GenEvent]:
     """Reasoning and content deltas of one request, then exactly one GenDone."""
-    parser = ThinkReasoningParser(force_reasoning=spec.opens_reasoning)
+    parser = ReasoningParser("qwen3", force_reasoning=spec.opens_reasoning)
     prompt_tokens = 0
     completion_tokens = 0
     finish_reason: FinishReason | None = None
