@@ -3,7 +3,7 @@ admissions, aborts and scheduler errors.
 
 Port of FreeToken message/tokenizer.py. Divergences: plain dataclasses passed over
 queue.Queue (no ZMQ encoder/decoder); stop strings are matched by the detokenizer, so
-DetokenizeMsg carries neither matched_stop nor stop_strs; no pool-usage snapshot,
+DetokenizeMsg carries neither matched_stop nor stop_strs; no GPU-memory figure,
 multimodal input or cache-rebuild messages.
 """
 
@@ -35,6 +35,14 @@ class DetokenizeMsg(BaseTokenizerMsg):
     next_token: int
     finished: bool
     finish_reason: FinishReason | None = None
+    # Pool occupancy after this step (not-evictable used, total), passed through to the
+    # frontend's /v1/stats; 0/0 for a pool the model does not have.
+    kv_used_pages: int = 0
+    kv_total_pages: int = 0
+    mamba_used_slots: int = 0
+    mamba_total_slots: int = 0
+    swa_used_tokens: int = 0
+    swa_total_tokens: int = 0
 
 
 @dataclass(kw_only=True)

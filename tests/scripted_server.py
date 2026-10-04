@@ -40,6 +40,10 @@ class ScriptedScheduler(Scheduler):
     cached_tokens: ClassVar[int] = 0
     # Whether a step raises, which kills the scheduler thread.
     fails: ClassVar[bool] = False
+    # The pools each step reports: used KV pages are the requests admitted so far, used GDN
+    # slots the running ones; no GDN pool when its total is 0.
+    kv_total_pages: ClassVar[int] = 64
+    mamba_total_slots: ClassVar[int] = 0
     instances: ClassVar[list[ScriptedScheduler]] = []
 
     def __init__(self, config: EngineConfig, eos_token_ids: set[int]) -> None:
@@ -88,6 +92,15 @@ class ScriptedScheduler(Scheduler):
     @property
     def runnable(self) -> bool:
         return len(self.running) > 0
+
+    def kv_page_usage(self) -> tuple[int, int]:
+        return len(self.admitted), self.kv_total_pages
+
+    def mamba_slot_usage(self) -> tuple[int, int] | None:
+        return (len(self.running), self.mamba_total_slots) if self.mamba_total_slots else None
+
+    def swa_token_usage(self) -> tuple[int, int] | None:
+        return None
 
     def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
         time.sleep(self.step_seconds)

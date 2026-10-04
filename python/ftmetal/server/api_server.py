@@ -14,10 +14,10 @@ TokenizeManagers probe their chat template's thinking and effort controls before
 refuses with EngineUnavailableError, answered 503 as FreeToken answers a closed admission;
 closing a request's reply stream before its terminal reply also aborts it, and an abort is
 sent once; /generate reports a failed request as an {"error": ...} event before [DONE]; a
-stop string matched by the detokenizer aborts the request; aborts are not acknowledged,
-because decode state is created at tokenization and dropped at the abort, so late tokens
-have nothing to attach to; no supervisor, stats, CORS, control, accounting or cache routes
-and no request log.
+stop string matched by the detokenizer aborts the request; the decode state of an aborted
+request is dropped when the tokenizer worker relays the abort, so tokens that race it are
+dropped too; no supervisor, stats, CORS, control, accounting or cache routes and no request
+log.
 """
 
 from __future__ import annotations

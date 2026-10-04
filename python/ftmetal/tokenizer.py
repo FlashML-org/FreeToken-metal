@@ -342,36 +342,32 @@ class DetokenizeManager:
         text = status.unsent_str
         found = [(text.find(stop), stop) for stop in status.stop_strs]
         matches = [(position, stop) for position, stop in found if position >= 0]
+        finished = msg.finished or bool(matches)
         if matches:
             emit_end, matched_stop = min(matches, key=lambda match: match[0])
-            reply = UserReply(
-                uid=msg.uid,
-                incremental_output=text[:emit_end],
-                finished=True,
-                completion_tokens_delta=1,
-                finish_reason="stop",
-                matched_stop=matched_stop,
-            )
+            finish_reason = "stop"
         elif msg.finished:
-            reply = UserReply(
-                uid=msg.uid,
-                incremental_output=text,
-                finished=True,
-                completion_tokens_delta=1,
-                finish_reason=msg.finish_reason,
-            )
+            emit_end, matched_stop, finish_reason = len(text), None, msg.finish_reason
         else:
             emit_end = len(text) - stop_prefix_holdback(text, status.stop_strs)
-            reply = UserReply(
-                uid=msg.uid,
-                incremental_output=text[:emit_end],
-                finished=False,
-                completion_tokens_delta=1,
-            )
-            status.unsent_str = text[emit_end:]
-        if reply.finished:
+            matched_stop, finish_reason = None, None
+        status.unsent_str = text[emit_end:]
+        if finished:
             self.decode_map.pop(msg.uid)
-        return reply
+        return UserReply(
+            uid=msg.uid,
+            incremental_output=text[:emit_end],
+            finished=finished,
+            completion_tokens_delta=1,
+            finish_reason=finish_reason,
+            matched_stop=matched_stop,
+            kv_used_pages=msg.kv_used_pages,
+            kv_total_pages=msg.kv_total_pages,
+            mamba_used_slots=msg.mamba_used_slots,
+            mamba_total_slots=msg.mamba_total_slots,
+            swa_used_tokens=msg.swa_used_tokens,
+            swa_total_tokens=msg.swa_total_tokens,
+        )
 
 
 __all__ = [
