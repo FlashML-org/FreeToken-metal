@@ -584,8 +584,23 @@ def test_a_dead_engine_fails_its_requests_and_refuses_new_ones(
     assert refused.json() == {"error": "server unavailable: maintenance failed (restart required)"}
 
 
+# (route, streamed request body): every protocol aborts a stream its client drops.
+DISCONNECT_CASES: list[tuple[str, dict[str, JsonValue]]] = [
+    ("/v1/chat/completions", {**chat_body(), "stream": True}),
+    ("/v1/completions", {"model": "tiny", "prompt": "hi", "stream": True}),
+    ("/v1/messages", {**chat_body(), "max_tokens": 10000, "stream": True}),
+    ("/v1/responses", {"model": "tiny", "input": "hi", "stream": True}),
+    ("/generate", {"prompt": "hi", "max_tokens": 10000}),
+]
+
+
+@pytest.mark.parametrize(("route", "body"), DISCONNECT_CASES)
 def test_client_disconnect_aborts_the_request(
-    tiny_model_dir: Path, scripted: type[ScriptedScheduler], monkeypatch: pytest.MonkeyPatch
+    tiny_model_dir: Path,
+    scripted: type[ScriptedScheduler],
+    monkeypatch: pytest.MonkeyPatch,
+    route: str,
+    body: dict[str, JsonValue],
 ) -> None:
     monkeypatch.setattr(scripted, "script", "tick " * 2000)
     monkeypatch.setattr(scripted, "step_seconds", 0.005)
@@ -600,13 +615,12 @@ def test_client_disconnect_aborts_the_request(
     port = server.servers[0].sockets[0].getsockname()[1]
     try:
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=WAIT_SECONDS)
-        body = json.dumps({**chat_body(), "stream": True})
         headers = {"Content-Type": "application/json"}
-        connection.request("POST", "/v1/chat/completions", body=body, headers=headers)
+        connection.request("POST", route, body=json.dumps(body), headers=headers)
         response = connection.getresponse()
         assert response.status == 200
-        lines = [response.readline() for _ in range(10)]
-        assert all(line.startswith(b"data: ") for line in lines[::2])
+        lines = [response.readline() for _ in range(12)]
+        assert all(line.startswith((b"data: ", b"event: ", b"\n")) for line in lines)
         connection.close()
         wait_for_abort(scripted.instances[0], 0)
     finally:
