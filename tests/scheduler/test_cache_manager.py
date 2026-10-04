@@ -5,7 +5,8 @@ Every page returns and rows hold page-aligned slots; a window pool backs every n
 and keeps only a request's window live as it slides. The radix type commits a request's
 prefix at its prefill and its finish, frees and re-points duplicates and evicts unlocked
 leaves under pressure; with a GDN state pool the hybrid radix commit donates the track
-snapshot, a finish donates its live slot, and both currencies evict under pressure; with a
+snapshot, which stays at or below the prompt's reusable prefix end so a next turn resumes
+there, a finish donates its live slot, and both currencies evict under pressure; with a
 window pool the SWA radix commit keeps the windows a next prompt can resume from, and the
 window slots evict on their own; naive with a GDN state pool holds one zeroed live slot per
 running request and gives it back on finish and abort. Parts port FreeToken
@@ -22,7 +23,8 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from ftmetal.attention.metadata import AttnType
+from ftmetal.attention.linear import LinearAttnBackend
+from ftmetal.attention.metadata import AttnType, LinearAttnMetadata
 from ftmetal.core import Batch, Req, SamplingParams
 from ftmetal.kvcache.linear_state_pool import PADDING_SLOT, LinearStatePool
 from ftmetal.kvcache.swa_pool import (
@@ -515,6 +517,10 @@ class Served(NamedTuple):
     chunk_lens: list[list[int]]
     # The most GDN slots the requests held at once.
     peak_live_slots: int
+    # Hybrid radix: the (slot, token count) of each prompt's tracked snapshots, chunk by chunk.
+    tracks: list[list[tuple[int, int]]]
+    # Hybrid radix: the tree snapshot each admission restores from.
+    restore_srcs: list[int | None]
 
 
 def serve(
@@ -525,22 +531,31 @@ def serve(
     max_extend_tokens: int,
     abort_at: int | None,
     arrive_at: list[int] | None = None,
+    reuse_lens: list[int | None] | None = None,
 ) -> Served:
     """Prompts served to completion in the scheduler's order: step N + 1 is allocated before
     step N drains, and a drain slides the window slots of a sliding-window model, commits a
     prompt's last chunk and frees a finished request. With a GDN state pool every step checks
-    its live slots and then dirties every slot, as a forward advances the states. Prompt i
-    arrives before iteration arrive_at[i] (all before the first by default); the first prompt
-    is aborted before iteration abort_at."""
+    its live slots and then dirties every slot, as a forward advances the states; under the
+    hybrid radix cache the GDN metadata places each prefill chunk's track snapshot. Prompt i
+    arrives before iteration arrive_at[i] (all before the first by default) with reuse_lens[i];
+    the first prompt is aborted before iteration abort_at."""
     pool = manager.swa_pool
     gdn_pool = manager.linear_state_pool
+    if gdn_pool is not None and manager.is_hybrid:
+        linear_backend = LinearAttnBackend(gdn_pool, manager.page_size)
+    else:
+        linear_backend = None
     peak_live_slots = 0
     decode = DecodeManager(manager.page_size)
     prefill = PrefillManager(manager, table, decode)
     params = SamplingParams(max_tokens=output_len, ignore_eos=True)
     arrivals = [1] * len(prompts) if arrive_at is None else arrive_at
+    prompt_reuse_lens = [None] * len(prompts) if reuse_lens is None else reuse_lens
     cached_lens: dict[int, int] = {}
+    restore_srcs: dict[int, int | None] = {}
     chunk_lens: list[list[int]] = [[] for _ in prompts]
+    tracks: list[list[tuple[int, int]]] = [[] for _ in prompts]
     finished: set[Req] = set()
     in_flight: Batch | None = None
     steps: list[tuple[Req, int, int]] = []
@@ -551,7 +566,8 @@ def serve(
         assert iterations < 1000, "the requests stopped making progress"
         for uid, prompt in enumerate(prompts):
             if arrivals[uid] == iterations:
-                prefill.add_one_req(uid, np.array(prompt, dtype=np.int32), params)
+                prompt_ids = np.array(prompt, dtype=np.int32)
+                prefill.add_one_req(uid, prompt_ids, params, prompt_reuse_lens[uid])
         aborted = prefill.abort_req(0) or decode.abort_req(0) if iterations == abort_at else None
         if aborted is not None:
             aborted.aborted = True
@@ -573,8 +589,18 @@ def serve(
                 held_slots = gdn_pool.num_slots - 1 - gdn_pool.num_free_slots
                 peak_live_slots = max(peak_live_slots, held_slots)
                 gdn_pool.recurrent_states[0] = gdn_pool.recurrent_states[0] + 1
+            if linear_backend is not None:
+                linear_backend.prepare_metadata(batch)
+                metadata = batch.attn_metadata[AttnType.LINEAR]
+                assert isinstance(metadata, LinearAttnMetadata)
+                for req, slot, seqlen in zip(
+                    batch.reqs, metadata.track_slots_host, metadata.track_seqlens_host
+                ):
+                    if slot >= 0:
+                        tracks[req.uid].append((slot, seqlen))
             for req in batch.reqs:
                 cached_lens.setdefault(req.uid, req.cached_len)
+                restore_srcs.setdefault(req.uid, req.mamba_restore_src)
                 if batch.is_prefill:
                     chunk_lens[req.uid].append(req.extend_len)
                 req.complete_one()
@@ -607,7 +633,13 @@ def serve(
                 check_window_live(manager, [step for step in steps if step[0] not in finished])
         in_flight = batch
     manager.check_integrity()
-    return Served([cached_lens[uid] for uid in range(len(prompts))], chunk_lens, peak_live_slots)
+    return Served(
+        [cached_lens[uid] for uid in range(len(prompts))],
+        chunk_lens,
+        peak_live_slots,
+        tracks,
+        [restore_srcs[uid] for uid in range(len(prompts))],
+    )
 
 
 def run(first: int, length: int) -> list[int]:
@@ -893,3 +925,123 @@ def test_naive_gdn_holds_one_live_slot_per_running_request() -> None:
         assert served.cached_lens == [0] * len(case.prompts), case.label
         assert served.chunk_lens == case.chunk_lens, case.label
         assert served.peak_live_slots == case.peak_live_slots, case.label
+
+
+class TrackCase(NamedTuple):
+    label: str
+    max_extend_tokens: int
+    output_len: int
+    # The first turn is run(1, prompt_len); a next turn can share its first reuse_len tokens.
+    prompt_len: int
+    reuse_len: int | None
+    # The next turn shares the first one's first shared_len tokens, then goes its own way.
+    shared_len: int
+    # The token counts the first turn's prefill chunks track their snapshots at.
+    track_seqlens: list[int]
+    # The prefix the next turn resumes from.
+    cached_len: int
+
+
+# Page size 4. A chat prompt ends with its generation suffix, five tokens here, of which the
+# next turn's re-rendered conversation shares the first three, as Qwen3.6's does.
+TRACK_CASES = [
+    TrackCase(
+        "the generation suffix holds the last stride boundary: the track stays below it",
+        max_extend_tokens=512,
+        output_len=4,
+        prompt_len=257,
+        reuse_len=252,
+        shared_len=255,
+        track_seqlens=[192],
+        cached_len=192,
+    ),
+    TrackCase(
+        "the reuse boundary sits in an earlier chunk: the chunks past it track nothing",
+        max_extend_tokens=100,
+        output_len=4,
+        prompt_len=380,
+        reuse_len=290,
+        shared_len=293,
+        track_seqlens=[64, 164, 264],
+        cached_len=264,
+    ),
+    TrackCase(
+        "no stride boundary below the reuse end in its chunk: the chunk before commits",
+        max_extend_tokens=100,
+        output_len=4,
+        prompt_len=380,
+        reuse_len=260,
+        shared_len=263,
+        track_seqlens=[64, 164],
+        cached_len=164,
+    ),
+    TrackCase(
+        "a prompt finishing at its prefill commits that track before its live state",
+        max_extend_tokens=100,
+        output_len=1,
+        prompt_len=380,
+        reuse_len=260,
+        shared_len=263,
+        track_seqlens=[64, 164],
+        cached_len=164,
+    ),
+    TrackCase(
+        "a reuse boundary on a stride boundary is tracked",
+        max_extend_tokens=512,
+        output_len=4,
+        prompt_len=133,
+        reuse_len=128,
+        shared_len=131,
+        track_seqlens=[128],
+        cached_len=128,
+    ),
+    TrackCase(
+        "a reusable prefix shorter than a stride tracks nothing",
+        max_extend_tokens=512,
+        output_len=4,
+        prompt_len=70,
+        reuse_len=60,
+        shared_len=63,
+        track_seqlens=[],
+        cached_len=0,
+    ),
+    TrackCase(
+        "a raw prompt tracks the deepest stride boundary strictly inside each chunk",
+        max_extend_tokens=100,
+        output_len=4,
+        prompt_len=300,
+        reuse_len=None,
+        shared_len=300,
+        track_seqlens=[64, 164, 264],
+        cached_len=264,
+    ),
+]
+
+
+def test_track_snapshot_commits_at_or_below_the_reusable_prefix_end() -> None:
+    """Each prefill chunk tracks a snapshot at its deepest stride boundary at or below the
+    prompt's reuse_len; the last one tracked commits, so the next turn, which re-renders the
+    conversation and shares only its reusable prefix, resumes from that very slot."""
+    for case in TRACK_CASES:
+        pool = make_pool()
+        page_table = np.zeros((3, 512), dtype=np.int32)
+        manager = CacheManager(256, 4, page_table, "hybrid_radix", pool)
+        table = TableManager(max_running_reqs=2, page_table=page_table)
+        first = run(1, case.prompt_len)
+        served = serve(
+            manager,
+            table,
+            [first],
+            case.output_len,
+            case.max_extend_tokens,
+            None,
+            reuse_lens=[case.reuse_len],
+        )
+        assert [seqlen for _, seqlen in served.tracks[0]] == case.track_seqlens, case.label
+        tracked_slots = {seqlen: slot for slot, seqlen in served.tracks[0]}
+        next_turn = first[: case.shared_len] + run(1000, 20)
+        resumed = serve(manager, table, [next_turn], case.output_len, case.max_extend_tokens, None)
+        assert (resumed.cached_lens[0], resumed.restore_srcs[0]) == (
+            case.cached_len,
+            tracked_slots.get(case.cached_len),
+        ), case.label

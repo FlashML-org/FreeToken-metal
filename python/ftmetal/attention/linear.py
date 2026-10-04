@@ -10,10 +10,14 @@ P-2 where Qwen's next turn diverges after the client drops the reasoning, and th
 would resume from the previous prefill chunk. Divergences: the builder is a backend with
 the shared prepare_metadata entry; the track fields are a slot and a token count per
 request (the layer splits its recurrence there) instead of chunk rows into the kernel's
-per-chunk states; a decode batch's metadata already has its bucket's shapes, so a replay
-keeps it; a capture batch's dummy rows run on scratch slots borrowed from the state pool
-for the captures, one each and zeroed before every replay (on FreeToken's shared padding
-slot they would race, and the arena checks compare the replays bit for bit).
+per-chunk states; the boundary is also at most the request's reuse_len, as the next turn
+re-renders the chat template's generation suffix and a snapshot inside it is off that
+turn's path, so a chunk past reuse_len tracks nothing and an earlier chunk's snapshot
+stays pending to the commit; a decode batch's metadata already has its bucket's shapes,
+so a replay keeps it; a capture batch's dummy rows run on scratch slots borrowed from the
+state pool for the captures, one each and zeroed before every replay (on FreeToken's
+shared padding slot they would race, and the arena checks compare the replays bit for
+bit).
 """
 
 from __future__ import annotations
@@ -79,7 +83,11 @@ class LinearAttnBackend(BaseAttnBackend):
             assert req.linear_slot_idx is not None, "every request needs a GDN state slot"
             slots.append(req.linear_slot_idx)
             track_slot, track_seqlen = -1, 0
-            strides = (req.extend_len - 1) // SNAPSHOT_STRIDE
+            if req.reuse_len is None:
+                track_limit = req.device_len - 1
+            else:
+                track_limit = min(req.device_len - 1, req.reuse_len)
+            strides = (track_limit - req.cached_len) // SNAPSHOT_STRIDE
             if batch.is_prefill and req.mamba_ping_pong is not None and strides > 0:
                 track_seqlen = req.cached_len + strides * SNAPSHOT_STRIDE
                 track_slot = req.mamba_ping_pong[req.mamba_next_track_idx]

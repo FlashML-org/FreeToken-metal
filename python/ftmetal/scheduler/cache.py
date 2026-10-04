@@ -361,9 +361,10 @@ class CacheManager:
     def cache_req_hybrid(self, req: Req, *, finished: bool) -> None:
         """Commit KV and the GDN snapshot of a request.
 
-        A prefill commit donates the frozen ping-pong slot (the snapshot its forward wrote at
-        mamba_last_track_seqlen) to the tree and replaces it if the tree took it. A finish
-        donates the live slot (the state at cached_len, if page-aligned) and frees the rest.
+        A prefill commit donates the frozen ping-pong slot (the snapshot the last tracked chunk,
+        not always the last chunk, wrote at mamba_last_track_seqlen) to the tree and replaces
+        it if the tree took it. A finish donates the live slot (the state at cached_len, if
+        page-aligned) and frees the rest.
         """
         cache, pool = self.hybrid_parts()
         old_handle = req.cache_handle
