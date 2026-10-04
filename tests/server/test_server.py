@@ -36,7 +36,12 @@ from ftmetal.scheduler.scheduler import ForwardData, Scheduler, TokenEvent
 from ftmetal.scheduler.status import SchedulerStatusReporter
 from ftmetal.server import api_server
 from ftmetal.server.api_server import create_app
-from ftmetal.server.args import ServerArgs, parse_args
+from ftmetal.server.args import (
+    ServerArgs,
+    infer_reasoning_parser,
+    infer_tool_call_parser,
+    parse_args,
+)
 from ftmetal.server.generation import FrontendManager
 
 MODEL_PATH = os.environ.get("FTMETAL_TEST_MODEL_PATH")
@@ -121,9 +126,16 @@ def scripted(monkeypatch: pytest.MonkeyPatch) -> type[ScriptedScheduler]:
     return ScriptedScheduler
 
 
+def tiny_server_args(tiny_model_dir: Path) -> ServerArgs:
+    """The tiny checkpoint mimics Qwen3.6's template, so it gets Qwen3.6's parsers."""
+    return ServerArgs(
+        model_path=str(tiny_model_dir), tool_call_parser="qwen3_coder", reasoning_parser="qwen3"
+    )
+
+
 @pytest.fixture
 def client(tiny_model_dir: Path, scripted: type[ScriptedScheduler]) -> Iterator[TestClient]:
-    with TestClient(create_app(ServerArgs(model_path=str(tiny_model_dir)))) as test_client:
+    with TestClient(create_app(tiny_server_args(tiny_model_dir))) as test_client:
         yield test_client
 
 
@@ -410,7 +422,7 @@ def test_client_disconnect_aborts_the_request(
 ) -> None:
     monkeypatch.setattr(scripted, "script", "tick " * 2000)
     monkeypatch.setattr(scripted, "step_seconds", 0.005)
-    app = create_app(ServerArgs(model_path=str(tiny_model_dir)))
+    app = create_app(tiny_server_args(tiny_model_dir))
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning"))
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
@@ -435,9 +447,11 @@ def test_client_disconnect_aborts_the_request(
         thread.join()
 
 
-def test_frontend_keeps_early_replies_and_aborts_on_early_close() -> None:
+def test_frontend_keeps_early_replies_and_aborts_on_early_close(tiny_model_dir: Path) -> None:
     frontend = FrontendManager(
-        send_tokenizer=queue.Queue(), backend_threads=[threading.current_thread()]
+        config=tiny_server_args(tiny_model_dir),
+        send_tokenizer=queue.Queue(),
+        backend_threads=[threading.current_thread()],
     )
 
     async def read_all(uid: int) -> list[str]:
@@ -496,6 +510,49 @@ def test_disable_command_graph_flag_overrides_the_environment(
     assert args.command_graph is command_graph
 
 
+QWEN3_6_CONFIG: dict[str, JsonValue] = {
+    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+    "model_type": "qwen3_5_moe",
+    "text_config": {"model_type": "qwen3_5_moe_text"},
+}
+GEMMA4_CONFIG: dict[str, JsonValue] = {
+    "architectures": ["Gemma4ForConditionalGeneration"],
+    "model_type": "gemma4",
+    "text_config": {"model_type": "gemma4_text"},
+}
+
+# (config.json, flags, tool-call parser, reasoning parser)
+PARSER_SELECTION_CASES: list[tuple[dict[str, JsonValue] | None, list[str], str, str | None]] = [
+    (QWEN3_6_CONFIG, [], "qwen3_coder", "qwen3"),
+    (GEMMA4_CONFIG, [], "gemma4", "gemma4"),
+    (None, [], "llama3", None),
+    (QWEN3_6_CONFIG, ["--reasoning-parser", "off"], "qwen3_coder", None),
+    (
+        GEMMA4_CONFIG,
+        ["--tool-call-parser", "qwen25", "--reasoning-parser", "qwen3"],
+        "qwen25",
+        "qwen3",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("config", "flags", "tool_call_parser", "reasoning_parser"), PARSER_SELECTION_CASES
+)
+def test_parsers_follow_the_model_family(
+    tiny_model_dir: Path,
+    config: dict[str, JsonValue] | None,
+    flags: list[str],
+    tool_call_parser: str,
+    reasoning_parser: str | None,
+) -> None:
+    if config is not None:
+        (tiny_model_dir / "config.json").write_text(json.dumps(config))
+    args = parse_args(["--model", str(tiny_model_dir), *flags], prog="ftm serve")
+    assert (args.tool_call_parser, args.reasoning_parser) == (tool_call_parser, reasoning_parser)
+    assert args.served_model_name == "tiny-model"
+
+
 def test_cache_type_flag_defaults_to_radix(tiny_model_dir: Path) -> None:
     assert parse_args(["--model", str(tiny_model_dir)], prog="ftm serve").cache_type == "radix"
     args = parse_args(["--model", str(tiny_model_dir), "--cache-type", "naive"], prog="ftm serve")
@@ -524,7 +581,12 @@ def test_gdn_snapshots_flag_takes_a_snapshot_count(tiny_model_dir: Path) -> None
 def test_real_model_answers_over_http() -> None:
     assert MODEL_PATH is not None
     config = ServerArgs(
-        model_path=MODEL_PATH, max_running_req=1, max_seq_len_override=4096, num_page_override=256
+        model_path=MODEL_PATH,
+        max_running_req=1,
+        max_seq_len_override=4096,
+        num_page_override=256,
+        tool_call_parser=infer_tool_call_parser(MODEL_PATH),
+        reasoning_parser=infer_reasoning_parser(MODEL_PATH),
     )
     with TestClient(create_app(config)) as real_client:
         body = {

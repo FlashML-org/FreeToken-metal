@@ -32,7 +32,9 @@ from ftmetal.message.tokenizer import (
     FinishReason,
     TokenizeMsg,
 )
-from ftmetal.server.reasoning_parser import ReasoningParser
+from ftmetal.server.args import ServerArgs
+from ftmetal.server.reasoning_parser import ReasoningParser, build_reasoning_parser
+from ftmetal.tokenizer import resolve_thinking_mode
 
 
 class EngineUnavailableError(RuntimeError):
@@ -49,6 +51,7 @@ class GenerationError(ValueError):
 
 @dataclass(kw_only=True)
 class FrontendManager:
+    config: ServerArgs
     # The tokenizer worker's inbox; None stops it.
     send_tokenizer: queue.Queue[BaseTokenizerMsg | None]
     # Set by the lifespan once the scheduler thread is up.
@@ -123,11 +126,6 @@ class GenSpec:
     sampling_params: SamplingParams
     chat_template_kwargs: dict[str, JsonValue] = field(default_factory=dict)
 
-    @property
-    def opens_reasoning(self) -> bool:
-        """Whether the rendered prompt ends inside <think>: unless enable_thinking is false."""
-        return self.chat_template_kwargs.get("enable_thinking") is not False
-
 
 @dataclass
 class ReasoningDelta:
@@ -197,11 +195,45 @@ def submit_generation(spec: GenSpec, frontend: FrontendManager) -> int:
     return uid
 
 
+def _make_reasoning_parser(spec: GenSpec, state: FrontendManager) -> ReasoningParser | None:
+    """Build a reasoning parser for this generation, or None if the server has no
+    reasoning parser configured. ``force_reasoning`` matches the encode-side
+    thinking mode so chat-mode content is never mislabeled as reasoning."""
+    parser_name = state.config.reasoning_parser
+    if parser_name == "qwen3":
+        # The qwen3 chat template opens an implicit <think> (thinking on) unless
+        # enable_thinking is explicitly false, so the model emits only the closing
+        # </think>. Mirror that default here, else the chain-of-thought leaks into content.
+        force_reasoning = (spec.chat_template_kwargs or {}).get("enable_thinking") is not False
+    elif parser_name == "glm":
+        # GLM's template honors enable_thinking (default on) even with tools; the
+        # generic fallback would force thinking and mislabel disabled output as reasoning.
+        force_reasoning = (spec.chat_template_kwargs or {}).get("enable_thinking") is not False
+    elif parser_name == "gemma4":
+        # Gemma4 defaults thinking off even when tools are present: its template injects an
+        # empty thought channel before generation. Do not let Codex tool definitions make all
+        # visible text look like hidden reasoning.
+        ctk = spec.chat_template_kwargs or {}
+        force_reasoning = (
+            ctk.get("thinking_mode") == "thinking"
+            or bool(ctk.get("enable_thinking"))
+            or bool(ctk.get("thinking"))
+        )
+    elif parser_name == "minimax_m3":
+        # M3's template pre-opens <mm:think> only in thinking_mode "enabled" (the
+        # model then emits just the closing tag); "adaptive" (default) leaves the
+        # model to open the tag itself and "disabled" pre-closes it.
+        force_reasoning = (spec.chat_template_kwargs or {}).get("thinking_mode") == "enabled"
+    else:
+        force_reasoning = resolve_thinking_mode(spec.chat_template_kwargs, None) == "thinking"
+    return build_reasoning_parser(state.config, force_reasoning)
+
+
 async def generate_events(
     uid: int, spec: GenSpec, frontend: FrontendManager
 ) -> AsyncGenerator[GenEvent]:
     """Reasoning and content deltas of one request, then exactly one GenDone."""
-    parser = ReasoningParser("qwen3", force_reasoning=spec.opens_reasoning)
+    parser = _make_reasoning_parser(spec, frontend)
     prompt_tokens = 0
     completion_tokens = 0
     finish_reason: FinishReason | None = None
@@ -214,17 +246,22 @@ async def generate_events(
             completion_tokens += reply.completion_tokens_delta
             finish_reason = reply.finish_reason
             matched_stop = reply.matched_stop
-            if reply.incremental_output:
+            if not reply.incremental_output:
+                continue
+            elif parser is None:
+                yield ContentDelta(reply.incremental_output)
+            else:
                 reasoning, content = parser.parse_stream_chunk(reply.incremental_output)
                 if reasoning:
                     yield ReasoningDelta(reasoning)
                 if content:
                     yield ContentDelta(content)
-    reasoning, content = parser.flush()
-    if reasoning:
-        yield ReasoningDelta(reasoning)
-    if content:
-        yield ContentDelta(content)
+    if parser is not None:
+        reasoning, content = parser.flush()
+        if reasoning:
+            yield ReasoningDelta(reasoning)
+        if content:
+            yield ContentDelta(content)
     assert finish_reason is not None
     yield GenDone(finish_reason, prompt_tokens, completion_tokens, matched_stop)
 

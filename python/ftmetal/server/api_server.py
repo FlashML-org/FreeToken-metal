@@ -173,7 +173,7 @@ def create_app(config: ServerArgs) -> FastAPI:
     detokenize_manager = DetokenizeManager(tokenize_manager.tokenizer, eos_token_ids)
     recv_tokenizer: queue.Queue[BaseTokenizerMsg | None] = queue.Queue()
     recv_backend: queue.Queue[BaseBackendMsg] = queue.Queue()
-    frontend = FrontendManager(send_tokenizer=recv_tokenizer)
+    frontend = FrontendManager(config=config, send_tokenizer=recv_tokenizer)
     engine_started: Future[None] = Future()
     engine_thread = threading.Thread(
         target=run_scheduler,
