@@ -68,34 +68,40 @@ class SlotCase(NamedTuple):
     label: str
     cache_type: Literal["naive", "radix"]
     max_running_req: int
-    linear_state_cache_ratio: float
+    gdn_snapshots: int | None
     num_slots: int
 
 
 # Radix (the hybrid radix cache): 4 slots per running request (live, ping-pong pair, locked
-# snapshot), a snapshot cache of int(ratio x max_running_req) slots, at least 4, and the
-# padding slot. Naive: one live slot per running request and the padding slot.
+# snapshot), the snapshot cache of gdn_snapshots slots, 8 by default, and the padding slot.
+# Naive: one live slot per running request and the padding slot.
 SLOT_CASES = [
-    SlotCase("radix", "radix", 2, 2.0, 4 * 2 + 4 + 1),
-    SlotCase("radix, the ratio's snapshot cache", "radix", 4, 2.0, 4 * 4 + 8 + 1),
-    SlotCase("radix, the snapshot cache floor", "radix", 8, 0.1, 4 * 8 + 4 + 1),
-    SlotCase("naive", "naive", 2, 2.0, 2 + 1),
-    SlotCase("naive ignores the ratio", "naive", 8, 0.1, 8 + 1),
+    SlotCase("radix, the default snapshot cache", "radix", 2, None, 4 * 2 + 8 + 1),
+    SlotCase("radix, one conversation's snapshots", "radix", 4, 2, 4 * 4 + 2 + 1),
+    SlotCase("radix, a snapshot cache past the default", "radix", 8, 32, 4 * 8 + 32 + 1),
+    SlotCase("naive", "naive", 2, None, 2 + 1),
+    SlotCase("naive ignores the snapshot count", "naive", 8, 1, 8 + 1),
 ]
+
+
+def slot_config(
+    cache_type: Literal["naive", "radix"], max_running_req: int, gdn_snapshots: int | None
+) -> EngineConfig:
+    return EngineConfig(
+        model_path="unused",
+        dtype=mx.float16,
+        page_size=4,
+        max_running_req=max_running_req,
+        gdn_snapshots=gdn_snapshots,
+        cache_type=cache_type,
+    )
 
 
 def test_kv_cost_prices_what_from_spec_allocates() -> None:
     specs = parse_config(TINY_TEXT_CONFIG).kv_cache_group_specs()
     num_pages = 10
     for case in SLOT_CASES:
-        config = EngineConfig(
-            model_path="unused",
-            dtype=mx.float16,
-            page_size=4,
-            max_running_req=case.max_running_req,
-            linear_state_cache_ratio=case.linear_state_cache_ratio,
-            cache_type=case.cache_type,
-        )
+        config = slot_config(case.cache_type, case.max_running_req, case.gdn_snapshots)
         costs = pool_costs(specs, config)
         pools = create_pools(specs, config, num_pages)
         linear_pool = pools[AttnType.LINEAR]
@@ -111,3 +117,9 @@ def test_kv_cost_prices_what_from_spec_allocates() -> None:
             AttnType.LINEAR: costs[AttnType.LINEAR].fixed_bytes,
         }, case.label
         assert costs[AttnType.FULL].fixed_bytes == costs[AttnType.LINEAR].bytes_per_page == 0
+
+
+def test_fewer_snapshots_than_one_conversation_are_refused() -> None:
+    specs = parse_config(TINY_TEXT_CONFIG).kv_cache_group_specs()
+    with pytest.raises(ValueError, match="--gdn-snapshots 2 or more"):
+        pool_costs(specs, slot_config("radix", 2, 1))

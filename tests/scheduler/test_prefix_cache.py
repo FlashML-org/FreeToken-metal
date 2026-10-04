@@ -5,11 +5,13 @@ cached (KV pages reused, GDN state restored from the snapshot) and must still de
 greedily to what mlx-lm produces alone; so must every request while both currencies are
 evicted under a small page and slot budget. The tiny model's greedy tokens hardly depend
 on the GDN state, so a hit's prefill logits are also held to mlx-lm's at 1e-4. Without
-linear layers the engine takes the plain radix cache, held to the same contract.
+linear layers the engine takes the plain radix cache, held to the same contract. A GDN
+snapshot cache smaller than one conversation's snapshots fails at startup.
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import mlx.core as mx
@@ -39,7 +41,7 @@ def make_scheduler(
     num_pages: int = 64,
     max_running_req: int = 2,
     max_extend_tokens: int = 512,
-    linear_state_cache_ratio: float = 2.0,
+    gdn_snapshots: int | None = None,
     cache_type: CacheTypeChoice = "radix",
 ) -> Scheduler:
     config = EngineConfig(
@@ -49,7 +51,7 @@ def make_scheduler(
         page_size=page_size,
         num_page_override=num_pages,
         max_extend_tokens=max_extend_tokens,
-        linear_state_cache_ratio=linear_state_cache_ratio,
+        gdn_snapshots=gdn_snapshots,
         cache_type=cache_type,
     )
     return Scheduler(config, eos_token_ids={127})
@@ -198,9 +200,7 @@ def test_eviction_under_small_budgets_keeps_outputs(tmp_path: Path) -> None:
     save_checkpoint(model, tmp_path, quantization=None)
     prompts = [random_tokens(270 + i, 150) for i in range(6)]
     expected = [reference_greedy(model, prompt, STEPS)[1] for prompt in prompts]
-    scheduler = make_scheduler(
-        tmp_path, num_pages=16, max_running_req=1, linear_state_cache_ratio=0.0
-    )
+    scheduler = make_scheduler(tmp_path, num_pages=16, max_running_req=1, gdn_snapshots=4)
     pool = scheduler.engine.ctx.linear_state_pool
     assert pool is not None and pool.num_slots == 9
     for uid, prompt in enumerate(prompts):
@@ -244,3 +244,16 @@ def test_plain_radix_reuses_a_shared_prefix_without_linear_layers(tmp_path: Path
     assert mx.allclose(hit_logits, miss_logits, atol=1e-4, rtol=1e-4)
     expected = model(mx.array(third)[None])[0, -1]
     assert mx.allclose(hit_logits, expected, atol=1e-4, rtol=1e-4)
+
+
+def test_too_few_snapshots_fail_at_startup_and_naive_ignores_the_count(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    save_checkpoint(build_reference(seed=29), tmp_path, quantization=None)
+    with pytest.raises(ValueError, match="--gdn-snapshots 2 or more"):
+        make_scheduler(tmp_path, gdn_snapshots=1)
+    with caplog.at_level(logging.WARNING, logger="ftmetal.scheduler.scheduler"):
+        scheduler = make_scheduler(tmp_path, gdn_snapshots=1, cache_type="naive")
+    assert "--gdn-snapshots" in caplog.text
+    pool = scheduler.engine.ctx.linear_state_pool
+    assert pool is not None and pool.num_slots == 2 + 1  # a live slot per running request

@@ -8,12 +8,14 @@ runtime rebuild. The conv state of a slot is a ring [kernel, conv_dim] of the la
 kernel conv inputs stored at position mod kernel, so the fused decode step can
 update it in the same launch that reads it (a shift register would race). A prefill
 snapshot for the hybrid radix cache is a whole slot, written into a request's
-ping-pong slot at the deepest page boundary inside its chunk. The pool is built from
-the LINEAR group's spec and prices itself (FreeToken's engine adds state_pool_bytes to
-the KV family's fixed cost instead). Naive holds only each running request's live slot
-and the padding slot, FreeToken's naive size; the live slot is a free-list slot the
-request takes at admission and returns at its finish or abort (SGLang's
-HybridReqToTokenPool), where FreeToken's naive keys it by table_idx.
+ping-pong slot at the deepest stride boundary inside its chunk and at most its prompt's
+reuse_len. The pool is built from the LINEAR group's spec and prices itself (FreeToken's
+engine adds state_pool_bytes to the KV family's fixed cost instead). The hybrid radix
+cache's snapshot cache is gdn_snapshots slots on top of the running requests' (FreeToken's
+is max(4, linear_state_cache_ratio x max_running_req)). Naive holds only each running
+request's live slot and the padding slot, FreeToken's naive size; the live slot is a
+free-list slot the request takes at admission and returns at its finish or abort
+(SGLang's HybridReqToTokenPool), where FreeToken's naive keys it by table_idx.
 """
 
 from __future__ import annotations
@@ -33,12 +35,29 @@ PADDING_SLOT = 0
 LIVE_SLOTS = 1
 TRACK_SLOTS = 2
 LOCKED_SNAPSHOT_SLOTS = 1
-MIN_SNAPSHOT_CACHE_SLOTS = 4
+# Snapshots a finished conversation leaves in the tree: its prompt's track and its live state.
+CONVERSATION_SNAPSHOTS = 2
+# The hybrid radix cache's default snapshot cache, about four conversations. 8 is arbitrary.
+DEFAULT_GDN_SNAPSHOTS = 8
+
+
+def gdn_snapshot_slots(gdn_snapshots: int | None) -> int:
+    """The hybrid radix cache's snapshot cache: gdn_snapshots, by default
+    DEFAULT_GDN_SNAPSHOTS; fewer than one conversation's snapshots are refused."""
+    if gdn_snapshots is None:
+        return DEFAULT_GDN_SNAPSHOTS
+    elif gdn_snapshots < CONVERSATION_SNAPSHOTS:
+        raise ValueError(
+            f"--gdn-snapshots {gdn_snapshots} holds fewer than the {CONVERSATION_SNAPSHOTS} "
+            f"snapshots of one conversation: pass --gdn-snapshots {CONVERSATION_SNAPSHOTS} or more"
+        )
+    else:
+        return gdn_snapshots
 
 
 def linear_pool_num_slots(config: PoolConfig) -> int:
     """The running requests' slots and the padding slot; radix (the hybrid radix cache) adds
-    a cross-request snapshot cache."""
+    its snapshot cache."""
     max_running_req = config.max_running_req
     if config.cache_type == "naive":
         # Enough for the decode graph captures too: they borrow their max_running_req scratch
@@ -46,8 +65,7 @@ def linear_pool_num_slots(config: PoolConfig) -> int:
         return LIVE_SLOTS * max_running_req + 1
     else:
         slots_per_req = LIVE_SLOTS + TRACK_SLOTS + LOCKED_SNAPSHOT_SLOTS
-        ratio_slots = int(config.linear_state_cache_ratio * max_running_req)
-        snapshot_cache = max(MIN_SNAPSHOT_CACHE_SLOTS, ratio_slots)
+        snapshot_cache = gdn_snapshot_slots(config.gdn_snapshots)
         return slots_per_req * max_running_req + snapshot_cache + 1
 
 
@@ -134,11 +152,13 @@ class LinearStatePool(BasePool):
 
 
 __all__ = [
+    "CONVERSATION_SNAPSHOTS",
+    "DEFAULT_GDN_SNAPSHOTS",
     "LIVE_SLOTS",
     "LOCKED_SNAPSHOT_SLOTS",
-    "MIN_SNAPSHOT_CACHE_SLOTS",
     "PADDING_SLOT",
     "TRACK_SLOTS",
     "LinearStatePool",
+    "gdn_snapshot_slots",
     "linear_pool_num_slots",
 ]

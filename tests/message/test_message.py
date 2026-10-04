@@ -51,6 +51,8 @@ def test_messages_have_neutral_defaults() -> None:
     second = TokenizeMsg(uid=2, text=[], sampling_params=SamplingParams())
     first.chat_template_kwargs["enable_thinking"] = False
     assert second.chat_template_kwargs == {} and first.tools is None
-    user = UserMsg(uid=1, input_ids=np.arange(3, dtype=np.int32), sampling_params=SamplingParams())
+    user = UserMsg(
+        uid=1, input_ids=np.arange(3, dtype=np.int32), sampling_params=SamplingParams(), reuse_len=3
+    )
     batch = BatchBackendMsg(data=[user, AbortBackendMsg(uid=1), ExitMsg()])
     assert [type(msg) for msg in batch.data] == [UserMsg, AbortBackendMsg, ExitMsg]

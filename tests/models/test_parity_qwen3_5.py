@@ -2,7 +2,8 @@
 
 The reference (mlx-lm, contiguous caches) and ftmetal (paged KV, GDN state pool,
 scheduler, overlap) run the same random weights: prefill logits must match and
-greedy decode must agree token for token.
+greedy decode must agree token for token, also for a chat turn resumed from the
+snapshot the previous turn left below its generation suffix.
 """
 
 from __future__ import annotations
@@ -16,8 +17,11 @@ import pytest
 
 from ftmetal.core import SamplingParams
 from ftmetal.engine.config import CacheTypeChoice, EngineConfig
+from ftmetal.message.backend import UserMsg
+from ftmetal.message.tokenizer import ChatMessage, TokenizeMsg
 from ftmetal.scheduler.scheduler import Scheduler
-from tiny_model import build_reference, reference_greedy, save_checkpoint
+from ftmetal.tokenizer import TokenizeManager
+from tiny_model import TINY_TEXT_CONFIG, build_reference, reference_greedy, save_checkpoint
 
 
 def make_scheduler(
@@ -219,3 +223,46 @@ def test_quantized_greedy_decode_matches_mlx_lm(tmp_path: Path, attention_backen
     params = SamplingParams(temperature=0.0, max_tokens=steps, ignore_eos=True)
     tokens = scheduler.generate(np.array(prompt, dtype=np.int32), params)
     assert tokens == expected
+
+
+def run_turn(
+    scheduler: Scheduler, uid: int, user_msg: UserMsg, steps: int
+) -> tuple[int, list[int]]:
+    """One tokenized turn to completion; returns the prefix its admission found cached and its
+    greedy tokens."""
+    params = SamplingParams(temperature=0.0, max_tokens=steps, ignore_eos=True)
+    scheduler.add_request(uid, user_msg.input_ids, params, user_msg.reuse_len)
+    forward_input = scheduler.schedule_next_batch()
+    assert forward_input is not None
+    cached_len = forward_input.batch.reqs[0].cached_len
+    data = scheduler.forward(forward_input)
+    while scheduler.runnable or data is not None:
+        data = scheduler.overlap_loop(data)
+    return cached_len, [event.token for event in scheduler.take_results()]
+
+
+def test_next_chat_turn_resumes_below_the_generation_suffix(tiny_model_dir: Path) -> None:
+    """The first turn's 129 tokens end with the 13-token generation suffix, holding the
+    stride boundary at 128; the next turn re-renders the conversation and shares 127. The
+    snapshot stays at 64, below the reusable 116, so the next turn resumes there and still
+    decodes to mlx-lm's tokens (a snapshot at 128 would leave it nothing to resume from)."""
+    model = build_reference(seed=8, text_config={**TINY_TEXT_CONFIG, "vocab_size": 512})
+    save_checkpoint(model, tiny_model_dir, quantization=None)
+    tokenize_manager = TokenizeManager(str(tiny_model_dir))
+    first: list[ChatMessage] = [{"role": "user", "content": "abcd" * 27}]
+    second: list[ChatMessage] = [
+        *first,
+        {"role": "assistant", "content": "a short reply"},
+        {"role": "user", "content": "and a follow-up question"},
+    ]
+    user_msgs = [
+        tokenize_manager.tokenize(TokenizeMsg(uid=uid, text=turn, sampling_params=SamplingParams()))
+        for uid, turn in enumerate((first, second))
+    ]
+    assert (len(user_msgs[0].input_ids), user_msgs[0].reuse_len) == (129, 116)
+    steps = 8
+    scheduler = make_scheduler(tiny_model_dir, page_size=4, max_extend_tokens=256, num_pages=256)
+    for uid, (user_msg, cached_len) in enumerate(zip(user_msgs, (0, 64))):
+        expected = reference_greedy(model, user_msg.input_ids.tolist(), steps)[1]
+        assert run_turn(scheduler, uid, user_msg, steps) == (cached_len, expected)
+    scheduler.cache_manager.check_integrity()

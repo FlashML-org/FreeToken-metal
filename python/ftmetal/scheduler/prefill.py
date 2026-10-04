@@ -12,7 +12,7 @@ allocation), so a continuation it leaves empty waits for that drain; a miss zero
 slot here; naive allocates its live slot here too (SGLang's HybridReqToTokenPool.alloc)
 where FreeToken's naive keys it by table_idx; the cached part of the token pool row is not
 written (only the extended tokens are ever gathered); a continuation chunk inherits the
-pending track snapshot of the chunk before it.
+pending track snapshot of the chunk before it; every chunk carries the prompt's reuse_len.
 """
 
 from __future__ import annotations
@@ -38,6 +38,8 @@ class PendingReq:
     input_ids: np.ndarray
     sampling_params: SamplingParams
     chunked_req: ChunkedReq | None = None
+    # Every chunk's Req.reuse_len.
+    reuse_len: int | None = None
 
     @property
     def input_len(self) -> int:
@@ -182,6 +184,7 @@ class PrefillAdder:
             uid=pending.uid,
             sampling_params=pending.sampling_params,
             cache_handle=resources.cache_handle,
+            reuse_len=pending.reuse_len,
         )
         req.linear_slot_idx = resources.linear_slot_idx
         req.mamba_ping_pong = resources.ping_pong
@@ -243,9 +246,17 @@ class PrefillManager:
     decode_manager: DecodeManager
     pending_list: list[PendingReq] = field(default_factory=list)
 
-    def add_one_req(self, uid: int, input_ids: np.ndarray, sampling_params: SamplingParams) -> None:
+    def add_one_req(
+        self,
+        uid: int,
+        input_ids: np.ndarray,
+        sampling_params: SamplingParams,
+        reuse_len: int | None = None,
+    ) -> None:
         self.pending_list.append(
-            PendingReq(uid, np.asarray(input_ids, dtype=np.int32), sampling_params)
+            PendingReq(
+                uid, np.asarray(input_ids, dtype=np.int32), sampling_params, reuse_len=reuse_len
+            )
         )
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:

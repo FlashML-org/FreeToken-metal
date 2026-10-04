@@ -4,7 +4,8 @@ Port of FreeToken core.py. Divergences: input ids are host numpy arrays and batc
 tensors are mx.arrays; the batch is passed to the model instead of living in the
 Context, its attention metadata is a dict keyed by AttnType (fla_metadata is the
 LINEAR entry); padded_reqs starts as reqs and only the graph runner pads it; a Req's
-cache_handle is None while it locks no cached prefix; SamplingParams is greedy at
+cache_handle is None while it locks no cached prefix; a Req carries reuse_len, where its
+prompt's reusable prefix ends (FreeToken has none); SamplingParams is greedy at
 temperature 0 or top-k 1 whatever top_p is (FreeToken also requires top_p == 1).
 """
 
@@ -60,6 +61,9 @@ class Req:
     mamba_last_track_seqlen: int | None = None
     # On a prefix hit: the tree's snapshot slot to copy into the live slot before the first chunk.
     mamba_restore_src: int | None = None
+    # The prompt's tokens a next turn can share, the chat template's generation suffix
+    # excluded: the track snapshot stays at or below it. None: the whole prompt.
+    reuse_len: int | None = None
     # SWA: tokens below this have had their window slots freed (slid out of the window).
     swa_evicted_seqlen: int = 0
     aborted: bool = False

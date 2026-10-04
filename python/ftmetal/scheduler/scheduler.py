@@ -24,6 +24,7 @@ from ftmetal.core import Batch, Req, SamplingParams, host_ints
 from ftmetal.engine.config import EngineConfig
 from ftmetal.engine.engine import Engine, ForwardOutput
 from ftmetal.engine.sample import BatchSamplingArgs
+from ftmetal.kvcache.linear_state_pool import gdn_snapshot_slots
 from ftmetal.kvcache.swa_pool import swa_radix_num_windows
 from ftmetal.message.backend import (
     AbortBackendMsg,
@@ -70,7 +71,7 @@ class TokenEvent:
 
 class Scheduler:
     def __init__(self, config: EngineConfig, eos_token_ids: set[int]) -> None:
-        # Before the engine loads anything: too few --swa-windows fails fast.
+        # Before the engine loads anything: too few --swa-windows or --gdn-snapshots fails fast.
         swa_group = config.model_config.swa_attention_group()
         cache_type = resolve_cache_type(
             config.cache_type,
@@ -90,6 +91,14 @@ class Scheduler:
             logger.warning(
                 f"--swa-windows sizes the SWA radix cache's window pool: ignored with the "
                 f"{cache_type} cache"
+            )
+        if cache_type == "hybrid_radix":
+            num_snapshots = gdn_snapshot_slots(config.gdn_snapshots)
+            logger.info(f"GDN snapshot cache: {num_snapshots} slots")
+        elif config.gdn_snapshots is not None:
+            logger.warning(
+                f"--gdn-snapshots sizes the hybrid radix cache's GDN snapshot cache: ignored "
+                f"with the {cache_type} cache"
             )
         self.engine = Engine(config)
         self.config = config
@@ -120,7 +129,15 @@ class Scheduler:
         # marks the request; process_last_data frees it once the forward has landed.
         self.inflight_data: ForwardData | None = None
 
-    def add_request(self, uid: int, input_ids: np.ndarray, sampling_params: SamplingParams) -> None:
+    def add_request(
+        self,
+        uid: int,
+        input_ids: np.ndarray,
+        sampling_params: SamplingParams,
+        reuse_len: int | None = None,
+    ) -> None:
+        """Queue a prompt; reuse_len is the tokens of it a next turn can share (None: all)."""
+        assert reuse_len is None or 0 <= reuse_len <= len(input_ids)
         max_output_len = self.engine.max_seq_len - len(input_ids)
         if max_output_len <= 0:
             raise ValueError(
@@ -128,7 +145,7 @@ class Scheduler:
             )
         if sampling_params.max_tokens > max_output_len:
             sampling_params.max_tokens = max_output_len
-        self.prefill_manager.add_one_req(uid, input_ids, sampling_params)
+        self.prefill_manager.add_one_req(uid, input_ids, sampling_params, reuse_len)
 
     def abort_request(self, uid: int) -> None:
         """Drop a pending or running request; a step already launched with it still runs.
@@ -222,7 +239,7 @@ class Scheduler:
                     return
                 elif isinstance(msg, UserMsg):
                     try:
-                        self.add_request(msg.uid, msg.input_ids, msg.sampling_params)
+                        self.add_request(msg.uid, msg.input_ids, msg.sampling_params, msg.reuse_len)
                     except ValueError as exc:
                         replies.append(
                             ErrorReplyMsg(

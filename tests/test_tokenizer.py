@@ -1,4 +1,5 @@
-"""Prompt rendering, raw prompts, incremental detokenization and stop strings.
+"""Prompt rendering, raw prompts, the reusable prefix end, incremental detokenization and
+stop strings.
 
 The tiny checkpoint covers the contract; with FTMETAL_TEST_MODEL_PATH set, the real
 checkpoint's tokenizer.json and chat template are checked against transformers, which is
@@ -8,8 +9,10 @@ also how FreeToken encodes a raw prompt.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from jinja2 import TemplateError
@@ -209,8 +212,85 @@ def test_raw_prompt_skips_the_template_and_matches_transformers(
         }
         (tiny_model_dir / "tokenizer_config.json").write_text(json.dumps(config))
     msg = TokenizeMsg(uid=0, text=prompt, sampling_params=SamplingParams())
-    assert TokenizeManager(str(tiny_model_dir)).tokenize(msg).input_ids.tolist() == input_ids
+    user_msg = TokenizeManager(str(tiny_model_dir)).tokenize(msg)
+    assert user_msg.input_ids.tolist() == input_ids
+    # A raw prompt has no generation suffix: a next prompt can share all of it.
+    assert user_msg.reuse_len == len(input_ids)
     assert AutoTokenizer.from_pretrained(tiny_model_dir).encode(prompt) == input_ids
+
+
+# The shape of Gemma4's template: <bos>, turns between <|turn> and <turn|>, and a generation
+# prompt that opens the model turn and, unless enable_thinking is true, an empty thought.
+GEMMA_STYLE_TEMPLATE = """\
+{{- bos_token }}
+{%- for message in messages %}
+{%- set role = 'model' if message.role == 'assistant' else message.role %}
+{{- '<|turn>' + role + '\\n' + message.content + '<turn|>\\n' }}
+{%- endfor %}
+{%- if add_generation_prompt %}
+{{- '<|turn>model\\n' }}
+{%- if not enable_thinking | default(false) %}
+{{- '<|channel>thought\\n<channel|>' }}
+{%- endif %}
+{%- endif %}
+"""
+GEMMA_STYLE_SPECIAL_TOKENS = ("<bos>", "<|turn>", "<turn|>", "<|channel>", "<channel|>")
+# Renders a tail only without the generation prompt, so the conversation's encoding is not a
+# prefix of the prompt's.
+UNSTABLE_TEMPLATE_TAIL = "{%- if not add_generation_prompt %}{{- 'x' }}{%- endif %}\n"
+CONVERSATION: list[ChatMessage] = [
+    {"role": "user", "content": "Hi"},
+    {"role": "assistant", "content": "Hello!"},
+    {"role": "user", "content": "Again"},
+]
+
+# (chat template, enable_thinking, the generation suffix the reusable prefix leaves out)
+REUSE_CASES: list[tuple[Literal["qwen", "gemma"], bool | None, str]] = [
+    ("qwen", None, "<|im_start|>assistant\n<think>\n"),
+    ("qwen", True, "<|im_start|>assistant\n<think>\n"),
+    ("qwen", False, "<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+    ("gemma", None, "<|turn>model\n<|channel>thought\n<channel|>"),
+    ("gemma", True, "<|turn>model\n"),
+    ("gemma", False, "<|turn>model\n<|channel>thought\n<channel|>"),
+]
+
+
+@pytest.mark.parametrize(("template", "enable_thinking", "suffix"), REUSE_CASES)
+def test_conversation_reuse_ends_before_the_generation_suffix(
+    tiny_model_dir: Path,
+    template: Literal["qwen", "gemma"],
+    enable_thinking: bool | None,
+    suffix: str,
+) -> None:
+    if template == "gemma":
+        tokenizer = Tokenizer.from_file(str(tiny_model_dir / "tokenizer.json"))
+        tokenizer.add_special_tokens(
+            [AddedToken(token, special=True) for token in GEMMA_STYLE_SPECIAL_TOKENS]
+        )
+        tokenizer.save(str(tiny_model_dir / "tokenizer.json"))
+        (tiny_model_dir / "chat_template.jinja").write_text(GEMMA_STYLE_TEMPLATE)
+        config = {"eos_token": "<turn|>", "bos_token": "<bos>"}
+        (tiny_model_dir / "tokenizer_config.json").write_text(json.dumps(config))
+    manager = TokenizeManager(str(tiny_model_dir))
+    msg = tokenize_msg(CONVERSATION, enable_thinking)
+    user_msg = manager.tokenize(msg)
+    input_ids = user_msg.input_ids.tolist()
+    unshared = manager.tokenizer.decode(input_ids[user_msg.reuse_len :], skip_special_tokens=False)
+    assert unshared == suffix
+    assert manager.render_prompt(msg) == manager.render_prompt(msg, False) + suffix
+
+
+def test_unstable_template_reuses_the_whole_prompt_and_warns_once(
+    tiny_model_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    template_path = tiny_model_dir / "chat_template.jinja"
+    template_path.write_text(template_path.read_text() + UNSTABLE_TEMPLATE_TAIL)
+    manager = TokenizeManager(str(tiny_model_dir))
+    with caplog.at_level(logging.WARNING, logger="ftmetal.tokenizer"):
+        for _ in range(2):
+            user_msg = manager.tokenize(tokenize_msg(CONVERSATION))
+            assert user_msg.reuse_len == len(user_msg.input_ids)
+    assert len(caplog.records) == 1
 
 
 def test_checkpoint_eos_and_sampling_defaults(tiny_model_dir: Path) -> None:
@@ -266,7 +346,17 @@ def test_real_tokenizer_matches_transformers() -> None:
                     add_generation_prompt=True,
                     **msg.chat_template_kwargs,
                 )
+                history = reference.apply_chat_template(
+                    messages,
+                    tools=tool_list,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                    **msg.chat_template_kwargs,
+                )
                 assert tokenize_manager.render_prompt(msg) == expected
-                assert tokenize_manager.tokenize(msg).input_ids.tolist() == reference.encode(
+                user_msg = tokenize_manager.tokenize(msg)
+                assert user_msg.input_ids.tolist() == reference.encode(
                     expected, add_special_tokens=False
                 )
+                history_ids = reference.encode(history, add_special_tokens=False)
+                assert user_msg.reuse_len == len(history_ids)
