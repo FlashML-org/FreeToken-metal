@@ -6,7 +6,9 @@ transformers; stop strings are matched here over the decoded text (the scheduler
 only EOS and max_tokens), so a match finishes the reply and the caller aborts the
 request; a request's decode state is created when its prompt is tokenized, so tokens
 that arrive after a stop, an abort or an error are dropped; text ending in a partial
-UTF-8 character is held back whole, and flushed as is when the request finishes.
+UTF-8 character is held back whole, and flushed as is when the request finishes; a
+conversation's reusable prefix ends where its rendering without the generation prompt
+does, when that encoding is a prefix of the prompt's (FreeToken has no such boundary).
 
 A raw prompt gets the special tokens tokenizer.json's post-processor adds, which is what
 transformers 5 adds for FreeToken: none for Qwen3.6, and none for Gemma4 either (its
@@ -17,6 +19,7 @@ client writes <bos> into it.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NoReturn
@@ -32,6 +35,8 @@ from ftmetal.core import SamplingParams
 from ftmetal.message.backend import UserMsg
 from ftmetal.message.frontend import UserReply
 from ftmetal.message.tokenizer import DetokenizeMsg, TokenizeMsg
+
+logger = logging.getLogger(__name__)
 
 TOKENIZER_FILE = "tokenizer.json"
 TOKENIZER_CONFIG_FILE = "tokenizer_config.json"
@@ -126,28 +131,49 @@ class TokenizeManager:
             token = tokenizer_config.get(name)
             if isinstance(token, str):
                 self.special_tokens[name] = token
+        self.has_warned_unstable_template = False
 
-    def render_prompt(self, msg: TokenizeMsg) -> str:
+    def render_prompt(self, msg: TokenizeMsg, add_generation_prompt: bool = True) -> str:
         if isinstance(msg.text, str):
             return msg.text
         else:
             return self.chat_template.render(
                 messages=msg.text,
                 tools=msg.tools,
-                add_generation_prompt=True,
+                add_generation_prompt=add_generation_prompt,
                 **self.special_tokens,
                 **msg.chat_template_kwargs,
             )
 
     def tokenize(self, msg: TokenizeMsg) -> UserMsg:
-        # The template renders every special token, so only a raw prompt's encoding adds any.
-        encoding = self.tokenizer.encode(
-            self.render_prompt(msg), add_special_tokens=isinstance(msg.text, str)
-        )
+        if isinstance(msg.text, str):
+            # Only a raw prompt's encoding adds special tokens: the template renders its own.
+            input_ids = self.tokenizer.encode(msg.text, add_special_tokens=True).ids
+            reuse_len = len(input_ids)
+        else:
+            # A next turn re-renders this conversation and goes on past it: what it shares
+            # ends before the generation suffix.
+            prompt_encoding, history_encoding = self.tokenizer.encode_batch(
+                [self.render_prompt(msg), self.render_prompt(msg, add_generation_prompt=False)],
+                add_special_tokens=False,
+            )
+            input_ids = prompt_encoding.ids
+            history_ids = history_encoding.ids
+            if input_ids[: len(history_ids)] == history_ids:
+                reuse_len = len(history_ids)
+            else:
+                if not self.has_warned_unstable_template:
+                    logger.warning(
+                        "the chat template's generation suffix does not extend the "
+                        "conversation's encoding: GDN snapshots track up to the prompt end"
+                    )
+                    self.has_warned_unstable_template = True
+                reuse_len = len(input_ids)
         return UserMsg(
             uid=msg.uid,
-            input_ids=np.array(encoding.ids, dtype=np.int32),
+            input_ids=np.array(input_ids, dtype=np.int32),
             sampling_params=msg.sampling_params,
+            reuse_len=reuse_len,
         )
 
 

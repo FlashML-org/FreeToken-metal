@@ -64,13 +64,21 @@ class ScriptedScheduler(Scheduler):
         # uid -> (tokens left, whether the last one is EOS)
         self.running: dict[int, tuple[list[int], bool]] = {}
         self.admitted: dict[int, tuple[list[int], SamplingParams]] = {}
+        self.reuse_lens: dict[int, int | None] = {}
         self.aborted: list[int] = []
         ScriptedScheduler.instances.append(self)
 
-    def add_request(self, uid: int, input_ids: np.ndarray, sampling_params: SamplingParams) -> None:
+    def add_request(
+        self,
+        uid: int,
+        input_ids: np.ndarray,
+        sampling_params: SamplingParams,
+        reuse_len: int | None = None,
+    ) -> None:
         if len(input_ids) > self.max_prompt_tokens:
             raise ValueError(f"prompt is too long: {len(input_ids)} tokens")
         self.admitted[uid] = (input_ids.tolist(), sampling_params)
+        self.reuse_lens[uid] = reuse_len
         script_tokens = [*self.tokenizer.encode(self.script).ids, self.eos_token_id]
         # Sampling past EOS repeats the script until max_tokens.
         repeats = sampling_params.max_tokens // len(script_tokens) + 1
@@ -333,6 +341,27 @@ def test_generate_streams_the_raw_text_sampled_greedily(
     assert all(texts) and "".join(texts) == SCRIPT
     # The framework's greedy defaults, not the checkpoint's recommended sampling.
     assert scripted.instances[0].admitted[0] == ([71, 72], SamplingParams(max_tokens=64))
+
+
+# (route, request body, the end of the prompt a next turn does not share)
+REUSE_CASES: list[tuple[str, dict[str, JsonValue], str]] = [
+    ("/v1/chat/completions", chat_body("hi"), "<|im_start|>assistant\n<think>\n"),
+    ("/v1/completions", {"model": "tiny", "prompt": "hi", "max_tokens": 4}, ""),
+    ("/generate", {"prompt": "hi", "max_tokens": 4}, ""),
+]
+
+
+def test_routes_admit_the_prompt_with_its_reusable_prefix_end(
+    client: TestClient, scripted: type[ScriptedScheduler], tiny_model_dir: Path
+) -> None:
+    tokenizer = Tokenizer.from_file(str(tiny_model_dir / "tokenizer.json"))
+    for uid, (route, body, unshared) in enumerate(REUSE_CASES):
+        assert client.post(route, json=body).status_code == 200, route
+        scheduler = scripted.instances[0]
+        input_ids = scheduler.admitted[uid][0]
+        reuse_len = scheduler.reuse_lens[uid]
+        assert reuse_len is not None, route
+        assert tokenizer.decode(input_ids[reuse_len:], skip_special_tokens=False) == unshared
 
 
 # (route, request body, status code, a fragment of the error body)

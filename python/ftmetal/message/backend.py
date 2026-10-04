@@ -1,7 +1,8 @@
 """Messages into the scheduler: new requests, aborts and exit.
 
 Port of FreeToken message/backend.py. Divergences: plain dataclasses passed over
-queue.Queue (no ZMQ encoder/decoder); input ids are a host numpy int32 array; no
+queue.Queue (no ZMQ encoder/decoder); input ids are a host numpy int32 array; UserMsg
+carries reuse_len, where the prompt's reusable prefix ends (FreeToken has none); no
 multimodal items and no cache-rebuild message.
 """
 
@@ -34,6 +35,9 @@ class UserMsg(BaseBackendMsg):
     uid: int
     input_ids: np.ndarray
     sampling_params: SamplingParams
+    # The prompt's tokens a next turn can share: a conversation without the chat template's
+    # generation suffix, all of a raw prompt.
+    reuse_len: int
 
 
 @dataclass(kw_only=True)
