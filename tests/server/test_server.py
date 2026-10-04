@@ -1,4 +1,5 @@
-"""The OpenAI API end to end over the real tokenizer worker and a scripted scheduler.
+"""The OpenAI API and /generate end to end over the real tokenizer worker and a scripted
+scheduler.
 
 The scheduler thread runs ScriptedScheduler, which samples a fixed text for every
 request, so the routes, the message flow and the detokenizer are tested without a
@@ -30,7 +31,7 @@ from ftmetal.core import SamplingParams
 from ftmetal.engine.config import EngineConfig
 from ftmetal.env import ENV_PREFIXES
 from ftmetal.message.frontend import BatchFrontendMsg, UserReply
-from ftmetal.message.tokenizer import AbortMsg, BaseTokenizerMsg
+from ftmetal.message.tokenizer import AbortMsg, BaseTokenizerMsg, FinishReason
 from ftmetal.scheduler.scheduler import ForwardData, Scheduler, TokenEvent
 from ftmetal.scheduler.status import SchedulerStatusReporter
 from ftmetal.server import api_server
@@ -41,6 +42,8 @@ from ftmetal.server.reasoning_parser import ThinkReasoningParser
 
 MODEL_PATH = os.environ.get("FTMETAL_TEST_MODEL_PATH")
 SCRIPT = "Let me think.</think>\n\nThe answer is 42."
+# One token per byte except </think>, plus EOS.
+SCRIPT_TOKENS = len(SCRIPT.encode()) - len("</think>") + 2
 WAIT_SECONDS = 5.0
 
 
@@ -60,13 +63,18 @@ class ScriptedScheduler(Scheduler):
         self.status_reporter = SchedulerStatusReporter(lambda line: None)
         # uid -> (tokens left, whether the last one is EOS)
         self.running: dict[int, tuple[list[int], bool]] = {}
+        self.admitted: dict[int, tuple[list[int], SamplingParams]] = {}
         self.aborted: list[int] = []
         ScriptedScheduler.instances.append(self)
 
     def add_request(self, uid: int, input_ids: np.ndarray, sampling_params: SamplingParams) -> None:
         if len(input_ids) > self.max_prompt_tokens:
             raise ValueError(f"prompt is too long: {len(input_ids)} tokens")
-        tokens = [*self.tokenizer.encode(self.script).ids, self.eos_token_id]
+        self.admitted[uid] = (input_ids.tolist(), sampling_params)
+        script_tokens = [*self.tokenizer.encode(self.script).ids, self.eos_token_id]
+        # Sampling past EOS repeats the script until max_tokens.
+        repeats = sampling_params.max_tokens // len(script_tokens) + 1
+        tokens = script_tokens * repeats if sampling_params.ignore_eos else script_tokens
         self.running[uid] = (
             tokens[: sampling_params.max_tokens],
             len(tokens) <= sampling_params.max_tokens,
@@ -240,6 +248,133 @@ def test_request_failures_surface_as_errors(
     assert too_long.status_code == 400
     assert too_long.json()["error"]["code"] == "context_length_exceeded"
     assert client.post("/v1/chat/completions", json=chat_body("x")).status_code == 400
+
+
+# (request body, choice texts, finish reasons, prompt tokens, completion tokens): a raw prompt
+# gets no chat template and spends one token per byte or special token.
+COMPLETION_CASES: list[tuple[dict[str, JsonValue], list[str], list[FinishReason], int, int]] = [
+    ({"prompt": "6 x 7 ="}, [SCRIPT], ["stop"], 7, SCRIPT_TOKENS),
+    ({"prompt": ["hi", "<|im_start|>"]}, [SCRIPT, SCRIPT], ["stop", "stop"], 3, 2 * SCRIPT_TOKENS),
+    ({"prompt": "hi", "max_tokens": 3}, ["Let"], ["length"], 2, 3),
+    (
+        {"prompt": "hi", "max_tokens": SCRIPT_TOKENS + 2, "ignore_eos": True},
+        [f"{SCRIPT}<|im_end|>Le"],
+        ["length"],
+        2,
+        SCRIPT_TOKENS + 2,
+    ),
+    # n is ignored: one choice per prompt.
+    ({"prompt": "hi", "n": 2}, [SCRIPT], ["stop"], 2, SCRIPT_TOKENS),
+]
+
+
+@pytest.mark.parametrize(
+    ("body", "texts", "finish_reasons", "prompt_tokens", "completion_tokens"), COMPLETION_CASES
+)
+def test_completion_returns_the_raw_text(
+    client: TestClient,
+    body: dict[str, JsonValue],
+    texts: list[str],
+    finish_reasons: list[FinishReason],
+    prompt_tokens: int,
+    completion_tokens: int,
+) -> None:
+    response = client.post("/v1/completions", json={"model": "tiny", **body})
+    assert response.status_code == 200
+    completion = response.json()
+    assert completion["object"] == "text_completion" and completion["id"].startswith("cmpl-")
+    assert completion["choices"] == [
+        {"index": index, "text": text, "finish_reason": finish_reason, "logprobs": None}
+        for index, (text, finish_reason) in enumerate(zip(texts, finish_reasons))
+    ]
+    assert completion["usage"] == {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+
+def test_streamed_completion_chunks_carry_the_raw_text(client: TestClient) -> None:
+    body = {
+        "model": "tiny",
+        "prompt": "hi",
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    response = client.post("/v1/completions", json=body)
+    assert response.headers["content-type"].startswith("text/event-stream")
+    events = sse_events(response.text)
+    assert events[-1] == "[DONE]"
+    chunks = [json.loads(event) for event in events[:-1]]
+    assert {chunk["id"] for chunk in chunks} == {chunks[0]["id"]}
+    assert all(chunk["object"] == "text_completion.chunk" for chunk in chunks)
+    choices = [chunk["choices"][0] for chunk in chunks[:-2]]
+    assert all(choice["text"] and choice["finish_reason"] is None for choice in choices)
+    assert "".join(choice["text"] for choice in choices) == SCRIPT
+    assert chunks[-2]["choices"] == [
+        {"index": 0, "text": "", "finish_reason": "stop", "logprobs": None}
+    ]
+    assert chunks[-1]["choices"] == []
+    assert chunks[-1]["usage"] == {
+        "prompt_tokens": 2,
+        "completion_tokens": SCRIPT_TOKENS,
+        "total_tokens": 2 + SCRIPT_TOKENS,
+    }
+
+
+def test_generate_streams_the_raw_text_sampled_greedily(
+    client: TestClient, scripted: type[ScriptedScheduler]
+) -> None:
+    response = client.post("/generate", json={"prompt": "hi", "max_tokens": 64})
+    assert response.headers["content-type"].startswith("text/event-stream")
+    events = sse_events(response.text)
+    assert events[-1] == "[DONE]"
+    texts = [json.loads(event)["text"] for event in events[:-1]]
+    assert all(texts) and "".join(texts) == SCRIPT
+    # The framework's greedy defaults, not the checkpoint's recommended sampling.
+    assert scripted.instances[0].admitted[0] == ([71, 72], SamplingParams(max_tokens=64))
+
+
+# (route, request body, status code, a fragment of the error body)
+REFUSED_CASES: list[tuple[str, dict[str, JsonValue], int, str]] = [
+    ("/v1/completions", {"model": "tiny", "prompt": [1, 2, 3]}, 400, "token-id prompt"),
+    ("/v1/completions", {"model": "tiny", "prompt": [[1, 2], [3]]}, 400, "token-id prompt"),
+    ("/v1/completions", {"model": "tiny", "prompt": "hi", "echo": True}, 400, "echo is not"),
+    ("/v1/completions", {"model": "tiny", "prompt": "hi", "logprobs": 1}, 400, "logprobs is not"),
+    (
+        "/v1/completions",
+        {"model": "tiny", "prompt": ["a", "b"], "stream": True},
+        400,
+        "only support a single text prompt",
+    ),
+    ("/v1/completions", {"model": "tiny", "prompt": "hi", "max_tokens": 0}, 422, "max_tokens"),
+    ("/generate", {"prompt": "hi", "max_tokens": 0}, 400, "max_tokens must be at least 1, got 0"),
+    ("/generate", {"prompt": [1, 2, 3], "max_tokens": 4}, 422, "prompt"),
+]
+
+
+@pytest.mark.parametrize(("route", "body", "status_code", "error"), REFUSED_CASES)
+def test_raw_prompt_requests_are_refused(
+    client: TestClient, route: str, body: dict[str, JsonValue], status_code: int, error: str
+) -> None:
+    response = client.post(route, json=body)
+    assert response.status_code == status_code and error in response.text
+
+
+def test_raw_prompt_failures_surface_as_errors(
+    client: TestClient, scripted: type[ScriptedScheduler], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scripted, "max_prompt_tokens", 4)
+    body = {"model": "tiny", "prompt": "a long prompt"}
+    rejected = client.post("/v1/completions", json=body)
+    assert rejected.status_code == 400
+    assert rejected.json()["error"]["code"] == "context_length_exceeded"
+    events = sse_events(client.post("/v1/completions", json={**body, "stream": True}).text)
+    assert json.loads(events[-2])["error"]["code"] == "context_length_exceeded"
+    assert events[-1] == "[DONE]"
+    generate_body = {"prompt": "a long prompt", "max_tokens": 4}
+    events = sse_events(client.post("/generate", json=generate_body).text)
+    assert events == [json.dumps({"error": "prompt is too long: 13 tokens"}), "[DONE]"]
 
 
 def test_client_disconnect_aborts_the_request(

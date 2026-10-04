@@ -7,6 +7,11 @@ only EOS and max_tokens), so a match finishes the reply and the caller aborts th
 request; a request's decode state is created when its prompt is tokenized, so tokens
 that arrive after a stop, an abort or an error are dropped; text ending in a partial
 UTF-8 character is held back whole, and flushed as is when the request finishes.
+
+A raw prompt gets the special tokens tokenizer.json's post-processor adds, which is what
+transformers 5 adds for FreeToken: none for Qwen3.6, and none for Gemma4 either (its
+post-processor has no <bos>), so a raw Gemma4 prompt starts with BOS only when the
+client writes <bos> into it.
 """
 
 from __future__ import annotations
@@ -123,17 +128,22 @@ class TokenizeManager:
                 self.special_tokens[name] = token
 
     def render_prompt(self, msg: TokenizeMsg) -> str:
-        return self.chat_template.render(
-            messages=msg.text,
-            tools=msg.tools,
-            add_generation_prompt=True,
-            **self.special_tokens,
-            **msg.chat_template_kwargs,
-        )
+        if isinstance(msg.text, str):
+            return msg.text
+        else:
+            return self.chat_template.render(
+                messages=msg.text,
+                tools=msg.tools,
+                add_generation_prompt=True,
+                **self.special_tokens,
+                **msg.chat_template_kwargs,
+            )
 
     def tokenize(self, msg: TokenizeMsg) -> UserMsg:
-        # The template renders every special token, so encoding adds none.
-        encoding = self.tokenizer.encode(self.render_prompt(msg), add_special_tokens=False)
+        # The template renders every special token, so only a raw prompt's encoding adds any.
+        encoding = self.tokenizer.encode(
+            self.render_prompt(msg), add_special_tokens=isinstance(msg.text, str)
+        )
         return UserMsg(
             uid=msg.uid,
             input_ids=np.array(encoding.ids, dtype=np.int32),
