@@ -29,10 +29,12 @@ uv run ftm shell --server http://127.0.0.1:8000             # or FTMETAL_HOST=ht
 
 `ftm serve` exposes `POST /v1/chat/completions` (streamed or not; `reasoning_content`
 carries the `<think>` block, `chat_template_kwargs: {"enable_thinking": false}` turns it
-off) and `GET /v1/models`; any API key is accepted. `ftm shell` is a client of that
-endpoint: `/think` toggles thinking, `/reset` clears the conversation, `/exit` or Ctrl-D
-quits, Ctrl-C cancels a reply. Environment knobs are read as `FTMETAL_<NAME>`, falling
-back to `FREETOKEN_<NAME>`.
+off), `POST /v1/completions` and `POST /generate` (a raw text prompt, no chat template;
+`/generate` streams `{"text": ...}` events and samples greedily) and `GET /v1/models`;
+any API key is accepted. `ftm shell` is a client of the chat endpoint: `/think` toggles
+thinking, `/reset` clears the conversation, `/exit` or Ctrl-D quits, Ctrl-C cancels a
+reply. Environment knobs are read as `FTMETAL_<NAME>`, falling back to
+`FREETOKEN_<NAME>`.
 
 ```bash
 FTMETAL_TEST_MODEL_PATH=/path/to/Qwen3.6-35B-A3B-MLX uv run pytest tests/server tests/test_tokenizer.py -q
