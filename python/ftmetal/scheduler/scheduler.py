@@ -24,6 +24,7 @@ from ftmetal.core import Batch, Req, SamplingParams, host_ints
 from ftmetal.engine.config import EngineConfig
 from ftmetal.engine.engine import Engine, ForwardOutput
 from ftmetal.engine.sample import BatchSamplingArgs
+from ftmetal.kvcache.linear_state_pool import gdn_snapshot_slots
 from ftmetal.kvcache.swa_pool import swa_radix_num_windows
 from ftmetal.message.backend import (
     AbortBackendMsg,
@@ -70,7 +71,7 @@ class TokenEvent:
 
 class Scheduler:
     def __init__(self, config: EngineConfig, eos_token_ids: set[int]) -> None:
-        # Before the engine loads anything: too few --swa-windows fails fast.
+        # Before the engine loads anything: too few --swa-windows or --gdn-snapshots fails fast.
         swa_group = config.model_config.swa_attention_group()
         cache_type = resolve_cache_type(
             config.cache_type,
@@ -90,6 +91,14 @@ class Scheduler:
             logger.warning(
                 f"--swa-windows sizes the SWA radix cache's window pool: ignored with the "
                 f"{cache_type} cache"
+            )
+        if cache_type == "hybrid_radix":
+            num_snapshots = gdn_snapshot_slots(config.gdn_snapshots)
+            logger.info(f"GDN snapshot cache: {num_snapshots} slots")
+        elif config.gdn_snapshots is not None:
+            logger.warning(
+                f"--gdn-snapshots sizes the hybrid radix cache's GDN snapshot cache: ignored "
+                f"with the {cache_type} cache"
             )
         self.engine = Engine(config)
         self.config = config

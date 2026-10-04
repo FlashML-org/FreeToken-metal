@@ -16,6 +16,7 @@ from typing import get_args
 
 from ftmetal.attention import SUPPORTED_ATTENTION_BACKENDS
 from ftmetal.engine.config import CacheTypeChoice, EngineConfig, command_graph_from_env
+from ftmetal.kvcache.linear_state_pool import CONVERSATION_SNAPSHOTS, DEFAULT_GDN_SNAPSHOTS
 
 
 @dataclass(frozen=True)
@@ -124,6 +125,15 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         "(default: the fewest that hold the running requests and a prefill, and 8 more)",
     )
     parser.add_argument(
+        "--gdn-snapshots",
+        type=positive_int,
+        metavar="N",
+        default=ServerArgs.gdn_snapshots,
+        help=f"GDN state snapshots the radix cache keeps on a model with linear attention, "
+        f"{CONVERSATION_SNAPSHOTS} per cached conversation, at least {CONVERSATION_SNAPSHOTS} "
+        f"(default: {DEFAULT_GDN_SNAPSHOTS})",
+    )
+    parser.add_argument(
         "--attention-backend",
         "--attn",
         choices=SUPPORTED_ATTENTION_BACKENDS.supported_names(),
@@ -153,6 +163,7 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         page_size=namespace.page_size,
         cache_type=namespace.cache_type,
         swa_windows=namespace.swa_windows,
+        gdn_snapshots=namespace.gdn_snapshots,
         attention_backend=namespace.attention_backend,
         command_graph=not namespace.disable_command_graph and command_graph_from_env(),
     )

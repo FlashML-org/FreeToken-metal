@@ -543,6 +543,15 @@ def test_swa_windows_flag_takes_a_window_count(tiny_model_dir: Path) -> None:
             parse_args([*flags, "--swa-windows", value], prog="ftm serve")
 
 
+def test_gdn_snapshots_flag_takes_a_snapshot_count(tiny_model_dir: Path) -> None:
+    flags = ["--model", str(tiny_model_dir)]
+    assert parse_args(flags, prog="ftm serve").gdn_snapshots is None
+    assert parse_args([*flags, "--gdn-snapshots", "12"], prog="ftm serve").gdn_snapshots == 12
+    for value in ("0", "1.5"):
+        with pytest.raises(SystemExit):
+            parse_args([*flags, "--gdn-snapshots", value], prog="ftm serve")
+
+
 @pytest.mark.skipif(MODEL_PATH is None, reason="FTMETAL_TEST_MODEL_PATH is not set")
 def test_real_model_answers_over_http() -> None:
     assert MODEL_PATH is not None
