@@ -15,12 +15,12 @@ request-ring middleware); the stats tracker and the request ring are the Fronten
 both TokenizeManagers probe their chat template's thinking and effort controls before
 serving (FreeToken probes on first use, and warms the frontend's on the first cache poll);
 closing a request's reply stream before its terminal reply also aborts it, and an abort is
-sent once; abort_user (prepare-stop's) aborts only a request whose consumer still reads, and
-leaves its reply queue in place, so the scheduler's acknowledgement ends that stream with an
-error where FreeToken leaves the client waiting; /generate leaves its 503 to new_user and
-reports a failed request as an {"error": ...} event before [DONE]; a stop string matched by
-the detokenizer aborts the request; the decode state of an aborted request is dropped when
-the tokenizer worker relays the abort, so tokens that race it are not counted.
+sent once; abort_user (prepare-stop's) also hands a consumer still reading a terminal
+"request aborted" error, where FreeToken leaves that client waiting; /generate leaves its
+503 to new_user and reports a failed request as an {"error": ...} event before [DONE]; a
+stop string matched by the detokenizer aborts the request; the decode state of an aborted
+request is dropped when the tokenizer worker relays the abort, so tokens that race it are
+not counted.
 """
 
 from __future__ import annotations
@@ -214,11 +214,15 @@ class FrontendManager:
             raise
 
     async def abort_user(self, uid: int) -> None:
-        """Abort uid if its consumer is still reading: the scheduler's acknowledgement then
-        ends the consumer's stream with an error instead of leaving it waiting."""
+        """Abort uid unless its stream already did; a consumer still reading (prepare-stop's
+        aborts) is handed a terminal error rather than left waiting."""
         await asyncio.sleep(0.1)
-        if uid in self.ack_map:
+        pending = self.ack_map.pop(uid, None)
+        if pending is not None:
             self.stats.on_abort(uid)
+            pending.put_nowait(
+                UserReply(uid=uid, incremental_output="", finished=True, error="request aborted")
+            )
             logger.warning(f"aborting request {uid}")
             await self.send_one(AbortMsg(uid=uid))
 
