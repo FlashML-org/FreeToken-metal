@@ -1,31 +1,27 @@
-"""OpenAI chat-completion and completion request and response schemas.
+"""OpenAI chat-completion and completion request schemas and the model list.
 
-Port of FreeToken server/api_models.py. Divergences: chat completions, completions and
-the model list only; text content only; tools are declared so they can be refused (no
-tool parser yet); a request's ranges are checked by pydantic (422) instead of by the
-route; responses are typed models instead of dicts.
+Port of FreeToken server/api_models.py. Divergence: the model card is owned by ftmetal.
 """
 
 from __future__ import annotations
 
 import time
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import (
-    BaseModel,
-    Field,
-    JsonValue,
-    SerializerFunctionWrapHandler,
-    model_serializer,
-)
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from ftmetal.message.tokenizer import FinishReason
+
+class MessageContent(BaseModel):
+    type: str
+    text: str | None = None
+    image_url: Any | None = None
+    audio_url: Any | None = None
 
 
 class Function(BaseModel):
     name: str
     description: str | None = None
-    parameters: dict[str, JsonValue] | None = None
+    parameters: dict[str, Any] | None = None
 
 
 class Tool(BaseModel):
@@ -33,185 +29,126 @@ class Tool(BaseModel):
     function: Function
 
 
-class TextContentPart(BaseModel):
-    type: Literal["text"]
-    text: str
+class ToolChoiceFunction(BaseModel):
+    name: str
 
 
-class Message(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: str | list[TextContentPart] | None = None
-    reasoning_content: str | None = None
+class ToolChoiceObject(BaseModel):
+    type: Literal["function"] = "function"
+    function: ToolChoiceFunction
 
 
 class StreamOptions(BaseModel):
     include_usage: bool = False
 
 
+class FunctionCall(BaseModel):
+    name: str | None = None
+    arguments: str | dict[str, Any] | None = None
+
+
+class ToolCall(BaseModel):
+    id: str | None = None
+    index: int | None = None
+    type: Literal["function"] = "function"
+    function: FunctionCall
+
+
+class Message(BaseModel):
+    role: str
+    content: str | list[MessageContent] | None = None
+    tool_call_id: str | None = None
+    name: str | None = None
+    reasoning: str | None = None
+    reasoning_content: str | None = None
+    thinking: str | None = None
+    tool_calls: list[ToolCall] | None = None
+
+
 class ChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     model: str
-    messages: list[Message] = Field(min_length=1)
-    max_tokens: int | None = Field(default=None, ge=1)
-    max_completion_tokens: int | None = Field(default=None, ge=1)
-    temperature: float | None = Field(default=None, ge=0.0)
-    top_p: float | None = Field(default=None, gt=0.0, le=1.0)
-    # -1 (or 0) disables top-k.
-    top_k: int | None = Field(default=None, ge=-1)
+    messages: list[Message]
+    max_tokens: int | None = None
+    max_completion_tokens: int | None = None
+    temperature: float | None = None
+    top_k: int | None = None
+    top_p: float | None = None
     n: int = 1
     stream: bool = False
     stream_options: StreamOptions | None = None
     stop: str | list[str] | None = None
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
+    reasoning_effort: str | None = None
+    # DeepSeek-wire thinking toggle ({"type": "enabled"|"disabled"}). Any so a
+    # foreign shape stays ignored (extra="allow" swallowed it before this field
+    # existed) instead of becoming a bare 422 at the route boundary; the handler
+    # reads the dict form and 400s only on an unknown "type" value.
+    thinking: Any | None = None
     ignore_eos: bool = False
-    chat_template_kwargs: dict[str, JsonValue] = Field(default_factory=dict)
-    tools: list[dict[str, JsonValue]] | None = None
+    tools: list[Tool] | None = None
+    tool_choice: Literal["none", "auto", "required"] | ToolChoiceObject | None = None
+    parallel_tool_calls: bool | None = None
+    function_call: Any | None = None
+    logit_bias: dict[str, float] | None = None
+    response_format: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def _sync_max_completion_tokens(self) -> "ChatCompletionRequest":
+        if self.max_completion_tokens is not None:
+            self.max_tokens = self.max_completion_tokens
+        return self
 
 
 class CompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     model: str
-    # The token-id forms are declared so they can be refused.
     prompt: str | list[str] | list[int] | list[list[int]]
-    max_tokens: int | None = Field(default=None, ge=1)
-    max_completion_tokens: int | None = Field(default=None, ge=1)
-    temperature: float | None = Field(default=None, ge=0.0)
-    top_p: float | None = Field(default=None, gt=0.0, le=1.0)
-    # -1 (or 0) disables top-k.
-    top_k: int | None = Field(default=None, ge=-1)
-    # Ignored: every prompt gets one choice.
+    max_tokens: int | None = None
+    max_completion_tokens: int | None = None
+    temperature: float | None = None
+    top_k: int | None = None
+    top_p: float | None = None
     n: int = 1
     stream: bool = False
     stream_options: StreamOptions | None = None
     stop: str | list[str] | None = None
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
     ignore_eos: bool = False
-    # Declared so they can be refused.
     logprobs: int | None = None
     echo: bool = False
     suffix: str | None = None
     logit_bias: dict[str, float] | None = None
-    response_format: dict[str, JsonValue] | None = None
+    response_format: dict[str, Any] | None = None
 
-
-class UsageInfo(BaseModel):
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
-
-
-class ChatResponseMessage(BaseModel):
-    role: Literal["assistant"] = "assistant"
-    content: str
-    reasoning_content: str | None = None
-
-
-class ChatCompletionChoice(BaseModel):
-    index: int = 0
-    message: ChatResponseMessage
-    finish_reason: FinishReason
-
-
-class ChatCompletionResponse(BaseModel):
-    id: str
-    object: Literal["chat.completion"] = "chat.completion"
-    created: int
-    model: str
-    choices: list[ChatCompletionChoice]
-    usage: UsageInfo
-
-
-class DeltaMessage(BaseModel):
-    role: Literal["assistant"] | None = None
-    content: str | None = None
-    reasoning_content: str | None = None
-
-    @model_serializer(mode="wrap")
-    def omit_absent_fields(self, handler: SerializerFunctionWrapHandler) -> dict[str, str]:
-        # A delta carries only the fields that changed.
-        return {key: value for key, value in handler(self).items() if value is not None}
-
-
-class ChatCompletionChunkChoice(BaseModel):
-    index: int = 0
-    delta: DeltaMessage
-    finish_reason: FinishReason | None = None
-
-
-class ChatCompletionChunk(BaseModel):
-    id: str
-    object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
-    created: int
-    model: str
-    choices: list[ChatCompletionChunkChoice]
-    usage: UsageInfo | None = None
-
-
-class CompletionChoice(BaseModel):
-    index: int = 0
-    text: str
-    finish_reason: FinishReason | None = None
-    logprobs: None = None
-
-
-class CompletionResponse(BaseModel):
-    id: str
-    object: Literal["text_completion"] = "text_completion"
-    created: int
-    model: str
-    choices: list[CompletionChoice]
-    usage: UsageInfo
-
-
-class CompletionChunk(BaseModel):
-    id: str
-    object: Literal["text_completion.chunk"] = "text_completion.chunk"
-    created: int
-    model: str
-    choices: list[CompletionChoice]
-    usage: UsageInfo | None = None
+    @model_validator(mode="after")
+    def _sync_max_completion_tokens(self) -> "CompletionRequest":
+        if self.max_completion_tokens is not None:
+            self.max_tokens = self.max_completion_tokens
+        return self
 
 
 class ModelCard(BaseModel):
     id: str
-    object: Literal["model"] = "model"
+    object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "ftmetal"
     root: str
+    # The model's own limit, not the KV budget in force. Two spellings of the same number:
+    # `max_model_len` is vLLM/SGLang's, `context_length` what most other clients look for.
+    max_model_len: int | None = None
+    context_length: int | None = None
+    # The checkpoint's probed effort vocabulary (freetoken.tokenizer.effort); None
+    # (not []) when the model has no effort knob or the probe could not run.
+    supported_reasoning_efforts: list[str] | None = None
+    default_reasoning_effort: str | None = None
 
 
 class ModelList(BaseModel):
-    object: Literal["list"] = "list"
-    data: list[ModelCard]
-
-
-class ErrorInfo(BaseModel):
-    message: str
-    type: str = "invalid_request_error"
-    param: str | None = None
-    code: str | None = None
-
-
-class ErrorResponse(BaseModel):
-    error: ErrorInfo
-
-
-__all__ = [
-    "ChatCompletionChoice",
-    "ChatCompletionChunk",
-    "ChatCompletionChunkChoice",
-    "ChatCompletionRequest",
-    "ChatCompletionResponse",
-    "ChatResponseMessage",
-    "CompletionChoice",
-    "CompletionChunk",
-    "CompletionRequest",
-    "CompletionResponse",
-    "DeltaMessage",
-    "ErrorInfo",
-    "ErrorResponse",
-    "Function",
-    "Message",
-    "ModelCard",
-    "ModelList",
-    "StreamOptions",
-    "TextContentPart",
-    "Tool",
-    "UsageInfo",
-]
+    object: str = "list"
+    data: list[ModelCard] = Field(default_factory=list)

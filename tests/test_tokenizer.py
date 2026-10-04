@@ -21,13 +21,7 @@ from transformers import AutoTokenizer
 
 from ftmetal.core import SamplingParams
 from ftmetal.message.frontend import UserReply
-from ftmetal.message.tokenizer import (
-    ChatMessage,
-    DetokenizeMsg,
-    FinishReason,
-    JsonValue,
-    TokenizeMsg,
-)
+from ftmetal.message.tokenizer import DetokenizeMsg, FinishReason, JsonValue, TokenizeMsg
 from ftmetal.tokenizer import (
     DetokenizeManager,
     TokenizeManager,
@@ -139,7 +133,7 @@ def test_dropped_request_ignores_late_tokens(tiny_model_dir: Path) -> None:
 
 
 def tokenize_msg(
-    messages: list[ChatMessage],
+    messages: list[dict[str, JsonValue]],
     enable_thinking: bool | None = None,
     tools: list[dict[str, JsonValue]] | None = None,
 ) -> TokenizeMsg:
@@ -157,7 +151,7 @@ def tokenize_msg(
 
 def test_chat_template_opens_or_closes_the_think_block(tiny_model_dir: Path) -> None:
     manager = TokenizeManager(str(tiny_model_dir))
-    messages: list[ChatMessage] = [{"role": "user", "content": "hi"}]
+    messages: list[dict[str, JsonValue]] = [{"role": "user", "content": "hi"}]
     thinking = manager.render_prompt(tokenize_msg(messages))
     assert thinking == "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n"
     assert manager.render_prompt(tokenize_msg(messages, enable_thinking=False)).endswith(
@@ -170,7 +164,7 @@ def test_chat_template_opens_or_closes_the_think_block(tiny_model_dir: Path) -> 
 
 def test_chat_template_raises_and_renders_plain_json(tiny_model_dir: Path) -> None:
     manager = TokenizeManager(str(tiny_model_dir))
-    out_of_order: list[ChatMessage] = [
+    out_of_order: list[dict[str, JsonValue]] = [
         {"role": "user", "content": "hi"},
         {"role": "system", "content": "late"},
     ]
@@ -238,7 +232,7 @@ GEMMA_STYLE_SPECIAL_TOKENS = ("<bos>", "<|turn>", "<turn|>", "<|channel>", "<cha
 # Renders a tail only without the generation prompt, so the conversation's encoding is not a
 # prefix of the prompt's.
 UNSTABLE_TEMPLATE_TAIL = "{%- if not add_generation_prompt %}{{- 'x' }}{%- endif %}\n"
-CONVERSATION: list[ChatMessage] = [
+CONVERSATION: list[dict[str, JsonValue]] = [
     {"role": "user", "content": "Hi"},
     {"role": "assistant", "content": "Hello!"},
     {"role": "user", "content": "Again"},
@@ -326,7 +320,7 @@ def test_real_tokenizer_matches_transformers() -> None:
             },
         }
     ]
-    conversations: list[list[ChatMessage]] = [
+    conversations: list[list[dict[str, JsonValue]]] = [
         [{"role": "user", "content": "What is 2 + 3?"}],
         [
             {"role": "system", "content": "Be brief."},

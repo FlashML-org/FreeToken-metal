@@ -10,21 +10,13 @@ multimodal input or cache-rebuild messages.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Required, TypedDict
+from typing import Literal
 
 from pydantic import JsonValue
 
 from ftmetal.core import SamplingParams
 
 FinishReason = Literal["stop", "length"]
-
-
-class ChatMessage(TypedDict, total=False):
-    """One conversation turn as the chat template reads it."""
-
-    role: Required[Literal["system", "user", "assistant"]]
-    content: Required[str]
-    reasoning_content: str
 
 
 @dataclass(kw_only=True)
@@ -58,8 +50,8 @@ class PromptAdmittedMsg(BaseTokenizerMsg):
 @dataclass(kw_only=True)
 class TokenizeMsg(BaseTokenizerMsg):
     uid: int
-    # A raw prompt, or a conversation for the chat template.
-    text: str | list[ChatMessage]
+    # A raw prompt, or a conversation for the chat template: OpenAI-shaped message dicts.
+    text: str | list[dict[str, JsonValue]]
     sampling_params: SamplingParams
     chat_template_kwargs: dict[str, JsonValue] = field(default_factory=dict)
     tools: list[dict[str, JsonValue]] | None = None
@@ -84,7 +76,6 @@ __all__ = [
     "AbortMsg",
     "BaseTokenizerMsg",
     "BatchTokenizerMsg",
-    "ChatMessage",
     "DetokenizeMsg",
     "ErrorReplyMsg",
     "FinishReason",

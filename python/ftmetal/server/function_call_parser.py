@@ -17,8 +17,7 @@
 # pyright: reportOptionalMemberAccess=false, reportAssignmentType=false
 """Tool-call parsing: one detector per model family's tool-call format, one-shot and streamed.
 
-Port of FreeToken server/function_call_parser.py, verbatim apart from formatting and
-absolute imports.
+Port of FreeToken server/function_call_parser.py, verbatim apart from formatting.
 """
 
 import ast
@@ -36,8 +35,8 @@ from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 from pydantic import BaseModel
 
-from ftmetal.server.api_models import Function, Tool
-from ftmetal.server.reasoning_parser import (
+from .api_models import Function, Tool
+from .reasoning_parser import (
     ATEM_CLOSING_TOKENS,
     ATEM_HEADER_SPAN,
     ATEM_INLINE_HEADER_RE,

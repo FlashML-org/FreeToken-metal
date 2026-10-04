@@ -19,11 +19,11 @@ import time
 import urllib.parse
 from collections.abc import Iterator
 
+from pydantic import BaseModel
+
 from ftmetal.env import read_env
 from ftmetal.server.api_models import (
-    ChatCompletionChunk,
     ChatCompletionRequest,
-    ErrorResponse,
     Message,
     ModelList,
     StreamOptions,
@@ -44,6 +44,38 @@ SHELL_HELP = """/think   toggle thinking (on by default)
 
 class ShellError(Exception):
     """The server refused or failed a request; the message is printed as is."""
+
+
+class ChunkUsage(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+
+
+class ChunkDelta(BaseModel):
+    content: str | None = None
+    reasoning_content: str | None = None
+
+
+class ChunkChoice(BaseModel):
+    delta: ChunkDelta
+    finish_reason: str | None = None
+
+
+class ChatCompletionChunk(BaseModel):
+    """The fields of a chat.completion.chunk event the shell reads."""
+
+    choices: list[ChunkChoice]
+    usage: ChunkUsage | None = None
+
+
+class StreamErrorInfo(BaseModel):
+    message: str
+
+
+class StreamError(BaseModel):
+    """The error event a stream ends with when its request fails."""
+
+    error: StreamErrorInfo
 
 
 def open_connection(server_url: str) -> http.client.HTTPConnection:
@@ -84,7 +116,7 @@ def stream_chat(server_url: str, request: ChatCompletionRequest) -> Iterator[Cha
                 return
             event = json.loads(payload)
             if isinstance(event, dict) and "error" in event:
-                raise ShellError(ErrorResponse.model_validate(event).error.message)
+                raise ShellError(StreamError.model_validate(event).error.message)
             yield ChatCompletionChunk.model_validate(event)
     finally:
         connection.close()

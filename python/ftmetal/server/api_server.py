@@ -1,28 +1,38 @@
-"""The FastAPI app and the two threads behind it: the tokenizer worker and the scheduler.
+"""The FastAPI app, the frontend state its routes share, and the two threads behind it: the
+tokenizer worker and the scheduler.
 
-Port of FreeToken server/api_server.py (app, lifespan, run_api_server, /generate), with
-the message loops of tokenizer/server.py (tokenize_worker) and of scheduler/scheduler.py
-(run_forever and its message handling). Divergences: one process; the tokenizer worker
-and the scheduler are threads fed by queue.Queue instead of processes over ZMQ, and
-the scheduler thread is the only MLX caller; the scheduler is built before the server
-accepts requests (no loading gate); a stop string matched by the detokenizer aborts
-the request; aborts are not acknowledged, because decode state is created at
-tokenization and dropped at the abort, so late tokens have nothing to attach to; no
-supervisor, stats, CORS, control or accounting routes.
+Port of FreeToken server/api_server.py (FrontendManager, app, lifespan, run_api_server,
+/generate), with the message loops of tokenizer/server.py (tokenize_worker) and of
+scheduler/scheduler.py (run_forever and its message handling). Divergences: one process;
+the tokenizer worker and the scheduler are threads fed by queue.Queue instead of processes
+over ZMQ, and the scheduler thread is the only MLX caller; replies reach the event loop
+through call_soon_threadsafe and wait per request on an asyncio.Queue; the scheduler is
+built before the server accepts requests, so maintenance_state is "serving" while both
+threads run and "failed" once one has died (no loading gate, no cache rebuild); new_user
+refuses with EngineUnavailableError, answered 503 as FreeToken answers a closed admission;
+closing a request's reply stream before its terminal reply also aborts it, and an abort is
+sent once; /generate reports a failed request as an {"error": ...} event before [DONE]; a
+stop string matched by the detokenizer aborts the request; aborts are not acknowledged,
+because decode state is created at tokenization and dropped at the abort, so late tokens
+have nothing to attach to; no supervisor, stats, CORS, control, accounting or cache routes
+and no request log.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import queue
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from concurrent.futures import Future
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from typing import Literal
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from jinja2 import TemplateError
 from pydantic import BaseModel
@@ -47,7 +57,6 @@ from ftmetal.message.tokenizer import (
 )
 from ftmetal.scheduler.scheduler import Scheduler
 from ftmetal.server.args import ServerArgs
-from ftmetal.server.generation import EngineUnavailableError, FrontendManager
 from ftmetal.server.openai_api import register_openai_routes
 from ftmetal.tokenizer import (
     DetokenizeManager,
@@ -57,6 +66,113 @@ from ftmetal.tokenizer import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class EngineUnavailableError(RuntimeError):
+    """The scheduler or tokenizer thread is not running, so no request can be admitted."""
+
+
+@dataclass(kw_only=True)
+class FrontendManager:
+    config: ServerArgs
+    # The tokenizer worker's inbox; None stops it.
+    send_tokenizer: queue.Queue[BaseTokenizerMsg | None]
+    # Set by the lifespan once the scheduler thread is up.
+    loop: asyncio.AbstractEventLoop | None = None
+    backend_threads: list[threading.Thread] = field(default_factory=list)
+    uid_counter: int = 0
+    ack_map: dict[int, asyncio.Queue[UserReply]] = field(default_factory=dict)
+    # The frontend's own TokenizeManager (count_tokens, the render check before a stream),
+    # built on first use; the worker's stays on its thread.
+    frontend_tokenize_manager: TokenizeManager | None = None
+    frontend_tokenizer_lock: threading.Lock = field(default_factory=threading.Lock)
+
+    @property
+    def maintenance_state(self) -> Literal["serving", "failed"]:
+        alive = bool(self.backend_threads) and all(
+            thread.is_alive() for thread in self.backend_threads
+        )
+        return "serving" if alive else "failed"
+
+    def frontend_tokenizer(self) -> TokenizeManager:
+        """Built and cached on first use; called from a worker thread, never the event loop."""
+        with self.frontend_tokenizer_lock:
+            if self.frontend_tokenize_manager is None:
+                self.frontend_tokenize_manager = TokenizeManager(self.config.model_path)
+            return self.frontend_tokenize_manager
+
+    def new_user(self) -> int:
+        if self.maintenance_state != "serving":
+            raise EngineUnavailableError(f"server unavailable: engine is {self.maintenance_state}")
+        uid = self.uid_counter
+        self.uid_counter += 1
+        self.ack_map[uid] = asyncio.Queue()
+        return uid
+
+    async def send_one(self, msg: BaseTokenizerMsg) -> None:
+        self.send_tokenizer.put(msg)
+
+    def post(self, msg: BaseFrontendMsg) -> None:
+        """Hand replies to the event loop; called from the tokenizer thread."""
+        assert self.loop is not None
+        self.loop.call_soon_threadsafe(self.deliver, msg)
+
+    def deliver(self, msg: BaseFrontendMsg) -> None:
+        replies = msg.data if isinstance(msg, BatchFrontendMsg) else [msg]
+        for reply in replies:
+            assert isinstance(reply, UserReply)
+            # A request whose stream closed has left the map; its late replies drop.
+            pending = self.ack_map.get(reply.uid)
+            if pending is not None:
+                pending.put_nowait(reply)
+
+    async def wait_for_ack(self, uid: int) -> AsyncGenerator[UserReply]:
+        """uid's replies up to the terminal one; closing the stream earlier aborts uid."""
+        pending = self.ack_map[uid]
+        finished = False
+        try:
+            while not finished:
+                reply = await pending.get()
+                finished = reply.finished
+                yield reply
+        finally:
+            if self.ack_map.pop(uid, None) is not None and not finished:
+                self.send_tokenizer.put(AbortMsg(uid=uid))
+
+    async def stream_generate(self, uid: int) -> AsyncGenerator[bytes]:
+        """uid's raw text as {"text": ...} server-sent events, then [DONE]."""
+        async for ack in self.wait_for_ack(uid):
+            if ack.error is not None:
+                event = json.dumps({"error": ack.error}, ensure_ascii=False)
+                yield f"data: {event}\n\n".encode()
+            elif ack.incremental_output:
+                # SSE: JSON-encode (so a newline inside a token can't break the frame)
+                # and terminate every event with a blank line.
+                event = json.dumps({"text": ack.incremental_output}, ensure_ascii=False)
+                yield f"data: {event}\n\n".encode()
+            if ack.finished:
+                break
+        yield b"data: [DONE]\n\n"
+
+    async def stream_with_cancellation(
+        self, generator: AsyncIterator[bytes | str], request: Request, uid: int
+    ) -> AsyncGenerator[bytes | str]:
+        try:
+            async for chunk in generator:
+                # detect if the client has disconnected
+                if await request.is_disconnected():
+                    logger.info(f"client disconnected for request {uid}")
+                    raise asyncio.CancelledError
+                yield chunk
+        except asyncio.CancelledError:
+            asyncio.create_task(self.abort_user(uid))
+            raise
+
+    async def abort_user(self, uid: int) -> None:
+        await asyncio.sleep(0.1)
+        if self.ack_map.pop(uid, None) is not None:
+            logger.warning(f"aborting request {uid}")
+            await self.send_one(AbortMsg(uid=uid))
 
 
 class GenerateRequest(BaseModel):
@@ -203,24 +319,35 @@ def create_app(config: ServerArgs) -> FastAPI:
         recv_tokenizer.put(None)
         await asyncio.to_thread(tokenizer_thread.join)
 
+    defaults = load_sampling_defaults(config.model_path)
+    model_sampling: dict[str, float | int] = {
+        "temperature": defaults.temperature,
+        "top_k": defaults.top_k,
+        "top_p": defaults.top_p,
+    }
     app = FastAPI(title="ftmetal", version=__version__, lifespan=lifespan)
-    register_openai_routes(app, frontend, config, load_sampling_defaults(config.model_path))
+    register_openai_routes(app, lambda: frontend, lambda: model_sampling)
+
+    @app.exception_handler(EngineUnavailableError)
+    async def engine_unavailable(request: Request, exc: EngineUnavailableError) -> JSONResponse:
+        return JSONResponse(status_code=503, content={"error": str(exc)})
 
     @app.post("/generate", response_model=None)
-    async def generate(req: GenerateRequest) -> StreamingResponse | JSONResponse:
+    async def generate(req: GenerateRequest, request: Request) -> StreamingResponse | JSONResponse:
         """A raw prompt sampled with the framework defaults, streamed as {"text": ...} events."""
-        # No maintenance-state 503: this engine has no cache rebuild to wait out.
         if req.max_tokens < 1:
             return JSONResponse(
                 {"error": f"max_tokens must be at least 1, got {req.max_tokens}"}, status_code=400
             )
-        try:
-            uid = frontend.new_user()
-        except EngineUnavailableError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=503)
+        uid = frontend.new_user()
         sampling_params = SamplingParams(ignore_eos=req.ignore_eos, max_tokens=req.max_tokens)
-        frontend.send_one(TokenizeMsg(uid=uid, text=req.prompt, sampling_params=sampling_params))
-        return StreamingResponse(frontend.stream_generate(uid), media_type="text/event-stream")
+        await frontend.send_one(
+            TokenizeMsg(uid=uid, text=req.prompt, sampling_params=sampling_params)
+        )
+        return StreamingResponse(
+            frontend.stream_with_cancellation(frontend.stream_generate(uid), request, uid),
+            media_type="text/event-stream",
+        )
 
     return app
 
@@ -229,4 +356,12 @@ def run_api_server(config: ServerArgs) -> None:
     uvicorn.run(create_app(config), host=config.server_host, port=config.server_port)
 
 
-__all__ = ["GenerateRequest", "create_app", "run_api_server", "run_scheduler", "run_tokenizer"]
+__all__ = [
+    "EngineUnavailableError",
+    "FrontendManager",
+    "GenerateRequest",
+    "create_app",
+    "run_api_server",
+    "run_scheduler",
+    "run_tokenizer",
+]

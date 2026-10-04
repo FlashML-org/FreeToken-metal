@@ -63,6 +63,10 @@ class ServerArgs(EngineConfig):
     reasoning_parser: str | None = None
     # max_tokens of a request that omits it; the scheduler clamps it to the context left.
     max_output_tokens: int = 32768
+    # Report the prefix-cache hit in each response's usage block (OpenAI
+    # prompt_tokens_details.cached_tokens, Anthropic cache_read_input_tokens, Responses
+    # input_tokens_details.cached_tokens).
+    enable_cache_report: bool = False
 
 
 def positive_int(value: str) -> int:
@@ -255,6 +259,12 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         "FTMETAL_COMMAND_GRAPH=0/1 decides (default 1)",
     )
     parser.add_argument(
+        "--enable-cache-report",
+        action="store_true",
+        help="report the prompt tokens served from the prefix cache in each response's usage "
+        "(on /v1/messages input_tokens then excludes them, as Anthropic bills)",
+    )
+    parser.add_argument(
         "--tool-call-parser",
         choices=TOOL_CALL_PARSER_CHOICES,
         default="auto",
@@ -288,6 +298,7 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         ),
         tool_call_parser=tool_call_parser,
         reasoning_parser=reasoning_parser,
+        enable_cache_report=namespace.enable_cache_report,
         server_host=namespace.server_host,
         server_port=namespace.server_port,
         max_running_req=namespace.max_running_req,
