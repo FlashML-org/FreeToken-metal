@@ -123,6 +123,8 @@ class Scheduler:
         )
         # Results not yet taken by the caller (run_forever forwards them as messages).
         self.results: list[TokenEvent] = []
+        # Prompts whose first prefill batch is prepared, not yet reported by run_forever.
+        self.prompt_admissions: list[PromptAdmittedMsg] = []
         # Requests whose tokens may still come; reported as failed if run_forever dies.
         self.live_uids: set[int] = set()
         # The launched-but-not-drained batch (overlap). An abort of one of its requests only
@@ -248,9 +250,6 @@ class Scheduler:
                         )
                     else:
                         self.live_uids.add(msg.uid)
-                        replies.append(
-                            PromptAdmittedMsg(uid=msg.uid, prompt_tokens=len(msg.input_ids))
-                        )
                 elif isinstance(msg, AbortBackendMsg):
                     self.abort_request(msg.uid)
                     self.live_uids.discard(msg.uid)
@@ -258,6 +257,8 @@ class Scheduler:
                     raise NotImplementedError(f"unexpected backend message {msg!r}")
 
             data = self.overlap_loop(data)
+            replies.extend(self.prompt_admissions)
+            self.prompt_admissions = []
             for event in self.take_results():
                 replies.append(
                     DetokenizeMsg(
@@ -300,7 +301,13 @@ class Scheduler:
         )
         if batch is None:
             return None
-        return self.prepare_batch(batch)
+        forward_input = self.prepare_batch(batch)
+        # Reported only once the batch is prepared, so a prompt is admitted exactly once.
+        self.prompt_admissions.extend(
+            PromptAdmittedMsg(uid=uid, prompt_tokens=prompt_tokens, cached_tokens=cached_tokens)
+            for uid, prompt_tokens, cached_tokens in batch.prompt_admissions
+        )
+        return forward_input
 
     def prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)

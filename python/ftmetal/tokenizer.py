@@ -8,7 +8,8 @@ request; a request's decode state is created when its prompt is tokenized, so to
 that arrive after a stop, an abort or an error are dropped; text ending in a partial
 UTF-8 character is held back whole, and flushed as is when the request finishes; a
 conversation's reusable prefix ends where its rendering without the generation prompt
-does, when that encoding is a prefix of the prompt's (FreeToken has no such boundary).
+does, when that encoding is a prefix of the prompt's (FreeToken has no such boundary);
+resolve_thinking_mode is FreeToken's, for the reasoning parser's force_reasoning.
 
 A raw prompt gets the special tokens tokenizer.json's post-processor adds, which is what
 transformers 5 adds for FreeToken: none for Qwen3.6, and none for Gemma4 either (its
@@ -22,7 +23,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import NoReturn
+from typing import Literal, NoReturn
 
 import numpy as np
 from jinja2 import TemplateError
@@ -95,6 +96,19 @@ def load_sampling_defaults(model_path: str) -> SamplingParams:
             top_k=top_k if isinstance(top_k, int) else framework.top_k,
             top_p=float(top_p) if isinstance(top_p, int | float) else framework.top_p,
         )
+
+
+def resolve_thinking_mode(
+    chat_template_kwargs: dict[str, JsonValue] | None, tools: list[dict[str, JsonValue]] | None
+) -> Literal["thinking", "chat"]:
+    """Whether a chat request thinks: when tools are offered or chat_template_kwargs asks."""
+    ctk = chat_template_kwargs or {}
+    if tools or ctk.get("enable_thinking") or ctk.get("thinking"):
+        return "thinking"
+    elif ctk.get("thinking_mode") == "thinking":
+        return "thinking"
+    else:
+        return "chat"
 
 
 def raise_exception(message: str) -> NoReturn:
@@ -277,6 +291,7 @@ __all__ = [
     "load_sampling_defaults",
     "raise_exception",
     "read_json_object",
+    "resolve_thinking_mode",
     "stop_prefix_holdback",
     "tojson",
 ]

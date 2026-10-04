@@ -3,29 +3,20 @@ admissions, aborts and scheduler errors.
 
 Port of FreeToken message/tokenizer.py. Divergences: plain dataclasses passed over
 queue.Queue (no ZMQ encoder/decoder); stop strings are matched by the detokenizer, so
-DetokenizeMsg carries neither matched_stop nor stop_strs; PromptAdmittedMsg is sent
-when the scheduler accepts the request and has no cached_tokens (no prefix cache); no
-pool-usage snapshot, multimodal input or cache-rebuild messages.
+DetokenizeMsg carries neither matched_stop nor stop_strs; no pool-usage snapshot,
+multimodal input or cache-rebuild messages.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Required, TypedDict
+from typing import Literal
 
 from pydantic import JsonValue
 
 from ftmetal.core import SamplingParams
 
 FinishReason = Literal["stop", "length"]
-
-
-class ChatMessage(TypedDict, total=False):
-    """One conversation turn as the chat template reads it."""
-
-    role: Required[Literal["system", "user", "assistant"]]
-    content: Required[str]
-    reasoning_content: str
 
 
 @dataclass(kw_only=True)
@@ -48,15 +39,19 @@ class DetokenizeMsg(BaseTokenizerMsg):
 
 @dataclass(kw_only=True)
 class PromptAdmittedMsg(BaseTokenizerMsg):
+    """Sent once per request, after its first prefill batch is prepared."""
+
     uid: int
     prompt_tokens: int
+    # The prefix-cache hit: prompt tokens served from the cache instead of recomputed.
+    cached_tokens: int = 0
 
 
 @dataclass(kw_only=True)
 class TokenizeMsg(BaseTokenizerMsg):
     uid: int
-    # A raw prompt, or a conversation for the chat template.
-    text: str | list[ChatMessage]
+    # A raw prompt, or a conversation for the chat template: OpenAI-shaped message dicts.
+    text: str | list[dict[str, JsonValue]]
     sampling_params: SamplingParams
     chat_template_kwargs: dict[str, JsonValue] = field(default_factory=dict)
     tools: list[dict[str, JsonValue]] | None = None
@@ -81,7 +76,6 @@ __all__ = [
     "AbortMsg",
     "BaseTokenizerMsg",
     "BatchTokenizerMsg",
-    "ChatMessage",
     "DetokenizeMsg",
     "ErrorReplyMsg",
     "FinishReason",

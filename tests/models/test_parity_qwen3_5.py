@@ -14,11 +14,12 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
+from pydantic import JsonValue
 
 from ftmetal.core import SamplingParams
 from ftmetal.engine.config import CacheTypeChoice, EngineConfig
 from ftmetal.message.backend import UserMsg
-from ftmetal.message.tokenizer import ChatMessage, TokenizeMsg
+from ftmetal.message.tokenizer import TokenizeMsg
 from ftmetal.scheduler.scheduler import Scheduler
 from ftmetal.tokenizer import TokenizeManager
 from tiny_model import TINY_TEXT_CONFIG, build_reference, reference_greedy, save_checkpoint
@@ -249,8 +250,8 @@ def test_next_chat_turn_resumes_below_the_generation_suffix(tiny_model_dir: Path
     model = build_reference(seed=8, text_config={**TINY_TEXT_CONFIG, "vocab_size": 512})
     save_checkpoint(model, tiny_model_dir, quantization=None)
     tokenize_manager = TokenizeManager(str(tiny_model_dir))
-    first: list[ChatMessage] = [{"role": "user", "content": "abcd" * 27}]
-    second: list[ChatMessage] = [
+    first: list[dict[str, JsonValue]] = [{"role": "user", "content": "abcd" * 27}]
+    second: list[dict[str, JsonValue]] = [
         *first,
         {"role": "assistant", "content": "a short reply"},
         {"role": "user", "content": "and a follow-up question"},

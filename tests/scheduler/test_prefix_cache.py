@@ -6,7 +6,8 @@ greedily to what mlx-lm produces alone; so must every request while both currenc
 evicted under a small page and slot budget. The tiny model's greedy tokens hardly depend
 on the GDN state, so a hit's prefill logits are also held to mlx-lm's at 1e-4. Without
 linear layers the engine takes the plain radix cache, held to the same contract. A GDN
-snapshot cache smaller than one conversation's snapshots fails at startup.
+snapshot cache smaller than one conversation's snapshots fails at startup. A prompt is
+reported admitted once, with the prefix its first chunk found cached.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from mlx_lm.models import qwen3_5 as reference
 from ftmetal.attention.linear import SNAPSHOT_STRIDE
 from ftmetal.core import SamplingParams
 from ftmetal.engine.config import CacheTypeChoice, EngineConfig
+from ftmetal.message.tokenizer import PromptAdmittedMsg
 from ftmetal.scheduler.scheduler import Scheduler
 from tiny_model import (
     TINY_FULL_ATTENTION_CONFIG,
@@ -190,6 +192,11 @@ def test_chunked_prompt_commits_its_last_tracked_snapshot(tmp_path: Path) -> Non
     scheduler = make_scheduler(tmp_path, max_extend_tokens=128)
     assert run_alone(scheduler, 0, prompt) == (0, expected)
     assert run_alone(scheduler, 1, prompt) == (192, expected)
+    # Each prompt is admitted once, at its first chunk, with the hit that chunk found.
+    assert scheduler.prompt_admissions == [
+        PromptAdmittedMsg(uid=0, prompt_tokens=300, cached_tokens=0),
+        PromptAdmittedMsg(uid=1, prompt_tokens=300, cached_tokens=192),
+    ]
     assert_hit_logits_match(scheduler, model, prompt, 256)
 
 

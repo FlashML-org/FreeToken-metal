@@ -1,1 +1,2 @@
-"""HTTP server: the OpenAI API over the tokenizer worker and the scheduler threads."""
+"""HTTP server: the OpenAI, Anthropic and Responses APIs over the tokenizer worker and
+the scheduler threads."""

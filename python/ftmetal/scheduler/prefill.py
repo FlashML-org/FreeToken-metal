@@ -270,7 +270,9 @@ class PrefillManager:
         )
         reqs: list[Req] = []
         chunked_list: list[PendingReq] = []
+        prompt_admissions: list[tuple[int, int, int]] = []
         for pending in self.pending_list:
+            is_continuation = pending.chunked_req is not None
             req = adder.try_add_one(pending)
             if req is None:
                 break
@@ -279,10 +281,14 @@ class PrefillManager:
                 pending.chunked_req = req
                 chunked_list.append(pending)
             reqs.append(req)
+            if not is_continuation:
+                prompt_admissions.append((req.uid, pending.input_len, req.cached_len))
         if not reqs:
             return None
         self.pending_list = chunked_list + self.pending_list[len(reqs) :]
-        return Batch(reqs=reqs, phase="prefill")
+        batch = Batch(reqs=reqs, phase="prefill")
+        batch.prompt_admissions = prompt_admissions
+        return batch
 
     def abort_req(self, uid: int) -> Req | None:
         for i, pending in enumerate(self.pending_list):

@@ -1,59 +1,562 @@
-"""OpenAI routes: POST /v1/chat/completions and /v1/completions, streamed or not, and
-GET /v1/models.
+"""OpenAI routes: /v1 (liveness), POST /v1/chat/completions and /v1/completions, streamed
+or not, and GET /v1/models.
 
-Port of FreeToken server/openai_api.py. Divergences: chat completions, completions and
-the model list only; tools, images, reasoning_effort and the thinking field are refused
-or ignored (thinking is toggled through chat_template_kwargs.enable_thinking); no
-maintenance gate or request log. As in FreeToken, a completion prompt is raw text with no
-chat template or reasoning split, n is ignored (one choice per prompt), and several
-prompts run one after another.
+Port of FreeToken server/openai_api.py. Divergences: reasoning_effort is refused (the effort
+vocabulary is not ported, see model_meta), so /v1/models carries no effort fields; no
+request log.
 """
+
+# Comments and docstrings keep FreeToken's line breaks.
+# ruff: noqa: E501
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
-from collections.abc import AsyncGenerator
-from contextlib import aclosing
+from collections.abc import AsyncIterator, Callable
+from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
 
 from ftmetal.core import SamplingParams
-from ftmetal.message.tokenizer import ChatMessage, FinishReason, TokenizeMsg
-from ftmetal.server.api_models import (
-    ChatCompletionChoice,
-    ChatCompletionChunk,
-    ChatCompletionChunkChoice,
+from ftmetal.message.tokenizer import TokenizeMsg
+
+from .api_models import (
     ChatCompletionRequest,
-    ChatCompletionResponse,
-    ChatResponseMessage,
-    CompletionChoice,
-    CompletionChunk,
     CompletionRequest,
-    CompletionResponse,
-    DeltaMessage,
-    ErrorInfo,
-    ErrorResponse,
-    Message,
     ModelCard,
     ModelList,
-    UsageInfo,
+    ToolChoiceObject,
 )
-from ftmetal.server.args import ServerArgs
-from ftmetal.server.generation import (
+from .function_call_parser import ToolCallItem
+from .generation import (
+    DEFAULT_MAX_OUTPUT_TOKENS,
     ContentDelta,
-    EngineUnavailableError,
-    FrontendManager,
+    GenDone,
     GenerationError,
     GenSpec,
     ReasoningDelta,
+    ToolCallArgsDelta,
+    ToolCallsDelta,
+    ToolCallStart,
     generate_events,
     generate_full,
+    prerender_error,
+    render_messages,
     resolve_sampling,
     submit_generation,
 )
+
+
+def _thinking_type(req: Any) -> str | None:
+    """The DeepSeek-wire thinking toggle, or None for absent/foreign shapes
+    (which stay ignored, as extra="allow" ignored them before the field existed)."""
+    if isinstance(req.thinking, dict):
+        value = req.thinking.get("type")
+        if value in ("enabled", "disabled"):
+            return value
+    return None
+
+
+def chat_request_to_genspec(
+    req: ChatCompletionRequest,
+    model_sampling: dict[str, Any],
+    default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+) -> GenSpec:
+    """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params')."""
+    from .model_meta import effort_toggle_kwargs
+
+    ctk = req.chat_template_kwargs
+    thinking_type = _thinking_type(req)
+    if req.reasoning_effort or thinking_type:
+        ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
+    return GenSpec(
+        messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
+        sampling_params=resolve_sampling(
+            temperature=req.temperature,
+            top_k=req.top_k,
+            top_p=req.top_p,
+            max_tokens=req.max_tokens,
+            ignore_eos=req.ignore_eos,
+            model_sampling=model_sampling,
+            stop=req.stop,
+            default_max_tokens=default_max_tokens,
+        ),
+        chat_template_kwargs=ctk,
+        template_tools=_tools_for_template(req),
+        parser_tools=(_all_tool_dicts(req.tools) if _should_parse_tools(req) else None),
+    )
+
+
+def _all_tool_dicts(tools) -> list[dict[str, Any]]:
+    return [t.model_dump(exclude_none=True) for t in (tools or [])]
+
+
+def _maintenance_gate(state: Any) -> JSONResponse | None:
+    """503 while the engine is not serving. Distinguishes the startup "loading" phase from a
+    runtime cache "rebuild"/"failed" so clients (and the desktop) get an actionable message.
+    None when serving."""
+    mstate = getattr(state, "maintenance_state", "serving")
+    if mstate == "serving":
+        return None
+    if mstate == "loading":
+        msg = "model is still loading"
+    elif mstate == "failed":
+        msg = "server unavailable: maintenance failed (restart required)"
+    else:
+        msg = "server unavailable: cache rebuild in progress"
+    return JSONResponse({"error": msg}, status_code=503)
+
+
+def register_openai_routes(
+    app: FastAPI,
+    get_state: Callable[[], Any],
+    get_model_sampling: Callable[[], dict[str, Any]],
+) -> None:
+    @app.api_route("/v1", methods=["GET", "POST", "HEAD", "OPTIONS"])
+    async def v1_root():
+        return {"status": "ok"}
+
+    @app.post("/v1/chat/completions")
+    async def v1_chat_completions(req: ChatCompletionRequest, request: Request):
+        state = get_state()
+        if (gate := _maintenance_gate(state)) is not None:
+            return gate
+        return await handle_chat_completion(req, request, state, get_model_sampling())
+
+    @app.post("/v1/completions")
+    async def v1_completions(req: CompletionRequest, request: Request):
+        state = get_state()
+        if (gate := _maintenance_gate(state)) is not None:
+            return gate
+        return await handle_completion(req, request, state, get_model_sampling())
+
+    @app.get("/v1/models")
+    async def v1_models():
+        state = get_state()
+        model_id = _served_model_name(state)
+        ctx = _model_context_length(state)
+        return ModelList(
+            data=[
+                ModelCard(
+                    id=model_id,
+                    root=state.config.model_path,
+                    max_model_len=ctx,
+                    context_length=ctx,
+                )
+            ]
+        )
+
+
+async def handle_chat_completion(
+    req: ChatCompletionRequest,
+    request: Request | None,
+    state: Any,
+    model_sampling: dict[str, Any],
+):
+    if req.function_call is not None:
+        return create_error_response(
+            "function_call is not supported; use tools/tool_choice instead"
+        )
+    if req.logit_bias is not None:
+        return create_error_response("logit_bias is not supported")
+    if _response_format_unsupported(req.response_format):
+        return create_error_response(
+            "response_format json_object/json_schema is not supported (no constrained decoding)",
+            param="response_format",
+        )
+    if req.n != 1:
+        return create_error_response("Only n=1 is supported", param="n")
+    if req.reasoning_effort is not None:
+        return create_error_response(
+            "reasoning_effort is not supported; toggle thinking with "
+            "chat_template_kwargs.enable_thinking or thinking.type",
+            param="reasoning_effort",
+        )
+    if isinstance(req.thinking, dict):
+        thinking_type = req.thinking.get("type")
+        if thinking_type is not None and thinking_type not in ("enabled", "disabled"):
+            return create_error_response(
+                f"thinking.type must be 'enabled' or 'disabled'; got {thinking_type!r}",
+                param="thinking",
+            )
+
+    try:
+        default_max_tokens = (
+            getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
+        )
+        spec = chat_request_to_genspec(req, model_sampling, default_max_tokens=default_max_tokens)
+    except ValueError as exc:
+        return create_error_response(str(exc))
+
+    if req.stream:
+        # Non-stream requests already surface render failures as a clean 400
+        # through GenerationError; only the stream path needs the pre-check.
+        err = await prerender_error(spec, state)
+        if err is not None:
+            return create_error_response(str(err), code=err.code)
+
+    try:
+        uid = await submit_generation(spec, state)
+    except GenerationError as exc:
+        return create_error_response(str(exc), code=exc.code)
+
+    if req.stream:
+        chunks = stream_chat_completion_chunks(uid, req, state, spec)
+        if request is not None:
+            chunks = state.stream_with_cancellation(chunks, request, uid)
+        return StreamingResponse(chunks, media_type="text/event-stream")
+
+    try:
+        result = await generate_full(uid, spec, state, source="/v1/chat/completions")
+    except GenerationError as exc:
+        return create_error_response(str(exc), code=exc.code)
+    message: dict[str, Any] = {"role": "assistant", "content": result.content}
+    if result.reasoning:
+        message["reasoning_content"] = result.reasoning
+    if result.tool_calls:
+        message["tool_calls"] = _tool_calls_to_openai(result.tool_calls)
+
+    return {
+        "id": f"chatcmpl-{uid}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": req.model,
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": result.finish_reason,
+            }
+        ],
+        "usage": _usage(
+            result.prompt_tokens,
+            result.completion_tokens,
+            _reported_cached(state, result.cached_tokens),
+        ),
+    }
+
+
+async def stream_chat_completion_chunks(
+    uid: int,
+    req: ChatCompletionRequest,
+    state: Any,
+    spec: GenSpec | None = None,
+) -> AsyncIterator[bytes]:
+    """Format generate_events() into the OpenAI chat.completion.chunk SSE stream."""
+    if spec is None:
+        spec = chat_request_to_genspec(req, {})
+    yield _sse(
+        _chat_chunk(
+            req,
+            uid,
+            [{"delta": {"role": "assistant", "content": ""}, "index": 0, "finish_reason": None}],
+        )
+    )
+
+    prompt_tokens = 0
+    completion_tokens = 0
+    cached_tokens = 0
+    tool_calls_sent = 0
+    open_tool: dict[str, Any] | None = None
+    events = generate_events(uid, spec, state, source="/v1/chat/completions")
+    while True:
+        try:
+            ev = await events.__anext__()
+        except StopAsyncIteration:
+            break
+        except GenerationError as exc:
+            # Request failed before producing output — emit an error chunk + [DONE] so the
+            # client gets a terminal signal instead of a stalled stream.
+            yield _sse(
+                {"error": {"message": str(exc), "type": "invalid_request_error", "code": exc.code}}
+            )
+            break
+        if isinstance(ev, ReasoningDelta):
+            yield _sse(
+                _chat_chunk(
+                    req,
+                    uid,
+                    [{"delta": {"reasoning_content": ev.text}, "index": 0, "finish_reason": None}],
+                )
+            )
+        elif isinstance(ev, ContentDelta):
+            yield _sse(
+                _chat_chunk(
+                    req,
+                    uid,
+                    [{"delta": {"content": ev.text}, "index": 0, "finish_reason": None}],
+                )
+            )
+        elif isinstance(ev, ToolCallStart):
+            open_tool = {
+                "index": tool_calls_sent,
+                "ordinal": ev.tool_index,
+                "sent": "",
+                "stable": ev.args_prefix_stable,
+            }
+            yield _sse(
+                _chat_chunk(
+                    req,
+                    uid,
+                    [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": open_tool["index"],
+                                        "id": _tool_call_id(ev.name, open_tool["index"]),
+                                        "type": "function",
+                                        "function": {"name": ev.name, "arguments": ""},
+                                    }
+                                ]
+                            },
+                            "index": 0,
+                            "finish_reason": None,
+                        }
+                    ],
+                )
+            )
+        elif isinstance(ev, ToolCallArgsDelta):
+            # Clients concatenate argument fragments, so only prefix-stable
+            # fragments stream; otherwise the full arguments arrive at close.
+            if open_tool is not None and open_tool["stable"] and ev.fragment:
+                open_tool["sent"] += ev.fragment
+                yield _sse(
+                    _chat_chunk(
+                        req,
+                        uid,
+                        [
+                            {
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": open_tool["index"],
+                                            "function": {"arguments": ev.fragment},
+                                        }
+                                    ]
+                                },
+                                "index": 0,
+                                "finish_reason": None,
+                            }
+                        ],
+                    )
+                )
+        elif isinstance(ev, ToolCallsDelta):
+            for call in ev.calls:
+                if open_tool is not None and open_tool["ordinal"] == call.tool_index:
+                    # Close of a ToolCallStart-opened call: send whatever of the
+                    # final (authoritative) arguments wasn't streamed yet.
+                    final = call.parameters or ""
+                    remainder = (
+                        final[len(open_tool["sent"]) :]
+                        if final.startswith(open_tool["sent"])
+                        else final
+                        if not open_tool["sent"]
+                        else ""
+                    )
+                    if remainder:
+                        yield _sse(
+                            _chat_chunk(
+                                req,
+                                uid,
+                                [
+                                    {
+                                        "delta": {
+                                            "tool_calls": [
+                                                {
+                                                    "index": open_tool["index"],
+                                                    "function": {"arguments": remainder},
+                                                }
+                                            ]
+                                        },
+                                        "index": 0,
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            )
+                        )
+                    open_tool = None
+                    tool_calls_sent += 1
+                    continue
+                # Standalone complete call (buffered fallback path).
+                for delta in _tool_call_deltas([call], start_index=tool_calls_sent):
+                    yield _sse(
+                        _chat_chunk(
+                            req,
+                            uid,
+                            [{"delta": {"tool_calls": [delta]}, "index": 0, "finish_reason": None}],
+                        )
+                    )
+                tool_calls_sent += 1
+        elif isinstance(ev, GenDone):
+            prompt_tokens = ev.prompt_tokens
+            completion_tokens = ev.completion_tokens
+            cached_tokens = ev.cached_tokens
+            yield _sse(
+                _chat_chunk(
+                    req, uid, [{"delta": {}, "index": 0, "finish_reason": ev.finish_reason}]
+                )
+            )
+
+    if req.stream_options and req.stream_options.include_usage:
+        yield _sse(
+            {
+                "id": f"chatcmpl-{uid}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": req.model,
+                "choices": [],
+                "usage": _usage(
+                    prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)
+                ),
+            }
+        )
+
+    yield b"data: [DONE]\n\n"
+
+
+async def handle_completion(
+    req: CompletionRequest,
+    request: Request | None,
+    state: Any,
+    model_sampling: dict[str, Any],
+):
+    unsupported = _completion_unsupported_reason(req)
+    if unsupported is not None:
+        return create_error_response(unsupported)
+    try:  # surfaces an out-of-range max_tokens as a 400 rather than a 500 from the worker
+        default_max_tokens = (
+            getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
+        )
+        _resolve_sampling(req, model_sampling, default_max_tokens=default_max_tokens)
+    except ValueError as exc:
+        return create_error_response(str(exc), param="max_tokens")
+
+    prompts = [req.prompt] if isinstance(req.prompt, str) else req.prompt
+    assert isinstance(prompts, list)
+    if req.stream:
+        if len(prompts) != 1:
+            return create_error_response("Streaming completions only support a single text prompt")
+        uid = state.new_user()
+        await state.send_one(
+            TokenizeMsg(
+                uid=uid,
+                text=prompts[0],  # pyright: ignore[reportArgumentType]
+                sampling_params=_resolve_sampling(
+                    req, model_sampling, default_max_tokens=default_max_tokens
+                ),
+            )
+        )
+        chunks = stream_completion_chunks(uid, req, state)
+        if request is not None:
+            chunks = state.stream_with_cancellation(chunks, request, uid)
+        return StreamingResponse(chunks, media_type="text/event-stream")
+
+    choices: list[dict[str, Any]] = []
+    prompt_tokens = 0
+    completion_tokens = 0
+    cached_tokens = 0
+    for index, prompt in enumerate(prompts):
+        uid = state.new_user()
+        await state.send_one(
+            TokenizeMsg(
+                uid=uid,
+                text=prompt,  # pyright: ignore[reportArgumentType]
+                sampling_params=_resolve_sampling(
+                    req, model_sampling, default_max_tokens=default_max_tokens
+                ),
+            )
+        )
+        text = ""
+        finish_reason = "stop"
+        async for ack in state.wait_for_ack(uid):
+            if getattr(ack, "error", None):
+                return create_error_response(ack.error)
+            prompt_tokens += ack.prompt_tokens_delta
+            completion_tokens += ack.completion_tokens_delta
+            cached_tokens += ack.cached_tokens
+            text += ack.incremental_output
+            if ack.finished:
+                finish_reason = getattr(ack, "finish_reason", None) or "stop"
+                break
+        choices.append(
+            {"index": index, "text": text, "finish_reason": finish_reason, "logprobs": None}
+        )
+
+    return {
+        "id": f"cmpl-{uuid.uuid4().hex}",
+        "object": "text_completion",
+        "created": int(time.time()),
+        "model": req.model,
+        "choices": choices,
+        "usage": _usage(prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)),
+    }
+
+
+async def stream_completion_chunks(
+    uid: int, req: CompletionRequest, state: Any
+) -> AsyncIterator[bytes]:
+    prompt_tokens = 0
+    completion_tokens = 0
+    cached_tokens = 0
+    finish_reason = "stop"
+    async for ack in state.wait_for_ack(uid):
+        if getattr(ack, "error", None):
+            yield _sse(
+                {"error": {"message": ack.error, "type": "invalid_request_error", "code": None}}
+            )
+            yield b"data: [DONE]\n\n"
+            return
+        prompt_tokens += ack.prompt_tokens_delta
+        completion_tokens += ack.completion_tokens_delta
+        cached_tokens += ack.cached_tokens
+        if ack.incremental_output:
+            yield _sse(
+                {
+                    "id": f"cmpl-{uid}",
+                    "object": "text_completion.chunk",
+                    "created": int(time.time()),
+                    "model": req.model,
+                    "choices": [
+                        {
+                            "text": ack.incremental_output,
+                            "index": 0,
+                            "finish_reason": None,
+                            "logprobs": None,
+                        }
+                    ],
+                }
+            )
+        if ack.finished:
+            finish_reason = getattr(ack, "finish_reason", None) or "stop"
+            break
+
+    yield _sse(
+        {
+            "id": f"cmpl-{uid}",
+            "object": "text_completion.chunk",
+            "created": int(time.time()),
+            "model": req.model,
+            "choices": [{"text": "", "index": 0, "finish_reason": finish_reason, "logprobs": None}],
+        }
+    )
+    if req.stream_options and req.stream_options.include_usage:
+        yield _sse(
+            {
+                "id": f"cmpl-{uid}",
+                "object": "text_completion.chunk",
+                "created": int(time.time()),
+                "model": req.model,
+                "choices": [],
+                "usage": _usage(
+                    prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)
+                ),
+            }
+        )
+    yield b"data: [DONE]\n\n"
 
 
 def create_error_response(
@@ -63,261 +566,172 @@ def create_error_response(
     param: str | None = None,
     code: str | None = None,
 ) -> JSONResponse:
-    error = ErrorResponse(error=ErrorInfo(message=message, type=err_type, param=param, code=code))
-    return JSONResponse(status_code=status_code, content=error.model_dump())
-
-
-def sse(payload: BaseModel) -> bytes:
-    return f"data: {payload.model_dump_json()}\n\n".encode()
-
-
-def usage_info(prompt_tokens: int, completion_tokens: int) -> UsageInfo:
-    return UsageInfo(
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        total_tokens=prompt_tokens + completion_tokens,
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "message": message,
+                "type": err_type,
+                "param": param,
+                "code": code,
+            }
+        },
     )
 
 
-def chat_message(message: Message) -> ChatMessage:
-    if isinstance(message.content, list):
-        content = "".join(part.text for part in message.content)
-    else:
-        content = message.content or ""
-    rendered: ChatMessage = {"role": message.role, "content": content}
-    if message.reasoning_content is not None:
-        rendered["reasoning_content"] = message.reasoning_content
-    return rendered
+def _resolve_sampling(
+    req: ChatCompletionRequest | CompletionRequest,
+    model_sampling: dict[str, Any],
+    default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+) -> SamplingParams:
+    return resolve_sampling(
+        temperature=req.temperature,
+        top_k=req.top_k,
+        top_p=req.top_p,
+        max_tokens=req.max_tokens,
+        ignore_eos=req.ignore_eos,
+        model_sampling=model_sampling,
+        stop=req.stop,
+        default_max_tokens=default_max_tokens,
+    )
 
 
-async def stream_chat_completion_chunks(
-    uid: int, req: ChatCompletionRequest, spec: GenSpec, frontend: FrontendManager
-) -> AsyncGenerator[bytes]:
-    """generate_events as chat.completion.chunk server-sent events."""
-    completion_id = f"chatcmpl-{uid}"
-    created = int(time.time())
+def _tools_for_template(req: ChatCompletionRequest) -> list[dict[str, Any]] | None:
+    if not _should_parse_tools(req):
+        return None
 
-    def chunk(delta: DeltaMessage, finish_reason: FinishReason | None = None) -> bytes:
-        choice = ChatCompletionChunkChoice(delta=delta, finish_reason=finish_reason)
-        return sse(
-            ChatCompletionChunk(
-                id=completion_id, created=created, model=req.model, choices=[choice]
+    tools = req.tools or []
+    if isinstance(req.tool_choice, ToolChoiceObject):
+        selected = req.tool_choice.function.name
+        tools = [tool for tool in tools if tool.function.name == selected]
+
+    return [tool.model_dump(exclude_none=True) for tool in tools]
+
+
+def _should_parse_tools(req: ChatCompletionRequest) -> bool:
+    return bool(req.tools) and req.tool_choice != "none"
+
+
+def _tool_calls_to_openai(calls: list[ToolCallItem]) -> list[dict[str, Any]]:
+    result = []
+    for index, call in enumerate(calls):
+        result.append(
+            {
+                "id": _tool_call_id(call.name, index),
+                "index": index,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": call.parameters,
+                },
+            }
+        )
+    return result
+
+
+def _tool_call_deltas(calls: list[ToolCallItem], start_index: int = 0) -> list[dict[str, Any]]:
+    """OpenAI tool_calls stream deltas. ``start_index`` offsets the slot index so
+    calls arriving across multiple ToolCallsDelta events (streamed one per call as
+    each closes) don't all collapse into slot 0."""
+    deltas: list[dict[str, Any]] = []
+    for offset, call in enumerate(calls):
+        index = start_index + offset
+        call_id = _tool_call_id(call.name, index)
+        deltas.append(
+            {
+                "index": index,
+                "id": call_id,
+                "type": "function",
+                "function": {"name": call.name, "arguments": ""},
+            }
+        )
+        deltas.append({"index": index, "function": {"arguments": call.parameters}})
+    return deltas
+
+
+def _tool_call_id(name: str | None, index: int) -> str:
+    prefix = (name or "tool").replace("_", "-")[:24]
+    return f"call_{prefix}_{index}_{uuid.uuid4().hex[:8]}"
+
+
+def _chat_chunk(
+    req: ChatCompletionRequest, uid: int, choices: list[dict[str, Any]]
+) -> dict[str, Any]:
+    return {
+        "id": f"chatcmpl-{uid}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": req.model,
+        "choices": choices,
+    }
+
+
+def _sse(payload: dict[str, Any]) -> bytes:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+
+
+def _reported_cached(state: Any, cached_tokens: int) -> int:
+    """The prefix-cache hit to report; 0 unless --enable-cache-report is set."""
+    return cached_tokens if getattr(state.config, "enable_cache_report", False) else 0
+
+
+def _usage(prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0) -> dict[str, Any]:
+    usage: dict[str, Any] = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+    # sglang convention: the details object appears only for a nonzero hit, so a
+    # disabled report and a 0-token hit serialize identically.
+    if cached_tokens > 0:
+        usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
+    return usage
+
+
+def _response_format_unsupported(response_format: dict[str, Any] | None) -> bool:
+    # We have no constrained/guided decoding; only plain text ('text' or unset) is honored.
+    return response_format is not None and response_format.get("type") not in (None, "text")
+
+
+def _completion_unsupported_reason(req: CompletionRequest) -> str | None:
+    if _is_token_prompt(req.prompt):
+        return "OpenAI token-id prompt inputs are not supported; pass text prompt strings instead"
+    if req.logprobs is not None:
+        return "logprobs is not supported"
+    if req.echo:
+        return "echo is not supported"
+    if req.suffix is not None:
+        return "suffix is not supported"
+    if req.logit_bias is not None:
+        return "logit_bias is not supported"
+    if _response_format_unsupported(req.response_format):
+        return "response_format json_object/json_schema is not supported (no constrained decoding)"
+    return None
+
+
+def _is_token_prompt(prompt: Any) -> bool:
+    return (
+        isinstance(prompt, list)
+        and bool(prompt)
+        and (
+            all(isinstance(item, int) for item in prompt)
+            or all(
+                isinstance(item, list) and all(isinstance(token, int) for token in item)
+                for item in prompt
             )
         )
-
-    yield chunk(DeltaMessage(role="assistant", content=""))
-    usage: UsageInfo | None = None
-    try:
-        async with aclosing(generate_events(uid, spec, frontend)) as events:
-            async for event in events:
-                if isinstance(event, ReasoningDelta):
-                    yield chunk(DeltaMessage(reasoning_content=event.text))
-                elif isinstance(event, ContentDelta):
-                    yield chunk(DeltaMessage(content=event.text))
-                else:
-                    usage = usage_info(event.prompt_tokens, event.completion_tokens)
-                    yield chunk(DeltaMessage(), event.finish_reason)
-    except GenerationError as exc:
-        # The headers are out, so a failure can only ride in the stream.
-        yield sse(ErrorResponse(error=ErrorInfo(message=str(exc), code=exc.code)))
-    if usage is not None and req.stream_options is not None and req.stream_options.include_usage:
-        yield sse(
-            ChatCompletionChunk(
-                id=completion_id, created=created, model=req.model, choices=[], usage=usage
-            )
-        )
-    yield b"data: [DONE]\n\n"
+    )
 
 
-async def stream_completion_chunks(
-    uid: int, req: CompletionRequest, frontend: FrontendManager
-) -> AsyncGenerator[bytes]:
-    """uid's raw text as text_completion.chunk server-sent events."""
-    completion_id = f"cmpl-{uid}"
-    created = int(time.time())
-
-    def chunk(choices: list[CompletionChoice], usage: UsageInfo | None = None) -> bytes:
-        return sse(
-            CompletionChunk(
-                id=completion_id, created=created, model=req.model, choices=choices, usage=usage
-            )
-        )
-
-    prompt_tokens = 0
-    completion_tokens = 0
-    finish_reason: FinishReason | None = None
-    error: ErrorResponse | None = None
-    async with aclosing(frontend.wait_for_ack(uid)) as replies:
-        async for reply in replies:
-            if reply.error is not None:
-                error = ErrorResponse(error=ErrorInfo(message=reply.error, code=reply.error_code))
-            else:
-                prompt_tokens += reply.prompt_tokens_delta
-                completion_tokens += reply.completion_tokens_delta
-                finish_reason = reply.finish_reason
-                if reply.incremental_output:
-                    yield chunk([CompletionChoice(text=reply.incremental_output)])
-    if error is not None:
-        yield sse(error)
-    else:
-        assert finish_reason is not None
-        yield chunk([CompletionChoice(text="", finish_reason=finish_reason)])
-        if req.stream_options is not None and req.stream_options.include_usage:
-            yield chunk([], usage_info(prompt_tokens, completion_tokens))
-    yield b"data: [DONE]\n\n"
+def _served_model_name(state: Any) -> str:
+    return getattr(state.config, "served_model_name", None) or state.config.model_path
 
 
-def register_openai_routes(
-    app: FastAPI, frontend: FrontendManager, config: ServerArgs, model_sampling: SamplingParams
-) -> None:
-    @app.get("/v1/models")
-    async def v1_models() -> ModelList:
-        model_id = config.served_model_name or config.model_name
-        return ModelList(data=[ModelCard(id=model_id, root=config.model_path)])
-
-    @app.post("/v1/chat/completions", response_model=None)
-    async def v1_chat_completions(
-        req: ChatCompletionRequest,
-    ) -> ChatCompletionResponse | StreamingResponse | JSONResponse:
-        if req.n != 1:
-            return create_error_response("only n=1 is supported", param="n")
-        if req.tools:
-            return create_error_response("tools are not supported yet", param="tools")
-        max_tokens = (
-            req.max_tokens if req.max_completion_tokens is None else req.max_completion_tokens
-        )
-        spec = GenSpec(
-            messages=[chat_message(message) for message in req.messages],
-            sampling_params=resolve_sampling(
-                temperature=req.temperature,
-                top_k=req.top_k,
-                top_p=req.top_p,
-                max_tokens=max_tokens,
-                ignore_eos=req.ignore_eos,
-                stop=req.stop,
-                model_sampling=model_sampling,
-                default_max_tokens=config.max_output_tokens,
-            ),
-            chat_template_kwargs=req.chat_template_kwargs,
-        )
-        try:
-            uid = submit_generation(spec, frontend)
-        except EngineUnavailableError as exc:
-            return create_error_response(str(exc), status_code=503, err_type="server_error")
-        if req.stream:
-            return StreamingResponse(
-                stream_chat_completion_chunks(uid, req, spec, frontend),
-                media_type="text/event-stream",
-            )
-        try:
-            result = await generate_full(uid, spec, frontend)
-        except GenerationError as exc:
-            return create_error_response(str(exc), code=exc.code)
-        message = ChatResponseMessage(
-            content=result.content, reasoning_content=result.reasoning or None
-        )
-        return ChatCompletionResponse(
-            id=f"chatcmpl-{uid}",
-            created=int(time.time()),
-            model=req.model,
-            choices=[ChatCompletionChoice(message=message, finish_reason=result.finish_reason)],
-            usage=usage_info(result.prompt_tokens, result.completion_tokens),
-        )
-
-    @app.post("/v1/completions", response_model=None)
-    async def v1_completions(
-        req: CompletionRequest,
-    ) -> CompletionResponse | StreamingResponse | JSONResponse:
-        prompts = [req.prompt] if isinstance(req.prompt, str) else req.prompt
-        text_prompts = [prompt for prompt in prompts if isinstance(prompt, str)]
-        if len(text_prompts) != len(prompts):
-            unsupported = (
-                "OpenAI token-id prompt inputs are not supported; pass text prompt strings instead"
-            )
-        elif req.logprobs is not None:
-            unsupported = "logprobs is not supported"
-        elif req.echo:
-            unsupported = "echo is not supported"
-        elif req.suffix is not None:
-            unsupported = "suffix is not supported"
-        elif req.logit_bias is not None:
-            unsupported = "logit_bias is not supported"
-        elif (req.response_format or {}).get("type") not in (None, "text"):
-            unsupported = (
-                "response_format json_object/json_schema is not supported (no constrained decoding)"
-            )
-        elif req.stream and len(text_prompts) != 1:
-            unsupported = "Streaming completions only support a single text prompt"
-        else:
-            unsupported = None
-        if unsupported is not None:
-            return create_error_response(unsupported)
-        max_tokens = (
-            req.max_tokens if req.max_completion_tokens is None else req.max_completion_tokens
-        )
-
-        def submit(prompt: str) -> int:
-            uid = frontend.new_user()
-            # One SamplingParams per request: the scheduler clamps max_tokens in place.
-            sampling_params = resolve_sampling(
-                temperature=req.temperature,
-                top_k=req.top_k,
-                top_p=req.top_p,
-                max_tokens=max_tokens,
-                ignore_eos=req.ignore_eos,
-                stop=req.stop,
-                model_sampling=model_sampling,
-                default_max_tokens=config.max_output_tokens,
-            )
-            frontend.send_one(TokenizeMsg(uid=uid, text=prompt, sampling_params=sampling_params))
-            return uid
-
-        if req.stream:
-            try:
-                uid = submit(text_prompts[0])
-            except EngineUnavailableError as exc:
-                return create_error_response(str(exc), status_code=503, err_type="server_error")
-            return StreamingResponse(
-                stream_completion_chunks(uid, req, frontend), media_type="text/event-stream"
-            )
-        else:
-            choices: list[CompletionChoice] = []
-            prompt_tokens = 0
-            completion_tokens = 0
-            for index, prompt in enumerate(text_prompts):
-                try:
-                    uid = submit(prompt)
-                except EngineUnavailableError as exc:
-                    return create_error_response(str(exc), status_code=503, err_type="server_error")
-                text: list[str] = []
-                finish_reason: FinishReason | None = None
-                async with aclosing(frontend.wait_for_ack(uid)) as replies:
-                    async for reply in replies:
-                        if reply.error is not None:
-                            return create_error_response(reply.error, code=reply.error_code)
-                        prompt_tokens += reply.prompt_tokens_delta
-                        completion_tokens += reply.completion_tokens_delta
-                        finish_reason = reply.finish_reason
-                        text.append(reply.incremental_output)
-                assert finish_reason is not None
-                choices.append(
-                    CompletionChoice(index=index, text="".join(text), finish_reason=finish_reason)
-                )
-            return CompletionResponse(
-                id=f"cmpl-{uuid.uuid4().hex}",
-                created=int(time.time()),
-                model=req.model,
-                choices=choices,
-                usage=usage_info(prompt_tokens, completion_tokens),
-            )
-
-
-__all__ = [
-    "chat_message",
-    "create_error_response",
-    "register_openai_routes",
-    "sse",
-    "stream_chat_completion_chunks",
-    "stream_completion_chunks",
-    "usage_info",
-]
+def _model_context_length(state: Any) -> int | None:
+    """The model ceiling, not `min(ceiling, KV budget)`: a rebuild moves the latter, and agents
+    read this once at startup."""
+    try:  # never 500 a metadata route: max_seq_len walks into the HF config on some builds
+        value = int(state.config.max_seq_len)
+    except Exception:  # noqa: BLE001
+        return None
+    return value if value > 0 else None
