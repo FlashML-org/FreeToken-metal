@@ -9,11 +9,16 @@ completion streams character by character and every marker arrives split across 
 from __future__ import annotations
 
 import json
+import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import ClassVar, Literal
 
 import numpy as np
+import uvicorn
+from fastapi import FastAPI
 from pydantic import JsonValue
 from tokenizers import Tokenizer
 
@@ -125,6 +130,24 @@ def wait_for_abort(scheduler: ScriptedScheduler, uid: int) -> None:
     while uid not in scheduler.aborted:
         assert time.monotonic() < deadline, f"request {uid} was never aborted"
         time.sleep(0.01)
+
+
+@contextmanager
+def running_server(app: FastAPI) -> Iterator[int]:
+    """app served over HTTP on a free loopback port, for clients that need a real socket;
+    yields the port."""
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + WAIT_SECONDS
+    while not server.started:
+        assert time.monotonic() < deadline, "the server did not start"
+        time.sleep(0.01)
+    try:
+        yield server.servers[0].sockets[0].getsockname()[1]
+    finally:
+        server.should_exit = True
+        thread.join()
 
 
 def tiny_server_args(

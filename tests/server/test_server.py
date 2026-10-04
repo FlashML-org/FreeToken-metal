@@ -17,7 +17,6 @@ from contextlib import aclosing
 from pathlib import Path
 
 import pytest
-import uvicorn
 from fastapi.testclient import TestClient
 from pydantic import JsonValue
 from tokenizers import Tokenizer
@@ -38,6 +37,7 @@ from scripted_server import (
     SCRIPT_TOKENS,
     WAIT_SECONDS,
     ScriptedScheduler,
+    running_server,
     sse_events,
     tiny_server_args,
     wait_for_abort,
@@ -609,16 +609,7 @@ def test_client_disconnect_aborts_the_request(
 ) -> None:
     monkeypatch.setattr(scripted, "script", "tick " * 2000)
     monkeypatch.setattr(scripted, "step_seconds", 0.005)
-    app = create_app(tiny_server_args(tiny_model_dir))
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning"))
-    thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
-    deadline = time.monotonic() + WAIT_SECONDS
-    while not server.started:
-        assert time.monotonic() < deadline, "the server did not start"
-        time.sleep(0.01)
-    port = server.servers[0].sockets[0].getsockname()[1]
-    try:
+    with running_server(create_app(tiny_server_args(tiny_model_dir))) as port:
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=WAIT_SECONDS)
         headers = {"Content-Type": "application/json"}
         connection.request("POST", route, body=json.dumps(body), headers=headers)
@@ -628,9 +619,6 @@ def test_client_disconnect_aborts_the_request(
         assert all(line.startswith((b"data: ", b"event: ", b"\n")) for line in lines)
         connection.close()
         wait_for_abort(scripted.instances[0], 0)
-    finally:
-        server.should_exit = True
-        thread.join()
 
 
 def test_frontend_keeps_early_replies_and_aborts_on_early_close(tiny_model_dir: Path) -> None:

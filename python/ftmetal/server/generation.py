@@ -5,8 +5,8 @@ back into its own wire shape.
 Port of FreeToken server/generation.py. Divergences: the state the routes hand in is
 api_server's in-process FrontendManager (asyncio queues fed by the tokenizer thread, not
 ZMQ to worker processes); images are refused (text-only engine), so collect_image_refs is
-inlined from FreeToken's mm/media.py and _resolve_images always fails the request; no
-request ring, so source is accepted and unused; count_prompt_tokens tokenizes one
+inlined from FreeToken's mm/media.py and _resolve_images always fails the request; a
+request is recorded into the state's own request ring; count_prompt_tokens tokenizes one
 TokenizeMsg with the engine's TokenizeManager API.
 """
 
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -24,6 +25,8 @@ from typing import Any
 from ftmetal.core import SamplingParams
 from ftmetal.message.tokenizer import TokenizeMsg
 from ftmetal.tokenizer import resolve_thinking_mode
+
+from .request_ring import RequestRecord
 
 try:
     # Chat templates render through jinja2 (a transformers dependency): a TemplateError means
@@ -510,13 +513,105 @@ async def with_keepalive(events: AsyncIterator[GenEvent], interval: float):
             task.cancel()
 
 
+def _record_generation(
+    *,
+    state: Any,
+    source: str | None,
+    stream: bool,
+    start: float,
+    prompt_tokens: int,
+    completion_tokens: int,
+    error: str | None,
+    first_token_at: float | None = None,
+) -> None:
+    """Log one generation request into the request ring. Every protocol adapter converges here,
+    so token totals are captured whatever endpoint served the request — unlike the HTTP
+    middleware, which for a stream records before the totals are known. `source is None` opts
+    out (those paths stay logged by the middleware)."""
+    if source is None:
+        return
+    state.request_ring.add(
+        RequestRecord(
+            ts=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            method="POST",
+            path=source,
+            status=500 if error else 200,
+            model=getattr(state.config, "served_model_name", None),
+            duration_ms=int((time.monotonic() - start) * 1000),
+            ttft_ms=int((first_token_at - start) * 1000) if first_token_at is not None else None,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            stream=stream,
+            error=error,
+        )
+    )
+
+
 async def generate_events(
     uid: int, spec: GenSpec, state: Any, *, source: str | None = None
 ) -> AsyncIterator[GenEvent]:
+    """Wraps `_generate_events_impl` to log the request with its totals, read off the terminal
+    `GenDone`. The `finally` still records the row on a mid-stream disconnect — but with 0 tokens
+    if the drop lands before `GenDone`, the only event carrying the totals."""
+    start = time.monotonic()
+    prompt_tokens = 0
+    completion_tokens = 0
+    first_token_at: float | None = None
+    error: str | None = None
+    try:
+        async for ev in _generate_events_impl(uid, spec, state):
+            if isinstance(ev, GenDone):
+                prompt_tokens = ev.prompt_tokens
+                completion_tokens = ev.completion_tokens
+            elif first_token_at is None:
+                first_token_at = time.monotonic()
+            yield ev
+    except GenerationError as exc:
+        error = str(exc)
+        raise
+    finally:
+        _record_generation(
+            state=state,
+            source=source,
+            stream=True,
+            start=start,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            error=error,
+            first_token_at=first_token_at,
+        )
+
+
+async def generate_full(
+    uid: int, spec: GenSpec, state: Any, *, source: str | None = None
+) -> GenResult:
+    """Wraps `_generate_full_impl` to log the request with its totals; the `finally` also records
+    a `GenerationError` as a failed row."""
+    start = time.monotonic()
+    result: GenResult | None = None
+    error: str | None = None
+    try:
+        result = await _generate_full_impl(uid, spec, state)
+        return result
+    except GenerationError as exc:
+        error = str(exc)
+        raise
+    finally:
+        _record_generation(
+            state=state,
+            source=source,
+            stream=False,
+            start=start,
+            prompt_tokens=result.prompt_tokens if result else 0,
+            completion_tokens=result.completion_tokens if result else 0,
+            error=error,
+        )
+
+
+async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIterator[GenEvent]:
     """Protocol-neutral streaming generation. Yields semantic events (reasoning /
     content / tool-call deltas) terminated by exactly one GenDone. Produces no wire
     format — the OpenAI/Anthropic/Responses streamers format these into their own.
-    source would name the request in the request ring, which is not ported.
 
     With tools configured, content is parsed incrementally: plain text streams live
     (the detector holds back only a suffix that could still grow into a tool-call
@@ -715,12 +810,9 @@ async def generate_events(
     )
 
 
-async def generate_full(
-    uid: int, spec: GenSpec, state: Any, *, source: str | None = None
-) -> GenResult:
+async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
     """Protocol-neutral non-streaming generation: accumulate, split reasoning, parse
-    tool calls, strip special tokens. The adapters format the GenResult into their wire.
-    source as in generate_events."""
+    tool calls, strip special tokens. The adapters format the GenResult into their wire."""
     full_content = ""
     prompt_tokens = 0
     completion_tokens = 0
