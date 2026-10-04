@@ -3,9 +3,8 @@ admissions, aborts and scheduler errors.
 
 Port of FreeToken message/tokenizer.py. Divergences: plain dataclasses passed over
 queue.Queue (no ZMQ encoder/decoder); stop strings are matched by the detokenizer, so
-DetokenizeMsg carries neither matched_stop nor stop_strs; PromptAdmittedMsg is sent
-when the scheduler accepts the request and has no cached_tokens (no prefix cache); no
-pool-usage snapshot, multimodal input or cache-rebuild messages.
+DetokenizeMsg carries neither matched_stop nor stop_strs; no pool-usage snapshot,
+multimodal input or cache-rebuild messages.
 """
 
 from __future__ import annotations
@@ -48,8 +47,12 @@ class DetokenizeMsg(BaseTokenizerMsg):
 
 @dataclass(kw_only=True)
 class PromptAdmittedMsg(BaseTokenizerMsg):
+    """Sent once per request, after its first prefill batch is prepared."""
+
     uid: int
     prompt_tokens: int
+    # The prefix-cache hit: prompt tokens served from the cache instead of recomputed.
+    cached_tokens: int = 0
 
 
 @dataclass(kw_only=True)

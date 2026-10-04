@@ -31,7 +31,12 @@ from ftmetal.core import SamplingParams
 from ftmetal.engine.config import EngineConfig
 from ftmetal.env import ENV_PREFIXES
 from ftmetal.message.frontend import BatchFrontendMsg, UserReply
-from ftmetal.message.tokenizer import AbortMsg, BaseTokenizerMsg, FinishReason
+from ftmetal.message.tokenizer import (
+    AbortMsg,
+    BaseTokenizerMsg,
+    FinishReason,
+    PromptAdmittedMsg,
+)
 from ftmetal.scheduler.scheduler import ForwardData, Scheduler, TokenEvent
 from ftmetal.scheduler.status import SchedulerStatusReporter
 from ftmetal.server import api_server
@@ -57,12 +62,15 @@ class ScriptedScheduler(Scheduler):
     script: ClassVar[str] = SCRIPT
     step_seconds: ClassVar[float] = 0.0
     max_prompt_tokens: ClassVar[int] = 4096
+    # The prefix-cache hit every admitted prompt reports.
+    cached_tokens: ClassVar[int] = 0
     instances: ClassVar[list[ScriptedScheduler]] = []
 
     def __init__(self, config: EngineConfig, eos_token_ids: set[int]) -> None:
         self.tokenizer = Tokenizer.from_file(str(Path(config.model_path) / "tokenizer.json"))
         self.eos_token_id = min(eos_token_ids)
         self.results: list[TokenEvent] = []
+        self.prompt_admissions: list[PromptAdmittedMsg] = []
         self.live_uids: set[int] = set()
         self.status_reporter = SchedulerStatusReporter(lambda line: None)
         # uid -> (tokens left, whether the last one is EOS)
@@ -83,6 +91,11 @@ class ScriptedScheduler(Scheduler):
             raise ValueError(f"prompt is too long: {len(input_ids)} tokens")
         self.admitted[uid] = (input_ids.tolist(), sampling_params)
         self.reuse_lens[uid] = reuse_len
+        self.prompt_admissions.append(
+            PromptAdmittedMsg(
+                uid=uid, prompt_tokens=len(input_ids), cached_tokens=self.cached_tokens
+            )
+        )
         script_tokens = [*self.tokenizer.encode(self.script).ids, self.eos_token_id]
         # Sampling past EOS repeats the script until max_tokens.
         repeats = sampling_params.max_tokens // len(script_tokens) + 1

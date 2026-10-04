@@ -99,6 +99,7 @@ def run_tokenizer(
                         incremental_output="",
                         finished=False,
                         prompt_tokens_delta=msg.prompt_tokens,
+                        cached_tokens=msg.cached_tokens,
                     )
                 )
             elif isinstance(msg, ErrorReplyMsg):

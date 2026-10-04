@@ -131,6 +131,8 @@ class Batch:
     # reqs followed by the dummy requests that fill a replayed decode batch to its graph's
     # batch size; set by GraphRunner.pad_batch.
     padded_reqs: list[Req] = field(init=False)
+    # (uid, prompt tokens, prefix-cache hit) of the prompts whose first chunk this prefill runs.
+    prompt_admissions: list[tuple[int, int, int]] = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
         self.padded_reqs = self.reqs

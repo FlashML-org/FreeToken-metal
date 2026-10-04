@@ -1,8 +1,7 @@
 """Replies to the API server: incremental text, usage deltas and the terminal state.
 
 Port of FreeToken message/frontend.py. Divergences: plain dataclasses handed to the
-event loop (no ZMQ encoder/decoder); no cached-token count, pool-usage snapshot or
-cache-rebuild reply.
+event loop (no ZMQ encoder/decoder); no pool-usage snapshot or cache-rebuild reply.
 """
 
 from __future__ import annotations
@@ -29,6 +28,8 @@ class UserReply(BaseFrontendMsg):
     finished: bool
     prompt_tokens_delta: int = 0
     completion_tokens_delta: int = 0
+    # The prefix-cache hit, reported with prompt_tokens_delta.
+    cached_tokens: int = 0
     # Set, with finished, when the request failed before producing output.
     error: str | None = None
     error_code: str | None = None
