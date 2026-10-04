@@ -6,12 +6,15 @@ FrontendManager, kept here so every protocol adapter imports it without a cycle.
 Divergences: the tokenizer worker is a thread of this process, so replies reach the
 event loop through call_soon_threadsafe and wait per request on an asyncio.Queue;
 closing a request's event stream before its terminal reply aborts it; generate_full
-folds the streamed events; no tool calls, images, keepalives or request log.
+folds the streamed events; stream_generate reports a failed request as an
+{"error": ...} event before [DONE] instead of ending the stream silently; no tool
+calls, images, keepalives or request log.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import queue
 import threading
 from collections.abc import AsyncGenerator
@@ -94,6 +97,18 @@ class FrontendManager:
             self.ack_map.pop(uid, None)
             if not finished:
                 self.abort_user(uid)
+
+    async def stream_generate(self, uid: int) -> AsyncGenerator[bytes]:
+        """uid's raw text as {"text": ...} server-sent events, then [DONE]."""
+        async with aclosing(self.wait_for_ack(uid)) as replies:
+            async for reply in replies:
+                if reply.error is not None:
+                    event = json.dumps({"error": reply.error}, ensure_ascii=False)
+                    yield f"data: {event}\n\n".encode()
+                elif reply.incremental_output:
+                    event = json.dumps({"text": reply.incremental_output}, ensure_ascii=False)
+                    yield f"data: {event}\n\n".encode()
+        yield b"data: [DONE]\n\n"
 
     def abort_user(self, uid: int) -> None:
         self.ack_map.pop(uid, None)

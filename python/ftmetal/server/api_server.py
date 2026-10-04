@@ -1,7 +1,7 @@
 """The FastAPI app and the two threads behind it: the tokenizer worker and the scheduler.
 
-Port of FreeToken server/api_server.py (app, lifespan, run_api_server), with the
-message loops of tokenizer/server.py (tokenize_worker) and of scheduler/scheduler.py
+Port of FreeToken server/api_server.py (app, lifespan, run_api_server, /generate), with
+the message loops of tokenizer/server.py (tokenize_worker) and of scheduler/scheduler.py
 (run_forever and its message handling). Divergences: one process; the tokenizer worker
 and the scheduler are threads fed by queue.Queue instead of processes over ZMQ, and
 the scheduler thread is the only MLX caller; the scheduler is built before the server
@@ -23,9 +23,12 @@ from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse, StreamingResponse
 from jinja2 import TemplateError
+from pydantic import BaseModel
 
 from ftmetal import __version__
+from ftmetal.core import SamplingParams
 from ftmetal.message.backend import (
     AbortBackendMsg,
     BaseBackendMsg,
@@ -44,7 +47,7 @@ from ftmetal.message.tokenizer import (
 )
 from ftmetal.scheduler.scheduler import Scheduler
 from ftmetal.server.args import ServerArgs
-from ftmetal.server.generation import FrontendManager
+from ftmetal.server.generation import EngineUnavailableError, FrontendManager
 from ftmetal.server.openai_api import register_openai_routes
 from ftmetal.tokenizer import (
     DetokenizeManager,
@@ -54,6 +57,12 @@ from ftmetal.tokenizer import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class GenerateRequest(BaseModel):
+    prompt: str
+    max_tokens: int
+    ignore_eos: bool = False
 
 
 def run_tokenizer(
@@ -195,6 +204,23 @@ def create_app(config: ServerArgs) -> FastAPI:
 
     app = FastAPI(title="ftmetal", version=__version__, lifespan=lifespan)
     register_openai_routes(app, frontend, config, load_sampling_defaults(config.model_path))
+
+    @app.post("/generate", response_model=None)
+    async def generate(req: GenerateRequest) -> StreamingResponse | JSONResponse:
+        """A raw prompt sampled with the framework defaults, streamed as {"text": ...} events."""
+        # No maintenance-state 503: this engine has no cache rebuild to wait out.
+        if req.max_tokens < 1:
+            return JSONResponse(
+                {"error": f"max_tokens must be at least 1, got {req.max_tokens}"}, status_code=400
+            )
+        try:
+            uid = frontend.new_user()
+        except EngineUnavailableError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=503)
+        sampling_params = SamplingParams(ignore_eos=req.ignore_eos, max_tokens=req.max_tokens)
+        frontend.send_one(TokenizeMsg(uid=uid, text=req.prompt, sampling_params=sampling_params))
+        return StreamingResponse(frontend.stream_generate(uid), media_type="text/event-stream")
+
     return app
 
 
@@ -202,4 +228,4 @@ def run_api_server(config: ServerArgs) -> None:
     uvicorn.run(create_app(config), host=config.server_host, port=config.server_port)
 
 
-__all__ = ["create_app", "run_api_server", "run_scheduler", "run_tokenizer"]
+__all__ = ["GenerateRequest", "create_app", "run_api_server", "run_scheduler", "run_tokenizer"]

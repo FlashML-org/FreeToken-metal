@@ -1,4 +1,5 @@
-"""The OpenAI API end to end over the real tokenizer worker and a scripted scheduler.
+"""The OpenAI API and /generate end to end over the real tokenizer worker and a scripted
+scheduler.
 
 The scheduler thread runs ScriptedScheduler, which samples a fixed text for every
 request, so the routes, the message flow and the detokenizer are tested without a
@@ -62,12 +63,14 @@ class ScriptedScheduler(Scheduler):
         self.status_reporter = SchedulerStatusReporter(lambda line: None)
         # uid -> (tokens left, whether the last one is EOS)
         self.running: dict[int, tuple[list[int], bool]] = {}
+        self.admitted: dict[int, tuple[list[int], SamplingParams]] = {}
         self.aborted: list[int] = []
         ScriptedScheduler.instances.append(self)
 
     def add_request(self, uid: int, input_ids: np.ndarray, sampling_params: SamplingParams) -> None:
         if len(input_ids) > self.max_prompt_tokens:
             raise ValueError(f"prompt is too long: {len(input_ids)} tokens")
+        self.admitted[uid] = (input_ids.tolist(), sampling_params)
         script_tokens = [*self.tokenizer.encode(self.script).ids, self.eos_token_id]
         # Sampling past EOS repeats the script until max_tokens.
         repeats = sampling_params.max_tokens // len(script_tokens) + 1
@@ -319,6 +322,19 @@ def test_streamed_completion_chunks_carry_the_raw_text(client: TestClient) -> No
     }
 
 
+def test_generate_streams_the_raw_text_sampled_greedily(
+    client: TestClient, scripted: type[ScriptedScheduler]
+) -> None:
+    response = client.post("/generate", json={"prompt": "hi", "max_tokens": 64})
+    assert response.headers["content-type"].startswith("text/event-stream")
+    events = sse_events(response.text)
+    assert events[-1] == "[DONE]"
+    texts = [json.loads(event)["text"] for event in events[:-1]]
+    assert all(texts) and "".join(texts) == SCRIPT
+    # The framework's greedy defaults, not the checkpoint's recommended sampling.
+    assert scripted.instances[0].admitted[0] == ([71, 72], SamplingParams(max_tokens=64))
+
+
 # (route, request body, status code, a fragment of the error body)
 REFUSED_CASES: list[tuple[str, dict[str, JsonValue], int, str]] = [
     ("/v1/completions", {"model": "tiny", "prompt": [1, 2, 3]}, 400, "token-id prompt"),
@@ -332,6 +348,8 @@ REFUSED_CASES: list[tuple[str, dict[str, JsonValue], int, str]] = [
         "only support a single text prompt",
     ),
     ("/v1/completions", {"model": "tiny", "prompt": "hi", "max_tokens": 0}, 422, "max_tokens"),
+    ("/generate", {"prompt": "hi", "max_tokens": 0}, 400, "max_tokens must be at least 1, got 0"),
+    ("/generate", {"prompt": [1, 2, 3], "max_tokens": 4}, 422, "prompt"),
 ]
 
 
@@ -354,6 +372,9 @@ def test_raw_prompt_failures_surface_as_errors(
     events = sse_events(client.post("/v1/completions", json={**body, "stream": True}).text)
     assert json.loads(events[-2])["error"]["code"] == "context_length_exceeded"
     assert events[-1] == "[DONE]"
+    generate_body = {"prompt": "a long prompt", "max_tokens": 4}
+    events = sse_events(client.post("/generate", json=generate_body).text)
+    assert events == [json.dumps({"error": "prompt is too long: 13 tokens"}), "[DONE]"]
 
 
 def test_client_disconnect_aborts_the_request(
