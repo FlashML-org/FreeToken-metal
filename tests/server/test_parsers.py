@@ -1,9 +1,15 @@
-"""The reasoning parsers on hand-picked completions, streamed in chunks and parsed whole."""
+"""The reasoning and tool-call parsers on hand-picked completions, streamed in chunks and
+parsed whole."""
 
 from __future__ import annotations
 
-import pytest
+import json
 
+import pytest
+from pydantic import JsonValue
+
+from ftmetal.server.api_models import Tool
+from ftmetal.server.function_call_parser import FunctionCallParser
 from ftmetal.server.reasoning_parser import ReasoningParser
 
 # (parser, force_reasoning, streamed chunks, reasoning, content streamed, content one-shot):
@@ -78,3 +84,104 @@ def test_reasoning_parser_splits_reasoning_from_content(
     assert "".join([*content_parts, content_delta]) == content
     one_shot = ReasoningParser(name, force_reasoning=force_reasoning)
     assert one_shot.parse_non_stream("".join(chunks)) == (reasoning.strip(), content_one_shot)
+
+
+TOOL_DICTS: list[dict[str, JsonValue]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_time",
+            "parameters": {"type": "object", "properties": {"zone": {"type": "string"}}},
+        },
+    },
+]
+TOOLS = [Tool.model_validate(tool) for tool in TOOL_DICTS]
+QWEN3_CODER_PARIS = (
+    "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n"
+    "</function>\n</tool_call>"
+)
+QWEN3_CODER_CET = (
+    "<tool_call>\n<function=get_time>\n<parameter=zone>\nCET\n</parameter>\n</function>\n"
+    "</tool_call>"
+)
+GEMMA4_PARIS = '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>'
+GEMMA4_CET = '<|tool_call>call:get_time{zone:<|"|>CET<|"|>}<tool_call|>'
+
+# (parser, streamed chunks, content around the calls, the calls as (name, arguments))
+TOOL_CALL_CASES: list[tuple[str, list[str], str, list[tuple[str, dict[str, JsonValue]]]]] = [
+    (
+        "qwen3_coder",
+        [
+            "Let me check.\n<tool_",
+            "call>\n<function=get_weather>\n<parameter=city>\nPar",
+            "is\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>",
+        ],
+        "Let me check.",
+        [("get_weather", {"city": "Paris", "days": 3})],
+    ),
+    (
+        "qwen3_coder",
+        [QWEN3_CODER_PARIS, "\n", QWEN3_CODER_CET],
+        "",
+        [("get_weather", {"city": "Paris"}), ("get_time", {"zone": "CET"})],
+    ),
+    ("qwen3_coder", ["No tools ", "needed."], "No tools needed.", []),
+    (
+        "qwen25",
+        [
+            '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris", "days": 3}}\n',
+            "</tool_call>",
+        ],
+        "",
+        [("get_weather", {"city": "Paris", "days": 3})],
+    ),
+    (
+        "gemma4",
+        ['Checking.<|tool_call>call:get_weather{city:<|"|>Par', 'is<|"|>,days:3}<tool_call|>'],
+        "Checking.",
+        [("get_weather", {"city": "Paris", "days": 3})],
+    ),
+    (
+        "gemma4",
+        [GEMMA4_PARIS, GEMMA4_CET],
+        "",
+        [("get_weather", {"city": "Paris"}), ("get_time", {"zone": "CET"})],
+    ),
+]
+
+
+@pytest.mark.parametrize(("name", "chunks", "content", "calls"), TOOL_CALL_CASES)
+def test_tool_call_parser_extracts_calls(
+    name: str, chunks: list[str], content: str, calls: list[tuple[str, dict[str, JsonValue]]]
+) -> None:
+    streamed = FunctionCallParser(TOOLS, name)
+    assert streamed.supports_streaming() and streamed.args_fragments_prefix_stable()
+    text: list[str] = []
+    names: dict[int, str | None] = {}
+    arguments: dict[int, str] = {}
+    for chunk in chunks:
+        for kind, payload in streamed.parse_stream_events(chunk):
+            if kind == "text":
+                text.append(payload)
+            else:
+                for fragment in payload:
+                    names.setdefault(fragment.tool_index, fragment.name)
+                    arguments[fragment.tool_index] = (
+                        arguments.get(fragment.tool_index, "") + fragment.parameters
+                    )
+    text.append(streamed.finish_stream())
+    assert "".join(text).strip() == content
+    assert [(names[i], json.loads(arguments[i])) for i in sorted(names)] == calls
+    one_shot = FunctionCallParser(TOOLS, name).parse_non_stream("".join(chunks))
+    assert one_shot.normal_text.strip() == content
+    assert [(call.name, json.loads(call.parameters)) for call in one_shot.calls] == calls

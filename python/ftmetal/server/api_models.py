@@ -22,6 +22,17 @@ from pydantic import (
 from ftmetal.message.tokenizer import FinishReason
 
 
+class Function(BaseModel):
+    name: str
+    description: str | None = None
+    parameters: dict[str, JsonValue] | None = None
+
+
+class Tool(BaseModel):
+    type: Literal["function"] = "function"
+    function: Function
+
+
 class TextContentPart(BaseModel):
     type: Literal["text"]
     text: str
@@ -195,10 +206,12 @@ __all__ = [
     "DeltaMessage",
     "ErrorInfo",
     "ErrorResponse",
+    "Function",
     "Message",
     "ModelCard",
     "ModelList",
     "StreamOptions",
     "TextContentPart",
+    "Tool",
     "UsageInfo",
 ]
