@@ -4,9 +4,8 @@ admissions, aborts and scheduler errors.
 Port of FreeToken message/tokenizer.py. Divergences: plain dataclasses passed over
 queue.Queue (no ZMQ encoder/decoder); stop strings are matched by the detokenizer, so
 DetokenizeMsg carries neither matched_stop nor stop_strs; PromptAdmittedMsg is sent
-when the scheduler accepts the request and has no cached_tokens (no prefix cache);
-TokenizeMsg.text is always a conversation (no raw-prompt route yet); no pool-usage
-snapshot, multimodal input or cache-rebuild messages.
+when the scheduler accepts the request and has no cached_tokens (no prefix cache); no
+pool-usage snapshot, multimodal input or cache-rebuild messages.
 """
 
 from __future__ import annotations
@@ -56,7 +55,8 @@ class PromptAdmittedMsg(BaseTokenizerMsg):
 @dataclass(kw_only=True)
 class TokenizeMsg(BaseTokenizerMsg):
     uid: int
-    text: list[ChatMessage]
+    # A raw prompt, or a conversation for the chat template.
+    text: str | list[ChatMessage]
     sampling_params: SamplingParams
     chat_template_kwargs: dict[str, JsonValue] = field(default_factory=dict)
     tools: list[dict[str, JsonValue]] | None = None

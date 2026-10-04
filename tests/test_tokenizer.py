@@ -1,16 +1,19 @@
-"""Prompt rendering, incremental detokenization and stop strings.
+"""Prompt rendering, raw prompts, incremental detokenization and stop strings.
 
 The tiny checkpoint covers the contract; with FTMETAL_TEST_MODEL_PATH set, the real
-checkpoint's tokenizer.json and chat template are checked against transformers.
+checkpoint's tokenizer.json and chat template are checked against transformers, which is
+also how FreeToken encodes a raw prompt.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 import pytest
 from jinja2 import TemplateError
+from tokenizers import AddedToken, Tokenizer, processors
 from transformers import AutoTokenizer
 
 from ftmetal.core import SamplingParams
@@ -175,6 +178,41 @@ def test_chat_template_raises_and_renders_plain_json(tiny_model_dir: Path) -> No
     assert '"description": "a <b> & c"' in prompt
 
 
+# (tokenizer.json post-processor, raw prompt, input ids): None keeps the ChatML tokenizer;
+# a post-processor comes with a <bos> special token (id 260) and a Gemma tokenizer config.
+RAW_PROMPT_CASES: list[tuple[str | None, str, list[int]]] = [
+    (None, "hi", [71, 72]),
+    (None, "<|im_start|>hi<think>", [256, 71, 72, 258]),
+    # Gemma4's post-processor adds no BOS, so a raw prompt has one only where it is written.
+    ("$A", "hi", [71, 72]),
+    ("$A", "<bos>hi", [260, 71, 72]),
+    ("<bos> $A", "hi", [260, 71, 72]),
+]
+
+
+@pytest.mark.parametrize(("post_processor", "prompt", "input_ids"), RAW_PROMPT_CASES)
+def test_raw_prompt_skips_the_template_and_matches_transformers(
+    tiny_model_dir: Path, post_processor: str | None, prompt: str, input_ids: list[int]
+) -> None:
+    if post_processor is not None:
+        tokenizer = Tokenizer.from_file(str(tiny_model_dir / "tokenizer.json"))
+        tokenizer.add_special_tokens([AddedToken("<bos>", special=True)])
+        special_tokens = [("<bos>", 260)] if "<bos>" in post_processor else []
+        tokenizer.post_processor = processors.TemplateProcessing(
+            single=post_processor, special_tokens=special_tokens
+        )
+        tokenizer.save(str(tiny_model_dir / "tokenizer.json"))
+        config = {
+            "eos_token": "<|im_end|>",
+            "bos_token": "<bos>",
+            "tokenizer_class": "GemmaTokenizer",
+        }
+        (tiny_model_dir / "tokenizer_config.json").write_text(json.dumps(config))
+    msg = TokenizeMsg(uid=0, text=prompt, sampling_params=SamplingParams())
+    assert TokenizeManager(str(tiny_model_dir)).tokenize(msg).input_ids.tolist() == input_ids
+    assert AutoTokenizer.from_pretrained(tiny_model_dir).encode(prompt) == input_ids
+
+
 def test_checkpoint_eos_and_sampling_defaults(tiny_model_dir: Path) -> None:
     manager = TokenizeManager(str(tiny_model_dir))
     eos = manager.tokenizer.token_to_id("<|im_end|>")
@@ -194,6 +232,8 @@ def test_real_tokenizer_matches_transformers() -> None:
 
     token_ids = tokenize_manager.tokenizer.encode(MULTILINGUAL_TEXT).ids
     assert token_ids == reference.encode(MULTILINGUAL_TEXT, add_special_tokens=False)
+    raw = TokenizeMsg(uid=0, text=MULTILINGUAL_TEXT, sampling_params=SamplingParams())
+    assert tokenize_manager.tokenize(raw).input_ids.tolist() == reference.encode(MULTILINGUAL_TEXT)
     assert "".join(outputs(decode_stream(detokenize_manager, token_ids))) == MULTILINGUAL_TEXT
 
     tools = [
