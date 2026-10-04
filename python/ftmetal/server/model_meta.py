@@ -1,21 +1,22 @@
-"""Protocol-level thinking toggles folded into the chat template kwargs.
+"""Model-derived facts the server publishes to its clients: the thinking gears of
+/v1/cache/status and the protocol-level thinking toggles folded into the chat template kwargs.
 
-Port of FreeToken server/model_meta.py (thinking_toggle_kwargs, effort_toggle_kwargs), with
-the toggle broadcasts of its tokenizer/effort.py. Divergences: the reasoning-effort
-vocabulary is not ported (no template probing, no /v1/models effort fields, no
-/v1/cache/status thinking gears), so the routes refuse reasoning_effort and
-effort_toggle_kwargs only ever folds the on/off direction; no MoE slot-cache sizes (this
-engine has no expert cache).
+Port of FreeToken server/model_meta.py. Divergence: no MoE slot-cache sizes (this engine has
+no expert cache).
 """
 
 from __future__ import annotations
 
-#: Protocol-level thinking toggles, broadcast in every spelling the ecosystem's
-#: templates read (``enable_thinking`` bool: qwen/glm/gemma/dsv4;
-#: ``thinking_mode`` string: minimax-m3). Jinja ignores undeclared variables,
-#: so a template simply picks the knob it knows -- no per-family routing needed.
-THINKING_OFF_KWARGS = {"enable_thinking": False, "thinking_mode": "disabled"}
-THINKING_ON_KWARGS = {"enable_thinking": True, "thinking_mode": "enabled"}
+from typing import Tuple
+
+from ftmetal.effort import (
+    EFFORT_SCALE,
+    THINKING_ADAPTIVE_KWARGS,
+    THINKING_OFF_KWARGS,
+    THINKING_ON_KWARGS,
+    ThinkingProfile,
+    effective_efforts,
+)
 
 
 def thinking_toggle_kwargs(enabled: bool) -> dict:
@@ -25,6 +26,64 @@ def thinking_toggle_kwargs(enabled: bool) -> dict:
     broadcast at once. A template picks the knob it knows and ignores the rest
     (Jinja never sees undeclared variables), so no per-family routing exists."""
     return dict(THINKING_ON_KWARGS if enabled else THINKING_OFF_KWARGS)
+
+
+def derive_think_gears(
+    profile: ThinkingProfile, parser_configured: bool
+) -> Tuple[Tuple[str, ...], str | None, dict] | None:
+    """``(gears, default_gear, kwargs_per_gear)`` for the /v1/cache/status
+    ``geometry.reasoning`` block, derived from the checkpoint's probed thinking
+    controls -- the checkpoint owns this knowledge; nothing here is keyed by
+    model family. ``None`` when there is nothing controllable to offer.
+
+    A template that grades effort without validating it gets the graded ladder
+    (its trained levels; never-advertised dialects quantize onto it); an always-on
+    model with a reasoning parser but no observable knob shows a single "on"
+    gear so clients can still label the state."""
+    efforts = profile.efforts
+    gears: list[str] = []
+    kwargs: dict[str, dict] = {}
+    if profile.toggleable:
+        gears.append("off")
+        kwargs["off"] = dict(THINKING_OFF_KWARGS)
+    if profile.has_adaptive:
+        gears.append("adaptive")
+        kwargs["adaptive"] = dict(THINKING_ADAPTIVE_KWARGS)
+
+    if efforts.consumes_effort:
+        # The served vocabulary: a validating template's own probed set; a
+        # non-validating grader gets the graded ladder (incl. xhigh -- muse's
+        # model card recommends it for agentic use) rather than the OpenAI triple.
+        names = [n for n in effective_efforts(efforts) if n in EFFORT_SCALE]
+        for name in sorted(names, key=lambda n: EFFORT_SCALE[n]):
+            gears.append(name)
+            gear_kwargs = dict(THINKING_ON_KWARGS) if profile.toggleable else {}
+            gear_kwargs["reasoning_effort"] = name
+            kwargs[name] = gear_kwargs
+    elif profile.toggleable:
+        gears.append("on")
+        kwargs["on"] = dict(THINKING_ON_KWARGS)
+    elif parser_configured:
+        # Always-thinking family (minimax): no knob, but the state is real.
+        gears.append("on")
+        kwargs["on"] = {}
+
+    if not gears:
+        return None
+
+    if profile.default_state == "off" and "off" in gears:
+        default = "off"
+    elif profile.default_state == "adaptive" and "adaptive" in gears:
+        default = "adaptive"
+    elif efforts.consumes_effort:
+        default = (
+            efforts.default
+            if efforts.default in gears
+            else ("medium" if "medium" in gears else gears[-1])
+        )
+    else:
+        default = "on" if "on" in gears else gears[-1]
+    return tuple(gears), default, kwargs
 
 
 _THINKING_KWARG_KEYS = ("enable_thinking", "thinking", "thinking_mode", "reasoning_effort")

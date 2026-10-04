@@ -1,9 +1,8 @@
 """OpenAI routes: /v1 (liveness), POST /v1/chat/completions and /v1/completions, streamed
 or not, and GET /v1/models.
 
-Port of FreeToken server/openai_api.py. Divergences: reasoning_effort is refused (the effort
-vocabulary is not ported, see model_meta), so /v1/models carries no effort fields; no
-request log.
+Port of FreeToken server/openai_api.py, verbatim apart from formatting. Divergence: no request
+log.
 """
 
 # Comments and docstrings keep FreeToken's line breaks.
@@ -11,6 +10,7 @@ request log.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -21,6 +21,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ftmetal.core import SamplingParams
+from ftmetal.effort import EFFORT_SCALE, KNOWN_REASONING_EFFORTS
 from ftmetal.message.tokenizer import TokenizeMsg
 
 from .api_models import (
@@ -48,6 +49,10 @@ from .generation import (
     resolve_sampling,
     submit_generation,
 )
+
+#: The wire superset plus "off", DeepSeek's disable synonym that
+#: effort_toggle_kwargs has always honored.
+_ACCEPTED_EFFORTS = (*KNOWN_REASONING_EFFORTS, "off")
 
 
 def _thinking_type(req: Any) -> str | None:
@@ -138,6 +143,7 @@ def register_openai_routes(
         state = get_state()
         model_id = _served_model_name(state)
         ctx = _model_context_length(state)
+        efforts, default_effort = await _effort_fields(state)
         return ModelList(
             data=[
                 ModelCard(
@@ -145,6 +151,8 @@ def register_openai_routes(
                     root=state.config.model_path,
                     max_model_len=ctx,
                     context_length=ctx,
+                    supported_reasoning_efforts=efforts,
+                    default_reasoning_effort=default_effort,
                 )
             ]
         )
@@ -169,10 +177,13 @@ async def handle_chat_completion(
         )
     if req.n != 1:
         return create_error_response("Only n=1 is supported", param="n")
-    if req.reasoning_effort is not None:
+    # Case/whitespace and the "off" disable synonym stay accepted here because
+    # effort_toggle_kwargs normalizes and honors them downstream.
+    effort = req.reasoning_effort.strip().lower() if isinstance(req.reasoning_effort, str) else None
+    if effort and effort not in _ACCEPTED_EFFORTS:
         return create_error_response(
-            "reasoning_effort is not supported; toggle thinking with "
-            "chat_template_kwargs.enable_thinking or thinking.type",
+            f"reasoning_effort must be one of {', '.join(_ACCEPTED_EFFORTS)}; "
+            f"got {req.reasoning_effort!r}",
             param="reasoning_effort",
         )
     if isinstance(req.thinking, dict):
@@ -721,6 +732,27 @@ def _is_token_prompt(prompt: Any) -> bool:
             )
         )
     )
+
+
+async def _effort_fields(state: Any) -> tuple[list[str] | None, str | None]:
+    """The checkpoint's probed effort vocabulary for /v1/models, or (None, None)
+    when there is no frontend tokenizer, it fails to build, or the model has no
+    effort knob — a metadata route must never 500 over this."""
+    build = getattr(state, "frontend_tokenizer", None)
+    if build is None:
+        return None, None
+    try:
+        manager = await asyncio.to_thread(build)
+        profile = await asyncio.to_thread(manager.effort_profile)
+    except Exception:  # noqa: BLE001 -- metadata only; the generation path reports real faults
+        return None, None
+    from ftmetal.effort import effective_efforts
+
+    served = effective_efforts(profile)
+    if not served:
+        return None, None
+    ordered = sorted(served, key=lambda name: -EFFORT_SCALE.get(name, 0.0))
+    return ordered, profile.default
 
 
 def _served_model_name(state: Any) -> str:

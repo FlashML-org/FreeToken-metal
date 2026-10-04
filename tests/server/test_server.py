@@ -511,7 +511,12 @@ def test_routes_admit_the_prompt_with_its_reusable_prefix_end(
 # (route, request body, status code, a fragment of the error body)
 REFUSED_CASES: list[tuple[str, dict[str, JsonValue], int, str]] = [
     ("/v1/chat/completions", {**chat_body(), "n": 2}, 400, '"param":"n"'),
-    ("/v1/chat/completions", {**chat_body(), "reasoning_effort": "high"}, 400, "reasoning_effort"),
+    (
+        "/v1/chat/completions",
+        {**chat_body(), "reasoning_effort": "turbo"},
+        400,
+        "reasoning_effort must be one of",
+    ),
     (
         "/v1/chat/completions",
         {**chat_body(), "function_call": "auto"},

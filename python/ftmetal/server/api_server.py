@@ -8,7 +8,9 @@ the tokenizer worker and the scheduler are threads fed by queue.Queue instead of
 over ZMQ, and the scheduler thread is the only MLX caller; replies reach the event loop
 through call_soon_threadsafe and wait per request on an asyncio.Queue; the scheduler is
 built before the server accepts requests, so maintenance_state is "serving" while both
-threads run and "failed" once one has died (no loading gate, no cache rebuild); new_user
+threads run and "failed" once one has died (no loading gate, no cache rebuild); both
+TokenizeManagers probe their chat template's thinking and effort controls before serving
+(FreeToken probes on first use, and warms the frontend's on the first cache poll); new_user
 refuses with EngineUnavailableError, answered 503 as FreeToken answers a closed admission;
 closing a request's reply stream before its terminal reply also aborts it, and an abort is
 sent once; /generate reports a failed request as an {"error": ...} event before [DONE]; a
@@ -39,6 +41,7 @@ from pydantic import BaseModel
 
 from ftmetal import __version__
 from ftmetal.core import SamplingParams
+from ftmetal.effort import ThinkingProfile
 from ftmetal.message.backend import (
     AbortBackendMsg,
     BaseBackendMsg,
@@ -102,6 +105,11 @@ class FrontendManager:
             if self.frontend_tokenize_manager is None:
                 self.frontend_tokenize_manager = TokenizeManager(self.config.model_path)
             return self.frontend_tokenize_manager
+
+    def warm_frontend_tokenizer(self) -> ThinkingProfile:
+        """Build the frontend tokenizer and probe its chat template's thinking and effort
+        controls; the lifespan runs it before serving."""
+        return self.frontend_tokenizer().thinking_profile()
 
     def new_user(self) -> int:
         if self.maintenance_state != "serving":
@@ -310,6 +318,9 @@ def create_app(config: ServerArgs) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         engine_thread.start()
+        # Both TokenizeManagers probe their template once, before the first request.
+        await asyncio.to_thread(tokenize_manager.thinking_profile)
+        await asyncio.to_thread(frontend.warm_frontend_tokenizer)
         await asyncio.wrap_future(engine_started)
         frontend.loop = asyncio.get_running_loop()
         tokenizer_thread.start()
