@@ -6,6 +6,7 @@
 
 #include "fdecode.h"
 #include "fprefill.h"
+#include "gather_qmm_sorted.h"
 #include "gdn_step.h"
 #include "rows.h"
 #include "sample.h"
@@ -20,6 +21,7 @@ NB_MODULE(_C, m) {
   m.def("init_gdn_step_library", &ftmetal::init_gdn_step_library, "source"_a);
   m.def("init_fdecode_library", &ftmetal::init_fdecode_library, "source"_a);
   m.def("init_fprefill_library", &ftmetal::init_fprefill_library, "source"_a);
+  m.def("init_gather_qmm_sorted_library", &ftmetal::init_gather_qmm_sorted_library, "source"_a);
   m.def("init_sample_library", &ftmetal::init_sample_library, "source"_a);
 
   m.def(
@@ -122,6 +124,21 @@ NB_MODULE(_C, m) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       "Paged causal flash-attention of each tile's queries over its request's keys; returns [T, Hq, D].");
+
+  m.def(
+      "gather_qmm_sorted",
+      &ftmetal::gather_qmm_sorted,
+      "x"_a,
+      "w"_a,
+      "scales"_a,
+      "biases"_a,
+      "expert_offsets"_a,
+      "slot_of"_a,
+      "group_size"_a,
+      "bits"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      "x[b] @ dequantize(w[slot_of[e]]).T for the rows b of each expert e; returns [B, 1, N].");
 
   m.def(
       "sample_tokens",
