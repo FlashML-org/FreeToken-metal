@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=75", "cmake>=3.27", "nanobind==2.13.0", "mlx==0.32.1"]
+requires = ["setuptools>=75", "cmake>=3.27", "nanobind==3.0.1", "mlx==0.32.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -10,7 +10,7 @@ readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.13"
 dependencies = [
-    "mlx==0.32.1",
+    "mlx==0.32.3",
     "numpy>=2.0,<3",
     "fastapi>=0.115,<1",
     "uvicorn>=0.30,<1",

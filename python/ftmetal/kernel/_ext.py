@@ -3,7 +3,7 @@
 from importlib.metadata import version
 from pathlib import Path
 
-REQUIRED_MLX_VERSION = "0.32.1"
+REQUIRED_MLX_VERSION = "0.32.3"
 METAL_DIR = Path(__file__).resolve().parent / "metal"
 
 if version("mlx") != REQUIRED_MLX_VERSION:
