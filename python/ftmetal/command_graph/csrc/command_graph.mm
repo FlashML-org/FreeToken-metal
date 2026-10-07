@@ -4,7 +4,7 @@
 // MTL_DEBUG_LAYER's wrapper classes are hooked the same way; every hook chains to the
 // original and does nothing else while no session is open on the calling thread. The
 // MLX internals read through member pointers (CommandEncoder::temporaries_ and encoder_,
-// Device::library_kernels_ and kernel_mtx_) are pinned to the mlx 0.32.1 headers.
+// Device::library_kernels_ and kernel_mtx_) are pinned to the mlx 0.32.3 headers.
 
 #include "command_graph.h"
 
@@ -870,7 +870,7 @@ void classify(Session& session) {
       graph.constants.size() + graph.intermediates.size() + graph.temporaries.size());
 }
 
-// MLX 0.32.1's steel GEMMParams (steel/gemm/params.h) is 68 bytes of fields padded to 72
+// MLX 0.32.3's steel GEMMParams (steel/gemm/params.h) is 68 bytes of fields padded to 72
 // by its int64 members; setBytes copies the padding, which holds the caller's stack.
 const uint32_t GEMM_PARAMS_BYTES = 72;
 const uint32_t GEMM_PARAMS_FIELD_BYTES = 68;
