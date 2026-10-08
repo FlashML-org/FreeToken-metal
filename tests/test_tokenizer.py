@@ -1,5 +1,5 @@
-"""Prompt rendering, raw prompts, the reusable prefix end, incremental detokenization and
-stop strings.
+"""Prompt rendering, raw prompts, the reusable prefix end, image expansion, incremental
+detokenization and stop strings.
 
 The tiny checkpoint covers the contract; with FTMETAL_TEST_MODEL_PATH set, the real
 checkpoint's tokenizer.json and chat template are checked against transformers, which is
@@ -8,6 +8,7 @@ also how FreeToken encodes a raw prompt.
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
@@ -16,18 +17,24 @@ from typing import Literal
 
 import pytest
 from jinja2 import TemplateError
+from PIL import Image
 from tokenizers import AddedToken, Tokenizer, processors
 from transformers import AutoTokenizer
 
 from ftmetal.core import SamplingParams
 from ftmetal.message.frontend import UserReply
 from ftmetal.message.tokenizer import DetokenizeMsg, FinishReason, JsonValue, TokenizeMsg
+from ftmetal.mm.config import MultimodalConfig
+from ftmetal.mm.item import MMItem
+from ftmetal.mm.processors.qwen_vl import QwenVLMMProcessor
+from ftmetal.models.loader import read_model_config
 from ftmetal.tokenizer import (
     DetokenizeManager,
     TokenizeManager,
     load_eos_token_ids,
     load_sampling_defaults,
 )
+from tiny_vl_model import write_qwen_vl_model
 
 MODEL_PATH = os.environ.get("FTMETAL_TEST_MODEL_PATH")
 MULTILINGUAL_TEXT = "Héllo, 世界! Ünïcödé 🚀🧪 naïve café\n\tдобрый день — ok."
@@ -285,6 +292,61 @@ def test_unstable_template_reuses_the_whole_prompt_and_warns_once(
             user_msg = manager.tokenize(tokenize_msg(CONVERSATION))
             assert user_msg.reuse_len == len(user_msg.input_ids)
     assert len(caplog.records) == 1
+
+
+def test_image_turn_reuses_its_expanded_prefix(
+    tiny_model_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_qwen_vl_model(tiny_model_dir)
+    model_path = str(tiny_model_dir)
+    processor = QwenVLMMProcessor(read_model_config(model_path), model_path, MultimodalConfig())
+    processed: list[int] = []
+    process = processor.process
+
+    def counting_process(images: list[Image.Image]) -> list[MMItem]:
+        processed.append(len(images))
+        return process(images)
+
+    monkeypatch.setattr(processor, "process", counting_process)
+    manager = TokenizeManager(model_path, processor)
+    buffer = io.BytesIO()
+    Image.new("RGB", (64, 64), (120, 30, 200)).save(buffer, format="PNG")
+    first_turn: list[dict[str, JsonValue]] = [
+        {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "What is it?"}]}
+    ]
+    next_turn: list[dict[str, JsonValue]] = [
+        *first_turn,
+        {"role": "assistant", "content": "A square."},
+        {"role": "user", "content": "Which color?"},
+    ]
+    first, following = [
+        manager.tokenize(
+            TokenizeMsg(
+                uid=0, text=messages, sampling_params=SamplingParams(), images=[buffer.getvalue()]
+            )
+        )
+        for messages in (first_turn, next_turn)
+    ]
+    # Each request decodes and preprocesses its image once.
+    assert processed == [1, 1]
+    assert first.mm_items is not None and following.mm_items is not None
+    ((start, end),) = first.mm_items[0].offsets
+    assert end - start == 64 and end <= first.reuse_len
+    assert following.mm_items[0].offsets == first.mm_items[0].offsets
+    # The first turn's reusable prefix, its image span included, opens the next turn's prompt.
+    first_ids = first.input_ids.tolist()
+    assert following.input_ids.tolist()[: first.reuse_len] == first_ids[: first.reuse_len]
+    for user_msg in (first, following):
+        unshared = user_msg.input_ids.tolist()[user_msg.reuse_len :]
+        decoded = manager.tokenizer.decode(unshared, skip_special_tokens=False)
+        assert decoded == "<|im_start|>assistant\n<think>\n"
+
+
+def test_images_need_an_image_processor(tiny_model_dir: Path) -> None:
+    messages: list[dict[str, JsonValue]] = [{"role": "user", "content": "hi"}]
+    msg = TokenizeMsg(uid=0, text=messages, sampling_params=SamplingParams(), images=[b""])
+    with pytest.raises(ValueError, match="image input is not supported"):
+        TokenizeManager(str(tiny_model_dir)).tokenize(msg)
 
 
 def test_checkpoint_eos_and_sampling_defaults(tiny_model_dir: Path) -> None:

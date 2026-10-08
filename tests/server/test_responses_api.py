@@ -1,18 +1,26 @@
 """The OpenAI Responses API end to end over the real tokenizer worker and a scripted
-scheduler: reasoning, message and function_call items, whole and streamed, and the
-stateless routes."""
+scheduler: reasoning, message and function_call items, whole and streamed, image input, and
+the stateless routes."""
 
 from __future__ import annotations
 
+import base64
+import dataclasses
+import io
 import json
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 from pydantic import JsonValue
+from tokenizers import Tokenizer
 
+from ftmetal.mm import MM_PAD_SHIFT_VALUE
+from ftmetal.mm.config import ENCODER_KINDS, EncoderKind, MultimodalConfig
 from ftmetal.server.api_server import create_app
 from scripted_server import SCRIPT, ScriptedScheduler, named_sse_events, tiny_server_args
+from tiny_vl_model import write_qwen_vl_model
 
 TOOLS: list[JsonValue] = [
     {
@@ -213,6 +221,112 @@ def test_cached_tokens_are_reported_when_asked(
     ) as client:
         response = client.post("/v1/responses", json={"model": "tiny", "input": "hi"}).json()
     assert response["usage"]["input_tokens_details"]["cached_tokens"] == 5
+
+
+def png_data_url(width: int, height: int) -> str:
+    buffer = io.BytesIO()
+    Image.new("RGB", (width, height), (120, 30, 200)).save(buffer, format="PNG")
+    return f"data:image/png;base64,{base64.b64encode(buffer.getvalue()).decode()}"
+
+
+def image_input(image_url: str) -> list[JsonValue]:
+    """A user message asking about one image."""
+    content: list[JsonValue] = [
+        {"type": "input_image", "image_url": image_url},
+        {"type": "input_text", "text": "What is it?"},
+    ]
+    return [{"type": "message", "role": "user", "content": content}]
+
+
+def image_span(input_ids: list[int]) -> tuple[int, int]:
+    """The half-open span of the one image's pad ids."""
+    rows = [i for i, token in enumerate(input_ids) if token >= MM_PAD_SHIFT_VALUE]
+    assert rows == list(range(rows[0], rows[-1] + 1))
+    return rows[0], rows[-1] + 1
+
+
+def test_input_image_reaches_the_scheduler_as_the_chat_route_sends_it(
+    tiny_model_dir: Path, scripted: type[ScriptedScheduler]
+) -> None:
+    write_qwen_vl_model(tiny_model_dir)
+    image_url = png_data_url(64, 64)
+    chat_content: list[JsonValue] = [
+        {"type": "image_url", "image_url": {"url": image_url}},
+        {"type": "text", "text": "What is it?"},
+    ]
+    chat_body = {"model": "tiny", "messages": [{"role": "user", "content": chat_content}]}
+    with TestClient(create_app(tiny_server_args(tiny_model_dir))) as client:
+        response = client.post(
+            "/v1/responses", json={"model": "tiny", "input": image_input(image_url)}
+        )
+        streamed = client.post(
+            "/v1/responses", json={"model": "tiny", "input": image_input(image_url), "stream": True}
+        )
+        chat = client.post("/v1/chat/completions", json=chat_body)
+    assert response.status_code == streamed.status_code == chat.status_code == 200
+    admitted = [scripted.instances[0].admitted[uid][0] for uid in range(3)]
+    assert admitted[0] == admitted[1] == admitted[2]
+    # 64x64 is scaled up to the 64-token minimum.
+    start, end = image_span(admitted[0])
+    assert end - start == 64
+    assert response.json()["usage"]["input_tokens"] == len(admitted[0])
+
+
+def test_tool_output_image_rides_the_following_user_turn(
+    tiny_model_dir: Path, scripted: type[ScriptedScheduler]
+) -> None:
+    write_qwen_vl_model(tiny_model_dir)
+    output: list[JsonValue] = [
+        {"type": "input_text", "text": "the screenshot"},
+        {"type": "input_image", "image_url": png_data_url(64, 64)},
+    ]
+    body = {
+        "model": "tiny",
+        "input": [
+            {"type": "message", "role": "user", "content": "Take a screenshot."},
+            {"type": "function_call", "call_id": "call_1", "name": "screenshot", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": output},
+        ],
+    }
+    with TestClient(create_app(tiny_server_args(tiny_model_dir))) as client:
+        assert client.post("/v1/responses", json=body).status_code == 200
+    input_ids = scripted.instances[0].admitted[0][0]
+    start, end = image_span(input_ids)
+    tokenizer = Tokenizer.from_file(str(tiny_model_dir / "tokenizer.json"))
+    before = tokenizer.decode(input_ids[:start], skip_special_tokens=False)
+    after = tokenizer.decode(input_ids[end:], skip_special_tokens=False)
+    assert before.endswith(
+        "<|im_start|>tool\nthe screenshot<|im_end|>\n<|im_start|>user\n<|vision_start|>"
+    )
+    assert after.startswith("<|vision_end|><|im_end|>\n<|im_start|>assistant\n")
+
+
+# (whether the checkpoint has a vision tower, the encoder kinds left unbuilt, the refusal)
+IMAGE_REFUSAL_CASES: list[tuple[bool, frozenset[EncoderKind], str]] = [
+    (False, frozenset(), "the served model has no vision support"),
+    (True, frozenset(ENCODER_KINDS), "image input is disabled on this server (--text-model-only)"),
+    (True, frozenset({"vision"}), "image input is disabled on this server (--mm-disable)"),
+]
+
+
+@pytest.mark.parametrize(("has_vision", "disabled_encoders", "reason"), IMAGE_REFUSAL_CASES)
+def test_text_only_server_refuses_images_before_any_stream(
+    tiny_model_dir: Path,
+    scripted: type[ScriptedScheduler],
+    has_vision: bool,
+    disabled_encoders: frozenset[EncoderKind],
+    reason: str,
+) -> None:
+    write_qwen_vl_model(tiny_model_dir, has_vision)
+    args = dataclasses.replace(
+        tiny_server_args(tiny_model_dir), mm=MultimodalConfig(disabled_encoders=disabled_encoders)
+    )
+    with TestClient(create_app(args)) as client:
+        for stream in (False, True):
+            body = {"model": "tiny", "input": image_input(png_data_url(8, 8)), "stream": stream}
+            response = client.post("/v1/responses", json=body)
+            assert response.status_code == 400 and reason in response.json()["error"]["message"]
+    assert scripted.instances[0].admitted == {}
 
 
 # (method, route, request body, status code, error message fragment)

@@ -1,7 +1,8 @@
 """Architecture name -> model package.
 
-Port of FreeToken models/register.py, reduced to the served families and the two
-hooks a package exposes: parse_config and weight_rules.
+Port of FreeToken models/register.py, reduced to the served families, the two hooks a
+package exposes (parse_config and weight_rules) and the multimodal processor and encoder
+towers. Divergence: an EncoderSpec names the checkpoint prefix of its tower's weights.
 """
 
 from __future__ import annotations
@@ -12,9 +13,22 @@ from dataclasses import dataclass
 import mlx.core as mx
 
 from ftmetal.layers.quantization.config import QuantConfig
+from ftmetal.mm.config import EncoderKind, Modality
 from ftmetal.models.blocks import BaseLLMModel
 from ftmetal.models.config import ModelConfig
 from ftmetal.models.loader import WeightRules
+
+
+@dataclass(frozen=True)
+class EncoderSpec:
+    # The name --mm-disable takes.
+    kind: EncoderKind
+    # The checkpoint config section that builds the tower.
+    config_key: str
+    # The inputs it serves.
+    modalities: tuple[Modality, ...]
+    # The checkpoint name prefix the tower's weights load from.
+    weight_prefix: str
 
 
 @dataclass(frozen=True)
@@ -23,14 +37,27 @@ class ModelSpec:
     model_cls: str
     parse_config: str = "parse_config"
     weight_rules: str = "weight_rules"
+    # "module:Class" turning the checkpoint's images into items; None: the family takes no
+    # multimodal input.
+    mm_processor: str | None = None
+    encoders: tuple[EncoderSpec, ...] = ()
 
 
+# Gemma4's release registers its image processor but no encoder until its vision tower is
+# built, so it serves text only and refuses images.
 MODEL_REGISTRY: dict[str, ModelSpec] = {
     "Qwen3_5MoeForConditionalGeneration": ModelSpec(
-        "ftmetal.models.qwen3_5_moe", "Qwen3_5MoeForCausalLM"
+        "ftmetal.models.qwen3_5_moe",
+        "Qwen3_5MoeForCausalLM",
+        mm_processor="ftmetal.mm.processors.qwen_vl:QwenVLMMProcessor",
+        encoders=(EncoderSpec("vision", "vision_config", ("image",), "model.visual."),),
     ),
     "Qwen3_5MoeForCausalLM": ModelSpec("ftmetal.models.qwen3_5_moe", "Qwen3_5MoeForCausalLM"),
-    "Gemma4ForConditionalGeneration": ModelSpec("ftmetal.models.gemma4", "Gemma4ForCausalLM"),
+    "Gemma4ForConditionalGeneration": ModelSpec(
+        "ftmetal.models.gemma4",
+        "Gemma4ForCausalLM",
+        mm_processor="ftmetal.mm.processors.gemma4:Gemma4MMProcessor",
+    ),
     "Gemma4ForCausalLM": ModelSpec("ftmetal.models.gemma4", "Gemma4ForCausalLM"),
 }
 
@@ -64,6 +91,7 @@ def create_model(architecture: str, model_config: ModelConfig, dtype: mx.Dtype) 
 
 __all__ = [
     "MODEL_REGISTRY",
+    "EncoderSpec",
     "ModelSpec",
     "create_model",
     "get_model_spec",

@@ -11,12 +11,14 @@ from __future__ import annotations
 import logging
 from typing import Literal, NamedTuple
 
+import mlx.core as mx
 import pytest
 
 from ftmetal.attention.metadata import AttnType
 from ftmetal.engine.cache_budget import (
     GIB,
     activation_reserve_bytes,
+    encoder_reserve_bytes,
     graph_reserve_bytes,
     memory_budget_bytes,
     plan_budget,
@@ -47,6 +49,7 @@ QWEN3_6_TEXT_CONFIG: dict[str, object] = {
     "num_experts": 256,
     "rope_parameters": {"type": "default", "rope_theta": 10000000, "partial_rotary_factor": 0.25},
 }
+MIB = 1 << 20
 WORKING_SET_BYTES = 40_200_896_512  # max_recommended_working_set_size, M4 Pro 48 GB
 WEIGHTS_BYTES = 20 * GIB
 # 30 GDN layers x (conv ring 4 x 8192 bf16 + state 32 x 128 x 128 fp32).
@@ -181,6 +184,42 @@ def test_graph_reserve_comes_off_the_paged_pools() -> None:
     assert "graphs" not in "".join(without.lines())
     lines = with_graphs.lines()
     assert lines.index("graphs          0.01 GiB") == lines.index("activations     5.25 GiB") + 1
+
+
+# Qwen3.6-35B-A3B's vision_config fields the encoder reserve reads.
+QWEN3_6_VISION_CONFIG: dict[str, object] = {
+    "in_channels": 3,
+    "temporal_patch_size": 2,
+    "patch_size": 16,
+    "hidden_size": 1152,
+    "intermediate_size": 4304,
+}
+
+
+# (patches, the peak above the weights and the float32 pixels measured on Qwen3.6's tower in
+# bf16, which holds the pixels' bf16 cast): the reserve must cover the peak and bf16 pixels.
+ENCODER_PEAK_CASES: list[tuple[int, float]] = [(16384, 482.6 * MIB), (65536, 1802.4 * MIB)]
+
+
+@pytest.mark.parametrize(("patches", "peak"), ENCODER_PEAK_CASES)
+def test_encoder_reserve_covers_the_measured_peak(patches: int, peak: float) -> None:
+    pixels = patches * 1536 * 2
+    assert encoder_reserve_bytes(QWEN3_6_VISION_CONFIG, mx.bfloat16, patches) >= peak + pixels
+
+
+def test_encoder_reserve_comes_off_the_paged_pools() -> None:
+    """The checkpoint's 16384 tokens of 2x2 patches: per patch a bf16 1536-wide feature and
+    13 bf16 1152-wide activations, then one 4096-row chunk of two 4304-wide ones."""
+    reserve = encoder_reserve_bytes(QWEN3_6_VISION_CONFIG, mx.bfloat16, 16384 * 4)
+    assert reserve == 65536 * (2 * 1536 + 2 * 13 * 1152) + 2 * 2 * 4096 * 4304 == 2_234_777_600
+    model_config = parse_config(QWEN3_6_TEXT_CONFIG)
+    config = EngineConfig(model_path="unused", max_running_req=8)
+    costs = pool_costs(model_config.kv_cache_group_specs(), config)
+    budget = memory_budget_bytes(WORKING_SET_BYTES)
+    without = plan_budget(budget, WEIGHTS_BYTES, 0, 0, costs)
+    with_encoder = plan_budget(budget, WEIGHTS_BYTES, 0, 0, costs, reserve)
+    assert without.paged_bytes - with_encoder.paged_bytes == reserve
+    assert "encoder         2.08 GiB" in with_encoder.lines()
 
 
 # The text_config fields of Gemma4-26B-A4B that its attention groups are parsed from.

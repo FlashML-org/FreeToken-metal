@@ -1,18 +1,21 @@
 """Admission of pending prompts into prefill batches, chunked by a token budget.
 
-Port of FreeToken scheduler/prefill.py. Admission matches the prefix cache, locks the
-match and reserves the GDN slots (1 live + 2 ping-pong, evicting tree snapshots if short;
-naive takes only the live slot, of which the pool keeps one per table row, and zeroes it);
-on a sliding-window model it needs window slots for the first chunk, up to one window, and
-every chunk is capped by the window slots left this pass. A hit carries the snapshot slot
-to restore from; a continuation chunk inherits the window frontier the chunk before it
-reaches. Divergences: no multimodal currency; the window cap credits none of the request's
-own out-of-window slots (they come back when its step in flight drains, after this
+Port of FreeToken scheduler/prefill.py and the PendingReq of scheduler/utils.py.
+Admission matches the prefix cache, locks the match, claims the encoder rows of the
+prompt's images past it and reserves the GDN slots (1 live + 2 ping-pong, evicting tree
+snapshots if short; naive takes only the live slot, of which the pool keeps one per table
+row, and zeroes it); on a sliding-window model it needs window slots for the first chunk,
+up to one window, and every chunk is capped by the window slots left this pass. A hit
+carries the snapshot slot to restore from; a continuation chunk inherits the window
+frontier the chunk before it reaches. Divergences: the window cap credits none of the
+request's own out-of-window slots (they come back when its step in flight drains, after this
 allocation), so a continuation it leaves empty waits for that drain; a miss zeroes its live
 slot here; naive allocates its live slot here too (SGLang's HybridReqToTokenPool.alloc)
 where FreeToken's naive keys it by table_idx; the cached part of the token pool row is not
 written (only the extended tokens are ever gathered); a continuation chunk inherits the
-pending track snapshot of the chunk before it; every chunk carries the prompt's reuse_len.
+pending track snapshot of the chunk before it; every chunk carries the prompt's reuse_len;
+no keep_images_whole (no bidirectional image blocks are served), so a chunk may end inside
+an image span.
 """
 
 from __future__ import annotations
@@ -24,8 +27,11 @@ import numpy as np
 from ftmetal.core import Batch, CacheHandle, Req, SamplingParams
 from ftmetal.kvcache.linear_state_pool import LIVE_SLOTS, TRACK_SLOTS
 from ftmetal.kvcache.radix_cache import align_down
+from ftmetal.mm.encoder_cache import EncoderCache
+from ftmetal.mm.item import MMItem
 from ftmetal.scheduler.cache import CacheManager, div_ceil
 from ftmetal.scheduler.decode import DecodeManager
+from ftmetal.scheduler.mm import mm_rows_after
 from ftmetal.scheduler.table import TableManager
 
 # GDN slots a hybrid radix request takes at admission: the live slot and the ping-pong pair.
@@ -40,6 +46,10 @@ class PendingReq:
     chunked_req: ChunkedReq | None = None
     # Every chunk's Req.reuse_len.
     reuse_len: int | None = None
+    # Every chunk's Req.mm_items, mrope_positions_full and mrope_delta.
+    mm_items: list[MMItem] | None = None
+    mrope_positions_full: np.ndarray | None = None
+    mrope_delta: int = 0
 
     @property
     def input_len(self) -> int:
@@ -185,6 +195,9 @@ class PrefillAdder:
             sampling_params=pending.sampling_params,
             cache_handle=resources.cache_handle,
             reuse_len=pending.reuse_len,
+            mm_items=pending.mm_items,
+            mrope_positions_full=pending.mrope_positions_full,
+            mrope_delta=pending.mrope_delta,
         )
         req.linear_slot_idx = resources.linear_slot_idx
         req.mamba_ping_pong = resources.ping_pong
@@ -244,6 +257,8 @@ class PrefillManager:
     cache_manager: CacheManager
     table_manager: TableManager
     decode_manager: DecodeManager
+    # Where the encoded images wait between chunks; None when the model serves none.
+    encoder_cache: EncoderCache | None = None
     pending_list: list[PendingReq] = field(default_factory=list)
 
     def add_one_req(
@@ -252,10 +267,19 @@ class PrefillManager:
         input_ids: np.ndarray,
         sampling_params: SamplingParams,
         reuse_len: int | None = None,
+        mm_items: list[MMItem] | None = None,
+        mrope_positions: np.ndarray | None = None,
+        mrope_delta: int = 0,
     ) -> None:
         self.pending_list.append(
             PendingReq(
-                uid, np.asarray(input_ids, dtype=np.int32), sampling_params, reuse_len=reuse_len
+                uid,
+                np.asarray(input_ids, dtype=np.int32),
+                sampling_params,
+                reuse_len=reuse_len,
+                mm_items=mm_items,
+                mrope_positions_full=mrope_positions,
+                mrope_delta=mrope_delta,
             )
         )
 
@@ -283,6 +307,12 @@ class PrefillManager:
             reqs.append(req)
             if not is_continuation:
                 prompt_admissions.append((req.uid, pending.input_len, req.cached_len))
+                if pending.mm_items and self.encoder_cache is not None:
+                    # Claim the rows every chunk of this request gathers: the entry outlives
+                    # the chunks.
+                    for item in pending.mm_items:
+                        rows = mm_rows_after(item, req.cached_len)
+                        self.encoder_cache.register(item.hash, req.uid, rows)
         if not reqs:
             return None
         self.pending_list = chunked_list + self.pending_list[len(reqs) :]

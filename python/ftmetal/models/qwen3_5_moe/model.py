@@ -1,9 +1,11 @@
 """Qwen3.5 / 3.6 hybrid GDN + gated-attention MoE decoder.
 
-Port of FreeToken models/qwen3_5_moe/model.py. Divergences: the batch flows
-through forward explicitly; norms are plain RMSNorm because MLX checkpoints store
-the (1 + w) shift; each Linear takes its affine scheme from the checkpoint's
-quantization map at construction.
+Port of FreeToken models/qwen3_5_moe/model.py, with the encode of its
+Qwen3_5MoeForConditionalGeneration. Divergences: the batch flows through forward
+explicitly; norms are plain RMSNorm because MLX checkpoints store the (1 + w) shift; each
+Linear takes its affine scheme from the checkpoint's quantization map at construction; one
+class serves both architectures and builds the vision tower when the config has one, in
+the engine dtype.
 """
 
 from __future__ import annotations
@@ -16,11 +18,13 @@ from ftmetal.layers.embedding import Embedding
 from ftmetal.layers.linear import Linear
 from ftmetal.layers.norm import RMSNorm
 from ftmetal.layers.quantization.config import AffineScheme
-from ftmetal.models.blocks import BaseLLMModel, select_last_rows
+from ftmetal.mm.item import MMItem
+from ftmetal.models.blocks import BaseLLMModel, embed_input_ids, select_last_rows
 from ftmetal.models.config import ModelConfig
 from ftmetal.models.qwen3_5_moe.attention import Qwen3_5Attention
 from ftmetal.models.qwen3_5_moe.gdn import Qwen3_5GatedDeltaNet
 from ftmetal.models.qwen3_5_moe.moe import Qwen3_5MoE
+from ftmetal.models.qwen3_5_moe.vision import Qwen3VLVisionModel
 from ftmetal.models.qwen3_5_moe.weight import (
     GATE_UP_PARTS,
     IN_PROJ_BA_PARTS,
@@ -117,7 +121,7 @@ class Qwen3_5Model(BaseOP):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
 
     def forward(self, batch: Batch) -> mx.array:
-        x = self.embed_tokens.forward(batch.input_ids)
+        x = embed_input_ids(self.embed_tokens, batch)
         for layer in self.layers:
             x = layer.forward(x, batch)
         return self.norm.forward(x)
@@ -135,12 +139,20 @@ class Qwen3_5MoeForCausalLM(BaseLLMModel):
                 scheme=scheme_of(config, "lm_head"),
                 dtype=dtype,
             )
+        if config.vision_config is not None:
+            self.visual = Qwen3VLVisionModel(config.vision_config)
+            self.visual.set_dtype(dtype)
 
     def forward(self, batch: Batch) -> mx.array:
         hidden = select_last_rows(self.model.forward(batch), batch)
         if self.config.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(hidden)
         return self.lm_head.forward(hidden)
+
+    def encode(self, item: MMItem) -> mx.array:
+        """[item.num_tokens, out_hidden_size] soft tokens of one image."""
+        assert item.feature is not None and item.grid_thw is not None
+        return self.visual(mx.array(item.feature).view(mx.bfloat16), [item.grid_thw])
 
 
 __all__ = ["Qwen3_5DecoderLayer", "Qwen3_5Model", "Qwen3_5MoeForCausalLM"]

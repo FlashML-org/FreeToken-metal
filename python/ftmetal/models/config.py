@@ -2,10 +2,10 @@
 
 Port of FreeToken models/config.py, reduced to the FULL, SWA and LINEAR group kinds and
 the fields Qwen3.5-style hybrid MoE and Gemma4 models use. Divergences: the quantization
-config is the MLX checkpoint's affine scheme map; no tensor parallelism, vision or MTP;
-the LINEAR group emits a KVCacheGroupSpec too (its per-slot conv and state shapes), so
-every pool is sized from a spec; the rope variant is a rope_type field, not a scaling
-dictionary.
+config is the MLX checkpoint's affine scheme map; no tensor parallelism or MTP; the
+LINEAR group emits a KVCacheGroupSpec too (its per-slot conv and state shapes), so every
+pool is sized from a spec; the rope variant is a rope_type field, not a scaling
+dictionary; vision_config is the checkpoint's raw section, which the tower parses.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ import mlx.core as mx
 
 from ftmetal.attention.metadata import AttnType
 from ftmetal.layers.quantization.config import QuantConfig
+from ftmetal.layers.rotary import MRopeLayout
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,21 @@ class RotaryConfig:
     # proportional: the first rotary_dim / 2 frequency pairs of a head_dim-wide rope rotate,
     # the rest pass through (Gemma4's global layers); default: the first rotary_dim dims.
     rope_type: Literal["default", "proportional"] = "default"
+    # 3-axis rope sections; None keeps the 1-D rope path, set only when the model serves
+    # vision.
+    mrope_section: tuple[int, int, int] | None = None
+    mrope_layout: MRopeLayout = "contiguous"
+
+
+def mrope_layout_from_rope_params(rope_params: dict[str, object]) -> MRopeLayout:
+    """rope_parameters flags -> layout name: mrope_interleaved_glm, else mrope_interleaved,
+    else contiguous."""
+    if rope_params.get("mrope_interleaved_glm"):
+        return "interleaved_glm"
+    elif rope_params.get("mrope_interleaved"):
+        return "interleaved"
+    else:
+        return "contiguous"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -140,10 +156,22 @@ class ModelConfig:
     attn_sm_scale: float | None = None
     final_logit_softcapping: float | None = None
     embedding_scale: float | None = None
+    # The checkpoint's vision_config section, None when this process builds no tower.
+    vision_config: dict[str, object] | None = None
+    image_token_id: int | None = None
 
     @property
     def is_moe(self) -> bool:
         return self.moe_enabled
+
+    @property
+    def is_multimodal(self) -> bool:
+        return self.vision_config is not None
+
+    @property
+    def is_mrope(self) -> bool:
+        """Whether attention takes 3-axis (t/h/w) rope positions."""
+        return self.rotary_config.mrope_section is not None
 
     @property
     def has_linear_attention(self) -> bool:
@@ -230,4 +258,5 @@ __all__ = [
     "ModelConfig",
     "RotaryConfig",
     "SWAAttentionGroupConfig",
+    "mrope_layout_from_rope_params",
 ]

@@ -252,6 +252,20 @@ REFUSED_CASES: list[tuple[str, dict[str, JsonValue], int, str]] = [
         400,
         "no vision support",
     ),
+    (
+        "/v1/messages/count_tokens",
+        {
+            "model": "tiny",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "source": {"type": "base64", "data": "AA=="}}],
+                }
+            ],
+        },
+        400,
+        "no vision support",
+    ),
 ]
 
 

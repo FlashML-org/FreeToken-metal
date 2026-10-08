@@ -2,10 +2,11 @@
 
 Port of FreeToken engine/graph.py. Divergences: a graph is a CommandGraph capture
 (ftmetal.command_graph) instead of a CUDA graph, so there is no GraphCaptureBuffer:
-the step inputs (input_ids, positions, out_loc and the metadata arrays a backend's
-prepare_for_replay leaves at the bucket's fixed shapes) are rebound by every replay,
-and so are the pools, which the replay takes and returns; the bs ladder ends at
-max_running_req, on the ladder or not; the arena is the graphs' shared pool, owned by
+the step inputs (input_ids, positions, out_loc, the [3, bs] mrope positions of a model
+serving vision, which join the sequence positions the GDN decode reads, and the metadata
+arrays a backend's prepare_for_replay leaves at the bucket's fixed shapes) are rebound by
+every replay, and so are the pools, which the replay takes and returns; the bs ladder ends
+at max_running_req, on the ladder or not; the arena is the graphs' shared pool, owned by
 GraphArena: every capture's intermediates and temporaries are planned into it, it is
 allocated after the captures, and each capture batch's replay on it must give its clean
 replay's logits; graphs outgrowing the memory budget's graph reserve fail the startup
@@ -54,10 +55,13 @@ class GraphRunner:
         graph_bs_list: list[int],
         max_seq_len: int,
         reserve_bytes: int,
+        is_mrope: bool,
     ) -> None:
         """An empty graph_bs_list turns replay off; max_seq_len is the page-table row width;
-        the graphs may keep reserve_bytes (their arena and pinned buffers)."""
+        the graphs may keep reserve_bytes (their arena and pinned buffers); an mrope model
+        takes [3, bs] rope positions as a step input."""
         self.model = model
+        self.is_mrope = is_mrope
         self.attn_backends = attn_backends
         self.pools = pools
         self.dummy_req = dummy_req
@@ -102,6 +106,8 @@ class GraphRunner:
         batch = Batch(reqs=[self.dummy_req] * bs, phase="decode")
         batch.input_ids = mx.zeros((bs,), dtype=mx.int32)
         batch.positions = mx.full((bs,), self.dummy_req.cached_len, dtype=mx.int32)
+        if self.is_mrope:
+            batch.mrope_positions = mx.full((3, bs), self.dummy_req.cached_len, dtype=mx.int32)
         for backend in self.attn_backends.values():
             backend.prepare_metadata(batch)
             backend.prepare_for_capture(batch)
@@ -128,8 +134,12 @@ class GraphRunner:
         return capture([logits, *pool_arrays(self.pools)], step_inputs, pools, externals)
 
     def step_inputs(self, batch: Batch) -> list[mx.array]:
-        """input_ids, positions, out_loc, then each backend's metadata arrays, in capture order."""
+        """input_ids, positions, out_loc, the mrope positions of an mrope model, then each
+        backend's metadata arrays, in capture order."""
         arrays = [batch.input_ids, batch.positions, batch.out_loc]
+        if self.is_mrope:
+            assert batch.mrope_positions is not None
+            arrays.append(batch.mrope_positions)
         for attn_type in self.attn_backends:
             arrays += batch.attn_metadata[attn_type].step_inputs()
         return arrays

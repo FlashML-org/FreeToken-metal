@@ -6,9 +6,10 @@ run_api_server, /generate), with the message loops of tokenizer/server.py (token
 and of scheduler/scheduler.py (run_forever and its message handling). Divergences: one
 process; the tokenizer worker and the scheduler are threads fed by queue.Queue instead of
 processes over ZMQ, and the scheduler thread is the only MLX caller; replies reach the event
-loop through call_soon_threadsafe and wait per request on an asyncio.Queue; the scheduler is
-built before the server accepts requests, so maintenance_state is "serving" while both
-threads run, "stopping" once prepare-stop closed admission and "failed" once a thread has
+loop through call_soon_threadsafe and wait per request on an asyncio.Queue; one image
+processor, built in create_app, serves both TokenizeManagers; the scheduler is built
+before the server accepts requests, so maintenance_state is "serving" while both threads
+run, "stopping" once prepare-stop closed admission and "failed" once a thread has
 died, which is also the fatal error /health reports (no supervisor, loading gate or cache
 rebuild, so no /v1/cache/rebuild, and /v1/cache/status lives in control_api with the
 request-ring middleware); the stats tracker and the request ring are the FrontendManager's;
@@ -64,6 +65,7 @@ from ftmetal.message.tokenizer import (
     PromptAdmittedMsg,
     TokenizeMsg,
 )
+from ftmetal.mm.processor import MMProcessor, get_mm_processor
 from ftmetal.scheduler.scheduler import Scheduler
 from ftmetal.server.access_log_filter import install_polling_access_log_filter
 from ftmetal.server.accounting import AdmissionClosedError, register_accounting_routes
@@ -108,6 +110,9 @@ class FrontendManager:
     is_stopping: bool = False
     accounting_prepare_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     sealed_accounting: dict[str, JsonValue] | None = None
+    # The checkpoint's image processor, shared with the worker's TokenizeManager; None: the
+    # model takes no images.
+    mm_processor: MMProcessor | None = None
     # The frontend's own TokenizeManager (count_tokens, the render check before a stream),
     # built on first use; the worker's stays on its thread.
     frontend_tokenize_manager: TokenizeManager | None = None
@@ -134,7 +139,9 @@ class FrontendManager:
         """Built and cached on first use; called from a worker thread, never the event loop."""
         with self.frontend_tokenizer_lock:
             if self.frontend_tokenize_manager is None:
-                self.frontend_tokenize_manager = TokenizeManager(self.config.model_path)
+                self.frontend_tokenize_manager = TokenizeManager(
+                    self.config.model_path, self.mm_processor
+                )
             return self.frontend_tokenize_manager
 
     def warm_frontend_tokenizer(self) -> ThinkingProfile:
@@ -337,12 +344,15 @@ def run_scheduler(
 
 
 def create_app(config: ServerArgs) -> FastAPI:
-    tokenize_manager = TokenizeManager(config.model_path)
+    mm_processor = get_mm_processor(config.model_path, config.mm)
+    tokenize_manager = TokenizeManager(config.model_path, mm_processor)
     eos_token_ids = load_eos_token_ids(config.model_path, tokenize_manager.tokenizer)
     detokenize_manager = DetokenizeManager(tokenize_manager.tokenizer, eos_token_ids)
     recv_tokenizer: queue.Queue[BaseTokenizerMsg | None] = queue.Queue()
     recv_backend: queue.Queue[BaseBackendMsg] = queue.Queue()
-    frontend = FrontendManager(config=config, send_tokenizer=recv_tokenizer)
+    frontend = FrontendManager(
+        config=config, send_tokenizer=recv_tokenizer, mm_processor=mm_processor
+    )
     engine_started: Future[None] = Future()
     engine_thread = threading.Thread(
         target=run_scheduler,

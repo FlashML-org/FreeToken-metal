@@ -11,6 +11,7 @@ import glob
 import json
 import logging
 import os
+import struct
 from dataclasses import dataclass, field
 
 import mlx.core as mx
@@ -154,6 +155,16 @@ def weight_files(model_path: str) -> list[str]:
     return files
 
 
+def checkpoint_tensor_names(model_path: str) -> list[str]:
+    names: list[str] = []
+    for file in weight_files(model_path):
+        with open(file, "rb") as f:
+            header_len = struct.unpack("<Q", f.read(8))[0]
+            header = json.loads(f.read(header_len))
+        names.extend(name for name in header if name != "__metadata__")
+    return names
+
+
 def load_checkpoint(model_path: str) -> dict[str, mx.array]:
     """Every tensor of the checkpoint under its checkpoint name, lazily mapped."""
     state: dict[str, mx.array] = {}
@@ -223,6 +234,7 @@ __all__ = [
     "FuseRule",
     "WeightRules",
     "apply_rules",
+    "checkpoint_tensor_names",
     "config_bool",
     "config_dict",
     "config_float",

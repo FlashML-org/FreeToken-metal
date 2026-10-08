@@ -1,38 +1,37 @@
 """Engine configuration and the model config it derives from the checkpoint.
 
 Port of FreeToken engine/config.py (EngineConfig), reduced to the knobs this engine
-has: one process, one GPU, MLX checkpoints.
+has: one process, one GPU, MLX checkpoints. Divergence: served_modalities reads the
+encoders from mm.processor.active_encoders (no active_encoders property) and is empty for
+a checkpoint without config.json; model_config drops the unbuilt encoder sections from the
+raw config dictionary.
 """
 
 from __future__ import annotations
 
-import json
 import os
-import struct
 from dataclasses import dataclass, field
 from functools import cached_property
+from pathlib import Path
 from typing import Literal
 
 import mlx.core as mx
 
 from ftmetal.env import read_env
 from ftmetal.layers.quantization.config import QuantConfig
+from ftmetal.mm.config import ENCODER_SECTIONS, Modality, MultimodalConfig
+from ftmetal.mm.processor import active_encoders
 from ftmetal.models.config import ModelConfig
-from ftmetal.models.loader import config_dict, config_str_list, read_model_config, weight_files
+from ftmetal.models.loader import (
+    checkpoint_tensor_names,
+    config_dict,
+    config_str_list,
+    read_model_config,
+)
 from ftmetal.models.register import parse_model_config
 
 # Prefix reuse: radix (the hybrid radix on a model with linear attention) or naive (none).
 CacheTypeChoice = Literal["naive", "radix"]
-
-
-def checkpoint_tensor_names(model_path: str) -> list[str]:
-    names: list[str] = []
-    for file in weight_files(model_path):
-        with open(file, "rb") as f:
-            header_len = struct.unpack("<Q", f.read(8))[0]
-            header = json.loads(f.read(header_len))
-        names.extend(name for name in header if name != "__metadata__")
-    return names
 
 
 def command_graph_from_env() -> bool:
@@ -67,10 +66,22 @@ class EngineConfig:
     swa_windows: int | None = None
     # Capture a decode graph per batch-size bucket at startup and replay decode from it.
     command_graph: bool = field(default_factory=command_graph_from_env)
+    # Runtime knobs of the multimodal path; the architecture side lives in the checkpoint
+    # config.
+    mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     @cached_property
     def raw_config(self) -> dict[str, object]:
         return read_model_config(self.model_path)
+
+    @cached_property
+    def served_modalities(self) -> frozenset[Modality]:
+        """Modalities this process accepts."""
+        if not (Path(self.model_path) / "config.json").is_file():
+            return frozenset()
+        else:
+            encoders = active_encoders(self.model_path, self.raw_config, self.mm)
+            return frozenset(modality for encoder in encoders for modality in encoder.modalities)
 
     @cached_property
     def architecture(self) -> str:
@@ -83,7 +94,16 @@ class EngineConfig:
         quant = QuantConfig.from_checkpoint(
             config_dict(self.raw_config, "quantization"), checkpoint_tensor_names(self.model_path)
         )
-        return parse_model_config(self.architecture, self.raw_config, quant)
+        # The parser sees no section of a tower this process does not build (for the vision
+        # tower that also means 1-D rope).
+        encoders = active_encoders(self.model_path, self.raw_config, self.mm)
+        built = {encoder.config_key for encoder in encoders}
+        raw_config = {
+            key: value
+            for key, value in self.raw_config.items()
+            if key in built or key not in ENCODER_SECTIONS
+        }
+        return parse_model_config(self.architecture, raw_config, quant)
 
     @property
     def max_seq_len(self) -> int:
@@ -96,4 +116,4 @@ class EngineConfig:
         return os.path.basename(os.path.normpath(self.model_path))
 
 
-__all__ = ["CacheTypeChoice", "EngineConfig", "checkpoint_tensor_names", "command_graph_from_env"]
+__all__ = ["CacheTypeChoice", "EngineConfig", "command_graph_from_env"]

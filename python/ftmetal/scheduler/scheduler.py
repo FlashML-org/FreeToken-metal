@@ -7,7 +7,8 @@ copy in the launched graph, ordered by the pool arrays it rebinds); requests arr
 add_request and results leave through send_result as TokenEvents; run_forever is the
 server's scheduler thread body over the message queues. A padded decode batch's dummy
 rows read the token pool's scratch row; only real requests allocate pages and write
-sampled tokens.
+sampled tokens. The multimodal gather plan and the mrope positions are built in numpy by
+scheduler/mm.py.
 """
 
 from __future__ import annotations
@@ -40,8 +41,10 @@ from ftmetal.message.tokenizer import (
     ErrorReplyMsg,
     PromptAdmittedMsg,
 )
+from ftmetal.mm.item import MMItem
 from ftmetal.scheduler.cache import CacheManager, resolve_cache_type
 from ftmetal.scheduler.decode import DecodeManager
+from ftmetal.scheduler.mm import make_mrope_positions, plan_mm_batch
 from ftmetal.scheduler.prefill import ChunkedReq, PrefillManager
 from ftmetal.scheduler.status import SchedulerStatusReporter
 from ftmetal.scheduler.table import TableManager
@@ -115,7 +118,10 @@ class Scheduler:
         )
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
-            self.cache_manager, self.table_manager, self.decode_manager
+            self.cache_manager,
+            self.table_manager,
+            self.decode_manager,
+            encoder_cache=self.engine.encoder_cache,
         )
         self.finished_reqs: set[Req] = set()
         self.status_reporter = SchedulerStatusReporter(
@@ -137,9 +143,14 @@ class Scheduler:
         input_ids: np.ndarray,
         sampling_params: SamplingParams,
         reuse_len: int | None = None,
+        mm_items: list[MMItem] | None = None,
+        mrope_positions: np.ndarray | None = None,
+        mrope_delta: int = 0,
     ) -> None:
-        """Queue a prompt; reuse_len is the tokens of it a next turn can share (None: all)."""
+        """Queue a prompt; reuse_len is the tokens of it a next turn can share (None: all);
+        mm_items, mrope_positions and mrope_delta are its images' tokenizer outputs."""
         assert reuse_len is None or 0 <= reuse_len <= len(input_ids)
+        assert not mm_items or self.engine.encoder_cache is not None, "no vision tower"
         max_output_len = self.engine.max_seq_len - len(input_ids)
         if max_output_len <= 0:
             raise ValueError(
@@ -147,7 +158,9 @@ class Scheduler:
             )
         if sampling_params.max_tokens > max_output_len:
             sampling_params.max_tokens = max_output_len
-        self.prefill_manager.add_one_req(uid, input_ids, sampling_params, reuse_len)
+        self.prefill_manager.add_one_req(
+            uid, input_ids, sampling_params, reuse_len, mm_items, mrope_positions, mrope_delta
+        )
 
     def abort_request(self, uid: int) -> None:
         """Drop a pending or running request; a step already launched with it still runs.
@@ -161,6 +174,9 @@ class Scheduler:
         req = self.prefill_manager.abort_req(uid) or self.decode_manager.abort_req(uid)
         if req is None:
             return
+        if req.mm_items and self.engine.encoder_cache is not None:
+            # Drop the request's claims; entries it held alone die here.
+            self.engine.encoder_cache.release(uid, [item.hash for item in req.mm_items])
         req.aborted = True
         inflight = (
             self.inflight_data is not None and req in self.inflight_data.forward_input.batch.reqs
@@ -248,7 +264,15 @@ class Scheduler:
                     return
                 elif isinstance(msg, UserMsg):
                     try:
-                        self.add_request(msg.uid, msg.input_ids, msg.sampling_params, msg.reuse_len)
+                        self.add_request(
+                            msg.uid,
+                            msg.input_ids,
+                            msg.sampling_params,
+                            msg.reuse_len,
+                            msg.mm_items,
+                            msg.mrope_positions,
+                            msg.mrope_delta,
+                        )
                     except ValueError as exc:
                         replies.append(
                             ErrorReplyMsg(
@@ -351,6 +375,15 @@ class Scheduler:
         )
         batch.positions = mx.array(positions)
         batch.input_ids = table.gather_tokens(mx.array(input_flat))
+        encoder_cache = self.engine.encoder_cache
+        if batch.is_prefill and encoder_cache is not None:
+            jobs, plan, rows = plan_mm_batch(batch.padded_reqs, encoder_cache)
+            if plan:
+                batch.mm_encoder_jobs = jobs
+                batch.mm_gather_plan = plan
+                batch.mm_rows = mx.array(np.array(rows, dtype=np.int32))
+        if self.engine.model_config.is_mrope:
+            batch.mrope_positions = mx.array(make_mrope_positions(batch.padded_reqs))
         self.engine.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,

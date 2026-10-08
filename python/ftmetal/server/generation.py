@@ -4,10 +4,8 @@ back into its own wire shape.
 
 Port of FreeToken server/generation.py. Divergences: the state the routes hand in is
 api_server's in-process FrontendManager (asyncio queues fed by the tokenizer thread, not
-ZMQ to worker processes); images are refused (text-only engine), so collect_image_refs is
-inlined from FreeToken's mm/media.py and _resolve_images always fails the request; a
-request is recorded into the state's own request ring; count_prompt_tokens tokenizes one
-TokenizeMsg with the engine's TokenizeManager API.
+ZMQ to worker processes); a request is recorded into the state's own request ring;
+count_prompt_tokens tokenizes one TokenizeMsg with the engine's TokenizeManager API.
 """
 
 # Comments and docstrings keep FreeToken's line breaks.
@@ -24,6 +22,7 @@ from typing import Any
 
 from ftmetal.core import SamplingParams
 from ftmetal.message.tokenizer import TokenizeMsg
+from ftmetal.mm.media import collect_image_refs, fetch_image_bytes, image_reject_reason
 from ftmetal.tokenizer import resolve_thinking_mode
 
 from .request_ring import RequestRecord
@@ -267,24 +266,14 @@ def _flatten_text_parts(parts: list[Any]) -> str | list[dict[str, Any]]:
     return out
 
 
-def collect_image_refs(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Pop the image refs out of rendered messages in prompt order; the bare {"type": "image"} parts stay for the chat template."""
-    refs: list[dict[str, Any]] = []
-    for m in messages:
-        content = m.get("content")
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "image":
-                ref = part.pop("freetoken_ref", None)
-                if ref:
-                    refs.append(ref)
-    return refs
-
-
 async def _resolve_images(refs: list[dict[str, Any]], state: Any) -> list[bytes]:
-    """Gate a request's images: this engine serves text only, so every image fails it."""
-    raise GenerationError("the served model has no vision support")
+    """Gate and fetch a request's images; every failure is a GenerationError."""
+    if reason := image_reject_reason(state.config):
+        raise GenerationError(reason)
+    try:
+        return await fetch_image_bytes(refs, state.config)
+    except ValueError as exc:
+        raise GenerationError(str(exc)) from exc
 
 
 def split_tool_lists(
@@ -310,8 +299,7 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
     """Enqueue one generation from a GenSpec; return its uid. Every protocol adapter
     calls this — it takes the neutral spec, not a wire request type."""
     refs = collect_image_refs(spec.messages)
-    if refs:
-        await _resolve_images(refs, state)
+    images = await _resolve_images(refs, state) if refs else None
     uid = state.new_user()
     await state.send_one(
         TokenizeMsg(
@@ -320,6 +308,7 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             sampling_params=spec.sampling_params,
             chat_template_kwargs=spec.chat_template_kwargs,
             tools=spec.template_tools,
+            images=images,
         )
     )
     return uid
@@ -344,14 +333,14 @@ async def count_prompt_tokens(
     template, load error) propagates as its original exception, a server fault. Load + tokenize
     run in a worker thread so the event loop is never blocked."""
     refs = collect_image_refs(messages)
-    if refs:
-        await _resolve_images(refs, state)
+    images = await _resolve_images(refs, state) if refs else None
     msg = TokenizeMsg(
         uid=0,
         text=messages,
         sampling_params=SamplingParams(),
         chat_template_kwargs=chat_template_kwargs,
         tools=tools,
+        images=images,
     )
     manager = await asyncio.to_thread(state.frontend_tokenizer)  # init failure -> server fault
     try:
