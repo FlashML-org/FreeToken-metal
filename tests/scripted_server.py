@@ -25,6 +25,7 @@ from tokenizers import Tokenizer
 from ftmetal.core import SamplingParams
 from ftmetal.engine.config import EngineConfig
 from ftmetal.message.tokenizer import PromptAdmittedMsg
+from ftmetal.mm.item import MMItem
 from ftmetal.scheduler.scheduler import ForwardData, Scheduler, TokenEvent
 from ftmetal.scheduler.status import SchedulerStatusReporter
 from ftmetal.server.args import ServerArgs
@@ -71,6 +72,9 @@ class ScriptedScheduler(Scheduler):
         input_ids: np.ndarray,
         sampling_params: SamplingParams,
         reuse_len: int | None = None,
+        mm_items: list[MMItem] | None = None,
+        mrope_positions: np.ndarray | None = None,
+        mrope_delta: int = 0,
     ) -> None:
         if len(input_ids) > self.max_prompt_tokens:
             raise ValueError(f"prompt is too long: {len(input_ids)} tokens")

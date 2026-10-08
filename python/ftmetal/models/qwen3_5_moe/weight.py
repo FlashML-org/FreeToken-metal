@@ -1,8 +1,10 @@
 """Checkpoint -> model key rules for Qwen3.5 / 3.6 MLX checkpoints.
 
-Port of FreeToken models/qwen3_5_moe/weight.py. Divergences: MLX checkpoints
-already store the norm weights shifted, the conv weight as [conv_dim, kernel, 1]
-and the experts stacked per layer, so the rules are renames and fusions only.
+Port of FreeToken models/qwen3_5_moe/weight.py, with the vision rename of
+models/qwen3_vl/weight.py. Divergences: MLX checkpoints already store the norm weights
+shifted, the conv weight as [conv_dim, kernel, 1] and the experts stacked per layer, so the
+rules are renames and fusions only; the tower is read under the HF model.visual. prefix
+only (an mlx-vlm vision_tower. checkpoint is served text only).
 """
 
 from __future__ import annotations
@@ -27,11 +29,16 @@ def weight_rules(model_config: ModelConfig) -> WeightRules:
     renames = (
         ("language_model.model.", "model."),
         ("language_model.lm_head.", "lm_head."),
+        ("model.visual.", "visual."),
     )
+    # A tower this process does not build leaves its weights unread.
+    drops = ("mtp.", "language_model.mtp.", "vision_tower.")
+    if model_config.vision_config is None:
+        drops += ("model.visual.",)
     return WeightRules(
         renames=renames,
         segments=(("switch_mlp", "experts"),),
-        drops=("mtp.", "language_model.mtp.", "vision_tower.", "model.visual."),
+        drops=drops,
         fuses=tuple(fuses),
     )
 

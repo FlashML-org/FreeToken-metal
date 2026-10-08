@@ -1,6 +1,7 @@
 """OpenAI chat-completion and completion request schemas and the model list.
 
-Port of FreeToken server/api_models.py. Divergence: the model card is owned by ftmetal.
+Port of FreeToken server/api_models.py. Divergences: the model card is owned by ftmetal
+and advertises the input modalities the server accepts, as /v1/stats does.
 """
 
 from __future__ import annotations
@@ -147,6 +148,8 @@ class ModelCard(BaseModel):
     # (not []) when the model has no effort knob or the probe could not run.
     supported_reasoning_efforts: list[str] | None = None
     default_reasoning_effort: str | None = None
+    # What a request may carry: "text", and "image" when a vision tower is served.
+    input_modalities: list[str] = Field(default_factory=lambda: ["text"])
 
 
 class ModelList(BaseModel):

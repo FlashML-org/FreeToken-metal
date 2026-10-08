@@ -10,6 +10,21 @@ from ftmetal.kernel.moe_align import ExpertAlignment
 PREFILL_REF_QUERY_ROWS = 512
 
 
+def mrope_ref(
+    x: mx.array, positions: mx.array, inv_freq: mx.array, section: mx.array, rotary_dim: int
+) -> mx.array:
+    """kernel.mrope in MLX ops: x [tokens, heads, head_dim], int32 [3, tokens] positions."""
+    half = rotary_dim // 2
+    angle = positions[section].T.astype(mx.float32) * inv_freq
+    cos = mx.cos(angle)[:, None, :]
+    sin = mx.sin(angle)[:, None, :]
+    x1 = x[..., :half].astype(mx.float32)
+    x2 = x[..., half:rotary_dim].astype(mx.float32)
+    rest = x[..., rotary_dim:].astype(mx.float32)
+    rotated = mx.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin, rest], axis=-1)
+    return rotated.astype(x.dtype)
+
+
 def scatter_rows_ref(pool: mx.array, rows: mx.array, dst_ids: mx.array) -> mx.array:
     out = mx.array(pool)
     out[dst_ids] = rows

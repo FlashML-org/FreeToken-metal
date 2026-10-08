@@ -6,7 +6,9 @@ Context, its attention metadata is a dict keyed by AttnType (fla_metadata is the
 LINEAR entry); padded_reqs starts as reqs and only the graph runner pads it; a Req's
 cache_handle is None while it locks no cached prefix; a Req carries reuse_len, where its
 prompt's reusable prefix ends (FreeToken has none); SamplingParams is greedy at
-temperature 0 or top-k 1 whatever top_p is (FreeToken also requires top_p == 1).
+temperature 0 or top-k 1 whatever top_p is (FreeToken also requires top_p == 1); a
+gather plan row is an MMGatherRow (mm/item.py), not a tuple; no mm_block_ends (no
+bidirectional image blocks are served).
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from ftmetal.attention.metadata import AttnType, BaseAttnMetadata
 from ftmetal.kvcache.hybrid_radix_cache import HybridCacheHandle
 from ftmetal.kvcache.radix_cache import RadixCacheHandle
 from ftmetal.kvcache.swa_radix_cache import SWACacheHandle
+from ftmetal.mm.item import MMGatherRow, MMItem
 
 # A locked prefix-cache match, of the cache type's own handle.
 CacheHandle = RadixCacheHandle | HybridCacheHandle | SWACacheHandle
@@ -67,6 +70,11 @@ class Req:
     # SWA: tokens below this have had their window slots freed (slid out of the window).
     swa_evicted_seqlen: int = 0
     aborted: bool = False
+    # The prompt's images in prompt order, and the tokenizer's precomputed int32
+    # [3, prompt_len] mrope positions and decode delta.
+    mm_items: list[MMItem] | None = None
+    mrope_positions_full: np.ndarray | None = None
+    mrope_delta: int = 0
 
     def __post_init__(self) -> None:
         self.input_ids = np.asarray(self.input_ids, dtype=np.int32)
@@ -133,9 +141,21 @@ class Batch:
     padded_reqs: list[Req] = field(init=False)
     # (uid, prompt tokens, prefix-cache hit) of the prompts whose first chunk this prefill runs.
     prompt_admissions: list[tuple[int, int, int]] = field(default_factory=list, init=False)
+    # [3, N] t/h/w rope positions on mrope models; positions keeps the sequence index.
+    mrope_positions: mx.array | None = field(default=None, init=False)
+    # A prefill chunk's cache-miss images to encode and the encoder rows it gathers, in
+    # scatter order, then the gathered embeddings and the batch rows they replace.
+    mm_encoder_jobs: list[MMItem] = field(default_factory=list, init=False)
+    mm_gather_plan: list[MMGatherRow] = field(default_factory=list, init=False)
+    mm_embeds: mx.array | None = field(default=None, init=False)
+    mm_rows: mx.array | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self.padded_reqs = self.reqs
+
+    def get_attn_positions(self) -> mx.array:
+        """The positions rope reads: mrope rows on mrope models, else the sequence index."""
+        return self.mrope_positions if self.mrope_positions is not None else self.positions
 
     @property
     def is_prefill(self) -> bool:
@@ -176,4 +196,11 @@ def host_floats(values: mx.array) -> list[float]:
     return floats
 
 
-__all__ = ["Batch", "CacheHandle", "Req", "SamplingParams", "host_floats", "host_ints"]
+__all__ = [
+    "Batch",
+    "CacheHandle",
+    "Req",
+    "SamplingParams",
+    "host_floats",
+    "host_ints",
+]

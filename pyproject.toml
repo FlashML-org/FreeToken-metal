@@ -19,6 +19,7 @@ dependencies = [
     "jinja2>=3.1,<4",
     "partial-json-parser>=0.2,<1",
     "openai>=2.0,<3",
+    "pillow>=11.0,<13",
 ]
 
 [project.scripts]

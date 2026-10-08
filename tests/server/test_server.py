@@ -1,5 +1,5 @@
 """The OpenAI API and /generate end to end over the real tokenizer worker and a scripted
-scheduler, plus the server's argument parsing.
+scheduler, image input on a tiny multimodal checkpoint, plus the server's argument parsing.
 
 With FTMETAL_TEST_MODEL_PATH set, one short request also runs on the real model.
 """
@@ -7,7 +7,10 @@ With FTMETAL_TEST_MODEL_PATH set, one short request also runs on the real model.
 from __future__ import annotations
 
 import asyncio
+import base64
+import dataclasses
 import http.client
+import io
 import json
 import os
 import queue
@@ -18,6 +21,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 from pydantic import JsonValue
 from tokenizers import Tokenizer
 
@@ -25,6 +29,8 @@ from ftmetal.core import SamplingParams
 from ftmetal.env import ENV_PREFIXES
 from ftmetal.message.frontend import BatchFrontendMsg, UserReply
 from ftmetal.message.tokenizer import AbortMsg, BaseTokenizerMsg, FinishReason
+from ftmetal.mm import MM_PAD_SHIFT_VALUE
+from ftmetal.mm.config import ENCODER_KINDS, EncoderKind, Modality, MultimodalConfig
 from ftmetal.server.api_server import FrontendManager, create_app
 from ftmetal.server.args import (
     ServerArgs,
@@ -42,6 +48,7 @@ from scripted_server import (
     tiny_server_args,
     wait_for_abort,
 )
+from tiny_vl_model import write_qwen_vl_model
 
 MODEL_PATH = os.environ.get("FTMETAL_TEST_MODEL_PATH")
 TOOLS: list[JsonValue] = [
@@ -79,6 +86,22 @@ CET_CALL: tuple[str, JsonValue] = ("get_time", {"zone": "CET"})
 
 def chat_body(content: str = "What is 6 x 7?") -> dict[str, JsonValue]:
     return {"model": "tiny", "messages": [{"role": "user", "content": content}]}
+
+
+def png_base64(width: int, height: int) -> str:
+    buffer = io.BytesIO()
+    Image.new("RGB", (width, height), (120, 30, 200)).save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
+def image_chat_body(image_base64: str, stream: bool = False) -> dict[str, JsonValue]:
+    """A chat completion asking about one image, sent as a data: URL."""
+    image_part: dict[str, JsonValue] = {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/png;base64,{image_base64}"},
+    }
+    content: list[JsonValue] = [image_part, {"type": "text", "text": "What is it?"}]
+    return {"model": "tiny", "messages": [{"role": "user", "content": content}], "stream": stream}
 
 
 def uid_of(completion: dict[str, JsonValue]) -> int:
@@ -558,6 +581,65 @@ def test_invalid_requests_are_refused(
     assert response.status_code == status_code and error in response.text
 
 
+def test_image_reaches_the_scheduler_as_its_expanded_span(
+    tiny_model_dir: Path, scripted: type[ScriptedScheduler]
+) -> None:
+    image_token_id = write_qwen_vl_model(tiny_model_dir)
+    image_base64 = png_base64(64, 64)
+    image_block: dict[str, JsonValue] = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": image_base64},
+    }
+    content: list[JsonValue] = [image_block, {"type": "text", "text": "What is it?"}]
+    messages_body: dict[str, JsonValue] = {
+        "model": "tiny",
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": content}],
+    }
+    not_an_image = base64.b64encode(b"plain text").decode()
+    with TestClient(create_app(tiny_server_args(tiny_model_dir))) as client:
+        counted = client.post("/v1/messages/count_tokens", json=messages_body).json()
+        usage = client.post("/v1/messages", json=messages_body).json()["usage"]
+        chat = client.post("/v1/chat/completions", json=image_chat_body(image_base64))
+        refused = client.post("/v1/chat/completions", json=image_chat_body(not_an_image, True))
+    input_ids, _ = scripted.instances[0].admitted[0]
+    # 64x64 is scaled up to the 64-token minimum; the placeholder is gone.
+    pad_ids = [token for token in input_ids if token >= MM_PAD_SHIFT_VALUE]
+    assert len(pad_ids) == 64 and len(set(pad_ids)) == 1 and image_token_id not in input_ids
+    assert counted["input_tokens"] == usage["input_tokens"] == len(input_ids)
+    # The OpenAI route renders the same prompt, the same image to the same pad id.
+    assert chat.status_code == 200 and scripted.instances[0].admitted[1][0] == input_ids
+    # The bytes are probed before the stream starts.
+    assert refused.status_code == 400 and "could not load image" in refused.text
+
+
+# (whether the checkpoint has a vision tower, the encoder kinds left unbuilt, the refusal)
+IMAGE_REFUSAL_CASES: list[tuple[bool, frozenset[EncoderKind], str]] = [
+    (False, frozenset(), "the served model has no vision support"),
+    (True, frozenset(ENCODER_KINDS), "image input is disabled on this server (--text-model-only)"),
+    (True, frozenset({"vision"}), "image input is disabled on this server (--mm-disable)"),
+]
+
+
+@pytest.mark.parametrize(("has_vision", "disabled_encoders", "reason"), IMAGE_REFUSAL_CASES)
+def test_text_only_server_refuses_images_before_any_stream(
+    tiny_model_dir: Path,
+    scripted: type[ScriptedScheduler],
+    has_vision: bool,
+    disabled_encoders: frozenset[EncoderKind],
+    reason: str,
+) -> None:
+    write_qwen_vl_model(tiny_model_dir, has_vision)
+    args = dataclasses.replace(
+        tiny_server_args(tiny_model_dir), mm=MultimodalConfig(disabled_encoders=disabled_encoders)
+    )
+    with TestClient(create_app(args)) as client:
+        for stream in (False, True):
+            body = image_chat_body(png_base64(8, 8), stream)
+            response = client.post("/v1/chat/completions", json=body)
+            assert response.status_code == 400 and reason in response.text
+
+
 def test_raw_prompt_failures_surface_as_errors(
     client: TestClient, scripted: type[ScriptedScheduler], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -752,6 +834,79 @@ def test_gdn_snapshots_flag_takes_a_snapshot_count(tiny_model_dir: Path) -> None
     for value in ("0", "1.5"):
         with pytest.raises(SystemExit):
             parse_args([*flags, "--gdn-snapshots", value], prog="ftm serve")
+
+
+def test_multimodal_flags_reach_the_server_args(tiny_model_dir: Path) -> None:
+    flags = ["--model", str(tiny_model_dir)]
+    defaults = parse_args(flags, prog="ftm serve")
+    assert defaults.mm == MultimodalConfig() and defaults.allowed_local_media_path == ""
+    args = parse_args(
+        [
+            *flags,
+            "--text-model-only",
+            "--image-min-tokens",
+            "64",
+            "--image-max-tokens",
+            "1024",
+            "--allowed-media-domains",
+            "images.example.com",
+            "--allowed-local-media-path",
+            str(tiny_model_dir),
+        ],
+        prog="ftm serve",
+    )
+    assert args.mm == MultimodalConfig(
+        disabled_encoders=frozenset(ENCODER_KINDS), image_min_tokens=64, image_max_tokens=1024
+    )
+    assert args.allowed_media_domains == "images.example.com"
+    assert args.allowed_local_media_path == os.path.realpath(tiny_model_dir)
+
+
+# (encoder flags, the encoder kinds left unbuilt, whether the server is text-only, the
+# modalities served from a checkpoint with a vision tower)
+ENCODER_FLAG_CASES: list[tuple[list[str], frozenset[EncoderKind], bool, frozenset[Modality]]] = [
+    (["--mm-disable", "vision"], frozenset({"vision"}), False, frozenset()),
+    # No family registers an audio tower, so this leaves the vision tower serving.
+    (["--mm-disable", "audio"], frozenset({"audio"}), False, frozenset({"image"})),
+    (["--mm-disable", "vision", "audio"], frozenset(ENCODER_KINDS), True, frozenset()),
+    (["--text-model-only", "--mm-disable", "audio"], frozenset(ENCODER_KINDS), True, frozenset()),
+]
+
+
+@pytest.mark.parametrize(
+    ("flags", "disabled_encoders", "text_model_only", "modalities"), ENCODER_FLAG_CASES
+)
+def test_encoder_flags_leave_their_towers_unbuilt(
+    tiny_model_dir: Path,
+    flags: list[str],
+    disabled_encoders: frozenset[EncoderKind],
+    text_model_only: bool,
+    modalities: frozenset[Modality],
+) -> None:
+    write_qwen_vl_model(tiny_model_dir)
+    args = parse_args(["--model", str(tiny_model_dir), *flags], prog="ftm serve")
+    assert args.mm.disabled_encoders == disabled_encoders
+    assert args.mm.text_model_only is text_model_only
+    assert args.served_modalities == modalities
+
+
+# (flags, with {model} for the checkpoint directory; the startup refusal)
+REFUSED_MULTIMODAL_FLAG_CASES: list[tuple[list[str], str]] = [
+    (["--image-min-tokens", "2048", "--image-max-tokens", "1024"], "2048 exceeds"),
+    (["--image-max-tokens", "0"], "expected a positive integer"),
+    (["--allowed-local-media-path", "{model}/missing"], "is not a directory"),
+    (["--mm-disable", "video"], "invalid choice: 'video'"),
+]
+
+
+@pytest.mark.parametrize(("flags", "error"), REFUSED_MULTIMODAL_FLAG_CASES)
+def test_multimodal_flags_are_validated_at_startup(
+    tiny_model_dir: Path, capsys: pytest.CaptureFixture[str], flags: list[str], error: str
+) -> None:
+    argv = ["--model", str(tiny_model_dir), *[flag.format(model=tiny_model_dir) for flag in flags]]
+    with pytest.raises(SystemExit):
+        parse_args(argv, prog="ftm serve")
+    assert error in capsys.readouterr().err
 
 
 @pytest.mark.skipif(MODEL_PATH is None, reason="FTMETAL_TEST_MODEL_PATH is not set")

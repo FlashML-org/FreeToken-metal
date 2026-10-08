@@ -3,9 +3,12 @@
 Port of FreeToken server/args.py (ServerArgs, parse_args, and its tool-call and reasoning
 parser inference). Divergences: ServerArgs extends EngineConfig directly (one process, no
 scheduler config or TP); only the flags this engine has, and --disable-command-graph for
-FreeToken's --cuda-graph-max-bs (the graph ladder always ends at max_running_req); the
-shell is a client of a running server, so there is no shell mode; the parser inference
-reads config.json itself (no transformers) and is module-level.
+FreeToken's --cuda-graph-max-bs (the graph ladder always ends at max_running_req); of the
+multimodal flags, no --mm-processor-kwargs (no transformers processor),
+--mm-embed-cache-device or --mm-encoder-weights (the tower stays resident in unified
+memory); --image-max-tokens defaults per image processor; the shell is a client of a running
+server, so there is no shell mode; the parser inference reads config.json itself (no
+transformers) and is module-level.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from typing import get_args
 from ftmetal.attention import SUPPORTED_ATTENTION_BACKENDS
 from ftmetal.engine.config import CacheTypeChoice, EngineConfig, command_graph_from_env
 from ftmetal.kvcache.linear_state_pool import CONVERSATION_SNAPSHOTS, DEFAULT_GDN_SNAPSHOTS
+from ftmetal.mm.config import ENCODER_KINDS, EncoderKind, MultimodalConfig
 from ftmetal.tokenizer import read_json_object
 
 TOOL_CALL_PARSER_CHOICES = (
@@ -67,6 +71,11 @@ class ServerArgs(EngineConfig):
     # prompt_tokens_details.cached_tokens, Anthropic cache_read_input_tokens, Responses
     # input_tokens_details.cached_tokens).
     enable_cache_report: bool = False
+    # Comma-separated hostname allowlist for client-supplied image URLs; empty admits any
+    # domain.
+    allowed_media_domains: str = ""
+    # Directory file:// image refs may be read from; empty rejects local files.
+    allowed_local_media_path: str = ""
     # Comma-separated CORS allow-list for browser and webview clients; empty disables the
     # CORS headers, "*" allows any origin. Parity: FreeToken's desktop-app origins.
     cors_origins: str = "tauri://localhost,http://tauri.localhost,http://localhost:1420"
@@ -281,6 +290,53 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         "family's (<think> for qwen3, the thought channel for gemma4), off disables it",
     )
     parser.add_argument(
+        "--text-model-only",
+        action="store_true",
+        help="Serve a multimodal checkpoint text-only: no encoder tower is built (its memory goes "
+        "to the KV pools) and every multimodal input is rejected. Same as --mm-disable with "
+        "every encoder kind.",
+    )
+    parser.add_argument(
+        "--mm-disable",
+        nargs="+",
+        choices=list(ENCODER_KINDS),
+        default=[],
+        metavar="{vision,audio}",
+        help="Encoder towers to leave unbuilt; every input they would serve is rejected.",
+    )
+    parser.add_argument(
+        "--image-min-tokens",
+        type=positive_int,
+        metavar="N",
+        default=MultimodalConfig.image_min_tokens,
+        help="Fewest tokens an image may take: the image processor scales smaller images up to "
+        "it, in the family's own units. Default: the processor's own limit.",
+    )
+    parser.add_argument(
+        "--image-max-tokens",
+        type=positive_int,
+        metavar="N",
+        default=MultimodalConfig.image_max_tokens,
+        help="Most tokens an image may take: the image processor scales larger images down to "
+        "it, in the family's own units (Qwen VL: one token per 32x32 pixels). Default: the "
+        "image processor's default (Qwen VL: 4096, a 2048x2048 image), else the checkpoint's "
+        "limit.",
+    )
+    parser.add_argument(
+        "--allowed-media-domains",
+        default=ServerArgs.allowed_media_domains,
+        metavar="DOMAINS",
+        help="comma-separated hostname allowlist for client-supplied image URLs; empty "
+        "(default) allows any domain",
+    )
+    parser.add_argument(
+        "--allowed-local-media-path",
+        default=ServerArgs.allowed_local_media_path,
+        metavar="DIR",
+        help="directory that file:// image refs may be read from; unset (default) rejects "
+        "local files",
+    )
+    parser.add_argument(
         "--cors-origins",
         default=ServerArgs.cors_origins,
         metavar="ORIGINS",
@@ -301,6 +357,24 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         reasoning_parser = None
     else:
         reasoning_parser = namespace.reasoning_parser
+    # A bad media root is a deployment mistake: fail at startup, not per request.
+    if namespace.allowed_local_media_path:
+        media_root = os.path.realpath(os.path.expanduser(namespace.allowed_local_media_path))
+        if not os.path.isdir(media_root):
+            parser.error(f"--allowed-local-media-path {media_root} is not a directory")
+    else:
+        media_root = ""
+    image_min_tokens, image_max_tokens = namespace.image_min_tokens, namespace.image_max_tokens
+    if (
+        image_min_tokens is not None
+        and image_max_tokens is not None
+        and image_min_tokens > image_max_tokens
+    ):
+        parser.error(
+            f"--image-min-tokens {image_min_tokens} exceeds --image-max-tokens {image_max_tokens}"
+        )
+    disabled_encoders: set[EncoderKind] = set(ENCODER_KINDS) if namespace.text_model_only else set()
+    disabled_encoders.update(namespace.mm_disable)
     return ServerArgs(
         model_path=model_path,
         served_model_name=(
@@ -323,6 +397,13 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         gdn_snapshots=namespace.gdn_snapshots,
         attention_backend=namespace.attention_backend,
         command_graph=not namespace.disable_command_graph and command_graph_from_env(),
+        mm=MultimodalConfig(
+            disabled_encoders=frozenset(disabled_encoders),
+            image_min_tokens=image_min_tokens,
+            image_max_tokens=image_max_tokens,
+        ),
+        allowed_media_domains=namespace.allowed_media_domains,
+        allowed_local_media_path=media_root,
     )
 
 

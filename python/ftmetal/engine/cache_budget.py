@@ -5,7 +5,8 @@ the budget is Metal's recommended working set minus a fixed headroom; every pool
 its own spec as (bytes per page, fixed bytes), the fixed costs come off first and the
 paged pools share the rest (FreeToken's engine adds the GDN state pool to the KV
 family's fixed cost by hand); the lines are the ones this engine has (weights, one per
-pool, activations, the decode graphs' arena); no MoE expert cache.
+pool, activations, the vision encoder's activations, the decode graphs' arena); no MoE
+expert cache.
 """
 
 from __future__ import annotations
@@ -13,8 +14,12 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+import mlx.core as mx
+
 from ftmetal.attention.metadata import AttnType
 from ftmetal.kvcache.base import PoolCost
+from ftmetal.models.loader import config_int
+from ftmetal.models.qwen3_5_moe.vision import MLP_ROWS
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +38,12 @@ IN_FLIGHT_STEPS = 2
 # partials (their partition count follows the page-table width).
 GRAPH_FIXED_BYTES = 4 << 20
 GRAPH_BYTES_PER_ROW = 5 << 18
+# Hidden widths per patch live in a vision tower block as it attends: the residual stream, the
+# normed copy, qkv and its bias-add copy (6), the rotated q and k halves and their
+# concatenation (4), and the attention output. Measured on Qwen3.6's tower in bf16, the peak
+# above the weights and the float32 pixels is 12.2 widths per patch plus 43 MiB (482.6 MiB at
+# 16384 patches, 1802.4 MiB at 65536).
+VISION_ACTIVATION_WIDTHS = 13
 # Each pool's budget line; the only LINEAR pool so far holds GDN state.
 POOL_LABELS: dict[AttnType, str] = {
     AttnType.FULL: "kv pages",
@@ -52,6 +63,25 @@ def activation_reserve_bytes(max_extend_tokens: int, num_qo_heads: int) -> int:
     return IN_FLIGHT_STEPS * per_step
 
 
+def encoder_reserve_bytes(
+    vision_config: dict[str, object], dtype: mx.Dtype, max_patches: int
+) -> int:
+    """The vision tower's peak above its weights for the largest image. Per patch: its bf16
+    feature and, in the tower dtype, VISION_ACTIVATION_WIDTHS hidden widths; then one MLP row
+    chunk's fc1 output and its gelu. A [patches, patches] score matrix is not counted: the
+    tower attends with a fused kernel."""
+    patch_dim = (
+        config_int(vision_config, "in_channels")
+        * config_int(vision_config, "temporal_patch_size")
+        * config_int(vision_config, "patch_size") ** 2
+    )
+    hidden = config_int(vision_config, "hidden_size")
+    intermediate = config_int(vision_config, "intermediate_size")
+    per_patch = mx.bfloat16.size * patch_dim + dtype.size * VISION_ACTIVATION_WIDTHS * hidden
+    mlp_chunk = dtype.size * 2 * MLP_ROWS * intermediate
+    return max_patches * per_patch + mlp_chunk
+
+
 def graph_reserve_bytes(max_graph_bs: int) -> int:
     """What decode graphs up to batch size max_graph_bs keep: the arena they share, and
     the few buffers they pin."""
@@ -69,6 +99,8 @@ class BudgetReport:
     activations: int
     graphs: int
     costs: dict[AttnType, PoolCost]
+    # The vision encoder's activations; 0 without a tower.
+    encoder: int = 0
 
     @property
     def bytes_per_page(self) -> int:
@@ -79,7 +111,8 @@ class BudgetReport:
         """What the paged pools share once the weights, activations, graphs and fixed costs
         are off."""
         fixed_bytes = sum(cost.fixed_bytes for cost in self.costs.values())
-        return self.budget - self.weights - self.activations - self.graphs - fixed_bytes
+        reserved = self.weights + self.activations + self.encoder + self.graphs
+        return self.budget - reserved - fixed_bytes
 
     def lines(self) -> list[str]:
         """The deductions in order, then each paged pool's share of what is left."""
@@ -96,22 +129,34 @@ class BudgetReport:
             for attn_type, cost in self.costs.items()
             if cost.bytes_per_page > 0
         ]
+        encoder_lines = [budget_line("encoder", self.encoder)] if self.encoder > 0 else []
         graph_lines = [budget_line("graphs", self.graphs)] if self.graphs > 0 else []
         return [
             budget_line("budget", self.budget),
             budget_line("weights", self.weights),
             *fixed_lines,
             budget_line("activations", self.activations),
+            *encoder_lines,
             *graph_lines,
             *paged_lines,
         ]
 
 
 def plan_budget(
-    budget: int, weights: int, activations: int, graphs: int, costs: dict[AttnType, PoolCost]
+    budget: int,
+    weights: int,
+    activations: int,
+    graphs: int,
+    costs: dict[AttnType, PoolCost],
+    encoder: int = 0,
 ) -> BudgetReport:
     report = BudgetReport(
-        budget=budget, weights=weights, activations=activations, graphs=graphs, costs=costs
+        budget=budget,
+        weights=weights,
+        activations=activations,
+        graphs=graphs,
+        costs=costs,
+        encoder=encoder,
     )
     assert report.bytes_per_page > 0, "no paged pool to give the budget to"
     if report.paged_bytes <= 0:
@@ -142,8 +187,10 @@ __all__ = [
     "GRAPH_FIXED_BYTES",
     "IN_FLIGHT_STEPS",
     "POOL_LABELS",
+    "VISION_ACTIVATION_WIDTHS",
     "BudgetReport",
     "activation_reserve_bytes",
+    "encoder_reserve_bytes",
     "graph_reserve_bytes",
     "memory_budget_bytes",
     "plan_budget",

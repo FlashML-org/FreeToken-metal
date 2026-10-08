@@ -9,8 +9,9 @@ request; a request's decode state is created when its prompt is tokenized, so to
 that arrive after a stop, an abort or an error are dropped; text ending in a partial
 UTF-8 character is held back whole, and flushed as is when the request finishes; a
 conversation's reusable prefix ends where its rendering without the generation prompt
-does, when that encoding is a prefix of the prompt's (FreeToken has no such boundary);
-resolve_thinking_mode is FreeToken's, for the reasoning parser's force_reasoning.
+does, when that encoding is a prefix of the prompt's (FreeToken has no such boundary),
+moved past the expansion of the image placeholders it holds, so each image is processed
+once; resolve_thinking_mode is FreeToken's, for the reasoning parser's force_reasoning.
 
 A raw prompt gets the special tokens tokenizer.json's post-processor adds, which is what
 transformers 5 adds for FreeToken: none for Qwen3.6, and none for Gemma4 either (its
@@ -45,6 +46,7 @@ from ftmetal.effort import (
 from ftmetal.message.backend import UserMsg
 from ftmetal.message.frontend import UserReply
 from ftmetal.message.tokenizer import DetokenizeMsg, TokenizeMsg
+from ftmetal.mm.processor import MMProcessor, find_all
 
 logger = logging.getLogger(__name__)
 
@@ -140,9 +142,11 @@ def tojson(
 
 
 class TokenizeManager:
-    def __init__(self, model_path: str) -> None:
+    def __init__(self, model_path: str, mm_processor: MMProcessor | None = None) -> None:
         path = Path(model_path)
         self.tokenizer = Tokenizer.from_file(str(path / TOKENIZER_FILE))
+        # None: the model takes no images.
+        self.mm_processor = mm_processor
         # The environment apply_chat_template renders with.
         environment = ImmutableSandboxedEnvironment(
             trim_blocks=True, lstrip_blocks=True, extensions=[loopcontrols]
@@ -275,12 +279,34 @@ class TokenizeManager:
                     )
                     self.has_warned_unstable_template = True
                 reuse_len = len(input_ids)
-        return UserMsg(
-            uid=msg.uid,
-            input_ids=np.array(input_ids, dtype=np.int32),
-            sampling_params=msg.sampling_params,
-            reuse_len=reuse_len,
-        )
+        if not msg.images:
+            return UserMsg(
+                uid=msg.uid,
+                input_ids=np.array(input_ids, dtype=np.int32),
+                sampling_params=msg.sampling_params,
+                reuse_len=reuse_len,
+            )
+        elif self.mm_processor is None:
+            raise ValueError("image input is not supported for this model")
+        else:
+            processor = self.mm_processor
+            mm = processor.apply(np.array(input_ids, dtype=np.int32), msg.images)
+            # The reusable prefix holds the prompt's first images, whose placeholders expand
+            # alike: it grows by their expansion.
+            prefix_images = len(find_all(input_ids[:reuse_len], processor.placeholder))
+            expansion = sum(
+                len(processor.prompt_replacement(item).full) - len(processor.placeholder)
+                for item in mm.mm_items[:prefix_images]
+            )
+            return UserMsg(
+                uid=msg.uid,
+                input_ids=mm.input_ids,
+                sampling_params=msg.sampling_params,
+                reuse_len=reuse_len + expansion,
+                mm_items=mm.mm_items,
+                mrope_positions=mm.mrope_positions,
+                mrope_delta=mm.mrope_delta,
+            )
 
 
 @dataclass

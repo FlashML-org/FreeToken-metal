@@ -1,7 +1,8 @@
 """OpenAI routes: /v1 (liveness), POST /v1/chat/completions and /v1/completions, streamed
 or not, and GET /v1/models.
 
-Port of FreeToken server/openai_api.py, verbatim apart from formatting.
+Port of FreeToken server/openai_api.py, verbatim apart from formatting and the model
+card's input_modalities.
 """
 
 # Comments and docstrings keep FreeToken's line breaks.
@@ -155,6 +156,7 @@ def register_openai_routes(
                     context_length=ctx,
                     supported_reasoning_efforts=efforts,
                     default_reasoning_effort=default_effort,
+                    input_modalities=["text", *sorted(state.config.served_modalities)],
                 )
             ]
         )

@@ -3,8 +3,8 @@ admissions, aborts and scheduler errors.
 
 Port of FreeToken message/tokenizer.py. Divergences: plain dataclasses passed over
 queue.Queue (no ZMQ encoder/decoder); stop strings are matched by the detokenizer, so
-DetokenizeMsg carries neither matched_stop nor stop_strs; no GPU-memory figure,
-multimodal input or cache-rebuild messages.
+DetokenizeMsg carries neither matched_stop nor stop_strs; no GPU-memory figure or
+cache-rebuild messages.
 """
 
 from __future__ import annotations
@@ -63,6 +63,8 @@ class TokenizeMsg(BaseTokenizerMsg):
     sampling_params: SamplingParams
     chat_template_kwargs: dict[str, JsonValue] = field(default_factory=dict)
     tools: list[dict[str, JsonValue]] | None = None
+    # The raw bytes of the request's images, in prompt order.
+    images: list[bytes] | None = None
 
 
 @dataclass(kw_only=True)

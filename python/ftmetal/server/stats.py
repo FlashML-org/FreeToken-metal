@@ -5,8 +5,8 @@ idle polls decay to zero by wall clock.
 
 Port of FreeToken server/stats.py. Divergences: no GPU-memory figure or GPU list, so
 vram_bytes is FreeToken's unknown 0 and gpus []; the model card reads this engine's
-ModelConfig (a sliding-window group makes hybrid_swa) and serves text only; the window pool's
-page unit is always one token (no DSV4).
+ModelConfig (a sliding-window group makes hybrid_swa); the window pool's page unit is always
+one token (no DSV4).
 """
 
 # Comments and docstrings keep FreeToken's line breaks, and its loose typing stays unchecked.
@@ -121,7 +121,7 @@ def derive_model_card(config: Any) -> dict:
         "ctx": config.max_seq_len,
         "attn": attn,
         "moe": mc.is_moe,
-        "input_modalities": ["text"],
+        "input_modalities": ["text", *sorted(config.served_modalities)],
     }
 
 

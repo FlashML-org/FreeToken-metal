@@ -19,6 +19,7 @@ from pydantic import JsonValue
 
 from ftmetal import __version__
 from ftmetal.env import ENV_PREFIXES
+from ftmetal.mm.config import ENCODER_KINDS, EncoderKind, MultimodalConfig
 from ftmetal.server.access_log_filter import PollingAccessLogFilter
 from ftmetal.server.api_server import create_app
 from scripted_server import (
@@ -30,22 +31,29 @@ from scripted_server import (
     wait_for_abort,
 )
 from tiny_model import TINY_TEXT_CONFIG
+from tiny_vl_model import QWEN_PREPROCESSOR_CONFIG, TINY_IMAGE_TOKEN_ID, TINY_VISION_CONFIG
 
 CHAT: dict[str, JsonValue] = {"model": "tiny", "messages": [{"role": "user", "content": "hi"}]}
 # prepare-stop answers loopback clients only.
 LOOPBACK_CLIENT = ("127.0.0.1", 50000)
 
 
-def write_model_config(model_dir: Path) -> None:
-    """A tiny Qwen3.6-shaped config.json and an empty checkpoint, so the model card parses."""
+def write_model_config(model_dir: Path, tensor_names: tuple[str, ...] = ()) -> None:
+    """A tiny Qwen3.6-shaped config.json and a checkpoint of one-float tensor_names, so the
+    model card parses."""
     config = {
         "architectures": ["Qwen3_5MoeForConditionalGeneration"],
         "model_type": "qwen3_5_moe",
         "text_config": TINY_TEXT_CONFIG,
     }
     (model_dir / "config.json").write_text(json.dumps(config))
-    header = b"{}"
-    (model_dir / "model.safetensors").write_bytes(struct.pack("<Q", len(header)) + header)
+    entries = {
+        name: {"dtype": "F32", "shape": [1], "data_offsets": [4 * i, 4 * i + 4]}
+        for i, name in enumerate(tensor_names)
+    }
+    header = json.dumps(entries).encode()
+    data = bytes(4 * len(tensor_names))
+    (model_dir / "model.safetensors").write_bytes(struct.pack("<Q", len(header)) + header + data)
 
 
 def test_health_follows_the_engine_lifecycle(
@@ -117,6 +125,41 @@ def test_stats_count_requests_and_keep_the_last_pool_usage(
     assert requests["completion_tokens_total"] == sum(item["completion_tokens"] for item in usage)
     assert requests["p95_ms"] >= 0 and requests["ttft_mean_ms"] >= 0
     assert busy["instance_id"] == idle["instance_id"]
+
+
+# (whether config.json has a vision_config, the encoder kinds left unbuilt, the advertised
+# modalities)
+MODALITY_CASES: list[tuple[bool, frozenset[EncoderKind], list[str]]] = [
+    (False, frozenset(), ["text"]),
+    (True, frozenset(), ["text", "image"]),
+    (True, frozenset(ENCODER_KINDS), ["text"]),
+    (True, frozenset({"vision"}), ["text"]),
+]
+
+
+@pytest.mark.parametrize(("has_vision", "disabled_encoders", "modalities"), MODALITY_CASES)
+def test_stats_and_models_advertise_the_served_modalities(
+    tiny_model_dir: Path,
+    scripted: type[ScriptedScheduler],
+    has_vision: bool,
+    disabled_encoders: frozenset[EncoderKind],
+    modalities: list[str],
+) -> None:
+    write_model_config(tiny_model_dir, ("model.visual.proj.weight",) if has_vision else ())
+    if has_vision:
+        config = json.loads((tiny_model_dir / "config.json").read_text())
+        config.update(vision_config=TINY_VISION_CONFIG, image_token_id=TINY_IMAGE_TOKEN_ID)
+        (tiny_model_dir / "config.json").write_text(json.dumps(config))
+        preprocessor_config = json.dumps(QWEN_PREPROCESSOR_CONFIG)
+        (tiny_model_dir / "preprocessor_config.json").write_text(preprocessor_config)
+    args = dataclasses.replace(
+        tiny_server_args(tiny_model_dir), mm=MultimodalConfig(disabled_encoders=disabled_encoders)
+    )
+    with TestClient(create_app(args)) as client:
+        stats = client.get("/v1/stats").json()
+        models = client.get("/v1/models").json()
+    assert stats["model"]["input_modalities"] == modalities
+    assert models["data"][0]["input_modalities"] == modalities
 
 
 # (route, request body, whether the record is a stream, whether it carries token counts): the
