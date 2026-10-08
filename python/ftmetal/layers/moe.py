@@ -49,7 +49,7 @@ class ExpertBank(BaseOP):
 
     def forward(self, x: mx.array, indices: mx.array, sorted_indices: bool) -> mx.array:
         if self.scheme is None:
-            return mx.gather_mm(  # pyright: ignore[reportCallIssue]  (stub requires lhs_indices)
+            return mx.gather_mm(
                 x, self.weight.swapaxes(-1, -2), rhs_indices=indices, sorted_indices=sorted_indices
             )
         return mx.gather_qmm(
