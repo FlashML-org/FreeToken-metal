@@ -12,6 +12,7 @@
 #include "fprefill.h"
 #include "gather_qmm_sorted.h"
 #include "gdn_step.h"
+#include "moe_lookup.h"
 #include "rows.h"
 #include "sample.h"
 
@@ -27,6 +28,7 @@ NB_MODULE(_C, m) {
   m.def("init_fprefill_library", &ftmetal::init_fprefill_library, "source"_a);
   m.def("init_gather_qmm_sorted_library", &ftmetal::init_gather_qmm_sorted_library, "source"_a);
   m.def("init_sample_library", &ftmetal::init_sample_library, "source"_a);
+  m.def("init_moe_lookup_library", &ftmetal::init_moe_lookup_library, "source"_a);
 
   m.def(
       "scatter_rows",
@@ -144,6 +146,57 @@ NB_MODULE(_C, m) {
       "stream"_a = nb::none(),
       "x[b] @ dequantize(w[slot_of[e]]).T for the rows b of each expert e; returns [B, 1, N].");
 
+  m.attr("MAILBOX_WORDS") = ftmetal::MAILBOX_WORDS;
+  nb::enum_<ftmetal::MailboxWord>(m, "MailboxWord", nb::is_arithmetic())
+      .value("STATE", ftmetal::MailboxWord::State)
+      .value("SEQUENCE", ftmetal::MailboxWord::Sequence)
+      .value("ACKNOWLEDGED", ftmetal::MailboxWord::Acknowledged)
+      .value("KIND", ftmetal::MailboxWord::Kind)
+      .value("LAYER", ftmetal::MailboxWord::Layer)
+      .value("STEP", ftmetal::MailboxWord::Step)
+      .value("NUM_ROWS", ftmetal::MailboxWord::NumRows)
+      .value("NUM_IDS", ftmetal::MailboxWord::NumIds)
+      .value("NUM_MISSES", ftmetal::MailboxWord::NumMisses)
+      .value("IDS", ftmetal::MailboxWord::Ids)
+      .value("NUM_LOADED", ftmetal::MailboxWord::NumLoaded)
+      .value("NUM_EVICTED", ftmetal::MailboxWord::NumEvicted)
+      .value("ERROR", ftmetal::MailboxWord::Error)
+      .value("CLAIM_TIME", ftmetal::MailboxWord::ClaimTime)
+      .value("DONE_TIME", ftmetal::MailboxWord::DoneTime);
+  nb::enum_<ftmetal::MailboxState>(m, "MailboxState", nb::is_arithmetic())
+      .value("IDLE", ftmetal::MailboxState::Idle)
+      .value("POSTED", ftmetal::MailboxState::Posted)
+      .value("CLAIMED", ftmetal::MailboxState::Claimed)
+      .value("DONE", ftmetal::MailboxState::Done)
+      .value("FAILED", ftmetal::MailboxState::Failed)
+      .value("SHUTDOWN", ftmetal::MailboxState::Shutdown);
+  nb::enum_<ftmetal::MailboxError>(m, "MailboxError", nb::is_arithmetic())
+      .value("NONE", ftmetal::MailboxError::None)
+      .value("IO", ftmetal::MailboxError::Io)
+      .value("TIMEOUT", ftmetal::MailboxError::Timeout)
+      .value("PROTOCOL", ftmetal::MailboxError::Protocol)
+      .value("SHUTDOWN", ftmetal::MailboxError::Shutdown)
+      .value("CAPACITY", ftmetal::MailboxError::Capacity);
+  nb::enum_<ftmetal::MoeLookupKind>(m, "MoeLookupKind", nb::is_arithmetic())
+      .value("DECODE", ftmetal::MoeLookupKind::Decode)
+      .value("PREFILL_COPY_MISS", ftmetal::MoeLookupKind::PrefillCopyMiss)
+      .value("PROBE", ftmetal::MoeLookupKind::Probe);
+
+  m.def(
+      "moe_lookup",
+      &ftmetal::moe_lookup,
+      "topk_ids"_a,
+      "moe_step"_a,
+      "slot_of"_a,
+      "mailbox"_a,
+      "last_use"_a,
+      "hit_stats"_a,
+      "layer_id"_a,
+      "kind"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      "Bank slots of one MoE layer's routed experts, the absent read by the CPU first; returns (slots, slot_map, mailbox, last_use, hit_stats).");
+
   nb::class_<ftmetal::SlotLru>(m, "SlotLru")
       .def(
           nb::init<int, int, int, int, mx::array, mx::array>(),
@@ -188,7 +241,9 @@ NB_MODULE(_C, m) {
       .def_ro("misses", &ftmetal::ExpertServiceStats::misses)
       .def_ro("experts_read", &ftmetal::ExpertServiceStats::experts_read)
       .def_ro("bytes_read", &ftmetal::ExpertServiceStats::bytes_read)
-      .def_ro("read_wait_ns", &ftmetal::ExpertServiceStats::read_wait_ns);
+      .def_ro("read_wait_ns", &ftmetal::ExpertServiceStats::read_wait_ns)
+      .def_ro("lookups", &ftmetal::ExpertServiceStats::lookups)
+      .def_ro("lookup_hits", &ftmetal::ExpertServiceStats::lookup_hits);
 
   using SegmentTable = nb::ndarray<const int64_t, nb::ndim<3>, nb::c_contig, nb::device::cpu>;
   nb::class_<ftmetal::ExpertService>(m, "ExpertService")
@@ -201,10 +256,14 @@ NB_MODULE(_C, m) {
              int window_slots,
              mx::array slot_of,
              mx::array last_use,
+             mx::array mailbox,
+             mx::array hit_stats,
              std::vector<mx::array> banks,
              const std::vector<std::string>& files,
              SegmentTable segments,
-             int io_threads) {
+             int io_threads,
+             double stall_timeout_s,
+             bool run_coordinator) {
             if (segments.shape(0) != static_cast<size_t>(num_layers) || segments.shape(2) != 5) {
               throw std::invalid_argument("ExpertService: segments must be int64 [num_layers, n, 5]");
             }
@@ -221,10 +280,14 @@ NB_MODULE(_C, m) {
                 window_slots,
                 std::move(slot_of),
                 std::move(last_use),
+                std::move(mailbox),
+                std::move(hit_stats),
                 std::move(banks),
                 files,
                 std::move(table),
-                io_threads);
+                io_threads,
+                stall_timeout_s,
+                run_coordinator);
           },
           "num_layers"_a,
           "num_experts"_a,
@@ -232,11 +295,15 @@ NB_MODULE(_C, m) {
           "window_slots"_a,
           "slot_of"_a,
           "last_use"_a,
+          "mailbox"_a,
+          "hit_stats"_a,
           "banks"_a,
           "files"_a,
           "segments"_a,
           "io_threads"_a,
-          "The slot cache's LRU and IO threads over the banks and the checkpoint files.")
+          "stall_timeout_s"_a,
+          "run_coordinator"_a,
+          "The slot cache's LRU, IO threads, lookup coordinator and watchdog.")
       .def(
           "fill_initial",
           &ftmetal::ExpertService::fill_initial,
@@ -272,7 +339,20 @@ NB_MODULE(_C, m) {
           "stats",
           &ftmetal::ExpertService::stats,
           nb::call_guard<nb::gil_scoped_release>(),
-          "Per-layer hits, misses, experts and bytes read, read wait.");
+          "Per-layer hits, misses, experts and bytes read, read wait, GPU lookups and hits.")
+      .def(
+          "arm",
+          &ftmetal::ExpertService::arm,
+          "Keep the coordinator spinning through the forward about to be submitted.")
+      .def(
+          "check_healthy",
+          &ftmetal::ExpertService::check_healthy,
+          "Raise the first failure: a read, a broken or unanswered request, the shutdown.")
+      .def(
+          "shutdown",
+          &ftmetal::ExpertService::shutdown,
+          nb::call_guard<nb::gil_scoped_release>(),
+          "Answer a waiting lookup with SHUTDOWN, refuse later ones and stop the threads.");
 
   m.def(
       "sample_tokens",

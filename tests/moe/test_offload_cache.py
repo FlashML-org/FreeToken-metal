@@ -1,12 +1,9 @@
 """OffloadMoeCache and ExpertSource on synthetic checkpoints, and on the real one.
 
-A synthetic checkpoint stacks each expert projection as MLX does, [experts, rows, ...]
-(affine quantized by mx.quantize, or bf16), in Qwen3.6 or Gemma4 names, over two files
-behind odd-sized filler tensors so that experts start off 4 KiB boundaries, with one
-layer's projections split across the files. Every bank row the cache holds must equal,
-byte for byte, the expert's row of apply_rules(load_checkpoint(...)): after the initial
-fill, after each ensure_experts call of a hand-written script (each returned slot, and
-every slot slot_of maps), and at every slot of a prefetched prefill layer's slot map,
+The synthetic checkpoints are offload_harness's. Every bank row the cache holds must
+equal, byte for byte, the expert's row of apply_rules(load_checkpoint(...)): after the
+initial fill, after each ensure_experts call of a hand-written script (each returned slot,
+and every slot slot_of maps), and at every slot of a prefetched prefill layer's slot map,
 whose resident experts keep their slots. Large experts make one run of reads longer than
 a staging buffer. Errors: a layer in another format, the window protocol, a file cut
 short under the cache. The real-checkpoint case needs FTMETAL_TEST_MODEL_PATH.
@@ -17,7 +14,6 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 import mlx.core as mx
 import numpy as np
@@ -28,18 +24,17 @@ from ftmetal.core import host_ints
 from ftmetal.engine.config import EngineConfig
 from ftmetal.layers.moe import MoELayer, moe_layout
 from ftmetal.layers.quantization.config import AffineScheme
-from ftmetal.models.loader import FuseRule, WeightRules, apply_rules, load_checkpoint
+from ftmetal.models.loader import apply_rules, load_checkpoint
 from ftmetal.models.qwen3_5_moe.model import fused_scheme_of
 from ftmetal.models.qwen3_5_moe.weight import GATE_UP_PARTS
 from ftmetal.models.register import model_weight_rules
 from ftmetal.moe.offload_cache import OffloadMoeCache
 from ftmetal.moe.source import ExpertSource
+from offload_harness import CheckpointSpec, Naming, build_cache, weight_rules, write_checkpoint
 
 MODEL_PATH = os.environ.get("FTMETAL_TEST_MODEL_PATH")
-Naming = Literal["qwen", "gemma4"]
 # One decode step: the (layer, distinct expert ids) calls of ensure_experts, in order.
 Step = tuple[tuple[int, tuple[int, ...]], ...]
-PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 
 
 @dataclass(frozen=True)
@@ -62,6 +57,18 @@ class Case:
     scheme: AffineScheme | None = AffineScheme(4, 64)
     # Bits of the last layer's experts, if not the scheme's.
     last_layer_bits: int | None = None
+
+    @property
+    def spec(self) -> CheckpointSpec:
+        return CheckpointSpec(
+            num_layers=self.num_layers,
+            num_experts=self.num_experts,
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+            naming=self.naming,
+            scheme=self.scheme,
+            last_layer_bits=self.last_layer_bits,
+        )
 
     def __str__(self) -> str:
         scheme = "bf16" if self.scheme is None else f"q{self.scheme.bits}g{self.scheme.group_size}"
@@ -109,75 +116,13 @@ CASES = [
 ]
 
 
-def weight_rules(naming: Naming) -> WeightRules:
-    """The text rules of the model family, for the expert banks."""
-    gate_up = FuseRule("gate_up_proj", ("gate_proj", "up_proj"))
-    if naming == "qwen":
-        return WeightRules(
-            renames=(("language_model.model.", "model."),),
-            segments=(("switch_mlp", "experts"),),
-            fuses=(gate_up,),
-            expert_segment="experts",
-        )
-    else:
-        return WeightRules(
-            segments=(("experts.switch_glu", "experts"),),
-            fuses=(gate_up,),
-            expert_segment="experts",
-        )
-
-
-def write_checkpoint(directory: Path, case: Case) -> None:
-    rng = np.random.default_rng(case.num_layers * 101 + case.hidden_size)
-    files: list[dict[str, mx.array]] = [
-        {"filler.a": mx.zeros((1001,), dtype=mx.uint8)},
-        {"filler.b": mx.zeros((333,), dtype=mx.uint8), "filler.c": mx.zeros((77,), mx.uint16)},
-    ]
-    split_layer = case.num_layers // 2
-    for layer_id in range(case.num_layers):
-        if case.naming == "qwen":
-            module = f"language_model.model.layers.{layer_id}.mlp.switch_mlp"
-        else:
-            module = f"model.layers.{layer_id}.experts.switch_glu"
-        for projection in PROJECTIONS:
-            if projection == "down_proj":
-                shape = (case.num_experts, case.hidden_size, case.intermediate_size)
-            else:
-                shape = (case.num_experts, case.intermediate_size, case.hidden_size)
-            weight = mx.array(0.02 * rng.standard_normal(shape, dtype=np.float32), mx.bfloat16)
-            if layer_id < split_layer or (layer_id == split_layer and projection == "gate_proj"):
-                file = files[0]
-            else:
-                file = files[1]
-            if case.scheme is None:
-                file[f"{module}.{projection}.weight"] = weight
-            else:
-                bits = case.scheme.bits
-                if layer_id == case.num_layers - 1 and case.last_layer_bits is not None:
-                    bits = case.last_layer_bits
-                packed, scales, biases = mx.quantize(weight, case.scheme.group_size, bits)
-                file[f"{module}.{projection}.weight"] = packed
-                file[f"{module}.{projection}.scales"] = scales
-                file[f"{module}.{projection}.biases"] = biases
-    directory.mkdir()
-    for i, file in enumerate(files):
-        mx.save_safetensors(str(directory / f"model-{i:05d}.safetensors"), file)
-
-
 def build(directory: Path, case: Case) -> tuple[OffloadMoeCache, dict[str, mx.array], ExpertSource]:
     """The cache over the case's checkpoint, the fused reference state and the source."""
-    write_checkpoint(directory, case)
-    rules = weight_rules(case.naming)
-    source = ExpertSource(str(directory), rules)
-    cache = OffloadMoeCache(
-        num_layers=case.num_layers,
-        num_experts=case.num_experts,
-        cache_size=case.cache_size,
-        prefill_overlap=case.prefill_overlap,
-        layout=moe_layout(case.hidden_size, case.intermediate_size, case.scheme, mx.bfloat16),
-        source=source,
+    cache, source = build_cache(
+        directory, case.spec, cache_size=case.cache_size, prefill_overlap=case.prefill_overlap
     )
-    return cache, apply_rules(load_checkpoint(str(directory)), rules), source
+    reference = apply_rules(load_checkpoint(str(directory)), weight_rules(case.naming))
+    return cache, reference, source
 
 
 def resident_rows(cache: OffloadMoeCache) -> dict[tuple[int, int], int]:
@@ -244,7 +189,7 @@ def test_rows_match_checkpoint(tmp_path: Path, case: Case) -> None:
 
 def test_source_rejects_a_layer_in_another_format(tmp_path: Path) -> None:
     case = Case(3, 4, 128, 64, 4, False, last_layer_bits=8)
-    write_checkpoint(tmp_path / "checkpoint", case)
+    write_checkpoint(tmp_path / "checkpoint", case.spec)
     source = ExpertSource(str(tmp_path / "checkpoint"), weight_rules(case.naming))
     layout = moe_layout(case.hidden_size, case.intermediate_size, case.scheme, mx.bfloat16)
     with pytest.raises(ValueError, match="model.layers.2.mlp.experts.gate_up_proj.weight"):

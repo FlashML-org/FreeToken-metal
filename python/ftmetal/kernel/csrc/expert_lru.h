@@ -29,6 +29,8 @@ using ExpertLoad = std::pair<int32_t, int32_t>;
 struct SlotAssignment {
   std::vector<int32_t> slots;
   std::vector<ExpertLoad> loads;
+  // Loads into a slot that held another expert.
+  int64_t num_evicted = 0;
 };
 
 class SlotLru {

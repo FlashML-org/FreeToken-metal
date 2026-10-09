@@ -5,10 +5,8 @@
 
 #include <algorithm>
 #include <cerrno>
-#include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <stdexcept>
 #include <tuple>
 
 namespace ftmetal {
@@ -49,10 +47,14 @@ ExpertService::ExpertService(
     int window_slots,
     mx::array slot_of,
     mx::array last_use,
+    mx::array mailbox,
+    mx::array hit_stats,
     std::vector<mx::array> banks,
     const std::vector<std::string>& files,
     std::vector<ExpertSegment> segments,
-    int io_threads)
+    int io_threads,
+    double stall_timeout_s,
+    bool run_coordinator)
     : lru_(num_layers, num_experts, num_slots, window_slots, std::move(slot_of), std::move(last_use)),
       num_layers_(num_layers),
       num_experts_(num_experts),
@@ -60,9 +62,24 @@ ExpertService::ExpertService(
       banks_(std::move(banks)),
       files_(files),
       segments_(std::move(segments)),
-      segments_per_layer_(static_cast<int>(segments_.size()) / num_layers) {
+      segments_per_layer_(static_cast<int>(segments_.size()) / num_layers),
+      mailbox_(std::move(mailbox)),
+      mailbox_data_(static_cast<uint32_t*>(shared_data(mailbox_, "mailbox"))),
+      hit_stats_(std::move(hit_stats)),
+      hit_stats_data_(static_cast<uint32_t*>(shared_data(hit_stats_, "hit_stats"))),
+      stall_timeout_(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::duration<double>(stall_timeout_s))) {
   if (io_threads < 1) {
     throw std::invalid_argument("ExpertService: io_threads must be positive");
+  }
+  if (!(stall_timeout_s > 0)) {
+    throw std::invalid_argument("ExpertService: stall_timeout_s must be positive");
+  }
+  if (mailbox_.dtype() != mx::uint32 || mailbox_.size() != MAILBOX_WORDS) {
+    throw std::invalid_argument("ExpertService: mailbox must be uint32 [1024]");
+  }
+  if (hit_stats_.dtype() != mx::uint32 || hit_stats_.shape() != mx::Shape{num_layers, 2}) {
+    throw std::invalid_argument("ExpertService: hit_stats must be uint32 [num_layers, 2]");
   }
   if (segments_.empty() || segments_.size() % num_layers != 0) {
     throw std::invalid_argument("ExpertService: segments must hold the same count per layer");
@@ -108,6 +125,7 @@ ExpertService::ExpertService(
   stats_.experts_read.assign(num_layers, 0);
   stats_.bytes_read.assign(num_layers, 0);
   stats_.read_wait_ns.assign(num_layers, 0);
+  std::fill(mailbox_data_, mailbox_data_ + MAILBOX_WORDS, 0u);
   try {
     for (const std::string& file : files_) {
       int descriptor = open(file.c_str(), O_RDONLY | O_CLOEXEC);
@@ -130,6 +148,10 @@ ExpertService::ExpertService(
     for (int i = 0; i < io_threads; ++i) {
       threads_.emplace_back(&ExpertService::work, this, i);
     }
+    watchdog_ = std::thread(&ExpertService::watch, this);
+    if (run_coordinator) {
+      coordinator_ = std::thread(&ExpertService::coordinate, this);
+    }
   } catch (...) {
     shutdown();
     throw;
@@ -141,26 +163,52 @@ ExpertService::~ExpertService() {
 }
 
 void ExpertService::shutdown() {
-  {
-    std::lock_guard<std::mutex> lock(queue_mutex_);
-    is_stopping_ = true;
-  }
-  queue_ready_.notify_all();
-  for (std::thread& thread : threads_) {
-    if (thread.joinable()) {
-      thread.join();
+  std::call_once(shutdown_once_, [this] {
+    fail(MailboxError::Shutdown, "the service was shut down");
+    is_stopping_coordination_.store(true, std::memory_order_release);
+    // State last: a waiting GPU leaves on SHUTDOWN, and a coordinator still answering finds
+    // its request taken and leaves the reply alone.
+    auto refuse_requests = [this] {
+      mailbox_word(MailboxWord::Error)
+          .store(static_cast<uint32_t>(MailboxError::Shutdown), std::memory_order_relaxed);
+      mailbox_word(MailboxWord::Acknowledged)
+          .store(
+              mailbox_word(MailboxWord::Sequence).load(std::memory_order_acquire),
+              std::memory_order_release);
+      mailbox_word(MailboxWord::State)
+          .store(static_cast<uint32_t>(MailboxState::Shutdown), std::memory_order_release);
+    };
+    refuse_requests();
+    {
+      std::lock_guard<std::mutex> lock(wake_mutex_);
     }
-  }
-  for (int descriptor : file_descriptors_) {
-    close(descriptor);
-  }
-  file_descriptors_.clear();
-}
-
-void ExpertService::check_healthy() const {
-  if (!failure_.empty()) {
-    throw std::runtime_error("ExpertService failed earlier: " + failure_);
-  }
+    coordinator_wake_.notify_all();
+    watchdog_wake_.notify_all();
+    for (std::thread* thread : {&coordinator_, &watchdog_}) {
+      if (thread->joinable()) {
+        thread->join();
+      }
+    }
+    // A lookup that read the state just before the first refusal may have posted since.
+    if (mailbox_word(MailboxWord::State).load(std::memory_order_acquire) !=
+        static_cast<uint32_t>(MailboxState::Shutdown)) {
+      refuse_requests();
+    }
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      is_stopping_ = true;
+    }
+    queue_ready_.notify_all();
+    for (std::thread& thread : threads_) {
+      if (thread.joinable()) {
+        thread.join();
+      }
+    }
+    for (int descriptor : file_descriptors_) {
+      close(descriptor);
+    }
+    file_descriptors_.clear();
+  });
 }
 
 void ExpertService::check_layer(int layer_id, const char* method) const {
@@ -302,14 +350,16 @@ void ExpertService::fill_initial(const std::vector<int32_t>& flat_ids) {
       submit(*batches.back(), layer_id, loads[layer_id]);
     }
   }
+  std::string error;
   for (const auto& batch : batches) {
     wait_for(*batch);
-    if (failure_.empty() && !batch->error.empty()) {
-      failure_ = batch->error;
+    if (error.empty()) {
+      error = batch->error;
     }
   }
-  if (!failure_.empty()) {
-    throw std::runtime_error(failure_);
+  if (!error.empty()) {
+    fail(MailboxError::Io, error);
+    throw ReadError(error);
   }
 }
 
@@ -319,10 +369,17 @@ std::vector<int32_t> ExpertService::ensure_experts(
     uint32_t step) {
   std::lock_guard<std::mutex> lock(call_mutex_);
   check_healthy();
+  return std::move(serve(layer_id, expert_ids, step).slots);
+}
+
+SlotAssignment ExpertService::serve(
+    int layer_id,
+    const std::vector<int32_t>& expert_ids,
+    uint32_t step) {
   for (const PrefillWindow& window : windows_) {
     if (!window.is_waited) {
       throw std::logic_error(
-          "ExpertService.ensure_experts: prefill layer " + std::to_string(window.layer_id) +
+          "ExpertService: prefill layer " + std::to_string(window.layer_id) +
           " is still being read into its window; wait for it first");
     }
   }
@@ -331,7 +388,7 @@ std::vector<int32_t> ExpertService::ensure_experts(
   stats_.hits[layer_id] += static_cast<int64_t>(expert_ids.size()) - num_loads;
   stats_.misses[layer_id] += num_loads;
   if (num_loads == 0) {
-    return std::move(assignment.slots);
+    return assignment;
   }
   if (std::any_of(assignment.loads.begin(), assignment.loads.end(), [this](const ExpertLoad& load) {
         return load.second < window_slots_;
@@ -347,10 +404,10 @@ std::vector<int32_t> ExpertService::ensure_experts(
   stats_.experts_read[layer_id] += num_loads;
   stats_.bytes_read[layer_id] += ensure_batch_.bytes_read.load(std::memory_order_relaxed);
   if (!ensure_batch_.error.empty()) {
-    failure_ = ensure_batch_.error;
-    throw std::runtime_error(failure_);
+    fail(MailboxError::Io, ensure_batch_.error);
+    throw ReadError(ensure_batch_.error);
   }
-  return std::move(assignment.slots);
+  return assignment;
 }
 
 void ExpertService::begin_prefill() {
@@ -411,8 +468,19 @@ void ExpertService::wait_prefill_layer(int layer_id) {
 }
 
 ExpertServiceStats ExpertService::stats() {
-  std::lock_guard<std::mutex> lock(call_mutex_);
-  return stats_;
+  ExpertServiceStats stats;
+  {
+    std::lock_guard<std::mutex> lock(call_mutex_);
+    stats = stats_;
+  }
+  for (int layer_id = 0; layer_id < num_layers_; ++layer_id) {
+    // The GPU's counts, read without synchronizing: an older value is fine.
+    stats.lookups.push_back(
+        std::atomic_ref<uint32_t>(hit_stats_data_[2 * layer_id]).load(std::memory_order_relaxed));
+    stats.lookup_hits.push_back(std::atomic_ref<uint32_t>(hit_stats_data_[2 * layer_id + 1])
+                                    .load(std::memory_order_relaxed));
+  }
+  return stats;
 }
 
 } // namespace ftmetal

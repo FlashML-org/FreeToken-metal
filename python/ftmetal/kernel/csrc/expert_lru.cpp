@@ -148,6 +148,7 @@ SlotAssignment SlotLru::resolve(
     int32_t flat_id = layer_id * num_experts_ + expert_ids[i];
     if (victim.flat_id >= 0) {
       slot_of_data_[victim.flat_id] = -1;
+      ++assignment.num_evicted;
     }
     id_of_slot_[victim.slot] = flat_id;
     slot_of_data_[flat_id] = victim.slot;

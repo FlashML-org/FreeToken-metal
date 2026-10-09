@@ -1,13 +1,11 @@
-"""SlotLru against a Python reference of the offload simulation's token-granular LRU.
+"""SlotLru against offload_harness's reference of the offload simulation's LRU.
 
-The reference keeps, per slot, the expert it holds and the step it was last used. A call
-first marks its hits used at this step, then gives each miss the slot least recently used
-before this step: a free slot first, then the lowest flat expert id. SlotLru must return
-the same slots and loads on every call and leave the same slot_of and last_use, and no
-load may take a slot one of the same call's hits uses. A call that would evict a slot used
-in its own step must raise, as must one naming more experts than the cache has slots. The
-windows: free window slots go first, invalidate_windows drops what they hold, and
-prefill_slot_map keeps resident experts and sends the others to the layer's window.
+SlotLru must return the same slots and loads on every call and leave the same slot_of and
+last_use, and no load may take a slot one of the same call's hits uses. A call that would
+evict a slot used in its own step must raise, as must one naming more experts than the
+cache has slots. The windows: free window slots go first, invalidate_windows drops what
+they hold, and prefill_slot_map keeps resident experts and sends the others to the
+layer's window.
 """
 
 from __future__ import annotations
@@ -19,6 +17,7 @@ import numpy as np
 import pytest
 
 from ftmetal.kernel._ext import _C
+from offload_harness import ReferenceLru
 
 # One step: the (layer, distinct expert ids) calls of resolve, in order.
 Step = tuple[tuple[int, tuple[int, ...]], ...]
@@ -86,37 +85,6 @@ CASES = [
 ]
 
 
-class ReferenceLru:
-    def __init__(self, case: Case) -> None:
-        self.num_experts = case.num_experts
-        self.id_of_slot = [-1] * case.num_slots
-        self.last_use = [0] * case.num_slots
-        for j, flat_id in enumerate(case.fill):
-            self.id_of_slot[case.window_slots + j] = flat_id
-
-    def resolve(
-        self, layer_id: int, expert_ids: list[int], step: int
-    ) -> tuple[list[int], list[tuple[int, int]]]:
-        flat_ids = [layer_id * self.num_experts + expert for expert in expert_ids]
-        slot_of = {flat_id: slot for slot, flat_id in enumerate(self.id_of_slot) if flat_id >= 0}
-        for flat_id in flat_ids:
-            if flat_id in slot_of:
-                self.last_use[slot_of[flat_id]] = step
-        loads: list[tuple[int, int]] = []
-        for expert, flat_id in zip(expert_ids, flat_ids):
-            if flat_id not in slot_of:
-                victim = min(
-                    (slot for slot, last in enumerate(self.last_use) if last < step),
-                    key=lambda slot: (self.last_use[slot], self.id_of_slot[slot], slot),
-                )
-                slot_of.pop(self.id_of_slot[victim], None)
-                self.id_of_slot[victim] = flat_id
-                self.last_use[victim] = step
-                slot_of[flat_id] = victim
-                loads.append((expert, victim))
-        return [slot_of[flat_id] for flat_id in flat_ids], loads
-
-
 def make_lru(
     num_layers: int, num_experts: int, num_slots: int, window_slots: int
 ) -> tuple[_C.SlotLru, mx.array, mx.array]:
@@ -131,7 +99,7 @@ def check(case: Case) -> None:
     lru, slot_of, last_use = make_lru(
         case.num_layers, case.num_experts, case.num_slots, case.window_slots
     )
-    reference = ReferenceLru(case)
+    reference = ReferenceLru(case.num_experts, case.num_slots, case.window_slots, case.fill)
     filled = lru.fill(list(case.fill))
     assert filled == [case.window_slots + j for j in range(len(case.fill))]
     for step, calls in enumerate(case.script, start=1):
