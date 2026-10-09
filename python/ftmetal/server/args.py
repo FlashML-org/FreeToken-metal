@@ -8,19 +8,28 @@ multimodal flags, no --mm-processor-kwargs (no transformers processor),
 --mm-embed-cache-device or --mm-encoder-weights (the tower stays resident in unified
 memory); --image-max-tokens defaults per image processor; the shell is a client of a running
 server, so there is no shell mode; the parser inference reads config.json itself (no
-transformers) and is module-level.
+transformers) and is module-level. MoE: --moe-strategy takes auto, fused and offload, and
+refuses FreeToken's cpu and hybrid (no host banks on unified memory); --expert-load is
+accepted and ignored; --memory-ratio defaults to unset (the working set less a headroom);
+no --moe-cpu-threads, --moe-cpu-layers, --moe-hybrid-max-fetch or --moe-prefill-hit-d2d.
 """
 
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import get_args
 
 from ftmetal.attention import SUPPORTED_ATTENTION_BACKENDS
-from ftmetal.engine.config import CacheTypeChoice, EngineConfig, command_graph_from_env
+from ftmetal.engine.config import (
+    CacheTypeChoice,
+    EngineConfig,
+    MoeStrategyChoice,
+    command_graph_from_env,
+)
 from ftmetal.kvcache.linear_state_pool import CONVERSATION_SNAPSHOTS, DEFAULT_GDN_SNAPSHOTS
 from ftmetal.mm.config import ENCODER_KINDS, EncoderKind, MultimodalConfig
 from ftmetal.tokenizer import read_json_object
@@ -41,6 +50,12 @@ TOOL_CALL_PARSER_CHOICES = (
     "gpt_oss",
     "gpt-oss",
 )
+# FreeToken's strategies that compute experts on the CPU from host banks.
+HOST_MOE_STRATEGIES = ("cpu", "hybrid")
+MOE_STRATEGY_CHOICES = (*get_args(MoeStrategyChoice), *HOST_MOE_STRATEGIES)
+
+logger = logging.getLogger(__name__)
+
 REASONING_PARSER_CHOICES = (
     "auto",
     "off",
@@ -86,6 +101,57 @@ def positive_int(value: str) -> int:
     if number < 1:
         raise argparse.ArgumentTypeError(f"expected a positive integer, got {value}")
     return number
+
+
+def non_negative_int(value: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"expected a non-negative integer, got {value}")
+    return number
+
+
+def unit_fraction(value: str) -> float:
+    """A number in [0, 1] (FreeToken's --moe-cache-rate)."""
+    number = float(value)
+    if not 0 <= number <= 1:
+        raise argparse.ArgumentTypeError(f"expected a number in [0, 1], got {value}")
+    return number
+
+
+def memory_fraction(value: str) -> float:
+    number = float(value)
+    if not 0 < number <= 1:
+        raise argparse.ArgumentTypeError(f"expected a number in (0, 1], got {value}")
+    return number
+
+
+class DeprecatedAlias(argparse.Action):
+    """An old flag (FreeToken's _DeprecatedAlias): warns when given, stores under the new
+    flag's dest."""
+
+    def __init__(
+        self,
+        option_strings: list[str],
+        dest: str,
+        *,
+        new_flag: str,
+        choices: tuple[str, ...],
+        default: str,
+        help: str,
+    ) -> None:
+        super().__init__(option_strings, dest, choices=choices, default=default, help=help)
+        self.new_flag = new_flag
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: object,
+        option_string: str | None = None,
+    ) -> None:
+        assert isinstance(values, str), f"{option_string} takes one value"
+        logger.warning(f"{option_string} is deprecated; use {self.new_flag}")
+        setattr(namespace, self.dest, values)
 
 
 def model_family_marker(model_path: str) -> str:
@@ -265,6 +331,85 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         help="metal: paged flash-prefill and flash-decode kernels; mlx: SDPA over gathered pages",
     )
     parser.add_argument(
+        "--memory-ratio",
+        type=memory_fraction,
+        metavar="R",
+        default=ServerArgs.memory_ratio,
+        help="the memory budget for weights, the MoE cache, the KV pools and the activations, "
+        "as a fraction of Metal's recommended working set (default: the working set less a "
+        "headroom); a small fraction emulates a Mac with less memory",
+    )
+    parser.add_argument(
+        "--moe-strategy",
+        choices=MOE_STRATEGY_CHOICES,
+        default=ServerArgs.moe_strategy,
+        help="how a MoE model's routed experts are served: fused keeps them resident, offload "
+        "reads them from the checkpoint into a slot cache, auto (default) keeps them resident "
+        "when they fit the memory budget beside --kv-reserve-tokens of KV and offloads "
+        "otherwise; cpu and hybrid are not supported on macOS",
+    )
+    parser.add_argument(
+        "--moe-backend",
+        dest="moe_strategy",
+        action=DeprecatedAlias,
+        new_flag="--moe-strategy",
+        choices=MOE_STRATEGY_CHOICES,
+        default=argparse.SUPPRESS,
+        help="[Deprecated] Use --moe-strategy.",
+    )
+    moe_cache_group = parser.add_mutually_exclusive_group()
+    moe_cache_group.add_argument(
+        "--moe-cache-size",
+        type=non_negative_int,
+        metavar="N",
+        default=ServerArgs.moe_cache_size,
+        help="expert slots of the MoE offload cache (with prefill overlap at least twice the "
+        "experts of a layer, else once)",
+    )
+    moe_cache_group.add_argument(
+        "--moe-cache-rate",
+        type=unit_fraction,
+        metavar="R",
+        default=ServerArgs.moe_cache_rate,
+        help="the MoE offload cache's slots as a fraction of all routed experts",
+    )
+    moe_cache_group.add_argument(
+        "--moe-cache-auto",
+        action="store_true",
+        help="size the MoE offload cache from the memory budget, experts first: the KV pools "
+        "get --kv-reserve-tokens, the experts the rest (the default of an offload without a "
+        "size flag)",
+    )
+    parser.add_argument(
+        "--kv-reserve-tokens",
+        type=non_negative_int,
+        metavar="N",
+        default=ServerArgs.kv_reserve_tokens,
+        help="KV tokens kept before the experts by --moe-cache-auto and by auto's "
+        f"resident check (default {ServerArgs.kv_reserve_tokens})",
+    )
+    parser.add_argument(
+        "--moe-cache-policy",
+        choices=["lru"],
+        default=ServerArgs.moe_cache_policy,
+        help="the MoE offload cache's eviction policy",
+    )
+    parser.add_argument(
+        "--disable-moe-prefill-overlap",
+        action="store_false",
+        dest="moe_prefill_overlap",
+        help="look up every prefill's experts like a decode's, instead of reading each layer's "
+        "ahead into two windows of the cache once a prefill is long; lowers the cache's "
+        "floor from twice a layer's experts to once",
+    )
+    parser.add_argument(
+        "--expert-load",
+        choices=["auto", "serial", "parallel"],
+        default=None,
+        help="accepted and ignored: the experts are read from the checkpoint straight into "
+        "the offload cache, with no host bank to load",
+    )
+    parser.add_argument(
         "--disable-command-graph",
         action="store_true",
         help="decode eagerly instead of replaying captured CommandGraphs; without the flag "
@@ -375,6 +520,22 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         )
     disabled_encoders: set[EncoderKind] = set(ENCODER_KINDS) if namespace.text_model_only else set()
     disabled_encoders.update(namespace.mm_disable)
+    if namespace.moe_strategy in HOST_MOE_STRATEGIES:
+        parser.error(
+            f"--moe-strategy {namespace.moe_strategy} computes experts on the CPU from host "
+            "banks, which macOS's unified memory has no use for; use offload or fused"
+        )
+    if namespace.expert_load is not None:
+        logger.warning(
+            "--expert-load is ignored: the experts are read from the checkpoint into the "
+            "offload cache"
+        )
+    # FreeToken: an offload without a size flag sizes its cache automatically.
+    moe_cache_auto = namespace.moe_cache_auto or (
+        namespace.moe_strategy == "offload"
+        and namespace.moe_cache_size == 0
+        and not namespace.moe_cache_rate
+    )
     return ServerArgs(
         model_path=model_path,
         served_model_name=(
@@ -397,6 +558,14 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         gdn_snapshots=namespace.gdn_snapshots,
         attention_backend=namespace.attention_backend,
         command_graph=not namespace.disable_command_graph and command_graph_from_env(),
+        memory_ratio=namespace.memory_ratio,
+        moe_strategy=namespace.moe_strategy,
+        moe_cache_size=namespace.moe_cache_size,
+        moe_cache_rate=namespace.moe_cache_rate if namespace.moe_cache_rate else None,
+        moe_cache_auto=moe_cache_auto,
+        kv_reserve_tokens=namespace.kv_reserve_tokens,
+        moe_cache_policy=namespace.moe_cache_policy,
+        moe_prefill_overlap=namespace.moe_prefill_overlap,
         mm=MultimodalConfig(
             disabled_encoders=frozenset(disabled_encoders),
             image_min_tokens=image_min_tokens,
@@ -408,12 +577,18 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
 
 
 __all__ = [
+    "HOST_MOE_STRATEGIES",
+    "MOE_STRATEGY_CHOICES",
     "REASONING_PARSER_CHOICES",
     "TOOL_CALL_PARSER_CHOICES",
+    "DeprecatedAlias",
     "ServerArgs",
     "infer_reasoning_parser",
     "infer_tool_call_parser",
+    "memory_fraction",
     "model_family_marker",
+    "non_negative_int",
     "parse_args",
     "positive_int",
+    "unit_fraction",
 ]

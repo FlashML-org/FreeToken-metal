@@ -68,16 +68,9 @@ class ExpertSource:
             data_start = 8 + header_bytes
             for name, entry in header.items():
                 key = rules.rename(name)
-                if key is None or self.expert_infix not in key:
+                if key is None or not rules.is_expert(key):
                     continue
-                module, _, suffix = key.rpartition(".")
-                parent, _, leaf = module.rpartition(".")
-                hit = rules.part_index.get(leaf)
-                if hit is None:
-                    model_key, index, count = key, 0, 1
-                else:
-                    rule, index = hit
-                    model_key, count = f"{parent}.{rule.fused}.{suffix}", len(rule.parts)
+                model_key, index, count = rules.fused_key(key)
                 if not isinstance(entry, dict):
                     raise ValueError(f"{file}: {name} has no tensor entry")
                 dtype_name, shape, offsets = (

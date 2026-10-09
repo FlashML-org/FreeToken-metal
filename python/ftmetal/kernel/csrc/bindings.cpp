@@ -147,10 +147,12 @@ NB_MODULE(_C, m) {
       "x[b] @ dequantize(w[slot_of[e]]).T for the rows b of each expert e; returns [B, 1, N].");
 
   m.attr("MAILBOX_WORDS") = ftmetal::MAILBOX_WORDS;
+  m.attr("EXPERT_STAGING_BYTES") = ftmetal::EXPERT_STAGING_BYTES;
   nb::enum_<ftmetal::MailboxWord>(m, "MailboxWord", nb::is_arithmetic())
       .value("STATE", ftmetal::MailboxWord::State)
       .value("SEQUENCE", ftmetal::MailboxWord::Sequence)
       .value("ACKNOWLEDGED", ftmetal::MailboxWord::Acknowledged)
+      .value("SHUTDOWN", ftmetal::MailboxWord::Shutdown)
       .value("KIND", ftmetal::MailboxWord::Kind)
       .value("LAYER", ftmetal::MailboxWord::Layer)
       .value("STEP", ftmetal::MailboxWord::Step)

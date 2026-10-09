@@ -22,6 +22,7 @@ using namespace metal;
 constant constexpr uint WORD_STATE = 0;
 constant constexpr uint WORD_SEQUENCE = 1;
 constant constexpr uint WORD_ACKNOWLEDGED = 2;
+constant constexpr uint WORD_SHUTDOWN = 3;
 constant constexpr uint WORD_KIND = 32;
 constant constexpr uint WORD_LAYER = 33;
 constant constexpr uint WORD_STEP = 34;
@@ -139,8 +140,9 @@ inline void system_fence() {
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     if (expert == 0) {
       bool answered = false;
-      // After a shutdown nobody answers: post nothing.
-      if (mailbox[WORD_STATE] != STATE_SHUTDOWN) {
+      // After a shutdown nobody answers: post nothing. The shutdown word, unlike the state,
+      // is never overwritten here, so a shutdown racing this post still releases the wait.
+      if (mailbox[WORD_SHUTDOWN] == 0) {
         mailbox[WORD_KIND] = params.kind;
         mailbox[WORD_LAYER] = uint(params.layer_id);
         mailbox[WORD_STEP] = step;
@@ -156,18 +158,19 @@ inline void system_fence() {
         while (true) {
           system_fence();
           state = mailbox[WORD_STATE];
-          if (state == STATE_SHUTDOWN ||
-              ((state == STATE_DONE || state == STATE_FAILED) &&
-               mailbox[WORD_ACKNOWLEDGED] == sequence)) {
+          if ((state == STATE_DONE || state == STATE_FAILED) &&
+              mailbox[WORD_ACKNOWLEDGED] == sequence) {
+            break;
+          }
+          if (mailbox[WORD_SHUTDOWN] != 0) {
+            state = STATE_SHUTDOWN;
             break;
           }
         }
         system_fence();
         answered = state == STATE_DONE;
-        if (state != STATE_SHUTDOWN) {
-          mailbox[WORD_STATE] = STATE_IDLE;
-          system_fence();
-        }
+        mailbox[WORD_STATE] = mailbox[WORD_SHUTDOWN] != 0 ? STATE_SHUTDOWN : STATE_IDLE;
+        system_fence();
       }
       is_answered = answered;
     }

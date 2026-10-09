@@ -26,6 +26,9 @@
 
 namespace ftmetal {
 
+// Each IO thread's aligned staging buffer, which one read fills.
+constexpr int64_t EXPERT_STAGING_BYTES = 8 << 20;
+
 // One checkpoint part of one bank, per MoE layer: expert e's bytes are
 // [file_offset + e * expert_bytes, file_offset + (e + 1) * expert_bytes) of file
 // file_index, and land at row_offset in a row of bank bank_index.

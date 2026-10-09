@@ -4,7 +4,8 @@ Port of FreeToken models/gemma4/model.py (and Gemma4MLP / Gemma4DenseMLP of its 
 Divergences: the batch flows through forward explicitly; the feed-forward sandwich runs
 unfused in the decoder layer, which holds its norms, router and experts as the
 checkpoint lays them out; each Linear takes its affine scheme from the checkpoint's
-quantization map at construction; the final logit softcap runs in the logits' dtype.
+quantization map at construction; the final logit softcap runs in the logits' dtype; the
+experts are always resident (no offload strategy yet).
 """
 
 from __future__ import annotations
@@ -145,6 +146,11 @@ class Gemma4Model(BaseOP):
 
 class Gemma4ForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig, *, dtype: mx.Dtype = mx.bfloat16) -> None:
+        if config.moe_strategy == "offload":
+            raise ValueError(
+                "MoE offload (--moe-strategy offload) is not supported for Gemma4 yet; serve "
+                "its experts resident with --moe-strategy fused"
+            )
         super().__init__()
         self.config = config
         self.model = Gemma4Model(config, dtype=dtype)

@@ -15,7 +15,8 @@ slot_of external, mailbox, last_use and hit_stats pools, moe_step and the ids st
 and replayed. Then the handshake's edges: no real rows post nothing, a probe round trip, a
 hit in the least recently used slot keeps it, a failed read and a cache too small for the
 step fail their requests, a corrupted sequence is a protocol error, a shutdown releases a
-waiting lookup, and the watchdog fails a request nobody answers.
+waiting lookup, also one whose post overwrote the shutdown's refusal, and the watchdog
+fails a request nobody answers.
 """
 
 from __future__ import annotations
@@ -382,6 +383,27 @@ def test_shutdown_releases_a_waiting_lookup(tmp_path: Path) -> None:
     # Nobody answers after a shutdown: a later lookup posts nothing.
     mx.eval(lookup(cache, [[2, 3]], 1, 2), cache.mailbox)
     assert words[Word.SEQUENCE] == 1 and words[Word.STATE] == State.SHUTDOWN
+
+
+def test_shutdown_word_releases_a_post_that_overwrote_the_refusal(tmp_path: Path) -> None:
+    """A lookup that read the mailbox just before a shutdown posts anyway, overwriting the
+    SHUTDOWN state: the shutdown word, which only the CPU writes, still releases it."""
+    cache = small_cache(tmp_path, run_coordinator=False, stall_timeout_s=600.0)
+    words = mailbox_words(cache)
+    slots = lookup(cache, [[0, 1]], 1, 1)
+    mx.async_eval(slots, cache.mailbox)
+    deadline = time.monotonic() + 10.0
+    while words[Word.STATE] != State.POSTED:
+        assert time.monotonic() < deadline, "the lookup never posted"
+        time.sleep(0.001)
+    # The shutdown as the waiting lookup sees it once its post has overwritten the state.
+    words[Word.SHUTDOWN] = 1
+    mx.eval(slots, cache.mailbox)
+    assert words[Word.STATE] == State.SHUTDOWN and words[Word.SEQUENCE] == 1
+    # Nothing posts once the word is set, whatever the state says.
+    words[Word.STATE] = State.IDLE
+    mx.eval(lookup(cache, [[2, 3]], 1, 2), cache.mailbox)
+    assert words[Word.SEQUENCE] == 1
 
 
 def test_watchdog_fails_an_unanswered_request(tmp_path: Path) -> None:

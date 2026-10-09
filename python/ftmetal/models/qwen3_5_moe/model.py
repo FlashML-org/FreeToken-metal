@@ -80,6 +80,7 @@ class Qwen3_5DecoderLayer(BaseOP):
         mlp_prefix = f"{prefix}.mlp"
         self.mlp = Qwen3_5MoE(
             config,
+            layer_id,
             experts_gate_up_scheme=fused_scheme_of(config, f"{mlp_prefix}.experts", GATE_UP_PARTS),
             experts_down_scheme=scheme_of(config, f"{mlp_prefix}.experts.down_proj"),
             gate_scheme=scheme_of(config, f"{mlp_prefix}.gate"),

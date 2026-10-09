@@ -18,15 +18,18 @@ namespace mx = mlx::core;
 
 namespace ftmetal {
 
-// The mailbox: uint32 words in 128-byte lines; line 0 the handshake, line 1 the request
-// header, lines 2-5 the request's distinct expert ids (uint16, the absent first), line 6 the
-// reply. Shared with metal/moe_lookup.metal.
+// The mailbox: uint32 words in 128-byte lines; line 0 the handshake and the shutdown word,
+// line 1 the request header, lines 2-5 the request's distinct expert ids (uint16, the absent
+// first), line 6 the reply. Shared with metal/moe_lookup.metal.
 enum class MailboxWord : int {
   State = 0,
   // The last request's sequence number, incremented by the GPU per request.
   Sequence = 1,
   // The sequence number of the last request answered.
   Acknowledged = 2,
+  // Nonzero once the service shut down; written by the CPU only, never cleared. The GPU
+  // posts nothing once it is set, and stops waiting when it appears.
+  Shutdown = 3,
   Kind = 32,
   Layer = 33,
   Step = 34,

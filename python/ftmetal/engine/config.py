@@ -4,11 +4,15 @@ Port of FreeToken engine/config.py (EngineConfig), reduced to the knobs this eng
 has: one process, one GPU, MLX checkpoints. Divergence: served_modalities reads the
 encoders from mm.processor.active_encoders (no active_encoders property) and is empty for
 a checkpoint without config.json; model_config drops the unbuilt encoder sections from the
-raw config dictionary.
+raw config dictionary; the MoE strategies are auto, fused and offload (no host-bank kinds),
+and no deprecated moe_backend field (only the flag); memory_ratio defaults to None, the
+working set less a headroom; the three cache size fields are checked exclusive here, not
+only as flags.
 """
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -32,6 +36,13 @@ from ftmetal.models.register import parse_model_config
 
 # Prefix reuse: radix (the hybrid radix on a model with linear attention) or naive (none).
 CacheTypeChoice = Literal["naive", "radix"]
+# How routed experts are served: fused keeps them resident, offload reads them into a slot
+# cache, auto picks fused when every expert fits the memory budget.
+MoeStrategyChoice = Literal["auto", "fused", "offload"]
+# From this many prefill tokens on, an offload prefill reads each layer's absent experts ahead
+# of it instead of looking them up: at T * top-8 >= 4 * 256 experts every expert averages
+# four rows, where gather_qmm_sorted's tile kernel beats the per-row matvec.
+DEFAULT_MOE_PREFILL_OVERLAP_MIN_TOKENS = 128
 
 
 def command_graph_from_env() -> bool:
@@ -40,6 +51,19 @@ def command_graph_from_env() -> bool:
     if value not in (None, "0", "1"):
         raise ValueError(f"FTMETAL_COMMAND_GRAPH must be 0 or 1, got {value!r}")
     return value != "0"
+
+
+def moe_prefill_overlap_min_tokens_from_env() -> int:
+    """FTMETAL_MOE_PREFILL_OVERLAP_MIN_TOKENS: the overlap prefill threshold, for tests."""
+    value = read_env("MOE_PREFILL_OVERLAP_MIN_TOKENS")
+    if value is None:
+        return DEFAULT_MOE_PREFILL_OVERLAP_MIN_TOKENS
+    elif value.isdigit() and int(value) > 0:
+        return int(value)
+    else:
+        raise ValueError(
+            f"FTMETAL_MOE_PREFILL_OVERLAP_MIN_TOKENS must be a positive integer, got {value!r}"
+        )
 
 
 @dataclass(frozen=True)
@@ -69,6 +93,55 @@ class EngineConfig:
     # Runtime knobs of the multimodal path; the architecture side lives in the checkpoint
     # config.
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
+    moe_strategy: MoeStrategyChoice = "auto"
+    # The offload cache's size in expert slots, or as a fraction of every expert, or auto (the
+    # KV pools get kv_reserve_tokens first, the experts the rest); at most one is set, and an
+    # offload with none is auto. 0 and None: not set.
+    moe_cache_size: int = 0
+    moe_cache_rate: float | None = None
+    moe_cache_auto: bool = False
+    # KV tokens auto keeps before the experts: auto's fused fit check and cache sizing.
+    kv_reserve_tokens: int = 8192
+    moe_cache_policy: Literal["lru"] = "lru"
+    # Long prefills read each layer's absent experts ahead into two windows of the cache.
+    moe_prefill_overlap: bool = True
+    moe_prefill_overlap_min_tokens: int = field(
+        default_factory=moe_prefill_overlap_min_tokens_from_env
+    )
+    # The memory budget as a fraction of Metal's recommended working set; None: the working
+    # set less its headroom. A fraction also emulates a smaller Mac.
+    memory_ratio: float | None = None
+
+    def __post_init__(self) -> None:
+        cache_flags = [
+            flag
+            for flag, is_set in (
+                ("moe_cache_size", self.moe_cache_size != 0),
+                ("moe_cache_rate", self.moe_cache_rate is not None),
+                ("moe_cache_auto", self.moe_cache_auto),
+            )
+            if is_set
+        ]
+        if len(cache_flags) > 1:
+            raise ValueError(f"{' and '.join(cache_flags)} are exclusive: set at most one")
+        if self.moe_cache_size < 0:
+            raise ValueError(f"moe_cache_size must not be negative, got {self.moe_cache_size}")
+        if self.moe_cache_rate is not None and not 0 <= self.moe_cache_rate <= 1:
+            raise ValueError(f"moe_cache_rate must be in [0, 1], got {self.moe_cache_rate}")
+        if self.kv_reserve_tokens < 0:
+            raise ValueError(
+                f"kv_reserve_tokens must not be negative, got {self.kv_reserve_tokens}"
+            )
+        if self.memory_ratio is not None and not 0 < self.memory_ratio <= 1:
+            raise ValueError(f"memory_ratio must be in (0, 1], got {self.memory_ratio}")
+
+    def moe_cache_size_flag(self, total_experts: int) -> int:
+        """The offload cache size the flags give, rate resolved (FreeToken: ceil of the
+        fraction of every expert); 0: auto."""
+        if self.moe_cache_rate:
+            return math.ceil(total_experts * self.moe_cache_rate)
+        else:
+            return self.moe_cache_size
 
     @cached_property
     def raw_config(self) -> dict[str, object]:
@@ -116,4 +189,11 @@ class EngineConfig:
         return os.path.basename(os.path.normpath(self.model_path))
 
 
-__all__ = ["CacheTypeChoice", "EngineConfig", "command_graph_from_env"]
+__all__ = [
+    "DEFAULT_MOE_PREFILL_OVERLAP_MIN_TOKENS",
+    "CacheTypeChoice",
+    "EngineConfig",
+    "MoeStrategyChoice",
+    "command_graph_from_env",
+    "moe_prefill_overlap_min_tokens_from_env",
+]

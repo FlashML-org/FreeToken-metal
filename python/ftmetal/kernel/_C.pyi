@@ -9,11 +9,13 @@ import numpy.typing as npt
 Stream = mx.Stream | mx.Device | None
 
 MAILBOX_WORDS: int
+EXPERT_STAGING_BYTES: int
 
 class MailboxWord(enum.IntEnum):
     STATE = 0
     SEQUENCE = 1
     ACKNOWLEDGED = 2
+    SHUTDOWN = 3
     KIND = 32
     LAYER = 33
     STEP = 34

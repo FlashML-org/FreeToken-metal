@@ -13,6 +13,7 @@ import logging
 import os
 import struct
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import mlx.core as mx
 from mlx.utils import tree_flatten, tree_unflatten
@@ -67,6 +68,23 @@ class WeightRules:
         for source, target in self.segments:
             key = key.replace(f".{source}.", f".{target}.")
         return key
+
+    def fused_key(self, name: str) -> tuple[str, int, int]:
+        """The model key a renamed checkpoint key loads into, its part index and its rule's
+        part count; a key no fuse rule names loads into itself as part 0 of 1."""
+        module, _, suffix = name.rpartition(".")
+        parent, _, leaf = module.rpartition(".")
+        hit = self.part_index.get(leaf)
+        if hit is None:
+            return name, 0, 1
+        else:
+            rule, index = hit
+            fused = f"{parent}.{rule.fused}.{suffix}" if parent else f"{rule.fused}.{suffix}"
+            return fused, index, len(rule.parts)
+
+    def is_expert(self, model_key: str) -> bool:
+        """Whether a model key is a leaf of a routed-expert bank."""
+        return self.expert_segment is not None and f".{self.expert_segment}." in model_key
 
 
 def read_model_config(model_path: str) -> dict[str, object]:
@@ -158,14 +176,47 @@ def weight_files(model_path: str) -> list[str]:
     return files
 
 
-def checkpoint_tensor_names(model_path: str) -> list[str]:
-    names: list[str] = []
+def checkpoint_headers(model_path: str) -> dict[str, object]:
+    """Every tensor entry of the checkpoint's safetensors headers, by checkpoint name."""
+    entries: dict[str, object] = {}
     for file in weight_files(model_path):
         with open(file, "rb") as f:
             header_len = struct.unpack("<Q", f.read(8))[0]
             header = json.loads(f.read(header_len))
-        names.extend(name for name in header if name != "__metadata__")
-    return names
+        assert isinstance(header, dict), f"{file}: the safetensors header is not an object"
+        entries.update((name, entry) for name, entry in header.items() if name != "__metadata__")
+    return entries
+
+
+def checkpoint_tensor_names(model_path: str) -> list[str]:
+    return list(checkpoint_headers(model_path))
+
+
+class CheckpointBytes(NamedTuple):
+    """What the checkpoint's weights a model loads under rules take, from the headers alone."""
+
+    non_expert: int
+    experts: int
+
+
+def checkpoint_bytes(model_path: str, rules: WeightRules) -> CheckpointBytes:
+    non_expert = experts = 0
+    for name, entry in checkpoint_headers(model_path).items():
+        key = rules.rename(name)
+        if key is None:
+            continue
+        offsets = entry.get("data_offsets") if isinstance(entry, dict) else None
+        if not (
+            isinstance(offsets, list)
+            and len(offsets) == 2
+            and all(isinstance(offset, int) for offset in offsets)
+        ):
+            raise ValueError(f"{model_path}: {name} has no data offsets: {entry}")
+        if rules.is_expert(rules.fused_key(key)[0]):
+            experts += offsets[1] - offsets[0]
+        else:
+            non_expert += offsets[1] - offsets[0]
+    return CheckpointBytes(non_expert, experts)
 
 
 def load_checkpoint(model_path: str) -> dict[str, mx.array]:
@@ -186,18 +237,14 @@ def apply_rules(state: dict[str, mx.array], rules: WeightRules) -> dict[str, mx.
         name = rules.rename(key)
         if name is None:
             continue
-        module, _, suffix = name.rpartition(".")
-        parent, _, leaf = module.rpartition(".")
-        hit = rules.part_index.get(leaf)
-        if hit is None:
-            out[name] = tensor
+        fused_key, index, num_parts = rules.fused_key(name)
+        if num_parts == 1:
+            out[fused_key] = tensor
             continue
-        rule, index = hit
-        fused_key = f"{parent}.{rule.fused}.{suffix}" if parent else f"{rule.fused}.{suffix}"
         parts = pending.setdefault(fused_key, {})
         parts[index] = tensor
-        if len(parts) == len(rule.parts):
-            ordered = [parts[i] for i in range(len(rule.parts))]
+        if len(parts) == num_parts:
+            ordered = [parts[i] for i in range(num_parts)]
             axis = -2 if ordered[0].ndim > 1 else 0
             out[fused_key] = mx.concatenate(ordered, axis=axis)
             pending.pop(fused_key)
@@ -226,17 +273,25 @@ def load_state(model: BaseOP, state: dict[str, mx.array]) -> None:
     model.update(tree_unflatten(list(state.items())))
 
 
-def load_weights(model: BaseOP, model_path: str, rules: WeightRules) -> None:
+def load_weights(
+    model: BaseOP, model_path: str, rules: WeightRules, *, skip_experts: bool = False
+) -> None:
+    """skip_experts leaves the routed-expert banks unread: an offload cache reads them."""
     state = apply_rules(load_checkpoint(model_path), rules)
+    if skip_experts:
+        state = {key: tensor for key, tensor in state.items() if not rules.is_expert(key)}
     load_state(model, state)
     mx.eval(model.parameters())
     logger.info(f"loaded weights from {model_path}")
 
 
 __all__ = [
+    "CheckpointBytes",
     "FuseRule",
     "WeightRules",
     "apply_rules",
+    "checkpoint_bytes",
+    "checkpoint_headers",
     "checkpoint_tensor_names",
     "config_bool",
     "config_dict",

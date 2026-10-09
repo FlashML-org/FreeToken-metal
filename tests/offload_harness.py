@@ -31,6 +31,10 @@ from ftmetal.moe.source import ExpertSource
 
 Naming = Literal["qwen", "gemma4"]
 PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+# What a cache built here tells a forward's prepare, which these caches never see: the
+# lookups take any top-k.
+TOP_K = 8
+PREFILL_OVERLAP_MIN_TOKENS = 128
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -134,8 +138,10 @@ def build_cache(
     cache = OffloadMoeCache(
         num_layers=spec.num_layers,
         num_experts=spec.num_experts,
+        top_k=TOP_K,
         cache_size=cache_size,
         prefill_overlap=prefill_overlap,
+        prefill_overlap_min_tokens=PREFILL_OVERLAP_MIN_TOKENS,
         layout=moe_layout(spec.hidden_size, spec.intermediate_size, spec.scheme, mx.bfloat16),
         source=source,
         stall_timeout_s=stall_timeout_s,

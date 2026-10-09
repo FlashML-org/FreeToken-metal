@@ -1,6 +1,7 @@
 #include "expert_service.h"
 
 #include <fcntl.h>
+#include <pthread/qos.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -15,11 +16,10 @@ namespace {
 
 // Reads are widened to this boundary, which F_NOCACHE transfers go straight to the device at.
 const int64_t READ_ALIGNMENT = 4096;
-const int64_t STAGING_BYTES = 8 << 20;
 // The VM page, so a staging buffer starts on a page of its own.
 const size_t STAGING_ALIGNMENT = 16384;
 // The longest wanted range of one read, so that its widened range fits the staging buffer.
-const int64_t MAX_READ_BYTES = STAGING_BYTES - 2 * READ_ALIGNMENT;
+const int64_t MAX_READ_BYTES = EXPERT_STAGING_BYTES - 2 * READ_ALIGNMENT;
 
 void wait_for(const ReadBatch& batch) {
   while (batch.remaining.load(std::memory_order_acquire) != 0) {
@@ -140,7 +140,7 @@ ExpertService::ExpertService(
     }
     for (int i = 0; i < io_threads; ++i) {
       void* memory = nullptr;
-      if (posix_memalign(&memory, STAGING_ALIGNMENT, STAGING_BYTES) != 0) {
+      if (posix_memalign(&memory, STAGING_ALIGNMENT, EXPERT_STAGING_BYTES) != 0) {
         throw std::bad_alloc();
       }
       staging_.emplace_back(static_cast<uint8_t*>(memory), std::free);
@@ -166,19 +166,19 @@ void ExpertService::shutdown() {
   std::call_once(shutdown_once_, [this] {
     fail(MailboxError::Shutdown, "the service was shut down");
     is_stopping_coordination_.store(true, std::memory_order_release);
-    // State last: a waiting GPU leaves on SHUTDOWN, and a coordinator still answering finds
-    // its request taken and leaves the reply alone.
-    auto refuse_requests = [this] {
-      mailbox_word(MailboxWord::Error)
-          .store(static_cast<uint32_t>(MailboxError::Shutdown), std::memory_order_relaxed);
-      mailbox_word(MailboxWord::Acknowledged)
-          .store(
-              mailbox_word(MailboxWord::Sequence).load(std::memory_order_acquire),
-              std::memory_order_release);
-      mailbox_word(MailboxWord::State)
-          .store(static_cast<uint32_t>(MailboxState::Shutdown), std::memory_order_release);
-    };
-    refuse_requests();
+    // The shutdown word first: a lookup that has not posted yet posts nothing, and one that
+    // posts anyway (it read the word just before) leaves its wait on it. State last: a waiting
+    // GPU leaves on SHUTDOWN, and a coordinator still answering finds its request taken and
+    // leaves the reply alone.
+    mailbox_word(MailboxWord::Shutdown).store(1, std::memory_order_release);
+    mailbox_word(MailboxWord::Error)
+        .store(static_cast<uint32_t>(MailboxError::Shutdown), std::memory_order_relaxed);
+    mailbox_word(MailboxWord::Acknowledged)
+        .store(
+            mailbox_word(MailboxWord::Sequence).load(std::memory_order_acquire),
+            std::memory_order_release);
+    mailbox_word(MailboxWord::State)
+        .store(static_cast<uint32_t>(MailboxState::Shutdown), std::memory_order_release);
     {
       std::lock_guard<std::mutex> lock(wake_mutex_);
     }
@@ -188,11 +188,6 @@ void ExpertService::shutdown() {
       if (thread->joinable()) {
         thread->join();
       }
-    }
-    // A lookup that read the state just before the first refusal may have posted since.
-    if (mailbox_word(MailboxWord::State).load(std::memory_order_acquire) !=
-        static_cast<uint32_t>(MailboxState::Shutdown)) {
-      refuse_requests();
     }
     {
       std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -260,6 +255,8 @@ void ExpertService::submit(ReadBatch& batch, int layer_id, const std::vector<Exp
 }
 
 void ExpertService::work(int thread_index) {
+  // A lookup spins on the GPU until these reads land.
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
   uint8_t* staging = staging_[thread_index].get();
   for (;;) {
     ReadTask task;

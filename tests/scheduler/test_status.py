@@ -1,4 +1,5 @@
-"""SchedulerStatusReporter: prefill lines every batch, decode lines per interval, idle summary."""
+"""SchedulerStatusReporter: prefill lines every batch, decode lines per interval, idle summary
+with the MoE offload hit rate of the burst."""
 
 from __future__ import annotations
 
@@ -71,3 +72,16 @@ def test_prefill_decode_and_idle_lines() -> None:
     # Idle with nothing since is silent.
     reporter.report_idle()
     assert len(lines) == 4
+
+
+def test_idle_line_reports_the_moe_hit_rate_of_the_burst() -> None:
+    lines: list[str] = []
+    clock = FakeClock()
+    reporter = SchedulerStatusReporter(lines.append, clock=clock)
+    decode = Batch(reqs=[make_req(0, 128, 129)], phase="decode")
+    # Cumulative (hit, missed) experts: 90 of 100 in the first burst, 49 of 50 in the second.
+    for moe_experts, rate in [((90, 10), "0.900"), ((139, 11), "0.980")]:
+        report(reporter, decode, new_tokens=1)
+        clock.now += 1.0
+        reporter.report_idle(moe_experts=moe_experts)
+        assert lines[-1].endswith(f", moe hit rate: {rate}")

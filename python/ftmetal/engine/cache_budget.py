@@ -1,12 +1,15 @@
 """Unified-memory budget: what the pools may take after the weights are resident.
 
 Port of FreeToken engine/cache_budget.py and BaseKVCachePool.solve_num_pages. Divergences:
-the budget is Metal's recommended working set minus a fixed headroom; every pool prices
-its own spec as (bytes per page, fixed bytes), the fixed costs come off first and the
-paged pools share the rest (FreeToken's engine adds the GDN state pool to the KV
-family's fixed cost by hand); the lines are the ones this engine has (weights, one per
-pool, activations, the vision encoder's activations, the decode graphs' arena); no MoE
-expert cache.
+the budget is Metal's recommended working set minus a fixed headroom, or memory_ratio of
+it; every pool prices its own spec as (bytes per page, fixed bytes), the fixed costs come
+off first and the paged pools share the rest (FreeToken's engine adds the GDN state pool to
+the KV family's fixed cost by hand); the lines are the ones this engine has (weights, the
+offload cache's experts, one per pool, activations, the vision encoder's activations, the
+decode graphs' arena); --moe-cache-auto (plan_cache_budget) gives the KV pools
+kv_reserve_tokens first and the experts the rest, out of what the other lines leave; the
+auto strategy keeps the experts resident when they fit beside that KV reserve (FreeToken's
+auto always offloads a MoE model off unified memory).
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ import mlx.core as mx
 
 from ftmetal.attention.metadata import AttnType
 from ftmetal.kvcache.base import PoolCost
+from ftmetal.models.config import MoeStrategy
 from ftmetal.models.loader import config_int
 from ftmetal.models.qwen3_5_moe.vision import MLP_ROWS
 
@@ -33,6 +37,9 @@ ACTIVATION_BYTES_PER_TOKEN = 1 << 20
 ATTENTION_SCORE_BYTES = 2
 # Two steps can be in flight under the overlap loop.
 IN_FLIGHT_STEPS = 2
+# A MoE offload's overlap prefill waits for the step before it, so one step's activations
+# are in flight (an inference, to check against the real model's peak memory).
+OFFLOAD_IN_FLIGHT_STEPS = 1
 # The decode CommandGraphs' shared arena, rounded up from Qwen3.6-35B-A3B at a 256k-token
 # page table: 1.05 MiB at batch size 1 and 8.30 MiB at 8, nearly all flash-decode
 # partials (their partition count follows the page-table width).
@@ -52,15 +59,22 @@ POOL_LABELS: dict[AttnType, str] = {
 }
 
 
-def memory_budget_bytes(recommended_working_set: int) -> int:
-    headroom = max(int(recommended_working_set * HEADROOM_FRACTION), HEADROOM_MIN_BYTES)
-    return recommended_working_set - headroom
+def memory_budget_bytes(recommended_working_set: int, memory_ratio: float | None) -> int:
+    """memory_ratio of the working set (FreeToken's --memory-ratio), else the working set
+    less its headroom."""
+    if memory_ratio is not None:
+        return int(recommended_working_set * memory_ratio)
+    else:
+        headroom = max(int(recommended_working_set * HEADROOM_FRACTION), HEADROOM_MIN_BYTES)
+        return recommended_working_set - headroom
 
 
-def activation_reserve_bytes(max_extend_tokens: int, num_qo_heads: int) -> int:
+def activation_reserve_bytes(
+    max_extend_tokens: int, num_qo_heads: int, in_flight_steps: int
+) -> int:
     per_step = ACTIVATION_FIXED_BYTES + max_extend_tokens * ACTIVATION_BYTES_PER_TOKEN
     per_step += num_qo_heads * max_extend_tokens * max_extend_tokens * ATTENTION_SCORE_BYTES
-    return IN_FLIGHT_STEPS * per_step
+    return in_flight_steps * per_step
 
 
 def encoder_reserve_bytes(
@@ -101,6 +115,9 @@ class BudgetReport:
     costs: dict[AttnType, PoolCost]
     # The vision encoder's activations; 0 without a tower.
     encoder: int = 0
+    # The offload cache: its expert slots and IO staging; 0 while the experts are resident
+    # (they are weights then).
+    experts: int = 0
 
     @property
     def bytes_per_page(self) -> int:
@@ -111,8 +128,12 @@ class BudgetReport:
         """What the paged pools share once the weights, activations, graphs and fixed costs
         are off."""
         fixed_bytes = sum(cost.fixed_bytes for cost in self.costs.values())
-        reserved = self.weights + self.activations + self.encoder + self.graphs
+        reserved = self.weights + self.experts + self.activations + self.encoder + self.graphs
         return self.budget - reserved - fixed_bytes
+
+    def holds_pages(self, num_pages: int) -> bool:
+        """Whether the paged pools get num_pages pages."""
+        return self.paged_bytes >= num_pages * self.bytes_per_page
 
     def lines(self) -> list[str]:
         """The deductions in order, then each paged pool's share of what is left."""
@@ -129,17 +150,60 @@ class BudgetReport:
             for attn_type, cost in self.costs.items()
             if cost.bytes_per_page > 0
         ]
+        expert_lines = [budget_line("experts", self.experts)] if self.experts > 0 else []
         encoder_lines = [budget_line("encoder", self.encoder)] if self.encoder > 0 else []
         graph_lines = [budget_line("graphs", self.graphs)] if self.graphs > 0 else []
         return [
             budget_line("budget", self.budget),
             budget_line("weights", self.weights),
+            *expert_lines,
             *fixed_lines,
             budget_line("activations", self.activations),
             *encoder_lines,
             *graph_lines,
             *paged_lines,
         ]
+
+
+def kv_reserve_pages(kv_reserve_tokens: int, page_size: int) -> int:
+    return -(-kv_reserve_tokens // page_size)
+
+
+def choose_moe_strategy(resident: BudgetReport, reserve_pages: int) -> MoeStrategy:
+    """--moe-strategy auto with no cache size flag: fused when the report of every weight
+    resident leaves the paged pools reserve_pages, else offload."""
+    if resident.holds_pages(reserve_pages):
+        return "fused"
+    else:
+        return "offload"
+
+
+def resolve_moe_cache_size(
+    requested: int,
+    *,
+    report: BudgetReport,
+    reserve_pages: int,
+    slot_bytes: int,
+    staging_bytes: int,
+    num_experts: int,
+    total_experts: int,
+    prefill_overlap: bool,
+) -> int:
+    """The offload cache's slots: requested when set (at least num_experts, twice that with
+    prefill overlap's two windows), else --moe-cache-auto: what the paged pools of report
+    (which has no experts line) leave past reserve_pages, from that floor to every expert."""
+    floor = 2 * num_experts if prefill_overlap else num_experts
+    if requested > 0 and requested < floor:
+        reason = "the two prefill overlap windows" if prefill_overlap else "one layer's experts"
+        hint = " or pass --disable-moe-prefill-overlap" if prefill_overlap else ""
+        raise ValueError(
+            f"--moe-cache-size {requested} cannot hold {reason}: give at least {floor} slots{hint}"
+        )
+    elif requested > 0:
+        return requested
+    else:
+        spare = report.paged_bytes - reserve_pages * report.bytes_per_page - staging_bytes
+        return max(floor, min(spare // slot_bytes, total_experts))
 
 
 def plan_budget(
@@ -149,6 +213,7 @@ def plan_budget(
     graphs: int,
     costs: dict[AttnType, PoolCost],
     encoder: int = 0,
+    experts: int = 0,
 ) -> BudgetReport:
     report = BudgetReport(
         budget=budget,
@@ -157,6 +222,7 @@ def plan_budget(
         graphs=graphs,
         costs=costs,
         encoder=encoder,
+        experts=experts,
     )
     assert report.bytes_per_page > 0, "no paged pool to give the budget to"
     if report.paged_bytes <= 0:
@@ -186,13 +252,17 @@ __all__ = [
     "GRAPH_BYTES_PER_ROW",
     "GRAPH_FIXED_BYTES",
     "IN_FLIGHT_STEPS",
+    "OFFLOAD_IN_FLIGHT_STEPS",
     "POOL_LABELS",
     "VISION_ACTIVATION_WIDTHS",
     "BudgetReport",
     "activation_reserve_bytes",
+    "choose_moe_strategy",
     "encoder_reserve_bytes",
     "graph_reserve_bytes",
+    "kv_reserve_pages",
     "memory_budget_bytes",
     "plan_budget",
+    "resolve_moe_cache_size",
     "solve_num_pages",
 ]

@@ -8,7 +8,8 @@ add_request and results leave through send_result as TokenEvents; run_forever is
 server's scheduler thread body over the message queues. A padded decode batch's dummy
 rows read the token pool's scratch row; only real requests allocate pages and write
 sampled tokens. The multimodal gather plan and the mrope positions are built in numpy by
-scheduler/mm.py.
+scheduler/mm.py. A drained step's tokens are used only once the engine's offload cache
+passes its health check (a failed expert read leaves stand-in experts behind).
 """
 
 from __future__ import annotations
@@ -105,6 +106,8 @@ class Scheduler:
             )
         self.engine = Engine(config)
         self.config = config
+        # The engine's MoE offload cache, for the idle line's hit rate; None while resident.
+        self.moe_offload_cache = self.engine.moe_offload_cache
         self.eos_token_ids = eos_token_ids
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
         assert self.engine.dummy_req.table_idx == self.table_manager.scratch_row
@@ -316,7 +319,10 @@ class Scheduler:
                 send_tokenizer.put(BatchTokenizerMsg(data=replies))
 
             if data is None and not self.runnable:
-                self.status_reporter.report_idle()
+                cache = self.moe_offload_cache
+                self.status_reporter.report_idle(
+                    moe_experts=None if cache is None else cache.hit_counts()
+                )
 
     def send_result(self, events: list[TokenEvent]) -> None:
         self.results.extend(events)
@@ -417,6 +423,7 @@ class Scheduler:
             return
         batch = last_data.forward_input.batch
         next_tokens = host_ints(last_data.forward_output.next_tokens)
+        self.engine.check_healthy()
         events: list[TokenEvent] = []
         new_finished: set[Req] = set()
         with self.cache_manager.lazy_free_region():

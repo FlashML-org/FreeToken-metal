@@ -264,8 +264,10 @@ def test_real_checkpoint_rows() -> None:
     cache = OffloadMoeCache(
         num_layers=source.num_layers,
         num_experts=source.num_experts,
+        top_k=model_config.num_experts_per_tok,
         cache_size=source.num_experts,
         prefill_overlap=False,
+        prefill_overlap_min_tokens=128,
         layout=layout,
         source=source,
     )

@@ -2,7 +2,8 @@
 
 Port of FreeToken models/config.py, reduced to the FULL, SWA and LINEAR group kinds and
 the fields Qwen3.5-style hybrid MoE and Gemma4 models use. Divergences: the quantization
-config is the MLX checkpoint's affine scheme map; no tensor parallelism or MTP; the
+config is the MLX checkpoint's affine scheme map; no tensor parallelism or MTP; the MoE
+strategy is fused or offload and every layer of a MoE model routes experts; the
 LINEAR group emits a KVCacheGroupSpec too (its per-slot conv and state shapes), so every
 pool is sized from a spec; the rope variant is a rope_type field, not a scaling
 dictionary; vision_config is the checkpoint's raw section, which the tower parses.
@@ -125,6 +126,9 @@ class LinearGatedDeltaGroupConfig(BaseAttentionGroupConfig):
 AttentionGroupConfig = (
     FullAttentionGroupConfig | SWAAttentionGroupConfig | LinearGatedDeltaGroupConfig
 )
+# How the routed experts are served: fused keeps every expert resident, offload reads them
+# from the checkpoint into a slot cache (moe/offload_cache.py).
+MoeStrategy = Literal["fused", "offload"]
 
 
 @dataclass(frozen=True)
@@ -159,10 +163,17 @@ class ModelConfig:
     # The checkpoint's vision_config section, None when this process builds no tower.
     vision_config: dict[str, object] | None = None
     image_token_id: int | None = None
+    # Set by the engine before it builds the model; the checkpoint does not say.
+    moe_strategy: MoeStrategy = "fused"
 
     @property
     def is_moe(self) -> bool:
         return self.moe_enabled
+
+    @property
+    def num_moe_layers(self) -> int:
+        """Decoder layers with routed experts: all of them in the served MoE families."""
+        return self.num_layers if self.moe_enabled else 0
 
     @property
     def is_multimodal(self) -> bool:
@@ -256,6 +267,7 @@ __all__ = [
     "KVCacheGroupSpec",
     "LinearGatedDeltaGroupConfig",
     "ModelConfig",
+    "MoeStrategy",
     "RotaryConfig",
     "SWAAttentionGroupConfig",
     "mrope_layout_from_rope_params",

@@ -9,11 +9,12 @@ Port of FreeToken server/control_api.py, plus the request-ring middleware, /v1/c
 and its cache_geometry from FreeToken server/api_server.py. Divergences: /health has no
 loading phase (the engine is built before the server accepts requests); the request ring is
 the FrontendManager's; /v1/cache/status only reports (no rebuild, so last_rebuild stays
-null), and what FreeToken learns from the engine's readiness meta (load-time pool sizes,
-per-unit costs, floors, the cache budget, the window pool) reads as its unknown 0, as do
-the MoE slot-cache fields (this engine has no expert cache), so every limit's max is 0; the
-pool sizes come from the reply snapshots alone and the thinking gears from the profile
-probed before serving.
+null), and of what FreeToken learns from the engine's readiness meta only the MoE offload
+cache's geometry arrives (MoeCacheGeometry, when the scheduler thread starts): load-time
+pool sizes, per-unit costs, floors, the cache budget and the window pool read as their
+unknown 0, so every limit's max is 0; num_experts and num_moe_layers are 0 while the
+experts are resident (FreeToken reports the model's); the pool sizes come from the reply
+snapshots alone and the thinking gears from the profile probed before serving.
 """
 
 # Comments and docstrings keep FreeToken's line breaks, and its loose typing stays unchecked.
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Awaitable
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from fastapi import FastAPI, Request, Response
@@ -39,6 +41,16 @@ TRACKED_REQUEST_PREFIXES = (
     "/v1/completions",
     "/generate",
 )
+
+
+@dataclass(frozen=True, kw_only=True)
+class MoeCacheGeometry:
+    """The MoE offload cache the engine built: experts per layer, MoE layers, slots, policy."""
+
+    num_experts: int
+    num_moe_layers: int
+    moe_cache_size: int
+    moe_cache_policy: str
 
 
 def build_health(state: Any, version: str) -> dict:
@@ -80,10 +92,11 @@ def _reasoning_geometry(state: Any) -> dict | None:
 def cache_geometry(state: Any) -> dict:
     """Current cache geometry for a cache panel. Each pool size is the running UserReply
     snapshot's (updated per generation), 0 before the first one. num_experts /
-    num_moe_layers / moe_cache_size are 0 as for a model without an MoE slot cache."""
+    num_moe_layers / moe_cache_size are the MoE offload cache's, 0 without one."""
     tr = state.stats
     config = state.config
     page_size = int(getattr(config, "page_size", 1) or 1)
+    moe: MoeCacheGeometry | None = getattr(state, "moe_cache", None)
     # Thinking control: the gears a client can offer and the chat_template_kwargs
     # each selects, derived from the checkpoint's own probed template (no
     # per-family registry).
@@ -91,12 +104,12 @@ def cache_geometry(state: Any) -> dict:
     geo = {
         "num_pages": tr.kv_total_pages,
         "page_size": page_size,
-        "moe_cache_size": 0,
+        "moe_cache_size": 0 if moe is None else moe.moe_cache_size,
         "num_mamba_slots": tr.mamba_total_slots,
-        "num_experts": 0,
-        "num_moe_layers": 0,
+        "num_experts": 0 if moe is None else moe.num_experts,
+        "num_moe_layers": 0 if moe is None else moe.num_moe_layers,
         # Eviction policy of the MoE slot cache; None without one.
-        "moe_cache_policy": None,
+        "moe_cache_policy": None if moe is None else moe.moe_cache_policy,
         # Per-unit VRAM costs, unknown without the readiness meta.
         "unit_bytes": {
             "kv_per_token": 0,
@@ -116,7 +129,7 @@ def cache_geometry(state: Any) -> dict:
     # is the floor fallback (page_size for KV, num_experts for MoE, else 0).
     geo["limits"] = {
         "kv_tokens": {"min": page_size, "max": 0},
-        "moe_experts": {"min": 0, "max": 0},
+        "moe_experts": {"min": 0 if moe is None else moe.num_experts, "max": 0},
         "mamba_slots": {"min": 0, "max": 0},
         "swa_tokens": {"min": 0, "max": 0},
     }
@@ -190,4 +203,4 @@ def register_control_routes(
         }
 
 
-__all__ = ["build_health", "cache_geometry", "register_control_routes"]
+__all__ = ["MoeCacheGeometry", "build_health", "cache_geometry", "register_control_routes"]

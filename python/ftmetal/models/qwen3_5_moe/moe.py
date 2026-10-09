@@ -2,7 +2,8 @@
 
 Port of FreeToken models/qwen3_5_moe/moe.py. Divergences: the router is the fused
 kernel/router Metal kernel (fp32 softmax, top-k, renorm in one launch) and the
-experts are the resident MoELayer.
+experts are the resident MoELayer, or OffloadMoELayer under the offload strategy (FreeToken's
+make_moe_layer choice, made here).
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from ftmetal.kernel.router import router_topk
 from ftmetal.layers.activation import sigmoid_gated_add, silu_and_mul
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
-from ftmetal.layers.moe import MoELayer
+from ftmetal.layers.moe import MoELayer, OffloadMoELayer
 from ftmetal.layers.quantization.config import AffineScheme
 from ftmetal.models.config import ModelConfig
 
@@ -42,6 +43,7 @@ class Qwen3_5MoE(BaseOP):
     def __init__(
         self,
         config: ModelConfig,
+        layer_id: int,
         *,
         experts_gate_up_scheme: AffineScheme | None,
         experts_down_scheme: AffineScheme | None,
@@ -56,14 +58,27 @@ class Qwen3_5MoE(BaseOP):
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
         self.gate = Linear(config.hidden_size, config.num_experts, scheme=gate_scheme, dtype=dtype)
-        self.experts = MoELayer(
-            config.num_experts,
-            config.num_experts_per_tok,
-            config.hidden_size,
-            config.moe_intermediate_size,
-            scheme=experts_gate_up_scheme,
-            dtype=dtype,
-        )
+        self.experts: MoELayer
+        if config.moe_strategy == "offload":
+            # Every decoder layer routes experts, so the MoE layer index is the layer's.
+            self.experts = OffloadMoELayer(
+                layer_id,
+                config.num_experts,
+                config.num_experts_per_tok,
+                config.hidden_size,
+                config.moe_intermediate_size,
+                scheme=experts_gate_up_scheme,
+                dtype=dtype,
+            )
+        else:
+            self.experts = MoELayer(
+                config.num_experts,
+                config.num_experts_per_tok,
+                config.hidden_size,
+                config.moe_intermediate_size,
+                scheme=experts_gate_up_scheme,
+                dtype=dtype,
+            )
         self.shared_expert = SharedExpert(
             config.hidden_size,
             config.shared_expert_intermediate_size,
