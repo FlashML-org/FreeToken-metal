@@ -3,18 +3,47 @@
 Port of FreeToken layers/quantization (QuantConfig / QuantScheme), reduced to the two
 kinds this engine serves: bf16 and MLX affine quantization. A module is affine
 quantized when the checkpoint holds its scales tensor; the per-module entries of the
-quantization section override the default bits and group size.
+quantization section override the default bits and group size. BankSpec is FreeToken's
+(layers/quantization/moe/base.py); expert_bank_layout is its MoEKernel.layout per
+expert projection instead of per layer, and has no resident (non-bank) arrays.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+import mlx.core as mx
+
 
 @dataclass(frozen=True)
 class AffineScheme:
     bits: int
     group_size: int
+
+
+@dataclass(frozen=True)
+class BankSpec:
+    """One array of an expert bank, per expert: the allocator prepends the expert or slot axis."""
+
+    shape: tuple[int, ...]
+    dtype: mx.Dtype
+
+
+def expert_bank_layout(
+    input_size: int, output_size: int, scheme: AffineScheme | None, dtype: mx.Dtype
+) -> dict[str, BankSpec]:
+    """The arrays of one [output, input] expert projection, by role: weight in dtype, or
+    the affine packed weight with its scales and biases."""
+    if scheme is None:
+        return {"weight": BankSpec((output_size, input_size), dtype)}
+    else:
+        packed = input_size * scheme.bits // 32
+        groups = input_size // scheme.group_size
+        return {
+            "weight": BankSpec((output_size, packed), mx.uint32),
+            "scales": BankSpec((output_size, groups), dtype),
+            "biases": BankSpec((output_size, groups), dtype),
+        }
 
 
 def affine_scheme(entry: dict[str, object]) -> AffineScheme:
@@ -66,4 +95,4 @@ class QuantConfig:
         return schemes.pop()
 
 
-__all__ = ["AffineScheme", "QuantConfig"]
+__all__ = ["AffineScheme", "BankSpec", "QuantConfig", "expert_bank_layout"]

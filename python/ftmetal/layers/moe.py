@@ -1,11 +1,11 @@
 """Resident routed experts over mx.gather_qmm / mx.gather_mm.
 
 Port of FreeToken layers/moe.py (MoELayer). Divergences: the experts live in one
-fused gate_up_proj and one down_proj bank per layer in bf16 or affine quantization, gated
-by silu or gelu_tanh (FreeToken's activation argument);
-routing is computed by the model and handed to forward; from SORT_MIN_PAIRS pairs up
-the pairs are expert-sorted by the moe_align kernel and un-sorted by moe_combine. The
-offload subclass arrives in round 3.
+fused gate_up_proj and one down_proj bank per layer in bf16 or affine quantization (the
+arrays of expert_bank_layout), gated by silu or gelu_tanh (FreeToken's activation
+argument); routing is computed by the model and handed to forward; from SORT_MIN_PAIRS
+pairs up the pairs are expert-sorted by the moe_align kernel and un-sorted by
+moe_combine. The offload subclass arrives in round 3.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import mlx.core as mx
 from ftmetal.kernel.moe_align import moe_align, moe_combine
 from ftmetal.layers.activation import gelu_tanh_and_mul, silu_and_mul
 from ftmetal.layers.base import BaseOP
-from ftmetal.layers.quantization.config import AffineScheme
+from ftmetal.layers.quantization.config import AffineScheme, BankSpec, expert_bank_layout
 
 # From this many (token, expert) pairs the expert-sorted path is at least as fast as the
 # unsorted one; measured on the M4 Pro at Qwen3.6-35B-A3B shapes (256 experts, top-8, 4-bit).
@@ -26,6 +26,11 @@ SORT_MIN_PAIRS = 32
 
 class ExpertBank(BaseOP):
     """One [num_experts, output, input] projection shared by every expert of a layer."""
+
+    # The roles of expert_bank_layout: weight always, scales and biases when affine.
+    weight: mx.array
+    scales: mx.array
+    biases: mx.array
 
     def __init__(
         self,
@@ -38,14 +43,8 @@ class ExpertBank(BaseOP):
     ) -> None:
         super().__init__()
         self.scheme = scheme
-        if scheme is None:
-            self.weight = mx.zeros((num_experts, output_size, input_size), dtype=dtype)
-        else:
-            packed = input_size * scheme.bits // 32
-            groups = input_size // scheme.group_size
-            self.weight = mx.zeros((num_experts, output_size, packed), dtype=mx.uint32)
-            self.scales = mx.zeros((num_experts, output_size, groups), dtype=dtype)
-            self.biases = mx.zeros((num_experts, output_size, groups), dtype=dtype)
+        for role, spec in expert_bank_layout(input_size, output_size, scheme, dtype).items():
+            setattr(self, role, mx.zeros((num_experts, *spec.shape), dtype=spec.dtype))
 
     def forward(self, x: mx.array, indices: mx.array, sorted_indices: bool) -> mx.array:
         if self.scheme is None:
@@ -64,6 +63,21 @@ class ExpertBank(BaseOP):
             mode="affine",
             sorted_indices=sorted_indices,
         )
+
+
+def moe_layout(
+    hidden_size: int, intermediate_size: int, scheme: AffineScheme | None, dtype: mx.Dtype
+) -> dict[str, BankSpec]:
+    """The expert arrays of one MoELayer, by their key under the layer, in bank order."""
+    projections = {
+        "gate_up_proj": expert_bank_layout(hidden_size, 2 * intermediate_size, scheme, dtype),
+        "down_proj": expert_bank_layout(intermediate_size, hidden_size, scheme, dtype),
+    }
+    return {
+        f"{projection}.{role}": spec
+        for projection, layout in projections.items()
+        for role, spec in layout.items()
+    }
 
 
 class MoELayer(BaseOP):
@@ -110,4 +124,4 @@ class MoELayer(BaseOP):
             return moe_combine(y, alignment.pair_positions, topk_weights)
 
 
-__all__ = ["SORT_MIN_PAIRS", "ExpertBank", "MoELayer"]
+__all__ = ["SORT_MIN_PAIRS", "ExpertBank", "MoELayer", "moe_layout"]

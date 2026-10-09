@@ -43,6 +43,9 @@ class WeightRules:
     # Checkpoint key prefixes to drop entirely.
     drops: tuple[str, ...] = ()
     fuses: tuple[FuseRule, ...] = ()
+    # The model-key segment whose leaves are routed-expert banks ("experts" matches
+    # model.layers.3.mlp.experts.gate_up_proj.weight); None: the model has none.
+    expert_segment: str | None = None
     # Model-key regex -> callable is deliberately absent: a shape fix is a fuse or a rename.
     part_index: dict[str, tuple[FuseRule, int]] = field(default_factory=dict, init=False)
 

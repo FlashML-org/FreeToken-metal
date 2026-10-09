@@ -63,6 +63,7 @@ def weight_rules(model_config: ModelConfig) -> WeightRules:
             FuseRule("qk_proj", K_EQ_V_PARTS),
             FuseRule("gate_up_proj", GATE_UP_PARTS),
         ),
+        expert_segment="experts",
     )
 
 
