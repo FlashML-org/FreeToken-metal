@@ -241,6 +241,7 @@ NB_MODULE(_C, m) {
   nb::class_<ftmetal::ExpertServiceStats>(m, "ExpertServiceStats")
       .def_ro("hits", &ftmetal::ExpertServiceStats::hits)
       .def_ro("misses", &ftmetal::ExpertServiceStats::misses)
+      .def_ro("requests", &ftmetal::ExpertServiceStats::requests)
       .def_ro("experts_read", &ftmetal::ExpertServiceStats::experts_read)
       .def_ro("bytes_read", &ftmetal::ExpertServiceStats::bytes_read)
       .def_ro("read_wait_ns", &ftmetal::ExpertServiceStats::read_wait_ns)

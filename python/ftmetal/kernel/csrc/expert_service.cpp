@@ -122,6 +122,7 @@ ExpertService::ExpertService(
   }
   stats_.hits.assign(num_layers, 0);
   stats_.misses.assign(num_layers, 0);
+  stats_.requests.assign(num_layers, 0);
   stats_.experts_read.assign(num_layers, 0);
   stats_.bytes_read.assign(num_layers, 0);
   stats_.read_wait_ns.assign(num_layers, 0);
@@ -394,6 +395,7 @@ SlotAssignment ExpertService::serve(
       window.layer_id = -1;
     }
   }
+  stats_.requests[layer_id] += 1;
   auto started = std::chrono::steady_clock::now();
   submit(ensure_batch_, layer_id, assignment.loads);
   wait_for(ensure_batch_);

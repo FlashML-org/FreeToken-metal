@@ -47,6 +47,8 @@ struct ExpertSegment {
 struct ExpertServiceStats {
   std::vector<int64_t> hits;
   std::vector<int64_t> misses;
+  // Reads of the misses of one lookup (ensure_experts call or mailbox request): one IO wait.
+  std::vector<int64_t> requests;
   std::vector<int64_t> experts_read;
   std::vector<int64_t> bytes_read;
   std::vector<int64_t> read_wait_ns;

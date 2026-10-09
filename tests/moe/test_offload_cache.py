@@ -159,6 +159,7 @@ def test_rows_match_checkpoint(tmp_path: Path, case: Case) -> None:
     rows = resident_rows(cache)
     assert len(rows) == case.cache_size - cache.window_slots
     check_rows(cache, reference, prefixes, rows)
+    calls_with_misses = 0
     for step, entry in enumerate(case.script, start=1):
         if isinstance(entry, Prefill):
             cache.begin_prefill()
@@ -178,13 +179,16 @@ def test_rows_match_checkpoint(tmp_path: Path, case: Case) -> None:
                     cache.prefetch_prefill_layer(entry.layers[i + 2])
         else:
             for layer_id, expert_ids in entry:
+                misses_before = sum(cache.stats().misses)
                 slots = cache.ensure_experts(layer_id, list(expert_ids), step)
+                calls_with_misses += sum(cache.stats().misses) > misses_before
                 rows = resident_rows(cache)
                 assert slots == [rows[(layer_id, expert)] for expert in expert_ids]
                 check_rows(cache, reference, prefixes, rows)
     stats = cache.stats()
     calls = [call for entry in case.script if not isinstance(entry, Prefill) for call in entry]
     assert sum(stats.hits) + sum(stats.misses) == sum(len(expert_ids) for _, expert_ids in calls)
+    assert sum(stats.requests) == calls_with_misses
 
 
 def test_source_rejects_a_layer_in_another_format(tmp_path: Path) -> None:
