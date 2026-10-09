@@ -245,6 +245,7 @@ NB_MODULE(_C, m) {
       .def_ro("experts_read", &ftmetal::ExpertServiceStats::experts_read)
       .def_ro("bytes_read", &ftmetal::ExpertServiceStats::bytes_read)
       .def_ro("read_wait_ns", &ftmetal::ExpertServiceStats::read_wait_ns)
+      .def_ro("serve_ns", &ftmetal::ExpertServiceStats::serve_ns)
       .def_ro("lookups", &ftmetal::ExpertServiceStats::lookups)
       .def_ro("lookup_hits", &ftmetal::ExpertServiceStats::lookup_hits);
 

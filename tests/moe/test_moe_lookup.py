@@ -230,6 +230,9 @@ def test_chain_matches_reference(tmp_path: Path, case: Case) -> None:
     num_lookups = case.num_steps + (1 if case.is_replayed else 0)
     assert stats.lookups == [num_lookups] * case.num_layers
     assert stats.misses == load_totals.tolist()
+    assert all(
+        (served > 0) == (requests > 0) for served, requests in zip(stats.serve_ns, stats.requests)
+    )
     assert (np.array(stats.lookup_hits) + load_totals).tolist() == distinct_totals.tolist()
     words = mailbox_words(cache)
     assert words[Word.SEQUENCE] == words[Word.ACKNOWLEDGED] == num_requests

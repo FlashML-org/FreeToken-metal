@@ -126,6 +126,7 @@ ExpertService::ExpertService(
   stats_.experts_read.assign(num_layers, 0);
   stats_.bytes_read.assign(num_layers, 0);
   stats_.read_wait_ns.assign(num_layers, 0);
+  stats_.serve_ns.assign(num_layers, 0);
   std::fill(mailbox_data_, mailbox_data_ + MAILBOX_WORDS, 0u);
   try {
     for (const std::string& file : files_) {

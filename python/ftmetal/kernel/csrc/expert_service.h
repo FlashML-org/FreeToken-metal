@@ -52,6 +52,8 @@ struct ExpertServiceStats {
   std::vector<int64_t> experts_read;
   std::vector<int64_t> bytes_read;
   std::vector<int64_t> read_wait_ns;
+  // The coordinator's time from claiming a mailbox request to its slots being ready.
+  std::vector<int64_t> serve_ns;
   std::vector<int64_t> lookups;
   std::vector<int64_t> lookup_hits;
 };

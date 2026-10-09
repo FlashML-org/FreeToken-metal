@@ -126,6 +126,7 @@ void ExpertService::answer() {
     return;
   }
   uint64_t claim_time = mach_absolute_time();
+  auto claimed = Clock::now();
   auto read = [this](MailboxWord word) {
     return mailbox_word(word).load(std::memory_order_relaxed);
   };
@@ -166,6 +167,8 @@ void ExpertService::answer() {
     try {
       std::lock_guard<std::mutex> lock(call_mutex_);
       SlotAssignment assignment = serve(static_cast<int>(layer_id), expert_ids, step);
+      stats_.serve_ns[layer_id] +=
+          std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - claimed).count();
       bool is_same_split = assignment.loads.size() == num_misses;
       for (size_t j = 0; is_same_split && j < num_misses; ++j) {
         is_same_split = assignment.loads[j].first == expert_ids[j];
