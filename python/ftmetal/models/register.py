@@ -8,7 +8,7 @@ towers. Divergence: an EncoderSpec names the checkpoint prefix of its tower's we
 from __future__ import annotations
 
 import importlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import mlx.core as mx
 
@@ -16,7 +16,7 @@ from ftmetal.layers.quantization.config import QuantConfig
 from ftmetal.mm.config import EncoderKind, Modality
 from ftmetal.models.blocks import BaseLLMModel
 from ftmetal.models.config import ModelConfig
-from ftmetal.models.loader import WeightRules
+from ftmetal.models.loader import WeightRules, mixed_fuses
 
 
 @dataclass(frozen=True)
@@ -78,9 +78,11 @@ def parse_model_config(
 
 
 def model_weight_rules(architecture: str, model_config: ModelConfig) -> WeightRules:
+    """The model's rules, with the fused modules this checkpoint quantizes unevenly unfused."""
     spec = get_model_spec(architecture)
     module = importlib.import_module(spec.module)
-    return getattr(module, spec.weight_rules)(model_config)
+    rules: WeightRules = getattr(module, spec.weight_rules)(model_config)
+    return replace(rules, unfused=mixed_fuses(rules, model_config.quant))
 
 
 def create_model(architecture: str, model_config: ModelConfig, dtype: mx.Dtype) -> BaseLLMModel:

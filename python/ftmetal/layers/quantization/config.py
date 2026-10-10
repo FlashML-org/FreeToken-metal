@@ -94,5 +94,9 @@ class QuantConfig:
             raise ValueError(f"fused modules {checkpoint_names} mix schemes {schemes}")
         return schemes.pop()
 
+    def schemes_for(self, checkpoint_names: list[str]) -> list[AffineScheme | None]:
+        """The scheme of each part of a fused module; the parts fuse only when all agree."""
+        return [self.scheme_for(name) for name in checkpoint_names]
+
 
 __all__ = ["AffineScheme", "BankSpec", "QuantConfig", "expert_bank_layout"]
