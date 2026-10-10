@@ -16,14 +16,14 @@ lowest flat expert id.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
 import mlx.core as mx
 import numpy as np
 
-from ftmetal.layers.moe import moe_layout
+from ftmetal.layers.moe import ExpertSchemes, moe_layout
 from ftmetal.layers.quantization.config import AffineScheme
 from ftmetal.models.loader import FuseRule, WeightRules
 from ftmetal.moe.offload_cache import STALL_TIMEOUT_S, OffloadMoeCache
@@ -47,7 +47,16 @@ class CheckpointSpec:
     scheme: AffineScheme | None = AffineScheme(4, 64)
     # Bits of the last layer's experts, if not the scheme's.
     last_layer_bits: int | None = None
+    # Bits of every layer's up projection, if not the scheme's: gate and up load apart.
+    up_bits: int | None = None
     is_identifying: bool = False
+
+    @property
+    def expert_schemes(self) -> ExpertSchemes:
+        if self.up_bits is None or self.scheme is None:
+            return ExpertSchemes.uniform(self.scheme)
+        up = AffineScheme(self.up_bits, self.scheme.group_size)
+        return ExpertSchemes(self.scheme, up, self.scheme)
 
 
 def weight_rules(naming: Naming) -> WeightRules:
@@ -66,6 +75,19 @@ def weight_rules(naming: Naming) -> WeightRules:
             fuses=(gate_up,),
             expert_segment="experts",
         )
+
+
+def checkpoint_rules(spec: CheckpointSpec) -> WeightRules:
+    """The rules the engine derives for the checkpoint: gate and up apart when they differ."""
+    rules = weight_rules(spec.naming)
+    schemes = spec.expert_schemes
+    if schemes.gate == schemes.up:
+        return rules
+    experts = "model.layers.{}.mlp.experts" if spec.naming == "qwen" else "model.layers.{}.experts"
+    unfused = frozenset(
+        f"{experts.format(layer_id)}.gate_up_proj" for layer_id in range(spec.num_layers)
+    )
+    return replace(rules, unfused=unfused)
 
 
 def expert_code(layer_id: int, projection: int, expert: int) -> int:
@@ -114,6 +136,8 @@ def write_checkpoint(directory: Path, spec: CheckpointSpec) -> None:
                 bits = spec.scheme.bits
                 if layer_id == spec.num_layers - 1 and spec.last_layer_bits is not None:
                     bits = spec.last_layer_bits
+                elif projection == "up_proj" and spec.up_bits is not None:
+                    bits = spec.up_bits
                 packed, scales, biases = mx.quantize(weight, spec.scheme.group_size, bits)
                 file[f"{module}.{projection}.weight"] = packed
                 file[f"{module}.{projection}.scales"] = scales
@@ -134,7 +158,7 @@ def build_cache(
 ) -> tuple[OffloadMoeCache, ExpertSource]:
     """The cache over a new checkpoint of spec written to directory, and its source."""
     write_checkpoint(directory, spec)
-    source = ExpertSource(str(directory), weight_rules(spec.naming))
+    source = ExpertSource(str(directory), checkpoint_rules(spec))
     cache = OffloadMoeCache(
         num_layers=spec.num_layers,
         num_experts=spec.num_experts,
@@ -142,7 +166,9 @@ def build_cache(
         cache_size=cache_size,
         prefill_overlap=prefill_overlap,
         prefill_overlap_min_tokens=PREFILL_OVERLAP_MIN_TOKENS,
-        layout=moe_layout(spec.hidden_size, spec.intermediate_size, spec.scheme, mx.bfloat16),
+        layout=moe_layout(
+            spec.hidden_size, spec.intermediate_size, spec.expert_schemes, mx.bfloat16
+        ),
         source=source,
         stall_timeout_s=stall_timeout_s,
         run_coordinator=run_coordinator,

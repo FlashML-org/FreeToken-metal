@@ -20,6 +20,7 @@ from ftmetal.layers.norm import RMSNorm
 from ftmetal.layers.quantization.config import AffineScheme
 from ftmetal.layers.rotary import MRotaryEmbedding, RotaryEmbedding
 from ftmetal.models.config import ModelConfig
+from ftmetal.models.qwen3_5_moe.weight import QKV_PARTS
 
 
 class Qwen3_5Attention(BaseOP):
@@ -28,7 +29,7 @@ class Qwen3_5Attention(BaseOP):
         config: ModelConfig,
         layer_id: int,
         *,
-        qkv_scheme: AffineScheme | None,
+        qkv_schemes: list[AffineScheme | None],
         o_scheme: AffineScheme | None,
         dtype: mx.Dtype,
     ) -> None:
@@ -44,7 +45,8 @@ class Qwen3_5Attention(BaseOP):
         self.qkv_proj = LinearMerged(
             config.hidden_size,
             [self.num_q * head_dim * 2, self.kv_attn_dim, self.kv_attn_dim],
-            scheme=qkv_scheme,
+            schemes=qkv_schemes,
+            part_names=QKV_PARTS,
             dtype=dtype,
         )
         self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps, dtype=dtype)

@@ -69,6 +69,7 @@ def weight_rules(model_config: ModelConfig) -> WeightRules:
 
 __all__ = [
     "GATE_UP_PARTS",
+    "K_EQ_V_PARTS",
     "QKV_PARTS",
     "QK_PARTS",
     "checkpoint_prefix",

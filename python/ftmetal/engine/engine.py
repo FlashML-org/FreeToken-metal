@@ -230,8 +230,14 @@ class Engine:
         experts_bytes = 0
         if is_offload:
             moe_layers = offload_layers(self.model)
+            layout = moe_layers[0].layout()
+            if any(layer.layout() != layout for layer in moe_layers[1:]):
+                raise ValueError(
+                    "MoE offload keeps every MoE layer's experts in one bank layout; this "
+                    "checkpoint stores them in different formats across layers"
+                )
             expert_source = ExpertSource(config.model_path, rules)
-            row_bytes = slot_bytes(moe_layers[0].layout())
+            row_bytes = slot_bytes(layout)
             total_experts = len(moe_layers) * model_config.num_experts
             cache_size = resolve_moe_cache_size(
                 config.moe_cache_size_flag(total_experts),

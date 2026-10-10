@@ -7,7 +7,8 @@ must match. Cases: decode replayed and eager; copy-miss and overlap prefills (th
 threshold knob lowered so tiny prompts take it), the chunks of one prompt on both sides of
 the threshold, a prompt chunked through overlap prefills; two requests decoding together,
 and three, which decode eagerly in two steps each since the cache cannot hold their worst
-case in one; prefill overlap off, with a cache below 2E.
+case in one; prefill overlap off, with a cache below 2E; up in 8 bits (gate and up two
+banks) on a replayed decode and an overlap prefill.
 """
 
 from __future__ import annotations
@@ -49,6 +50,7 @@ class Case:
     cache_size: int = CACHE_SIZE
     # Whether some prefill reads layers ahead into the windows.
     reads_windows: bool = False
+    up_bits: int = EXPERT_BITS
 
 
 CASES = [
@@ -62,6 +64,8 @@ CASES = [
     Case("two-requests", (13, 29)),
     Case("three-requests-split-decode", (9, 17, 26)),
     Case("overlap-off-small-cache", (40,), prefill_overlap=False, cache_size=NUM_EXPERTS + 8),
+    Case("up-8-bit-replayed-decode", (9,), up_bits=8),
+    Case("up-8-bit-overlap-prefill", (40,), overlap_min_tokens=16, reads_windows=True, up_bits=8),
 ]
 
 
@@ -69,17 +73,28 @@ def is_expert_projection(module_path: str, module: nn.Module) -> bool:
     return "switch_mlp" in module_path and hasattr(module, "to_quantized")
 
 
-def write_checkpoint(path: Path) -> None:
-    """The reference model with its experts alone affine quantized."""
+def write_checkpoint(path: Path, up_bits: int) -> None:
+    """The reference model with its experts alone affine quantized, up in up_bits."""
     model = build_reference(seed=11, text_config=OFFLOAD_TEXT_CONFIG)
-    nn.quantize(
-        model,
-        group_size=EXPERT_GROUP_SIZE,
-        bits=EXPERT_BITS,
-        class_predicate=is_expert_projection,
-    )
+    up = {"group_size": EXPERT_GROUP_SIZE, "bits": up_bits}
+
+    def predicate(module_path: str, module: nn.Module) -> bool | dict[str, int]:
+        if not is_expert_projection(module_path, module):
+            return False
+        return up if module_path.endswith("up_proj") else True
+
+    nn.quantize(model, group_size=EXPERT_GROUP_SIZE, bits=EXPERT_BITS, class_predicate=predicate)
     mx.eval(model.parameters())
-    quantization = {"group_size": EXPERT_GROUP_SIZE, "bits": EXPERT_BITS, "mode": "affine"}
+    quantization: dict[str, object] = {
+        "group_size": EXPERT_GROUP_SIZE,
+        "bits": EXPERT_BITS,
+        "mode": "affine",
+    }
+    num_layers = OFFLOAD_TEXT_CONFIG["num_hidden_layers"]
+    assert isinstance(num_layers, int)
+    quantization.update(
+        {f"language_model.model.layers.{i}.mlp.switch_mlp.up_proj": up for i in range(num_layers)}
+    )
     save_checkpoint(model, path, quantization=quantization)
 
 
@@ -130,7 +145,7 @@ def test_offload_matches_resident_experts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: Case
 ) -> None:
     monkeypatch.setenv("FTMETAL_MOE_PREFILL_OVERLAP_MIN_TOKENS", str(case.overlap_min_tokens))
-    write_checkpoint(tmp_path)
+    write_checkpoint(tmp_path, case.up_bits)
     rng = np.random.default_rng(len(case.name))
     prompts = [[int(t) for t in rng.integers(1, 120, size=n)] for n in case.prompt_lens]
 
@@ -141,6 +156,7 @@ def test_offload_matches_resident_experts(
 
     cache = scheduler.engine.moe_offload_cache
     assert cache is not None and cache.cache_size == case.cache_size
+    assert ("gate_up_proj.up_proj.weight" in cache.layout) == (case.up_bits != EXPERT_BITS)
     assert cache.fits_one_step(len(prompts)) == (len(prompts) < 3)
     stats = cache.stats()
     assert sum(stats.misses) > 0

@@ -21,6 +21,7 @@ from ftmetal.layers.norm import RMSNorm
 from ftmetal.layers.quantization.config import AffineScheme
 from ftmetal.layers.rotary import RotaryEmbedding
 from ftmetal.models.config import FullAttentionGroupConfig, ModelConfig, SWAAttentionGroupConfig
+from ftmetal.models.gemma4.weight import K_EQ_V_PARTS, QKV_PARTS
 
 
 class Gemma4Attention(BaseOP):
@@ -29,7 +30,7 @@ class Gemma4Attention(BaseOP):
         config: ModelConfig,
         layer_id: int,
         *,
-        qkv_scheme: AffineScheme | None,
+        qkv_schemes: list[AffineScheme | None],
         o_scheme: AffineScheme | None,
         dtype: mx.Dtype,
     ) -> None:
@@ -48,11 +49,19 @@ class Gemma4Attention(BaseOP):
         kv_dim = self.num_kv * self.head_dim
         if self.k_eq_v:
             self.qk_proj = LinearMerged(
-                config.hidden_size, [q_dim, kv_dim], scheme=qkv_scheme, dtype=dtype
+                config.hidden_size,
+                [q_dim, kv_dim],
+                schemes=qkv_schemes,
+                part_names=K_EQ_V_PARTS,
+                dtype=dtype,
             )
         else:
             self.qkv_proj = LinearMerged(
-                config.hidden_size, [q_dim, kv_dim, kv_dim], scheme=qkv_scheme, dtype=dtype
+                config.hidden_size,
+                [q_dim, kv_dim, kv_dim],
+                schemes=qkv_schemes,
+                part_names=QKV_PARTS,
+                dtype=dtype,
             )
         self.o_proj = Linear(q_dim, config.hidden_size, scheme=o_scheme, dtype=dtype)
         eps = config.rms_norm_eps

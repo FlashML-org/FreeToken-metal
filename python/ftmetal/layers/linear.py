@@ -3,7 +3,8 @@
 Port of FreeToken layers/linear.py. Divergences: no tensor parallelism, so
 LinearReplicated / LinearRowParallel collapse into Linear and LinearColParallelMerged
 into LinearMerged; the quant method is the scheme itself (bf16 matmul or
-mx.quantized_matmul) instead of a kernel registry.
+mx.quantized_matmul) instead of a kernel registry; a LinearMerged whose parts the
+checkpoint quantizes differently runs one Linear per part.
 """
 
 from __future__ import annotations
@@ -60,7 +61,9 @@ class Linear(BaseOP):
 
 
 class LinearMerged(Linear):
-    """Several projections of one input fused along the output axis (qkv, gate|up)."""
+    """Several projections of one input fused along the output axis (qkv, gate|up): one
+    weight when every part has the same scheme, else one Linear per part under the part's
+    name (part_names: the fuse rule's parts, which the loader then leaves apart)."""
 
     def __init__(
         self,
@@ -68,18 +71,38 @@ class LinearMerged(Linear):
         output_sizes: list[int],
         has_bias: bool = False,
         *,
-        scheme: AffineScheme | None = None,
+        schemes: list[AffineScheme | None],
+        part_names: tuple[str, ...],
         dtype: mx.Dtype = mx.bfloat16,
     ) -> None:
-        super().__init__(input_size, sum(output_sizes), has_bias, scheme=scheme, dtype=dtype)
+        assert len(schemes) == len(output_sizes) == len(part_names), "one scheme per part"
+        if len(set(schemes)) == 1:
+            super().__init__(
+                input_size, sum(output_sizes), has_bias, scheme=schemes[0], dtype=dtype
+            )
+            self.part_names: tuple[str, ...] = ()
+        else:
+            BaseOP.__init__(self)
+            self.input_size = input_size
+            self.output_size = sum(output_sizes)
+            self.part_names = part_names
+            for name, size, scheme in zip(part_names, output_sizes, schemes):
+                setattr(self, name, Linear(input_size, size, has_bias, scheme=scheme, dtype=dtype))
         self._output_sizes = tuple(output_sizes)
 
     @property
     def output_sizes(self) -> tuple[int, ...]:
         return self._output_sizes
 
+    def forward(self, x: mx.array) -> mx.array:
+        if self.part_names:
+            return mx.concatenate(self.forward_split(x), axis=-1)
+        return super().forward(x)
+
     def forward_split(self, x: mx.array) -> list[mx.array]:
         """The fused projection cut back into its parts."""
+        if self.part_names:
+            return [getattr(self, name).forward(x) for name in self.part_names]
         bounds = []
         offset = 0
         for size in self._output_sizes[:-1]:

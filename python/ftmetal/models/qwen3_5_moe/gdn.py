@@ -26,6 +26,7 @@ from ftmetal.layers.linear import Linear, LinearMerged
 from ftmetal.layers.norm import GatedRMSNorm
 from ftmetal.layers.quantization.config import AffineScheme
 from ftmetal.models.config import LinearGatedDeltaGroupConfig
+from ftmetal.models.qwen3_5_moe.weight import IN_PROJ_BA_PARTS, IN_PROJ_QKVZ_PARTS
 
 # Shortest prefill run chunked; the per-token kernel is faster below it (crossover at
 # 52-56 tokens on the M4 Pro at the Qwen3.6 shapes, calls serialized as layers are).
@@ -40,8 +41,8 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         rms_norm_eps: float,
         layer_id: int,
         *,
-        qkvz_scheme: AffineScheme | None,
-        ba_scheme: AffineScheme | None,
+        qkvz_schemes: list[AffineScheme | None],
+        ba_schemes: list[AffineScheme | None],
         out_scheme: AffineScheme | None,
         dtype: mx.Dtype,
     ) -> None:
@@ -56,10 +57,18 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self.conv_dim = 2 * self.key_dim + self.value_dim
         self.conv_kernel_size = group.conv_kernel_dim
         self.in_proj_qkvz = LinearMerged(
-            hidden_size, [self.conv_dim, self.value_dim], scheme=qkvz_scheme, dtype=dtype
+            hidden_size,
+            [self.conv_dim, self.value_dim],
+            schemes=qkvz_schemes,
+            part_names=IN_PROJ_QKVZ_PARTS,
+            dtype=dtype,
         )
         self.in_proj_ba = LinearMerged(
-            hidden_size, [self.num_v_heads, self.num_v_heads], scheme=ba_scheme, dtype=dtype
+            hidden_size,
+            [self.num_v_heads, self.num_v_heads],
+            schemes=ba_schemes,
+            part_names=IN_PROJ_BA_PARTS,
+            dtype=dtype,
         )
         self.conv1d = DepthwiseConv1d(self.conv_dim, self.conv_kernel_size, dtype)
         self.dt_bias = mx.ones((self.num_v_heads,), dtype=dtype)

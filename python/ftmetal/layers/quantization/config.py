@@ -87,13 +87,6 @@ class QuantConfig:
             return self.default
         return None
 
-    def scheme_for_fused(self, checkpoint_names: list[str]) -> AffineScheme | None:
-        """One scheme for modules fused into a single weight; they must agree."""
-        schemes = {self.scheme_for(name) for name in checkpoint_names}
-        if len(schemes) != 1:
-            raise ValueError(f"fused modules {checkpoint_names} mix schemes {schemes}")
-        return schemes.pop()
-
     def schemes_for(self, checkpoint_names: list[str]) -> list[AffineScheme | None]:
         """The scheme of each part of a fused module; the parts fuse only when all agree."""
         return [self.scheme_for(name) for name in checkpoint_names]

@@ -18,8 +18,10 @@ from pydantic import JsonValue
 
 from ftmetal.core import SamplingParams
 from ftmetal.engine.config import CacheTypeChoice, EngineConfig
+from ftmetal.layers.moe import ExpertBank, ExpertBankParts
 from ftmetal.message.backend import UserMsg
 from ftmetal.message.tokenizer import TokenizeMsg
+from ftmetal.models.qwen3_5_moe.model import Qwen3_5MoeForCausalLM
 from ftmetal.scheduler.scheduler import Scheduler
 from ftmetal.tokenizer import TokenizeManager
 from tiny_model import TINY_TEXT_CONFIG, build_reference, reference_greedy, save_checkpoint
@@ -221,6 +223,61 @@ def test_quantized_greedy_decode_matches_mlx_lm(tmp_path: Path, attention_backen
     _, expected = reference_greedy(model, prompt, steps)
 
     scheduler = make_scheduler(tmp_path, page_size=4, attention_backend=attention_backend)
+    params = SamplingParams(temperature=0.0, max_tokens=steps, ignore_eos=True)
+    tokens = scheduler.generate(np.array(prompt, dtype=np.int32), params)
+    assert tokens == expected
+
+
+# Bits a sensitivity-driven quant (OptiQ) may give single modules, checkpoint path -> bits or
+# None (left bf16): the parts of a fused module differ (in_proj_qkvz, qkv, the experts' and
+# the shared expert's gate_up, in_proj_ba with a bf16 part), and down differs from gate|up.
+MIXED_BITS: dict[str, int | None] = {
+    "language_model.model.layers.0.linear_attn.in_proj_z": 8,
+    "language_model.model.layers.1.self_attn.k_proj": 8,
+    "language_model.model.layers.1.self_attn.v_proj": 8,
+    "language_model.model.layers.1.mlp.switch_mlp.up_proj": 8,
+    "language_model.model.layers.2.linear_attn.in_proj_a": None,
+    "language_model.model.layers.2.mlp.shared_expert.gate_proj": 8,
+    "language_model.model.layers.3.mlp.switch_mlp.down_proj": 8,
+}
+
+
+@pytest.mark.parametrize("attention_backend", ["mlx", "metal"])
+def test_mixed_bit_greedy_decode_matches_mlx_lm(tmp_path: Path, attention_backend: str) -> None:
+    model = build_reference(seed=6)
+
+    def predicate(path: str, module: nn.Module) -> bool | dict[str, int]:
+        if not hasattr(module, "to_quantized") or path.endswith(("mlp.gate", "shared_expert_gate")):
+            return False
+        if path not in MIXED_BITS:
+            return True
+        bits = MIXED_BITS[path]
+        return False if bits is None else {"group_size": 32, "bits": bits}
+
+    nn.quantize(model, group_size=32, bits=4, class_predicate=predicate)
+    mx.eval(model.parameters())
+    quantization: dict[str, object] = {"group_size": 32, "bits": 4, "mode": "affine"}
+    quantization.update(
+        {path: {"group_size": 32, "bits": bits} for path, bits in MIXED_BITS.items() if bits}
+    )
+    save_checkpoint(model, tmp_path, quantization=quantization)
+    prompt = [int(t) for t in np.random.default_rng(6).integers(1, 120, size=31)]
+    steps = 16
+    _, expected = reference_greedy(model, prompt, steps)
+
+    scheduler = make_scheduler(tmp_path, page_size=4, attention_backend=attention_backend)
+    model = scheduler.engine.model
+    assert isinstance(model, Qwen3_5MoeForCausalLM)
+    layers = model.model.layers
+    split = {
+        "in_proj_qkvz": layers[0].linear_attn.in_proj_qkvz.part_names,
+        "qkv_proj": layers[1].self_attn.qkv_proj.part_names,
+        "in_proj_ba": layers[2].linear_attn.in_proj_ba.part_names,
+        "shared gate_up_proj": layers[2].mlp.shared_expert.gate_up_proj.part_names,
+    }
+    assert all(split.values()), split
+    assert isinstance(layers[1].mlp.experts.gate_up_proj, ExpertBankParts)
+    assert isinstance(layers[3].mlp.experts.gate_up_proj, ExpertBank)
     params = SamplingParams(temperature=0.0, max_tokens=steps, ignore_eos=True)
     tokens = scheduler.generate(np.array(prompt, dtype=np.int32), params)
     assert tokens == expected

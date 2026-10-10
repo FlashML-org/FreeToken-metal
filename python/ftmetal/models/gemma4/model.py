@@ -18,7 +18,7 @@ from ftmetal.core import Batch
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.embedding import Embedding
 from ftmetal.layers.linear import Linear
-from ftmetal.layers.moe import MoELayer
+from ftmetal.layers.moe import ExpertSchemes, MoELayer
 from ftmetal.layers.norm import RMSNorm
 from ftmetal.layers.quantization.config import AffineScheme
 from ftmetal.models.blocks import BaseLLMModel, select_last_rows
@@ -40,13 +40,14 @@ def scheme_of(config: ModelConfig, checkpoint_module: str) -> AffineScheme | Non
     return config.quant.scheme_for(checkpoint_module)
 
 
-def fused_scheme_of(
+def schemes_of(
     config: ModelConfig, parent_module: str, parts: tuple[str, ...]
-) -> AffineScheme | None:
-    """The scheme of parts (checkpoint module names under parent_module) fused into one."""
+) -> list[AffineScheme | None]:
+    """The scheme of each part (a checkpoint module name under parent_module) of a fused
+    module; they fuse only when all agree."""
     if config.quant is None:
-        return None
-    return config.quant.scheme_for_fused([f"{parent_module}.{part}" for part in parts])
+        return [None] * len(parts)
+    return config.quant.schemes_for([f"{parent_module}.{part}" for part in parts])
 
 
 @partial(mx.compile, shapeless=True)
@@ -64,14 +65,14 @@ class Gemma4DecoderLayer(BaseOP):
         self.self_attn = Gemma4Attention(
             config,
             layer_id,
-            qkv_scheme=fused_scheme_of(config, f"{prefix}.self_attn", attn_parts),
+            qkv_schemes=schemes_of(config, f"{prefix}.self_attn", attn_parts),
             o_scheme=scheme_of(config, f"{prefix}.self_attn.o_proj"),
             dtype=dtype,
         )
         self.mlp = Gemma4GatedMLP(
             config.hidden_size,
             config.intermediate_size,
-            gate_up_scheme=fused_scheme_of(config, f"{prefix}.mlp", GATE_UP_PARTS),
+            gate_up_schemes=schemes_of(config, f"{prefix}.mlp", GATE_UP_PARTS),
             down_scheme=scheme_of(config, f"{prefix}.mlp.down_proj"),
             dtype=dtype,
         )
@@ -82,10 +83,6 @@ class Gemma4DecoderLayer(BaseOP):
         self.post_feedforward_layernorm = RMSNorm(hidden, eps=eps, dtype=dtype)
         if self.is_moe:
             experts = f"{prefix}.experts.switch_glu"
-            experts_scheme = fused_scheme_of(config, experts, GATE_UP_PARTS)
-            assert experts_scheme == scheme_of(config, f"{experts}.down_proj"), (
-                "expert banks share one scheme"
-            )
             self.router = Gemma4Router(
                 config, proj_scheme=scheme_of(config, f"{prefix}.router.proj"), dtype=dtype
             )
@@ -94,7 +91,7 @@ class Gemma4DecoderLayer(BaseOP):
                 config.num_experts_per_tok,
                 config.hidden_size,
                 config.moe_intermediate_size,
-                scheme=experts_scheme,
+                schemes=ExpertSchemes(*schemes_of(config, experts, (*GATE_UP_PARTS, "down_proj"))),
                 activation="gelu_tanh",
                 dtype=dtype,
             )

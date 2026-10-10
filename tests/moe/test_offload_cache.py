@@ -5,8 +5,9 @@ equal, byte for byte, the expert's row of apply_rules(load_checkpoint(...)): aft
 initial fill, after each ensure_experts call of a hand-written script (each returned slot,
 and every slot slot_of maps), and at every slot of a prefetched prefill layer's slot map,
 whose resident experts keep their slots. Large experts make one run of reads longer than
-a staging buffer. Errors: a layer in another format, the window protocol, a file cut
-short under the cache. The real-checkpoint case needs FTMETAL_TEST_MODEL_PATH.
+a staging buffer; gate and up in different bits load as two banks. Errors: a layer in
+another format, the window protocol, a file cut short under the cache. The
+real-checkpoint case needs FTMETAL_TEST_MODEL_PATH.
 """
 
 from __future__ import annotations
@@ -22,15 +23,22 @@ from mlx.utils import tree_flatten
 
 from ftmetal.core import host_ints
 from ftmetal.engine.config import EngineConfig
-from ftmetal.layers.moe import MoELayer, moe_layout
+from ftmetal.layers.moe import ExpertSchemes, MoELayer, moe_layout
 from ftmetal.layers.quantization.config import AffineScheme
 from ftmetal.models.loader import apply_rules, load_checkpoint
-from ftmetal.models.qwen3_5_moe.model import fused_scheme_of
+from ftmetal.models.qwen3_5_moe.model import schemes_of
 from ftmetal.models.qwen3_5_moe.weight import GATE_UP_PARTS
 from ftmetal.models.register import model_weight_rules
 from ftmetal.moe.offload_cache import OffloadMoeCache
 from ftmetal.moe.source import ExpertSource
-from offload_harness import CheckpointSpec, Naming, build_cache, weight_rules, write_checkpoint
+from offload_harness import (
+    CheckpointSpec,
+    Naming,
+    build_cache,
+    checkpoint_rules,
+    weight_rules,
+    write_checkpoint,
+)
 
 MODEL_PATH = os.environ.get("FTMETAL_TEST_MODEL_PATH")
 # One decode step: the (layer, distinct expert ids) calls of ensure_experts, in order.
@@ -57,6 +65,8 @@ class Case:
     scheme: AffineScheme | None = AffineScheme(4, 64)
     # Bits of the last layer's experts, if not the scheme's.
     last_layer_bits: int | None = None
+    # Bits of every layer's up projection, if not the scheme's.
+    up_bits: int | None = None
 
     @property
     def spec(self) -> CheckpointSpec:
@@ -68,10 +78,13 @@ class Case:
             naming=self.naming,
             scheme=self.scheme,
             last_layer_bits=self.last_layer_bits,
+            up_bits=self.up_bits,
         )
 
     def __str__(self) -> str:
         scheme = "bf16" if self.scheme is None else f"q{self.scheme.bits}g{self.scheme.group_size}"
+        if self.up_bits is not None:
+            scheme += f"-up{self.up_bits}"
         return (
             f"{self.naming}-L{self.num_layers}-E{self.num_experts}-H{self.hidden_size}"
             f"-I{self.intermediate_size}-S{self.cache_size}"
@@ -113,6 +126,28 @@ CASES = [
     Case(2, 4, 192, 64, 8, True, script=(Prefill((0, 1)), ((1, (2, 3)),)), scheme=None),
     # 2 MiB per expert and projection: a run of four experts outgrows the staging buffer.
     Case(1, 4, 2048, 2048, 4, False, script=(((0, (0, 1, 2, 3)),),)),
+    # Up in 8 bits: gate and up are two banks, read and placed apart.
+    Case(
+        3,
+        8,
+        192,
+        64,
+        12,
+        False,
+        script=(((0, (0, 5, 6)), (1, (7,)), (2, (1, 2))), ((0, (5, 7, 3)), (2, (6, 0)))),
+        up_bits=8,
+    ),
+    Case(
+        2,
+        4,
+        128,
+        64,
+        10,
+        True,
+        script=(((1, (2,)),), Prefill((0, 1)), ((1, (0, 3)),)),
+        naming="gemma4",
+        up_bits=8,
+    ),
 ]
 
 
@@ -121,7 +156,7 @@ def build(directory: Path, case: Case) -> tuple[OffloadMoeCache, dict[str, mx.ar
     cache, source = build_cache(
         directory, case.spec, cache_size=case.cache_size, prefill_overlap=case.prefill_overlap
     )
-    reference = apply_rules(load_checkpoint(str(directory)), weight_rules(case.naming))
+    reference = apply_rules(load_checkpoint(str(directory)), checkpoint_rules(case.spec))
     return cache, reference, source
 
 
@@ -195,7 +230,9 @@ def test_source_rejects_a_layer_in_another_format(tmp_path: Path) -> None:
     case = Case(3, 4, 128, 64, 4, False, last_layer_bits=8)
     write_checkpoint(tmp_path / "checkpoint", case.spec)
     source = ExpertSource(str(tmp_path / "checkpoint"), weight_rules(case.naming))
-    layout = moe_layout(case.hidden_size, case.intermediate_size, case.scheme, mx.bfloat16)
+    layout = moe_layout(
+        case.hidden_size, case.intermediate_size, ExpertSchemes.uniform(case.scheme), mx.bfloat16
+    )
     with pytest.raises(ValueError, match="model.layers.2.mlp.experts.gate_up_proj.weight"):
         source.segment_table(layout)
 
@@ -242,14 +279,31 @@ def test_expert_bank_matches_moe_layout() -> None:
         "gate_up_proj.weight": ((8, 128, 128), mx.bfloat16),
         "down_proj.weight": ((8, 128, 64), mx.bfloat16),
     }
-    for scheme, expected in [(AffineScheme(4, 64), affine), (None, bf16)]:
-        layer = MoELayer(8, 2, 128, 64, scheme=scheme, dtype=mx.bfloat16)
+    # Gate 4-bit, up 8-bit, down 4-bit: gate and up are two banks.
+    split = {
+        "gate_up_proj.gate_proj.weight": ((8, 64, 16), mx.uint32),
+        "gate_up_proj.gate_proj.scales": ((8, 64, 2), mx.bfloat16),
+        "gate_up_proj.gate_proj.biases": ((8, 64, 2), mx.bfloat16),
+        "gate_up_proj.up_proj.weight": ((8, 64, 32), mx.uint32),
+        "gate_up_proj.up_proj.scales": ((8, 64, 2), mx.bfloat16),
+        "gate_up_proj.up_proj.biases": ((8, 64, 2), mx.bfloat16),
+        "down_proj.weight": ((8, 128, 8), mx.uint32),
+        "down_proj.scales": ((8, 128, 1), mx.bfloat16),
+        "down_proj.biases": ((8, 128, 1), mx.bfloat16),
+    }
+    four, eight = AffineScheme(4, 64), AffineScheme(8, 64)
+    for schemes, expected in [
+        (ExpertSchemes.uniform(four), affine),
+        (ExpertSchemes.uniform(None), bf16),
+        (ExpertSchemes(four, eight, four), split),
+    ]:
+        layer = MoELayer(8, 2, 128, 64, schemes=schemes, dtype=mx.bfloat16)
         parameters = {
             key: (value.shape, value.dtype)
             for key, value in dict(tree_flatten(layer.parameters())).items()
         }
         assert parameters == expected
-        layout = moe_layout(128, 64, scheme, mx.bfloat16)
+        layout = moe_layout(128, 64, schemes, mx.bfloat16)
         assert list(layout) == list(expected)
         assert {role: ((8, *spec.shape), spec.dtype) for role, spec in layout.items()} == expected
 
@@ -261,9 +315,11 @@ def test_real_checkpoint_rows() -> None:
     model_config = config.model_config
     rules = model_weight_rules(config.architecture, model_config)
     source = ExpertSource(MODEL_PATH, rules)
-    scheme = fused_scheme_of(model_config, "model.layers.0.mlp.experts", GATE_UP_PARTS)
+    schemes = ExpertSchemes(
+        *schemes_of(model_config, "model.layers.0.mlp.experts", (*GATE_UP_PARTS, "down_proj"))
+    )
     layout = moe_layout(
-        model_config.hidden_size, model_config.moe_intermediate_size, scheme, mx.bfloat16
+        model_config.hidden_size, model_config.moe_intermediate_size, schemes, mx.bfloat16
     )
     cache = OffloadMoeCache(
         num_layers=source.num_layers,
