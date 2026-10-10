@@ -201,19 +201,20 @@ NB_MODULE(_C, m) {
 
   nb::class_<ftmetal::SlotLru>(m, "SlotLru")
       .def(
-          nb::init<int, int, int, int, mx::array, mx::array>(),
+          nb::init<int, int, int, const std::vector<int32_t>&, mx::array, mx::array>(),
           "num_layers"_a,
           "num_experts"_a,
-          "num_slots"_a,
-          "window_slots"_a,
+          "window_size"_a,
+          "layer_slots"_a,
           "slot_of"_a,
           "last_use"_a,
-          "Token-granular LRU over the slots; writes slot_of and last_use in place.")
+          "Per-layer token-granular LRUs over the slots; writes slot_of and last_use in place.")
+      .def_prop_ro("num_slots", &ftmetal::SlotLru::num_slots)
       .def(
           "fill",
           &ftmetal::SlotLru::fill,
           "flat_ids"_a,
-          "Empty the cache and place flat_ids from slot window_slots on; returns their slots.")
+          "Empty the cache and place each of flat_ids in its layer's run; returns their slots.")
       .def(
           "resolve",
           [](ftmetal::SlotLru& lru, int layer_id, const std::vector<int32_t>& expert_ids,
@@ -226,17 +227,13 @@ NB_MODULE(_C, m) {
           "step"_a,
           "Slots of the layer's distinct experts at step; returns (slots, [(expert, slot)] to load).")
       .def(
-          "invalidate_windows",
-          &ftmetal::SlotLru::invalidate_windows,
-          "Drop every expert held in a window slot.")
-      .def(
           "prefill_slot_map",
           [](const ftmetal::SlotLru& lru, int layer_id) {
             ftmetal::SlotAssignment assignment = lru.prefill_slot_map(layer_id);
             return std::make_pair(std::move(assignment.slots), std::move(assignment.loads));
           },
           "layer_id"_a,
-          "Every expert's slot, window layer_id % 2 for the absent; returns (slot_map, loads).");
+          "Every expert's slot, window layer_id % 2's for the absent; returns (slot_map, loads).");
 
   nb::class_<ftmetal::ExpertServiceStats>(m, "ExpertServiceStats")
       .def_ro("hits", &ftmetal::ExpertServiceStats::hits)
@@ -256,8 +253,8 @@ NB_MODULE(_C, m) {
           [](ftmetal::ExpertService* service,
              int num_layers,
              int num_experts,
-             int num_slots,
-             int window_slots,
+             int window_size,
+             const std::vector<int32_t>& layer_slots,
              mx::array slot_of,
              mx::array last_use,
              mx::array mailbox,
@@ -280,8 +277,8 @@ NB_MODULE(_C, m) {
             new (service) ftmetal::ExpertService(
                 num_layers,
                 num_experts,
-                num_slots,
-                window_slots,
+                window_size,
+                layer_slots,
                 std::move(slot_of),
                 std::move(last_use),
                 std::move(mailbox),
@@ -295,8 +292,8 @@ NB_MODULE(_C, m) {
           },
           "num_layers"_a,
           "num_experts"_a,
-          "num_slots"_a,
-          "window_slots"_a,
+          "window_size"_a,
+          "layer_slots"_a,
           "slot_of"_a,
           "last_use"_a,
           "mailbox"_a,
@@ -313,7 +310,7 @@ NB_MODULE(_C, m) {
           &ftmetal::ExpertService::fill_initial,
           "flat_ids"_a,
           nb::call_guard<nb::gil_scoped_release>(),
-          "Empty the cache, place flat_ids from slot window_slots on and read them.")
+          "Empty the cache, place each of flat_ids in its layer's run and read them.")
       .def(
           "ensure_experts",
           &ftmetal::ExpertService::ensure_experts,

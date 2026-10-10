@@ -119,7 +119,7 @@ CASES = [
             Prefill((0, 1, 2, 3)),
             ((0, (0, 3)), (1, (0, 1, 2)), (2, (2,)), (3, (1,))),
             Prefill((1, 2)),
-            ((2, (0, 1, 2, 3)),),
+            ((2, (0, 1, 3)),),
         ),
         naming="gemma4",
     ),
@@ -138,13 +138,13 @@ CASES = [
         up_bits=8,
     ),
     Case(
-        2,
+        3,
         4,
         128,
         64,
-        10,
+        11,
         True,
-        script=(((1, (2,)),), Prefill((0, 1)), ((1, (0, 3)),)),
+        script=(((1, (2,)),), Prefill((0, 1, 2)), ((1, (0, 3)),)),
         naming="gemma4",
         up_bits=8,
     ),
@@ -192,7 +192,7 @@ def test_rows_match_checkpoint(tmp_path: Path, case: Case) -> None:
     assert (source.segment_table(cache.layout)[..., 1] % 4096 != 0).any(), "all experts aligned"
     cache.fill_initial()
     rows = resident_rows(cache)
-    assert len(rows) == case.cache_size - cache.window_slots
+    assert len(rows) == sum(cache.layer_slots)
     check_rows(cache, reference, prefixes, rows)
     calls_with_misses = 0
     for step, entry in enumerate(case.script, start=1):
@@ -205,9 +205,13 @@ def test_rows_match_checkpoint(tmp_path: Path, case: Case) -> None:
             for i, layer_id in enumerate(entry.layers):
                 slot_map = host_ints(cache.prefetch_prefill_layer(layer_id))
                 cache.wait_prefill_layer(layer_id)
-                window = (layer_id % 2) * cache.num_experts
+                window_slot = (layer_id % 2) * cache.window_size
                 for expert, slot in enumerate(slot_map):
-                    assert slot == resident.get((layer_id, expert), window + expert)
+                    if (layer_id, expert) in resident:
+                        assert slot == resident[(layer_id, expert)]
+                    else:
+                        assert slot == window_slot
+                        window_slot += 1
                 layer_rows = {(layer_id, expert): slot for expert, slot in enumerate(slot_map)}
                 check_rows(cache, reference, prefixes, layer_rows)
                 if i + 2 < len(entry.layers):
@@ -238,7 +242,7 @@ def test_source_rejects_a_layer_in_another_format(tmp_path: Path) -> None:
 
 
 def test_window_protocol(tmp_path: Path) -> None:
-    case = Case(4, 4, 128, 64, 10, True)
+    case = Case(4, 4, 128, 64, 14, True)
     cache, _, _ = build(tmp_path / "checkpoint", case)
     cache.fill_initial()
     cache.begin_prefill()
@@ -252,7 +256,8 @@ def test_window_protocol(tmp_path: Path) -> None:
     cache.wait_prefill_layer(0)
     cache.prefetch_prefill_layer(2)
     cache.begin_prefill()
-    assert cache.ensure_experts(1, [3], 1) == [0]
+    # Windows [0, 2); layer 1's run [5, 8) holds experts 0-2, expert 0 (lowest id) goes.
+    assert cache.ensure_experts(1, [3], 1) == [5]
 
 
 def test_read_failure_poisons_the_cache(tmp_path: Path) -> None:
@@ -261,7 +266,7 @@ def test_read_failure_poisons_the_cache(tmp_path: Path) -> None:
     last_file = tmp_path / "checkpoint" / "model-00001.safetensors"
     os.truncate(last_file, last_file.stat().st_size // 2)
     with pytest.raises(RuntimeError, match="model-00001.safetensors at .*: unexpected end of file"):
-        cache.ensure_experts(1, [0, 1, 2, 3], 1)
+        cache.ensure_experts(1, [2, 3], 1)
     with pytest.raises(RuntimeError, match="failed earlier"):
         cache.ensure_experts(0, [0], 2)
 
@@ -325,7 +330,7 @@ def test_real_checkpoint_rows() -> None:
         num_layers=source.num_layers,
         num_experts=source.num_experts,
         top_k=model_config.num_experts_per_tok,
-        cache_size=source.num_experts,
+        cache_size=source.num_layers * model_config.num_experts_per_tok,
         prefill_overlap=False,
         prefill_overlap_min_tokens=128,
         layout=layout,

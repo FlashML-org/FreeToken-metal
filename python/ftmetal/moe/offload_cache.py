@@ -2,8 +2,9 @@
 
 Port of FreeToken moe/offload_cache.py (OffloadMoeCache). Divergences: memory is unified,
 so there are no host banks: one bank per layout role holds cache_size expert rows, filled
-straight from the checkpoint files by _C.ExpertService (in C++: the token-granular LRU
-over the slots, the IO threads, the two prefill windows); slot_of and last_use are shared
+straight from the checkpoint files by _C.ExpertService (in C++: a token-granular LRU per
+MoE layer over its own run of slots, the IO threads, the two prefill windows); the runs are
+sized by a hot-expert table (moe/layer_slots.py), not shared; slot_of and last_use are shared
 arrays the C++ side writes in place; ensure_experts takes the forward's step and returns
 the slots; prefetch_prefill_layer returns the layer's slot map (resident experts keep
 their slots, only the absent are read into the window) instead of copying a whole layer.
@@ -13,9 +14,10 @@ flags, with a watchdog (FreeToken cpu_executor.py) failing an unanswered request
 forward is prepared like an attention backend's metadata: a decode, or a prefill below
 prefill_overlap_min_tokens, looks its experts up (a copy-miss prefill: its misses join the
 LRU, where FreeToken's prefill streams whole layers); a longer prefill reads each layer's
-absent experts into a window one layer ahead, ordered by the host. No slot a step reads may
-be rewritten within the step, since the GPU caches may keep its old row: a forward whose
-experts may not all fit the cache runs as several steps, each its own command buffer.
+absent experts into a window one layer ahead, ordered by the host. A miss evicts a slot of
+its own layer only, which no other layer reads, so a forward never rewrites a slot it has
+read (the GPU caches could keep the old row) as long as every layer's experts fit its run
+at once: max_rows caps a lookup forward's rows, and the scheduler keeps to it.
 """
 
 from __future__ import annotations
@@ -24,11 +26,13 @@ import math
 from typing import Literal
 
 import mlx.core as mx
+import numpy as np
 
 from ftmetal.core import Batch
 from ftmetal.kernel._ext import _C
 from ftmetal.kernel.moe_lookup import moe_lookup
 from ftmetal.layers.quantization.config import BankSpec
+from ftmetal.moe.layer_slots import hottest_experts, split_layer_slots
 from ftmetal.moe.source import ExpertSource
 
 # The instance NVMe saturates near queue depth 4 (io_bench); 8 threads keep it there while
@@ -66,34 +70,40 @@ class OffloadMoeCache:
         source: ExpertSource,
         stall_timeout_s: float = STALL_TIMEOUT_S,
         run_coordinator: bool = True,
+        expert_counts: np.ndarray | None = None,
     ) -> None:
         """A prefill of prefill_overlap_min_tokens or more reads its layers ahead when
-        prefill_overlap is on. Without run_coordinator nobody answers the lookups (a stalled
-        coordinator, for tests); the watchdog fails a request unanswered for stall_timeout_s."""
-        assert not prefill_overlap or cache_size >= 2 * num_experts, (
-            "Prefill overlap borrows two full expert-layer windows from the cache, so "
-            "cache_size must be at least 2 * num_experts"
-        )
-        assert cache_size >= num_experts, "cache_size must hold one layer's experts"
+        prefill_overlap is on. expert_counts int64 [num_layers, num_experts] (a hot-expert
+        table) sizes the layers' runs and picks the experts they start with; None: even runs
+        of the lowest-numbered experts. Without run_coordinator nobody answers the lookups (a
+        stalled coordinator, for tests); the watchdog fails a request unanswered for
+        stall_timeout_s."""
         assert (source.num_layers, source.num_experts) == (num_layers, num_experts), (
             f"the checkpoint has {source.num_layers} MoE layers of {source.num_experts} experts"
+        )
+        split = split_layer_slots(
+            cache_size, num_layers, num_experts, top_k, expert_counts, prefill_overlap
         )
         self.num_layers = num_layers
         self.num_experts = num_experts
         self.top_k = top_k
-        self.cache_size = cache_size
+        self.expert_counts = expert_counts
+        self.layer_slots = split.layer_slots
+        self.window_size = split.window_size
+        # Every layer holds its own experts at once: the cache may come out below cache_size.
+        self.cache_size = split.num_slots
         self.prefill_overlap = prefill_overlap
         self.prefill_overlap_min_tokens = prefill_overlap_min_tokens
-        self.window_slots = 2 * num_experts if prefill_overlap else 0
+        self.window_slots = 2 * split.window_size
         self.layout = layout
         self.banks = {
-            role: mx.zeros((cache_size, *spec.shape), dtype=spec.dtype)
+            role: mx.zeros((self.cache_size, *spec.shape), dtype=spec.dtype)
             for role, spec in layout.items()
         }
         self.slot_of = mx.full((num_layers * num_experts,), -1, dtype=mx.int32)
         # The lookups update these in place and return them; lookup rebinds them, and a
         # command graph replay passes and returns them as pools.
-        self.last_use = mx.zeros((cache_size,), dtype=mx.uint32)
+        self.last_use = mx.zeros((self.cache_size,), dtype=mx.uint32)
         self.mailbox = mx.zeros((_C.MAILBOX_WORDS,), dtype=mx.uint32)
         self.hit_stats = mx.zeros((num_layers, 2), dtype=mx.uint32)
         mx.eval(
@@ -102,8 +112,8 @@ class OffloadMoeCache:
         self.service = _C.ExpertService(
             num_layers,
             num_experts,
-            cache_size,
-            self.window_slots,
+            self.window_size,
+            self.layer_slots,
             self.slot_of,
             self.last_use,
             self.mailbox,
@@ -115,11 +125,10 @@ class OffloadMoeCache:
             stall_timeout_s,
             run_coordinator,
         )
-        # The forward being built (prepare): its mode and real rows, the layers per step, the
-        # last step (from 1) and moe_step int32 [2] = (real rows, step), the lookups' input.
+        # The forward being built (prepare): its mode and real rows, the last step (from 1)
+        # and moe_step int32 [2] = (real rows, step), the lookups' input.
         self.mode: MoeForwardMode = "decode"
         self.num_rows = 0
-        self.layers_per_step = num_layers
         self.step = 0
         self.moe_step = mx.zeros((2,), dtype=mx.int32)
         # An overlap prefill's slot map of each prefetched layer, and the MoE output of the
@@ -131,11 +140,25 @@ class OffloadMoeCache:
     def nbytes(self) -> int:
         return sum(bank.nbytes for bank in self.banks.values())
 
+    @property
+    def max_rows(self) -> int | None:
+        """The most rows a lookup forward may take: then even all-distinct experts fit every
+        layer's run at once; None: every run holds all its layer's experts."""
+        smallest = min(self.layer_slots)
+        return None if smallest >= self.num_experts else smallest // self.top_k
+
+    def fits_lookups(self, num_rows: int) -> bool:
+        return self.max_rows is None or num_rows <= self.max_rows
+
     def prepare(self, batch: Batch) -> None:
-        """Choose the forward's mode and start its first step; before the model builds it."""
+        """Choose the forward's mode and start its step; before the model builds it. A prefill
+        too long for the runs reads its layers ahead whatever its length."""
         if batch.is_decode:
             self.begin_lookups("decode", batch.size)
-        elif self.prefill_overlap and batch.num_tokens >= self.prefill_overlap_min_tokens:
+        elif self.prefill_overlap and (
+            batch.num_tokens >= self.prefill_overlap_min_tokens
+            or not self.fits_lookups(batch.num_tokens)
+        ):
             self.mode = "overlap"
         else:
             self.begin_lookups("copy_miss", batch.num_tokens)
@@ -145,37 +168,24 @@ class OffloadMoeCache:
         self.begin_lookups("decode", 0)
 
     def begin_lookups(self, mode: MoeForwardMode, num_rows: int) -> None:
+        if not self.fits_lookups(num_rows):
+            raise RuntimeError(
+                f"a {mode} forward of {num_rows} rows may route more experts than the smallest "
+                f"layer's {min(self.layer_slots)} slots hold; the scheduler caps rows at "
+                f"{self.max_rows}"
+            )
         self.mode = mode
         self.num_rows = num_rows
-        self.layers_per_step = self.max_layers_per_step(num_rows)
         self.advance_step()
-
-    def max_layers_per_step(self, num_rows: int) -> int:
-        """The layers one step of num_rows real rows may take: a slot the step reads keeps its
-        expert until the step ends, so the step's layers must hold their worst case at once."""
-        worst_experts = min(self.num_experts, num_rows * self.top_k)
-        if worst_experts == 0:
-            return self.num_layers
-        else:
-            return min(self.num_layers, self.cache_size // worst_experts)
-
-    def fits_one_step(self, num_rows: int) -> bool:
-        """Whether a decode of num_rows real rows runs as one step, as a graph replay must."""
-        return self.max_layers_per_step(num_rows) == self.num_layers
 
     def advance_step(self) -> None:
         assert self.step < MAX_STEP, "the step counter outgrew moe_step's int32"
         self.step += 1
         self.moe_step = mx.array([self.num_rows, self.step], dtype=mx.int32)
 
-    def lookup_slots(self, layer_id: int, topk_ids: mx.array, hidden_states: mx.array) -> mx.array:
+    def lookup_slots(self, layer_id: int, topk_ids: mx.array) -> mx.array:
         """The bank slot int32 [T, top_k] of each routed pair topk_ids of a decode or copy-miss
-        layer whose input is hidden_states. A layer that starts a new step evaluates the layers
-        before first, ending their step with their command buffer."""
-        if layer_id > 0 and layer_id % self.layers_per_step == 0:
-            mx.eval(hidden_states)
-            self.advance_step()
-            self.arm()
+        layer."""
         if self.mode == "decode":
             kind = _C.MoeLookupKind.DECODE
         else:
@@ -214,13 +224,11 @@ class OffloadMoeCache:
             self.prefill_previous_output = output
 
     def fill_initial(self) -> None:
-        """Read the lowest-numbered experts of every layer into the slots outside the windows."""
-        flat_ids = [
-            layer_id * self.num_experts + expert
-            for expert in range(self.num_experts)
-            for layer_id in range(self.num_layers)
-        ]
-        self.service.fill_initial(flat_ids[: self.cache_size - self.window_slots])
+        """Read each layer's most routed experts (the lowest-numbered without a hot-expert
+        table) into its run."""
+        self.service.fill_initial(
+            hottest_experts(self.layer_slots, self.num_experts, self.expert_counts)
+        )
 
     def ensure_experts(self, layer_id: int, expert_ids: list[int], step: int) -> list[int]:
         """The slot of each of the layer's distinct experts at step (from 1); the misses are

@@ -337,8 +337,10 @@ def test_gemma4_refuses_moe_offload() -> None:
 NON_EXPERT_BYTES = 1_378_867_456
 EXPERT_BYTES = 18_119_393_280
 EXPERT_SLOT_BYTES = 1_769_472
+NUM_LAYERS = 40
 NUM_EXPERTS = 256
-TOTAL_EXPERTS = 40 * NUM_EXPERTS
+TOP_K = 8
+TOTAL_EXPERTS = NUM_LAYERS * NUM_EXPERTS
 
 
 class OffloadBudgetCase(NamedTuple):
@@ -425,39 +427,40 @@ OFFLOAD_BUDGET_CASES = [
             "kv pages        1.39 GiB",
         ],
     ),
-    # The floors: the two prefill overlap windows, or one layer's experts without them.
+    # The floors: one token's experts per layer (40 x 8) plus, with prefill overlap, the two
+    # windows those runs need (2 x 248).
     OffloadBudgetCase(
-        0.17,
+        0.185,
         0,
         None,
         True,
         "offload",
-        512,
+        816,
         [
-            "budget          6.36 GiB",
+            "budget          6.93 GiB",
             "weights         1.28 GiB",
-            "experts         0.91 GiB",
+            "experts         1.41 GiB",
             "gdn slots       1.51 GiB",
             "activations     2.62 GiB",
             "graphs          0.01 GiB",
-            "kv pages        0.03 GiB",
+            "kv pages        0.09 GiB",
         ],
     ),
     OffloadBudgetCase(
-        0.23,
+        0.235,
         0,
         None,
         False,
         "offload",
-        256,
+        320,
         [
-            "budget          8.61 GiB",
+            "budget          8.80 GiB",
             "weights         1.28 GiB",
-            "experts         0.48 GiB",
+            "experts         0.59 GiB",
             "gdn slots       1.51 GiB",
             "activations     5.25 GiB",
             "graphs          0.01 GiB",
-            "kv pages        0.07 GiB",
+            "kv pages        0.15 GiB",
         ],
     ),
     # This box keeps every expert resident under auto; an offload's cache-auto takes them all.
@@ -516,7 +519,9 @@ def offload_budget(
         reserve_pages=reserve_pages,
         slot_bytes=EXPERT_SLOT_BYTES,
         staging_bytes=STAGING_BYTES,
+        num_layers=NUM_LAYERS,
         num_experts=NUM_EXPERTS,
+        top_k=TOP_K,
         total_experts=TOTAL_EXPERTS,
         prefill_overlap=config.moe_prefill_overlap,
     )
@@ -547,8 +552,8 @@ def test_qwen3_6_offload_budget(case: OffloadBudgetCase) -> None:
 
 # (EngineConfig fields, the refusal)
 REFUSED_OFFLOAD_CASES: list[tuple[dict[str, float | int | bool | None], str]] = [
-    ({"moe_cache_size": 300}, "cannot hold the two prefill overlap windows: give at least 512"),
-    ({"moe_cache_size": 200, "moe_prefill_overlap": False}, "give at least 256 slots$"),
+    ({"moe_cache_size": 300}, "and the two prefill overlap windows: give at least 816"),
+    ({"moe_cache_size": 200, "moe_prefill_overlap": False}, "give at least 320 slots$"),
     ({"memory_ratio": 0.15, "moe_prefill_overlap": False}, "does not fit the memory budget"),
     ({"moe_cache_size": 512, "moe_cache_rate": 0.5}, "moe_cache_size and moe_cache_rate are"),
     ({"moe_cache_rate": 0.5, "moe_cache_auto": True}, "moe_cache_rate and moe_cache_auto are"),

@@ -173,11 +173,7 @@ class GraphRunner:
             self.moe_offload_cache.set_table_arrays(arrays[-num_tables:])
 
     def can_replay(self, batch: Batch) -> bool:
-        return (
-            batch.is_decode
-            and batch.size <= self.max_graph_bs
-            and (self.moe_offload_cache is None or self.moe_offload_cache.fits_one_step(batch.size))
-        )
+        return batch.is_decode and batch.size <= self.max_graph_bs
 
     def replay(self, batch: Batch) -> mx.array:
         """Logits [batch.size, vocab] of a padded decode batch; the pools are rebound."""

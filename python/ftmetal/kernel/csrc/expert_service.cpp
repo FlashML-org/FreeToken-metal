@@ -43,8 +43,8 @@ std::string error_text(int error_number) {
 ExpertService::ExpertService(
     int num_layers,
     int num_experts,
-    int num_slots,
-    int window_slots,
+    int window_size,
+    const std::vector<int32_t>& layer_slots,
     mx::array slot_of,
     mx::array last_use,
     mx::array mailbox,
@@ -55,10 +55,9 @@ ExpertService::ExpertService(
     int io_threads,
     double stall_timeout_s,
     bool run_coordinator)
-    : lru_(num_layers, num_experts, num_slots, window_slots, std::move(slot_of), std::move(last_use)),
+    : lru_(num_layers, num_experts, window_size, layer_slots, std::move(slot_of), std::move(last_use)),
       num_layers_(num_layers),
       num_experts_(num_experts),
-      window_slots_(window_slots),
       banks_(std::move(banks)),
       files_(files),
       segments_(std::move(segments)),
@@ -87,11 +86,11 @@ ExpertService::ExpertService(
   for (size_t b = 0; b < banks_.size(); ++b) {
     const mx::array& bank = banks_[b];
     std::string name = "bank " + std::to_string(b);
-    if (bank.ndim() < 1 || bank.shape(0) != num_slots) {
+    if (bank.ndim() < 1 || bank.shape(0) != lru_.num_slots()) {
       throw std::invalid_argument("ExpertService: " + name + " must be [num_slots, ...]");
     }
     bank_data_.push_back(static_cast<uint8_t*>(shared_data(bank, name)));
-    bank_row_bytes_.push_back(static_cast<int64_t>(bank.nbytes()) / num_slots);
+    bank_row_bytes_.push_back(static_cast<int64_t>(bank.nbytes()) / lru_.num_slots());
   }
   // Each layer's segments must tile every bank row exactly, so a read expert is whole.
   for (int layer_id = 0; layer_id < num_layers; ++layer_id) {
@@ -389,13 +388,6 @@ SlotAssignment ExpertService::serve(
   if (num_loads == 0) {
     return assignment;
   }
-  if (std::any_of(assignment.loads.begin(), assignment.loads.end(), [this](const ExpertLoad& load) {
-        return load.second < window_slots_;
-      })) {
-    for (PrefillWindow& window : windows_) {
-      window.layer_id = -1;
-    }
-  }
   stats_.requests[layer_id] += 1;
   auto started = std::chrono::steady_clock::now();
   submit(ensure_batch_, layer_id, assignment.loads);
@@ -421,7 +413,6 @@ void ExpertService::begin_prefill() {
     }
     window.layer_id = -1;
   }
-  lru_.invalidate_windows();
 }
 
 std::vector<int32_t> ExpertService::prefetch_prefill_layer(int layer_id) {

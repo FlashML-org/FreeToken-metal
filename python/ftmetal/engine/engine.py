@@ -60,6 +60,7 @@ from ftmetal.models.blocks import BaseLLMModel, SupportsMultimodal
 from ftmetal.models.config import MoeStrategy
 from ftmetal.models.loader import WeightRules, checkpoint_bytes, load_weights
 from ftmetal.models.register import MODEL_REGISTRY, create_model, model_weight_rules
+from ftmetal.moe.layer_slots import load_expert_counts
 from ftmetal.moe.offload_cache import STAGING_BYTES, OffloadMoeCache, slot_bytes
 from ftmetal.moe.source import ExpertSource
 
@@ -252,7 +253,9 @@ class Engine:
                 reserve_pages=kv_reserve_pages(config.kv_reserve_tokens, config.page_size),
                 slot_bytes=row_bytes,
                 staging_bytes=STAGING_BYTES,
+                num_layers=len(moe_layers),
                 num_experts=model_config.num_experts,
+                top_k=model_config.num_experts_per_tok,
                 total_experts=total_experts,
                 prefill_overlap=prefill_overlap,
             )
@@ -313,6 +316,23 @@ class Engine:
         self.moe_offload_cache: OffloadMoeCache | None = None
         if expert_source is not None:
             started = time.perf_counter()
+            counts = None
+            if config.moe_layer_slots == "hot":
+                table = load_expert_counts(
+                    config.model_path,
+                    model_config.model_type,
+                    len(moe_layers),
+                    model_config.num_experts,
+                    model_config.hidden_size,
+                )
+                if table is None:
+                    logger.warning(
+                        "MoE offload: no hot-expert table for this model (none in its directory, "
+                        "none shipped), so every layer gets the same number of slots"
+                    )
+                else:
+                    counts, table_path = table
+                    logger.info(f"MoE offload: layer slots from the hot-expert table {table_path}")
             self.moe_offload_cache = OffloadMoeCache(
                 num_layers=len(moe_layers),
                 num_experts=model_config.num_experts,
@@ -322,6 +342,12 @@ class Engine:
                 prefill_overlap_min_tokens=config.moe_prefill_overlap_min_tokens,
                 layout=moe_layers[0].layout(),
                 source=expert_source,
+                expert_counts=counts,
+            )
+            cache = self.moe_offload_cache
+            logger.info(
+                f"MoE offload: layer slots {min(cache.layer_slots)}-{max(cache.layer_slots)}, "
+                f"windows of {cache.window_size}, at most {cache.max_rows} rows per lookup forward"
             )
             self.moe_offload_cache.fill_initial()
             self.moe_offload_cache.probe()

@@ -1,10 +1,13 @@
-// SlotLru: the bookkeeping of the routed-expert slot cache, a token-granular LRU over S
-// bank slots shared by every MoE layer. An expert is named by its flat id
+// SlotLru: the bookkeeping of the routed-expert slot cache. Each MoE layer owns a run of
+// bank slots and keeps a token-granular LRU over them. An expert is named by its flat id
 // layer_id * num_experts + expert. slot_of [num_layers * num_experts] int32 (-1: absent)
 // and last_use [num_slots] uint32 (the step a slot was last used, 0: never) are mx.arrays
 // the GPU reads, written here in place through their data pointers; id_of_slot (-1: free)
-// lives only here. Slots [0, window_slots) are the two prefill windows of num_experts
-// slots each (window_slots 0: none); between prefills they are ordinary slots.
+// lives only here. Slots [0, 2 * window_size) are the two prefill windows (window_size 0:
+// none), which hold an overlap prefill layer's absent experts and nothing else; the layers'
+// runs follow, layer 0 first, layer_slots[l] slots each. A miss evicts a slot of its own
+// layer, which no other layer reads: a step that resolves each layer once (one command
+// buffer) never rewrites a slot it has read, whatever the victim order.
 #pragma once
 
 #include <compare>
@@ -38,24 +41,26 @@ class SlotLru {
   SlotLru(
       int num_layers,
       int num_experts,
-      int num_slots,
-      int window_slots,
+      int window_size,
+      const std::vector<int32_t>& layer_slots,
       mx::array slot_of,
       mx::array last_use);
 
-  // Empty the cache, then place flat_ids in slots window_slots, window_slots + 1, ...;
+  // 2 * window_size + the sum of layer_slots.
+  int num_slots() const {
+    return num_slots_;
+  }
+
+  // Empty the cache, then place each of flat_ids in the next slot of its layer's run;
   // returns their slots.
   std::vector<int32_t> fill(const std::vector<int32_t>& flat_ids);
 
   // The slot of each of one layer's distinct experts at step (from 1), loading the misses
-  // into the least recently used slots that this call does not use.
+  // into the least recently used slots of the layer's run that this call does not use.
   SlotAssignment resolve(int layer_id, const std::vector<int32_t>& expert_ids, uint32_t step);
 
-  // Drop every expert held in a window slot.
-  void invalidate_windows();
-
-  // Every expert of the layer: its slot when resident outside the windows, else its slot in
-  // window layer_id % 2, which the loads list. The LRU is not touched.
+  // Every expert of the layer: its slot when resident, else the next slot of window
+  // layer_id % 2, which the loads list. The LRU is not touched.
   SlotAssignment prefill_slot_map(int layer_id) const;
 
  private:
@@ -73,8 +78,10 @@ class SlotLru {
 
   int num_layers_;
   int num_experts_;
+  int window_size_;
+  // layer_base_[l]: the first slot of layer l's run; layer_base_[num_layers]: num_slots.
+  std::vector<int32_t> layer_base_;
   int num_slots_;
-  int window_slots_;
   mx::array slot_of_;
   mx::array last_use_;
   int32_t* slot_of_data_;

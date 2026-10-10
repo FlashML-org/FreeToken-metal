@@ -283,6 +283,15 @@ class PrefillManager:
             )
         )
 
+    @property
+    def pending_tokens(self) -> int:
+        """The prompt tokens still to prefill, before any prefix-cache hit."""
+        return sum(
+            pending.input_len
+            - (0 if pending.chunked_req is None else pending.chunked_req.device_len)
+            for pending in self.pending_list
+        )
+
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
         if not self.pending_list:
             return None

@@ -38,6 +38,9 @@ package-dir = { "" = "python" }
 [tool.setuptools.packages.find]
 where = ["python"]
 
+[tool.setuptools.package-data]
+"ftmetal.moe" = ["hot_experts/*.json"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py313"

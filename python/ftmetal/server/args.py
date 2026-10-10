@@ -395,6 +395,14 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         help="the MoE offload cache's eviction policy",
     )
     parser.add_argument(
+        "--moe-layer-slots",
+        choices=["hot", "equal"],
+        default=ServerArgs.moe_layer_slots,
+        help="how the MoE offload cache splits its slots among the layers: by the model's "
+        "hot-expert table (expert_hot_rank.json in its directory, else the one shipped for the "
+        "model) or evenly",
+    )
+    parser.add_argument(
         "--disable-moe-prefill-overlap",
         action="store_false",
         dest="moe_prefill_overlap",
@@ -565,6 +573,7 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         moe_cache_auto=moe_cache_auto,
         kv_reserve_tokens=namespace.kv_reserve_tokens,
         moe_cache_policy=namespace.moe_cache_policy,
+        moe_layer_slots=namespace.moe_layer_slots,
         moe_prefill_overlap=namespace.moe_prefill_overlap,
         mm=MultimodalConfig(
             disabled_encoders=frozenset(disabled_encoders),

@@ -68,16 +68,17 @@ class SlotLru:
         self,
         num_layers: int,
         num_experts: int,
-        num_slots: int,
-        window_slots: int,
+        window_size: int,
+        layer_slots: list[int],
         slot_of: mx.array,
         last_use: mx.array,
     ) -> None: ...
+    @property
+    def num_slots(self) -> int: ...
     def fill(self, flat_ids: list[int]) -> list[int]: ...
     def resolve(
         self, layer_id: int, expert_ids: list[int], step: int
     ) -> tuple[list[int], list[tuple[int, int]]]: ...
-    def invalidate_windows(self) -> None: ...
     def prefill_slot_map(self, layer_id: int) -> tuple[list[int], list[tuple[int, int]]]: ...
 
 class ExpertServiceStats:
@@ -105,8 +106,8 @@ class ExpertService:
         self,
         num_layers: int,
         num_experts: int,
-        num_slots: int,
-        window_slots: int,
+        window_size: int,
+        layer_slots: list[int],
         slot_of: mx.array,
         last_use: mx.array,
         mailbox: mx.array,

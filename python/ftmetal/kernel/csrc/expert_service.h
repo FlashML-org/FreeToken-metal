@@ -94,16 +94,17 @@ struct PrefillWindow {
 
 class ExpertService {
  public:
-  // mailbox uint32 [MAILBOX_WORDS] and hit_stats uint32 [num_layers, 2] are the lookups';
-  // banks: one evaluated row-contiguous [num_slots, ...] array per bank; segments:
+  // window_size and layer_slots lay out the slots (SlotLru); mailbox uint32 [MAILBOX_WORDS]
+  // and hit_stats uint32 [num_layers, 2] are the lookups'; banks: one evaluated
+  // row-contiguous [num_slots, ...] array per bank; segments:
   // num_layers * segments-per-layer entries, layer-major. The watchdog fails a request left
   // unanswered for stall_timeout_s; without run_coordinator nobody answers (a stalled
   // coordinator, for tests).
   ExpertService(
       int num_layers,
       int num_experts,
-      int num_slots,
-      int window_slots,
+      int window_size,
+      const std::vector<int32_t>& layer_slots,
       mx::array slot_of,
       mx::array last_use,
       mx::array mailbox,
@@ -128,7 +129,7 @@ class ExpertService {
       const std::vector<int32_t>& expert_ids,
       uint32_t step);
 
-  // Drain the windows' reads, drop the experts the window slots hold, forget the windows.
+  // Drain the windows' reads and forget the layers they hold.
   void begin_prefill();
 
   // Start reading the layer's non-resident experts into window layer_id % 2; returns its
@@ -168,7 +169,6 @@ class ExpertService {
   SlotLru lru_;
   int num_layers_;
   int num_experts_;
-  int window_slots_;
   std::vector<mx::array> banks_;
   std::vector<uint8_t*> bank_data_;
   std::vector<int64_t> bank_row_bytes_;

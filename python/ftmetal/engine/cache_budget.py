@@ -24,6 +24,7 @@ from ftmetal.kvcache.base import PoolCost
 from ftmetal.models.config import MoeStrategy
 from ftmetal.models.loader import config_int
 from ftmetal.models.qwen3_5_moe.vision import MLP_ROWS
+from ftmetal.moe.layer_slots import min_cache_size
 
 logger = logging.getLogger(__name__)
 
@@ -185,16 +186,23 @@ def resolve_moe_cache_size(
     reserve_pages: int,
     slot_bytes: int,
     staging_bytes: int,
+    num_layers: int,
     num_experts: int,
+    top_k: int,
     total_experts: int,
     prefill_overlap: bool,
 ) -> int:
-    """The offload cache's slots: requested when set (at least num_experts, twice that with
-    prefill overlap's two windows), else --moe-cache-auto: what the paged pools of report
-    (which has no experts line) leave past reserve_pages, from that floor to every expert."""
-    floor = 2 * num_experts if prefill_overlap else num_experts
+    """The offload cache's slots: requested when set (at least one token's experts per layer,
+    plus two full windows with prefill overlap), else --moe-cache-auto: what the paged pools
+    of report (which has no experts line) leave past reserve_pages, from that floor to every
+    expert."""
+    floor = min_cache_size(num_layers, num_experts, top_k, prefill_overlap)
     if requested > 0 and requested < floor:
-        reason = "the two prefill overlap windows" if prefill_overlap else "one layer's experts"
+        reason = (
+            "one token's experts per layer and the two prefill overlap windows"
+            if prefill_overlap
+            else "one token's experts per layer"
+        )
         hint = " or pass --disable-moe-prefill-overlap" if prefill_overlap else ""
         raise ValueError(
             f"--moe-cache-size {requested} cannot hold {reason}: give at least {floor} slots{hint}"

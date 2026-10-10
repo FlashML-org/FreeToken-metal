@@ -1,11 +1,12 @@
-"""SlotLru against offload_harness's reference of the offload simulation's LRU.
+"""SlotLru against offload_harness's reference of its per-layer LRUs.
 
 SlotLru must return the same slots and loads on every call and leave the same slot_of and
-last_use, and no load may take a slot one of the same call's hits uses. A call that would
-evict a slot used in its own step must raise, as must one naming more experts than the
-cache has slots. The windows: free window slots go first, invalidate_windows drops what
-they hold, and prefill_slot_map keeps resident experts and sends the others to the
-layer's window.
+last_use, no load may take a slot one of the same call's hits uses, and a miss takes a slot
+of its own layer's run only. A call that would evict a slot its layer used in the same step
+must raise, as must one naming more experts than the layer's run holds, and a fill beyond a
+run. The windows: prefill_slot_map keeps resident experts and sends the others, in expert
+order, to the next slots of window layer_id % 2, and refuses more absent experts than a
+window holds.
 """
 
 from __future__ import annotations
@@ -37,13 +38,22 @@ def random_script(
     )
 
 
+def first_experts(num_experts: int, layer_slots: tuple[int, ...]) -> tuple[int, ...]:
+    """Flat ids of each layer's lowest-numbered experts filling its run."""
+    return tuple(
+        layer_id * num_experts + expert
+        for layer_id, num_slots in enumerate(layer_slots)
+        for expert in range(num_slots)
+    )
+
+
 @dataclass(frozen=True)
 class Case:
     num_layers: int
     num_experts: int
-    num_slots: int
-    window_slots: int
-    # Flat ids filled from slot window_slots on.
+    window_size: int
+    layer_slots: tuple[int, ...]
+    # Flat ids filled, each into the next slot of its layer's run.
     fill: tuple[int, ...]
     script: tuple[Step, ...]
     name: str
@@ -53,13 +63,13 @@ class Case:
 
 
 CASES = [
-    # Layer-interleaved fill as the simulation's; misses evict the never-used ids first.
+    # Misses evict the layer's never-used ids first.
     Case(
         2,
         4,
-        5,
         0,
-        (0, 4, 1, 5, 2),
+        (3, 2),
+        (0, 4, 1, 5),
         (((0, (0, 3)), (1, (1, 2))), ((0, (3, 1)), (1, (0, 3)))),
         "basic",
     ),
@@ -67,41 +77,61 @@ CASES = [
     Case(
         1,
         4,
-        3,
         0,
+        (3,),
         (0, 1, 2),
         (((0, (0,)),), ((0, (1,)),), ((0, (2,)),), ((0, (0, 3)),)),
         "hit-masked",
     ),
-    # Ties on last use break by the lowest flat id, wherever its slot is.
-    Case(2, 3, 4, 0, (5, 1, 3, 0), (((1, (1,)),), ((0, (2,)), (1, (2,)))), "lowest-id-tie"),
+    # Ties on last use break by the lowest flat id, wherever its slot is in the run.
+    Case(2, 3, 0, (2, 2), (1, 0, 5, 3), (((1, (1,)),), ((0, (2,)), (1, (2,)))), "lowest-id-tie"),
     # A free slot goes before every resident expert, even one never used.
-    Case(2, 4, 6, 0, (0, 4), (((0, (1, 2)), (1, (1,))), ((1, (2, 3)),)), "free-first"),
-    # Free window slots are taken first, in slot order.
-    Case(2, 2, 6, 4, (0, 2), (((0, (0, 1)), (1, (1,))), ((0, (1,)), (1, (0, 1)))), "windows"),
+    Case(2, 4, 0, (3, 3), (0, 4), (((0, (1, 2)), (1, (1,))), ((1, (2, 3)),)), "free-first"),
+    # Layer 0's slots are the least recently used, yet layer 1's misses take its own.
+    Case(
+        2, 4, 0, (2, 2), (0, 1, 4, 5), (((0, (0, 1)),), ((1, (0, 1)),), ((1, (2, 3)),)), "own-run"
+    ),
     # Every slot changes hands many times.
-    Case(3, 8, 12, 0, tuple(range(12)), random_script(0, 200, 3, 8, 3), "random-200"),
-    Case(4, 16, 72, 32, tuple(range(40)), random_script(1, 100, 4, 16, 4), "random-windows"),
+    Case(
+        3,
+        8,
+        0,
+        (4, 4, 4),
+        first_experts(8, (4, 4, 4)),
+        random_script(0, 200, 3, 8, 3),
+        "random-200",
+    ),
+    Case(
+        4,
+        16,
+        6,
+        (10, 12, 8, 10),
+        first_experts(16, (10, 12, 8, 10)),
+        random_script(1, 100, 4, 16, 4),
+        "random-windows",
+    ),
 ]
 
 
 def make_lru(
-    num_layers: int, num_experts: int, num_slots: int, window_slots: int
+    num_layers: int, num_experts: int, window_size: int, layer_slots: tuple[int, ...]
 ) -> tuple[_C.SlotLru, mx.array, mx.array]:
+    num_slots = 2 * window_size + sum(layer_slots)
     slot_of = mx.full((num_layers * num_experts,), -1, dtype=mx.int32)
     last_use = mx.zeros((num_slots,), dtype=mx.uint32)
     mx.eval(slot_of, last_use)
-    lru = _C.SlotLru(num_layers, num_experts, num_slots, window_slots, slot_of, last_use)
+    lru = _C.SlotLru(num_layers, num_experts, window_size, list(layer_slots), slot_of, last_use)
+    assert lru.num_slots == num_slots
     return lru, slot_of, last_use
 
 
 def check(case: Case) -> None:
     lru, slot_of, last_use = make_lru(
-        case.num_layers, case.num_experts, case.num_slots, case.window_slots
+        case.num_layers, case.num_experts, case.window_size, case.layer_slots
     )
-    reference = ReferenceLru(case.num_experts, case.num_slots, case.window_slots, case.fill)
+    reference = ReferenceLru(case.num_experts, case.window_size, list(case.layer_slots), case.fill)
     filled = lru.fill(list(case.fill))
-    assert filled == [case.window_slots + j for j in range(len(case.fill))]
+    assert filled == [reference.id_of_slot.index(flat_id) for flat_id in case.fill]
     for step, calls in enumerate(case.script, start=1):
         for layer_id, expert_ids in calls:
             slots, loads = lru.resolve(layer_id, list(expert_ids), step)
@@ -109,6 +139,8 @@ def check(case: Case) -> None:
             loaded = {expert: slot for expert, slot in loads}
             hit_slots = {slot for expert, slot in zip(expert_ids, slots) if expert not in loaded}
             assert not hit_slots & set(loaded.values()), (step, layer_id)
+            run = range(reference.bases[layer_id], reference.bases[layer_id + 1])
+            assert all(slot in run for slot in slots), (step, layer_id)
     expected_slot_of = [-1] * (case.num_layers * case.num_experts)
     for slot, flat_id in enumerate(reference.id_of_slot):
         if flat_id >= 0:
@@ -122,28 +154,25 @@ def test_matches_reference_lru(case: Case) -> None:
     check(case)
 
 
-def test_too_small_cache_raises() -> None:
-    lru, _, _ = make_lru(2, 4, 2, 0)
+def test_capacity_errors() -> None:
+    lru, _, _ = make_lru(2, 4, 0, (2, 2))
     lru.resolve(0, [0, 1], 1)
-    with pytest.raises(RuntimeError, match="used at step 1"):
-        lru.resolve(1, [0], 1)
-    with pytest.raises(RuntimeError, match="cannot hold"):
+    with pytest.raises(RuntimeError, match="would evict a slot it used at step 1"):
+        lru.resolve(0, [2], 1)
+    with pytest.raises(RuntimeError, match="2 slots cannot hold its 3 experts"):
         lru.resolve(1, [0, 1, 2], 2)
-    assert lru.resolve(1, [0, 1], 2)[1] == [(0, 0), (1, 1)]
+    assert lru.resolve(1, [0, 1], 2)[1] == [(0, 2), (1, 3)]
+    with pytest.raises(ValueError, match="more experts than its 2 slots"):
+        lru.fill([0, 1, 2])
 
 
-def test_windows() -> None:
-    lru, slot_of, last_use = make_lru(2, 2, 6, 4)
-    lru.fill([0, 2])
-    assert lru.resolve(0, [0, 1], 1) == ([4, 0], [(1, 0)])
-    assert lru.resolve(1, [1], 1) == ([1], [(1, 1)])
-    with pytest.raises(RuntimeError, match="window slot"):
-        lru.prefill_slot_map(0)
-    lru.invalidate_windows()
-    assert np.array(slot_of).tolist() == [4, -1, 5, -1]
-    assert np.array(last_use).tolist() == [0, 0, 0, 0, 1, 0]
-    assert lru.prefill_slot_map(0) == ([4, 1], [(1, 1)])
-    assert lru.prefill_slot_map(1) == ([5, 3], [(1, 3)])
-    without_windows, _, _ = make_lru(2, 2, 6, 0)
-    with pytest.raises(RuntimeError, match="no prefill windows"):
-        without_windows.prefill_slot_map(0)
+def test_prefill_slot_map() -> None:
+    # Windows [0, 3) and [3, 6); layer 0's run [6, 8), layer 1's [8, 9).
+    lru, _, _ = make_lru(2, 4, 3, (2, 1))
+    lru.fill([0, 1, 4])
+    assert lru.prefill_slot_map(0) == ([6, 7, 0, 1], [(2, 0), (3, 1)])
+    assert lru.prefill_slot_map(1) == ([8, 3, 4, 5], [(1, 3), (2, 4), (3, 5)])
+    too_small, _, _ = make_lru(1, 4, 1, (2,))
+    too_small.fill([0, 1])
+    with pytest.raises(RuntimeError, match="windows of 1 slots cannot hold layer 0's 2 absent"):
+        too_small.prefill_slot_map(0)

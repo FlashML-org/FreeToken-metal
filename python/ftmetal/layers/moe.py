@@ -252,7 +252,7 @@ class OffloadMoELayer(MoELayer):
         if cache.mode == "overlap":
             return self.prefill_forward(cache, hidden_states, topk_weights, topk_ids)
         else:
-            slots = cache.lookup_slots(self.moe_layer_id, topk_ids, hidden_states)
+            slots = cache.lookup_slots(self.moe_layer_id, topk_ids)
             x = mx.expand_dims(hidden_states, (-2, -3))
             y = self.glu(x, lambda projection, h: self.gather(cache, projection, h, slots))
             return (y.squeeze(-2) * topk_weights[..., None]).sum(axis=-2)

@@ -109,7 +109,21 @@ class Scheduler:
         # The engine's MoE offload cache, for the idle line's hit rate; None while resident.
         self.moe_offload_cache = self.engine.moe_offload_cache
         self.eos_token_ids = eos_token_ids
-        self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
+        # An offload cache holds every layer's experts of a lookup forward at once only up to
+        # max_rows rows: the decode rows are capped through the requests admitted, a looked-up
+        # prefill's tokens through its budget (prefill_budget).
+        max_admitted = config.max_running_req
+        cache = self.moe_offload_cache
+        if cache is not None and cache.max_rows is not None and cache.max_rows < max_admitted:
+            logger.warning(
+                f"MoE offload: {cache.max_rows} requests run at once, not "
+                f"{config.max_running_req}: a decode of more rows could route more experts than "
+                f"the smallest layer's {min(cache.layer_slots)} cache slots hold"
+            )
+            max_admitted = cache.max_rows
+        self.table_manager = TableManager(
+            config.max_running_req, self.engine.page_table, max_admitted=max_admitted
+        )
         assert self.engine.dummy_req.table_idx == self.table_manager.scratch_row
         self.cache_manager = CacheManager(
             self.engine.num_pages,
@@ -344,7 +358,7 @@ class Scheduler:
 
     def schedule_next_batch(self) -> ForwardInput | None:
         batch = (
-            self.prefill_manager.schedule_next_batch(self.config.max_extend_tokens)
+            self.prefill_manager.schedule_next_batch(self.prefill_budget())
             or self.decode_manager.schedule_next_batch()
         )
         if batch is None:
@@ -356,6 +370,21 @@ class Scheduler:
             for uid, prompt_tokens, cached_tokens in batch.prompt_admissions
         )
         return forward_input
+
+    def prefill_budget(self) -> int:
+        """max_extend_tokens, or with an offload cache, for a prefill that will look its experts
+        up (no prefill overlap, or fewer pending tokens than its threshold), the cache's
+        max_rows; the cache reads a longer one's layers ahead whatever its length."""
+        budget = self.config.max_extend_tokens
+        cache = self.moe_offload_cache
+        if cache is None or cache.max_rows is None:
+            return budget
+        if (
+            cache.prefill_overlap
+            and self.prefill_manager.pending_tokens >= cache.prefill_overlap_min_tokens
+        ):
+            return budget
+        return min(budget, cache.max_rows)
 
     def prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)

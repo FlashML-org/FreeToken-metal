@@ -103,6 +103,9 @@ class EngineConfig:
     # KV tokens auto keeps before the experts: auto's fused fit check and cache sizing.
     kv_reserve_tokens: int = 8192
     moe_cache_policy: Literal["lru"] = "lru"
+    # How the offload cache sizes each MoE layer's run of slots: by the model's hot-expert
+    # table (its directory's, else the shipped one; even without one), or evenly.
+    moe_layer_slots: Literal["hot", "equal"] = "hot"
     # Long prefills read each layer's absent experts ahead into two windows of the cache.
     moe_prefill_overlap: bool = True
     moe_prefill_overlap_min_tokens: int = field(

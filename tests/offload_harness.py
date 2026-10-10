@@ -31,9 +31,9 @@ from ftmetal.moe.source import ExpertSource
 
 Naming = Literal["qwen", "gemma4"]
 PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
-# What a cache built here tells a forward's prepare, which these caches never see: the
-# lookups take any top-k.
-TOP_K = 8
+# What a cache built here tells a forward's prepare (which these caches never see) and the
+# slot split (each layer's run holds at least this many): the lookups take any top-k.
+TOP_K = 2
 PREFILL_OVERLAP_MIN_TOKENS = 128
 
 
@@ -177,14 +177,22 @@ def build_cache(
 
 
 class ReferenceLru:
+    """SlotLru's victim choice, slot by slot: per-layer runs after two windows."""
+
     def __init__(
-        self, num_experts: int, num_slots: int, window_slots: int, fill: tuple[int, ...]
+        self, num_experts: int, window_size: int, layer_slots: list[int], fill: tuple[int, ...]
     ) -> None:
         self.num_experts = num_experts
-        self.id_of_slot = [-1] * num_slots
-        self.last_use = [0] * num_slots
-        for j, flat_id in enumerate(fill):
-            self.id_of_slot[window_slots + j] = flat_id
+        self.bases = [2 * window_size]
+        for num_slots in layer_slots:
+            self.bases.append(self.bases[-1] + num_slots)
+        self.id_of_slot = [-1] * self.bases[-1]
+        self.last_use = [0] * self.bases[-1]
+        next_slot = self.bases[:-1]
+        for flat_id in fill:
+            layer_id = flat_id // num_experts
+            self.id_of_slot[next_slot[layer_id]] = flat_id
+            next_slot[layer_id] += 1
 
     def resolve(
         self, layer_id: int, expert_ids: list[int], step: int
@@ -198,8 +206,9 @@ class ReferenceLru:
         loads: list[tuple[int, int]] = []
         for expert, flat_id in zip(expert_ids, flat_ids):
             if flat_id not in slot_of:
+                run = range(self.bases[layer_id], self.bases[layer_id + 1])
                 victim = min(
-                    (slot for slot, last in enumerate(self.last_use) if last < step),
+                    (slot for slot in run if self.last_use[slot] < step),
                     key=lambda slot: (self.last_use[slot], self.id_of_slot[slot], slot),
                 )
                 slot_of.pop(self.id_of_slot[victim], None)

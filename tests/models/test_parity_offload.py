@@ -1,13 +1,14 @@
 """Numeric parity of MoE offload against resident experts on a tiny Qwen3.5 MoE model.
 
 One checkpoint (affine 4-bit experts, 16 per layer, top-4) is served with every expert
-resident and from an offload cache of 2E + 8 slots, which misses and evicts at most steps:
-the fp32 greedy tokens must agree and the logits of the first prompt's last prefill chunk
-must match. Cases: decode replayed and eager; copy-miss and overlap prefills (the overlap
-threshold knob lowered so tiny prompts take it), the chunks of one prompt on both sides of
-the threshold, a prompt chunked through overlap prefills; two requests decoding together,
-and three, which decode eagerly in two steps each since the cache cannot hold their worst
-case in one; prefill overlap off, with a cache below 2E; up in 8 bits (gate and up two
+resident and from an offload cache of 52 slots (four runs of 10, two windows of 6), which
+misses and evicts at most steps: the fp32 greedy tokens must agree and the logits of the
+first prompt's last prefill chunk must match. A run of 10 holds two rows' experts, so at
+most two requests run at once and a looked-up prefill takes two tokens per forward. Cases:
+decode replayed and eager; copy-miss and overlap prefills (the overlap threshold knob
+lowered so tiny prompts take it), the chunks of one prompt on both sides of the threshold,
+a prompt chunked through overlap prefills; two requests decoding together, and three, of
+which two run at once; prefill overlap off, with no windows; up in 8 bits (gate and up two
 banks) on a replayed decode and an overlap prefill.
 """
 
@@ -32,7 +33,7 @@ OFFLOAD_TEXT_CONFIG = {**TINY_TEXT_CONFIG, "num_experts": NUM_EXPERTS, "num_expe
 # Group 32: the tiny widths (64 and 96) are not multiples of 64.
 EXPERT_GROUP_SIZE = 32
 EXPERT_BITS = 4
-CACHE_SIZE = 2 * NUM_EXPERTS + 8
+CACHE_SIZE = 52
 STEPS = 10
 # Absolute and relative: the paths differ in summation order only (a weighted sum against
 # moe_combine, the sorted tile kernel against the per-row matvec).
@@ -62,8 +63,8 @@ CASES = [
     # 64, 64 and 22 tokens through the windows.
     Case("chunked-overlap-prefill", (150,), overlap_min_tokens=16, reads_windows=True),
     Case("two-requests", (13, 29)),
-    Case("three-requests-split-decode", (9, 17, 26)),
-    Case("overlap-off-small-cache", (40,), prefill_overlap=False, cache_size=NUM_EXPERTS + 8),
+    Case("three-requests", (9, 17, 26)),
+    Case("overlap-off", (40,), prefill_overlap=False, cache_size=32),
     Case("up-8-bit-replayed-decode", (9,), up_bits=8),
     Case("up-8-bit-overlap-prefill", (40,), overlap_min_tokens=16, reads_windows=True, up_bits=8),
 ]
@@ -157,7 +158,9 @@ def test_offload_matches_resident_experts(
     cache = scheduler.engine.moe_offload_cache
     assert cache is not None and cache.cache_size == case.cache_size
     assert ("gate_up_proj.up_proj.weight" in cache.layout) == (case.up_bits != EXPERT_BITS)
-    assert cache.fits_one_step(len(prompts)) == (len(prompts) < 3)
+    assert cache.max_rows == 2
+    max_running = max(2, len(case.prompt_lens))
+    assert len(scheduler.table_manager.free_slots) == min(max_running, cache.max_rows)
     stats = cache.stats()
     assert sum(stats.misses) > 0
     # A window read counts as an expert read but not as a miss.

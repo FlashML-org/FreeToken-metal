@@ -13,10 +13,10 @@ victim), padding rows and unused experts must read a slot the layer uses, and th
 must add up. The chain runs eagerly, and captured once as a command graph (banks and
 slot_of external, mailbox, last_use and hit_stats pools, moe_step and the ids step inputs)
 and replayed. Then the handshake's edges: no real rows post nothing, a probe round trip, a
-hit in the least recently used slot keeps it, a failed read and a cache too small for the
-step fail their requests, a corrupted sequence is a protocol error, a shutdown releases a
-waiting lookup, also one whose post overwrote the shutdown's refusal, and the watchdog
-fails a request nobody answers.
+hit in the least recently used slot keeps it, a failed read and a layer routing more
+experts than its run holds fail their requests, a corrupted sequence is a protocol error, a
+shutdown releases a waiting lookup, also one whose post overwrote the shutdown's refusal,
+and the watchdog fails a request nobody answers.
 """
 
 from __future__ import annotations
@@ -149,7 +149,7 @@ def check_step(
             elif used_slots:
                 assert int(pair_rows[i, 0]) in used_slots, (step, layer_id, i)
             else:
-                assert 0 <= int(pair_rows[i, 0]) < case.cache_size
+                assert 0 <= int(pair_rows[i, 0]) < len(reference.id_of_slot)
         for expert in range(case.num_experts):
             if expert in slot_of:
                 expected = expected_row(layer_id, expert, slot_of[expert])
@@ -176,8 +176,8 @@ def test_chain_matches_reference(tmp_path: Path, case: Case) -> None:
     if case.is_filled:
         cache.fill_initial()
         slot_of = np.array(cache.slot_of)
-        fill = tuple(int(np.flatnonzero(slot_of == slot)[0]) for slot in range(case.cache_size))
-    reference = ReferenceLru(case.num_experts, case.cache_size, 0, fill)
+        fill = tuple(int(np.flatnonzero(slot_of == slot)[0]) for slot in range(cache.cache_size))
+    reference = ReferenceLru(case.num_experts, cache.window_size, cache.layer_slots, fill)
     shape = (case.num_layers, case.num_rows, case.top_k)
 
     graph = None
@@ -302,7 +302,7 @@ def test_hit_in_the_least_recently_used_slot_keeps_it(tmp_path: Path) -> None:
     cache = small_cache(tmp_path)
     cache.fill_initial()
     slot_of = np.array(cache.slot_of)
-    assert slot_of[:4].tolist() == [0, 2, 4, 6], "layer 0's experts 0-3 fill the even slots"
+    assert slot_of[:4].tolist() == [0, 1, 2, 3], "layer 0's experts 0-3 fill its run"
     # Step 1 uses every resident expert but layer 0's expert 0, which becomes the least
     # recently used; step 2's request hits it and misses expert 4.
     mx.eval(lookup(cache, [[1, 2], [3, 1]], 2, 1), cache.mailbox)
@@ -337,18 +337,14 @@ def test_failed_read_fails_the_request(tmp_path: Path) -> None:
         cache.check_healthy()
 
 
-def test_step_beyond_the_cache_fails_the_request(tmp_path: Path) -> None:
+def test_layer_beyond_its_run_fails_the_request(tmp_path: Path) -> None:
     cache = small_cache(tmp_path)
-    # Layer 0 takes all 8 slots at step 1; layer 1 would have to evict one of them.
-    mx.eval(lookup(cache, [[0, 1, 2, 3], [4, 5, 6, 7]], 2, 1), cache.mailbox)
-    layer_1_slots, _ = cache.lookup(
-        1, mx.array([[0]], dtype=mx.int32), mx.array([1, 1], dtype=mx.int32), Kind.DECODE
-    )
-    mx.eval(layer_1_slots, cache.mailbox)
+    # Layer 0's run is 4 of the 8 slots: a step routing 5 of its experts cannot fit.
+    mx.eval(lookup(cache, [[0, 1, 2, 3], [4, 0, 1, 2]], 2, 1), cache.mailbox)
     words = mailbox_words(cache)
-    assert words[Word.SEQUENCE] == words[Word.ACKNOWLEDGED] == 2
+    assert words[Word.SEQUENCE] == words[Word.ACKNOWLEDGED] == 1
     assert words[Word.ERROR] == _C.MailboxError.CAPACITY
-    with pytest.raises(RuntimeError, match="would evict a slot used at step 1"):
+    with pytest.raises(RuntimeError, match="4 slots cannot hold its 5 experts"):
         cache.check_healthy()
 
 
