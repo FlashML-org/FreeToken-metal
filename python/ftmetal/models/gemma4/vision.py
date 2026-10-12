@@ -2,9 +2,10 @@
 
 Port of FreeToken models/gemma4/vision.py. Divergences: one image per call, so there are no
 padding patches to mask or strip; the q / k / v and gate / up projections are fused and the
-MLP is the text model's GeGLU, run in row chunks past MLP_ROWS patches; the 2-D rope runs in
-fp32 and rounds once; the pooling is a scatter-add by the patches' host-side kernel
-indices; no weight streaming and no unified-release embedder.
+MLP is the text model's GeGLU, run in row chunks past MLP_ROWS patches; the 2-D rope is
+mx.fast.rope on each half of a head, a patch's x and y as per-row offsets; the pooling is a
+scatter-add by the patches' host-side kernel indices; no weight streaming and no
+unified-release embedder.
 """
 
 from __future__ import annotations
@@ -78,16 +79,18 @@ def parse_vision_config(vision_config: dict[str, object]) -> VisionConfig:
     )
 
 
-def rotate_axes(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
-    """x [P, heads, D] rotated half by half (rotate_half within each half) by cos / sin
-    [P, 1, D] in fp32, rounded once to x's dtype."""
-    quarter = x.shape[-1] // 4
-    x32 = x.astype(mx.float32)
-    x_first, x_second, y_first, y_second = mx.split(
-        x32, [quarter, 2 * quarter, 3 * quarter], axis=-1
+def rotate_axes(x: mx.array, positions: mx.array, base: float) -> mx.array:
+    """x [P, heads, D]: the first half of each head rotated by its patch's x, the second by its
+    y (rotate_half within each half); positions int32 [P, 2]."""
+    half = x.shape[-1] // 2
+    rows = x[:, :, None]
+    first = mx.fast.rope(
+        rows[..., :half], half, traditional=False, base=base, scale=1.0, offset=positions[:, 0]
     )
-    rotated = mx.concatenate([-x_second, x_first, -y_second, y_first], axis=-1)
-    return (x32 * cos + rotated * sin).astype(x.dtype)
+    second = mx.fast.rope(
+        rows[..., half:], half, traditional=False, base=base, scale=1.0, offset=positions[:, 1]
+    )
+    return mx.concatenate([first, second], axis=-1)[:, :, 0]
 
 
 class Gemma4VisionAttention(BaseOP):
@@ -101,6 +104,7 @@ class Gemma4VisionAttention(BaseOP):
         self.num_heads = vision.num_heads
         self.num_kv_heads = vision.num_kv_heads
         self.head_dim = vision.head_dim
+        self.rope_theta = vision.rope_theta
         q_dim = self.num_heads * self.head_dim
         kv_dim = self.num_kv_heads * self.head_dim
         self.qkv_proj = LinearMerged(
@@ -121,14 +125,18 @@ class Gemma4VisionAttention(BaseOP):
         self.k_norm = RMSNorm(self.head_dim, eps=eps, dtype=dtype)
         self.v_norm = RMSNorm(self.head_dim, eps=eps, dtype=dtype, with_scale=False)
 
-    def forward(self, x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
+    def forward(self, x: mx.array, positions: mx.array) -> mx.array:
         num_patches = x.shape[0]
         q, k, v = self.qkv_proj.forward_split(x)
         q = rotate_axes(
-            self.q_norm.forward(q.reshape(num_patches, self.num_heads, self.head_dim)), cos, sin
+            self.q_norm.forward(q.reshape(num_patches, self.num_heads, self.head_dim)),
+            positions,
+            self.rope_theta,
         )
         k = rotate_axes(
-            self.k_norm.forward(k.reshape(num_patches, self.num_kv_heads, self.head_dim)), cos, sin
+            self.k_norm.forward(k.reshape(num_patches, self.num_kv_heads, self.head_dim)),
+            positions,
+            self.rope_theta,
         )
         v = self.v_norm.forward(v.reshape(num_patches, self.num_kv_heads, self.head_dim))
         out = mx.fast.scaled_dot_product_attention(
@@ -167,8 +175,8 @@ class Gemma4VisionEncoderLayer(BaseOP):
         self.pre_feedforward_layernorm = RMSNorm(hidden, eps=eps, dtype=dtype)
         self.post_feedforward_layernorm = RMSNorm(hidden, eps=eps, dtype=dtype)
 
-    def forward(self, x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
-        attended = self.self_attn.forward(self.input_layernorm.forward(x), cos, sin)
+    def forward(self, x: mx.array, positions: mx.array) -> mx.array:
+        attended = self.self_attn.forward(self.input_layernorm.forward(x), positions)
         x = x + self.post_attention_layernorm.forward(attended)
         normed = self.pre_feedforward_layernorm.forward(x)
         if normed.shape[0] <= MLP_ROWS:
@@ -193,9 +201,9 @@ class Gemma4VisionEncoder(BaseOP):
             for layer_id in range(vision.num_layers)
         ]
 
-    def forward(self, x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
+    def forward(self, x: mx.array, positions: mx.array) -> mx.array:
         for layer in self.layers:
-            x = layer.forward(x, cos, sin)
+            x = layer.forward(x, positions)
             # One layer at a time: the whole tower's lazy graph holds many layers' activations.
             mx.eval(x)
         return x
@@ -238,9 +246,6 @@ class Gemma4VisionModel(BaseOP):
         if vision.standardize:
             self.std_bias = mx.zeros((vision.hidden_size,), dtype=dtype)
             self.std_scale = mx.ones((vision.hidden_size,), dtype=dtype)
-        spatial_dim = vision.head_dim // NUM_AXES
-        exponents = np.arange(0, spatial_dim, 2, dtype=np.float32) / spatial_dim
-        self._inv_freq = mx.array(1.0 / (vision.rope_theta**exponents), dtype=mx.float32)
 
     def forward(
         self, pixel_values: mx.array, position_ids: np.ndarray, num_soft_tokens: int
@@ -253,12 +258,7 @@ class Gemma4VisionModel(BaseOP):
         assert num_patches == num_soft_tokens * kernel**2, (num_patches, num_soft_tokens)
         positions = mx.array(position_ids)
         x = self.patch_embedder.forward(pixel_values, positions)
-
-        # Angles in fp32, laid out x x y y: each axis' frequencies twice, for rotate_half.
-        angles = positions.astype(mx.float32)[:, :, None] * self._inv_freq
-        angles = mx.concatenate([angles[:, 0], angles[:, 0], angles[:, 1], angles[:, 1]], axis=-1)
-        cos, sin = mx.cos(angles)[:, None], mx.sin(angles)[:, None]
-        x = self.encoder.forward(x, cos, sin)
+        x = self.encoder.forward(x, positions)
 
         # Average each kernel x kernel block of patches, blocks in row-major order.
         columns = int(position_ids[:, 0].max()) + 1
