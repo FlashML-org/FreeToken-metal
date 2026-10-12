@@ -8,12 +8,12 @@ banks under gate_up_proj, and down may differ from both; routing is computed by 
 and handed to forward; from SORT_MIN_PAIRS pairs up the pairs are expert-sorted by the
 moe_align kernel and un-sorted by moe_combine. Resident and offload layers share glu and
 differ only in where a projection gathers its experts' weights from.
-OffloadMoELayer serves affine experts only, from the slot banks of the context's
-offload cache: a decode or copy-miss forward gathers the slots its lookup returns, unsorted
-(below four rows per expert the per-row matvec is the fast path); an overlap prefill sorts
-its pairs and reads each expert at its slot map entry (gather_qmm_sorted), its prefill
-buffers and the order of its reads and layers kept by the host, where FreeToken waits on
-CUDA events.
+OffloadMoELayer serves affine experts only, gate and up in one scheme (align_gate_up),
+from the context's offload cache: a decode or copy-miss forward gathers the slots its
+lookup returns from its pool's rows, unsorted (below four rows per expert the per-row
+matvec is the fast path); an overlap prefill sorts its pairs and reads each expert at its
+byte offsets in the banks (gather_qmm_sorted), its prefill buffers and the order of its
+reads and layers kept by the host, where FreeToken waits on CUDA events.
 """
 
 from __future__ import annotations
@@ -114,6 +114,28 @@ class ExpertSchemes:
                 "gate_up_proj.up_proj": (hidden_size, intermediate_size, self.up),
             }
         return {**gate_up, "down_proj": (intermediate_size, hidden_size, self.down)}
+
+
+def align_gate_up(schemes: ExpertSchemes) -> ExpertSchemes:
+    """schemes with gate and up in one scheme, the wider when they differ: under the same
+    scales and biases a 4-bit code is the same value as an 8-bit one, so the narrower part
+    widens losslessly (the offload cache widens it as it reads the checkpoint)."""
+    gate, up = schemes.gate, schemes.up
+    if gate == up:
+        return schemes
+    elif (
+        gate is None
+        or up is None
+        or gate.group_size != up.group_size
+        or {gate.bits, up.bits} != {4, 8}
+    ):
+        raise ValueError(
+            f"MoE offload fuses gate and up into one scheme, but gate {gate} and up {up} do "
+            f"not align: only 4 and 8 bits of one group size do"
+        )
+    else:
+        wide = gate if gate.bits > up.bits else up
+        return ExpertSchemes(wide, wide, schemes.down)
 
 
 class ExpertProjection(Protocol):
@@ -225,7 +247,8 @@ class OffloadMoELayer(MoELayer):
         activation: Literal["silu", "gelu_tanh"] = "silu",
         dtype: mx.Dtype = mx.bfloat16,
     ) -> None:
-        """moe_layer_id: the layer's index among the model's MoE layers, the cache's layer."""
+        """moe_layer_id: the layer's index among the model's MoE layers, the cache's layer;
+        schemes as the checkpoint stores them, gate and up aligned to one (align_gate_up)."""
         if None in (schemes.gate, schemes.up, schemes.down):
             raise ValueError("MoE offload serves affine-quantized experts only; these are bf16")
         super().__init__(
@@ -233,7 +256,7 @@ class OffloadMoELayer(MoELayer):
             top_k,
             hidden_size,
             intermediate_size,
-            schemes=schemes,
+            schemes=align_gate_up(schemes),
             activation=activation,
             dtype=dtype,
             allocate_experts=False,
@@ -270,12 +293,15 @@ class OffloadMoELayer(MoELayer):
         if self.moe_layer_id == 0:
             cache.begin_prefill_forward()
         mx.async_eval(hidden_states, topk_weights, topk_ids)
-        slot_map = cache.prefill_slot_map(self.moe_layer_id)
+        expert_bytes = cache.expert_bytes(self.moe_layer_id)
         alignment = moe_align(topk_ids, self.num_experts)
         x = mx.expand_dims(hidden_states, -2)[alignment.sorted_token_indices]
         offsets = alignment.expert_offsets
         y = self.glu(
-            x, lambda projection, h: self.gather_sorted(cache, projection, h, offsets, slot_map)
+            x,
+            lambda projection, h: self.gather_sorted(
+                cache, projection, h, offsets, expert_bytes[projection]
+            ),
         )
         out = moe_combine(y, alignment.pair_positions, topk_weights)
         mx.async_eval(out)
@@ -285,13 +311,15 @@ class OffloadMoELayer(MoELayer):
     def gather(
         self, cache: OffloadMoeCache, projection: str, x: mx.array, slots: mx.array
     ) -> mx.array:
-        """x [T, 1, 1, K] through the projection of the experts at slots [T, top_k]."""
+        """x [T, 1, 1, K] through the projection of the experts at slots [T, top_k] of the
+        layer's pool."""
         scheme = self.affine_scheme(projection)
+        banks = cache.layer_banks(self.moe_layer_id)
         return mx.gather_qmm(
             x,
-            cache.banks[f"{projection}.weight"],
-            cache.banks[f"{projection}.scales"],
-            cache.banks[f"{projection}.biases"],
+            banks[f"{projection}.weight"],
+            banks[f"{projection}.scales"],
+            banks[f"{projection}.biases"],
             rhs_indices=slots,
             transpose=True,
             group_size=scheme.group_size,
@@ -305,18 +333,24 @@ class OffloadMoELayer(MoELayer):
         projection: str,
         x: mx.array,
         expert_offsets: mx.array,
-        slot_map: mx.array,
+        expert_bytes: mx.array,
     ) -> mx.array:
         """x [P, 1, K], its pairs sorted by expert, through each expert's projection at its
-        slot map entry."""
-        scheme = self.affine_scheme(projection)
+        byte offsets expert_bytes [E, 3] into the banks."""
+        # The kernel reads the raw banks' scales and biases in x's dtype.
+        assert x.dtype == self.bank_dtype, f"x is {x.dtype}, the banks {self.bank_dtype}"
+        _, output_size, scheme = self.schemes.projections(
+            self.hidden_size, self.intermediate_size
+        )[projection]
+        assert scheme is not None, "offload experts are affine quantized"
         return gather_qmm_sorted(
             x,
             cache.banks[f"{projection}.weight"],
             cache.banks[f"{projection}.scales"],
             cache.banks[f"{projection}.biases"],
             expert_offsets,
-            slot_map,
+            expert_bytes,
+            n=output_size,
             group_size=scheme.group_size,
             bits=scheme.bits,
         )
@@ -330,5 +364,6 @@ __all__ = [
     "ExpertSchemes",
     "MoELayer",
     "OffloadMoELayer",
+    "align_gate_up",
     "moe_layout",
 ]

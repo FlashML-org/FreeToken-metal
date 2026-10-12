@@ -13,7 +13,7 @@ uniformly over 256 experts. The variants:
      The copy runs three ways, timed alone: mx.take into fresh arrays (always all 256), a
      slice update of a preallocated buffer, and ftmetal's in-place copy_rows into a buffer
      that is the bank's first 256 rows; the totals take the fastest;
-  C  gather_qmm_sorted on the large bank through the slot table (and on the resident bank);
+  C  gather_qmm_sorted on the large bank at the experts' byte offsets (and on the resident bank);
   E  mx.gather_qmm on the large bank with ascending slot ids (rhs kernel only at B / E >= 4,
      else one matvec per row).
 The large bank tiles the resident one; expert e sits at a random slot past the prefill
@@ -155,6 +155,17 @@ def bench_bank(
     half_copy = min(["take 256", "update 128", "copy_rows 128"], key=copy_ms.__getitem__)
 
     input_size = resident.weight.shape[2] * 32 // BITS
+    output_size = resident.weight.shape[1]
+
+    def slot_bytes(slots: mx.array) -> mx.array:
+        """Each slot's byte offsets into the weight, scales and biases."""
+        row_bytes = mx.array([array[0].nbytes for array in resident], dtype=mx.int64)
+        return slots.astype(mx.int64)[:, None] * row_bytes
+
+    random_bytes = slot_bytes(random_slots)
+    buffer_bytes = slot_bytes(buffer_rows)
+    mx.eval(random_bytes, buffer_bytes)
+    options = {"n": output_size, "group_size": GROUP_SIZE, "bits": BITS}
     for rows in row_counts:
         experts = np.sort(rng.integers(0, NUM_EXPERTS, rows))
         offsets = np.searchsorted(experts, np.arange(NUM_EXPERTS + 1))
@@ -171,12 +182,8 @@ def bench_bank(
 
         calls: list[ProjectionCall] = [
             lambda: buffer_gather(resident),
-            lambda: gather_qmm_sorted(
-                x, *large, expert_offsets, random_slots, group_size=GROUP_SIZE, bits=BITS
-            ),
-            lambda: gather_qmm_sorted(
-                x, *resident, expert_offsets, buffer_rows, group_size=GROUP_SIZE, bits=BITS
-            ),
+            lambda: gather_qmm_sorted(x, *large, expert_offsets, random_bytes, **options),
+            lambda: gather_qmm_sorted(x, *resident, expert_offsets, buffer_bytes, **options),
             lambda: mx.gather_qmm(
                 x, *large, rhs_indices=slot_ids, sorted_indices=True, **QUANTIZATION
             ),

@@ -85,7 +85,8 @@ void init_moe_lookup_library(const std::string& source);
 // topk_ids int32 [T, top_k]; moe_step int32 [2] = {real rows, step}; slot_of int32
 // [L * E]; mailbox uint32 [MAILBOX_WORDS]; last_use uint32 [S]; hit_stats uint32 [L, 2]
 // (lookups, hit experts). Returns {slots int32 [T, top_k], slot_map int32 [E], mailbox,
-// last_use, hit_stats}. Padding rows and unused experts get a slot the step already uses.
+// last_use, hit_stats}, the slots less slot_base (the first slot of the layer's pool).
+// Padding rows and unused experts get a slot the step already uses.
 std::vector<mx::array> moe_lookup(
     const mx::array& topk_ids,
     const mx::array& moe_step,
@@ -94,6 +95,7 @@ std::vector<mx::array> moe_lookup(
     const mx::array& last_use,
     const mx::array& hit_stats,
     int layer_id,
+    int slot_base,
     MoeLookupKind kind,
     mx::StreamOrDevice s = {});
 
@@ -101,6 +103,7 @@ struct MoeLookupConfig {
   int layer_id;
   int num_experts;
   MoeLookupKind kind;
+  int slot_base;
 
   bool operator==(const MoeLookupConfig&) const = default;
 };

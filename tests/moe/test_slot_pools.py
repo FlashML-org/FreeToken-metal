@@ -2,23 +2,28 @@
 
 plan_slot_layout must give every layer one token's experts, the rest evenly or to the most
 routed (layer, expert) pairs, every expert when the slots allow, sum a pool's layers, put the
-pools smallest first, and lay two prefill buffers of a whole layer each over the first pools
-or before them, none when every expert fits; too few slots must be refused, from
-min_cache_size down. The caps: a decode's rows fit every pool's layers at once, a lookup
-prefill's tokens one layer, and step_starts cuts a lookup forward where a pool would
-overflow. initial_experts fills each pool with its layers' most routed experts, coldest
-first. find_expert_counts prefers the model directory's table to the shipped one.
+pools smallest first (unified: the layers of one quant type), and lay two prefill buffers of a
+whole layer each over the first pools or before them, none when every expert fits; too few
+slots must be refused, from min_cache_size down. The caps: a decode's rows fit every pool's
+layers at once, a lookup prefill's tokens one layer, and step_starts cuts a lookup forward
+where a pool would overflow. initial_experts fills each pool with its layers' most routed
+experts, coldest first. find_expert_counts prefers the model directory's table to the shipped
+one.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import dataclass
 from pathlib import Path
 
+import mlx.core as mx
 import numpy as np
 import pytest
 
+from ftmetal.layers.moe import ExpertSchemes, moe_layout
+from ftmetal.layers.quantization.config import AffineScheme, BankSpec
 from ftmetal.moe.slot_pools import (
     HOT_EXPERTS_FILE,
     MoePoolGrouping,
@@ -32,6 +37,16 @@ from ftmetal.moe.slot_pools import (
 )
 
 COUNTS = np.array([[10, 1, 5, 0], [3, 3, 9, 2]], dtype=np.int64)
+
+
+def tiny_layout(bits: int) -> dict[str, BankSpec]:
+    """Experts of hidden and intermediate 64, group 64: a slot of 6912 bytes at 4 bits (gate_up
+    weight rows of 4096), 13056 at 8 (8192)."""
+    return moe_layout(64, 64, ExpertSchemes.uniform(AffineScheme(bits, 64)), mx.bfloat16)
+
+
+def uniform(num_layers: int) -> list[dict[str, BankSpec]]:
+    return [tiny_layout(4)] * num_layers
 
 
 @dataclass(frozen=True)
@@ -99,7 +114,7 @@ CASES = [
         "per-layer",
         True,
         "dedicated",
-        per_layer([3, 3, 3, 3], 16),
+        per_layer([3, 3, 3, 3], 0),
         8,
     ),
     # Each layer's hottest expert first (layer 0's 0, layer 1's 2), then the three most
@@ -116,7 +131,7 @@ CASES = [
         "per-layer",
         True,
         "dedicated",
-        per_layer([8] * 40, 512),
+        per_layer([8] * 40, 0),
         256,
     ),
     Case(
@@ -155,7 +170,7 @@ CASES = [
         "unified",
         True,
         "dedicated",
-        [(list(range(40)), 512, 488)],
+        [(list(range(40)), 0, 488)],
         256,
     ),
 ]
@@ -165,7 +180,7 @@ CASES = [
 def test_plan_slot_layout(case: Case) -> None:
     layout = plan_slot_layout(
         case.cache_size,
-        case.num_layers,
+        uniform(case.num_layers),
         case.num_experts,
         case.top_k,
         grouping=case.grouping,
@@ -183,15 +198,17 @@ def test_too_few_slots_are_refused() -> None:
         options = {"prefill_overlap": prefill_overlap, "buffer_placement": buffer_placement}
         assert min_cache_size(40, 256, 8, **options) == floor
         for grouping in ("unified", "per-layer"):
-            plan_slot_layout(floor, 40, 256, 8, grouping=grouping, counts=None, **options)
+            plan_slot_layout(floor, uniform(40), 256, 8, grouping=grouping, counts=None, **options)
             with pytest.raises(ValueError, match=f"cannot hold .*: give at least {floor}$"):
-                plan_slot_layout(floor - 1, 40, 256, 8, grouping=grouping, counts=None, **options)
+                plan_slot_layout(
+                    floor - 1, uniform(40), 256, 8, grouping=grouping, counts=None, **options
+                )
 
 
 def qwen_layout(cache_size: int, grouping: MoePoolGrouping) -> SlotLayout:
     return plan_slot_layout(
         cache_size,
-        40,
+        uniform(40),
         256,
         8,
         grouping=grouping,
@@ -221,7 +238,7 @@ def test_caps_and_steps() -> None:
 def test_initial_experts() -> None:
     layout = plan_slot_layout(
         5,
-        2,
+        uniform(2),
         4,
         1,
         grouping="per-layer",
@@ -233,7 +250,7 @@ def test_initial_experts() -> None:
     assert initial_experts(layout, None) == [1, 0, 6, 5, 4]
     unified = plan_slot_layout(
         5,
-        2,
+        uniform(2),
         4,
         1,
         grouping="unified",
@@ -243,6 +260,68 @@ def test_initial_experts() -> None:
     )
     assert initial_experts(unified, COUNTS) == [5, 4, 2, 6, 0]
     assert initial_experts(unified, None) == [2, 5, 1, 4, 0]
+
+
+def test_mixed_layouts() -> None:
+    # Layer 0 in 8 bits, layers 1-5 in 4: runs of 4, 4, 3, 3, 3, 3 over 20 slots.
+    layouts = [tiny_layout(8)] + uniform(5)
+    options = {"counts": None, "prefill_overlap": True, "buffer_placement": "overlay"}
+    per_layer = plan_slot_layout(20, layouts, 4, 1, grouping="per-layer", **options)
+    # The widest slots first, then the smallest pools.
+    assert [pool.layers for pool in per_layer.pools] == [[0], [2], [3], [4], [5], [1]]
+    weight = "gate_up_proj.weight"
+    assert [pool.offsets[weight] for pool in per_layer.pools] == [
+        0,
+        32768,
+        45056,
+        57344,
+        69632,
+        81920,
+    ]
+    # Each buffer holds 4 rows of 8192 bytes: the first 65536 bytes of the weight bank lie
+    # under them, layer 0's 4 rows and 3 + 3 + 2 rows of 4096 bytes after; no other bank
+    # covers more of a pool.
+    assert per_layer.buffer_bytes[weight] == 32768
+    assert [pool.volatile_slots for pool in per_layer.pools] == [4, 3, 3, 2, 0, 0]
+    assert per_layer.bank_bytes[weight] == 81920 + 4 * 4096
+    # A bank is rows of the greatest common divisor of its layouts' rows.
+    assert per_layer.bank_widths[weight] == 4096
+    unified = plan_slot_layout(20, layouts, 4, 1, grouping="unified", **options)
+    assert [(pool.layers, pool.num_slots) for pool in unified.pools] == [
+        ([0], 4),
+        ([1, 2, 3, 4, 5], 16),
+    ]
+    dedicated = plan_slot_layout(
+        23,
+        layouts,
+        4,
+        1,
+        grouping="per-layer",
+        counts=None,
+        prefill_overlap=True,
+        buffer_placement="dedicated",
+    )
+    assert dedicated.pools[0].offsets[weight] == 2 * 32768
+    assert all(pool.volatile_slots == 0 for pool in dedicated.pools)
+
+
+def test_unified_groups_by_quant_type() -> None:
+    # One row format in two quant types (as GGUF's Q4_0 and Q4_K) makes two pools.
+    other = {
+        role: dataclasses.replace(spec, quant=AffineScheme(4, 32))
+        for role, spec in tiny_layout(4).items()
+    }
+    layout = plan_slot_layout(
+        8,
+        uniform(2) + [other],
+        4,
+        1,
+        grouping="unified",
+        counts=None,
+        prefill_overlap=False,
+        buffer_placement="overlay",
+    )
+    assert [pool.layers for pool in layout.pools] == [[2], [0, 1]]
 
 
 def test_model_table_before_shipped(tmp_path: Path) -> None:

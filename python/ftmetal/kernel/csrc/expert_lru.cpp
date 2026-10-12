@@ -24,30 +24,36 @@ void check_layout(
     int num_experts,
     int buffer_size,
     const std::vector<int32_t>& layer_pools,
-    const std::vector<int32_t>& pool_bounds) {
+    const std::vector<int32_t>& pool_bounds,
+    const std::vector<int32_t>& pool_volatile) {
   if (num_layers < 1 || num_experts < 1) {
     throw std::invalid_argument("SlotLru: num_layers and num_experts must be positive");
   }
   if (buffer_size < 0 || buffer_size > num_experts) {
     throw std::invalid_argument("SlotLru: buffer_size must be in [0, num_experts]");
   }
-  if (layer_pools.size() != static_cast<size_t>(num_layers) || pool_bounds.size() < 2) {
+  if (layer_pools.size() != static_cast<size_t>(num_layers) || pool_bounds.size() < 2 ||
+      pool_volatile.size() + 1 != pool_bounds.size()) {
     throw std::invalid_argument(
-        "SlotLru: layer_pools must hold one pool per layer and pool_bounds a pool or more");
+        "SlotLru: layer_pools must hold one pool per layer, pool_bounds a pool or more and "
+        "pool_volatile one count per pool");
   }
-  int32_t num_pools = static_cast<int32_t>(pool_bounds.size()) - 1;
+  int32_t num_pools = static_cast<int32_t>(pool_volatile.size());
   for (int32_t pool : layer_pools) {
     if (pool < 0 || pool >= num_pools) {
       throw std::invalid_argument("SlotLru: a layer's pool is out of range");
     }
   }
-  if (pool_bounds[0] < 0 ||
+  if (pool_bounds[0] != 0 ||
       std::adjacent_find(pool_bounds.begin(), pool_bounds.end(), std::greater_equal<int32_t>()) !=
           pool_bounds.end()) {
-    throw std::invalid_argument("SlotLru: pool_bounds must rise from slot 0 or later");
+    throw std::invalid_argument("SlotLru: pool_bounds must rise from slot 0");
   }
-  if (2 * buffer_size > pool_bounds.back()) {
-    throw std::invalid_argument("SlotLru: the prefill buffers outgrow the slots");
+  for (int32_t pool = 0; pool < num_pools; ++pool) {
+    int32_t num_slots = pool_bounds[pool + 1] - pool_bounds[pool];
+    if (pool_volatile[pool] < 0 || pool_volatile[pool] > num_slots) {
+      throw std::invalid_argument("SlotLru: a pool's volatile slots are out of range");
+    }
   }
 }
 
@@ -59,6 +65,7 @@ SlotLru::SlotLru(
     int buffer_size,
     const std::vector<int32_t>& layer_pools,
     const std::vector<int32_t>& pool_bounds,
+    const std::vector<int32_t>& pool_volatile,
     mx::array slot_of,
     mx::array last_use)
     : num_layers_(num_layers),
@@ -66,12 +73,13 @@ SlotLru::SlotLru(
       buffer_size_(buffer_size),
       layer_pools_(layer_pools),
       pool_bounds_(pool_bounds),
+      pool_volatile_(pool_volatile),
       slot_of_(std::move(slot_of)),
       last_use_(std::move(last_use)),
       slot_of_data_(static_cast<int32_t*>(shared_data(slot_of_, "slot_of"))),
       last_use_data_(static_cast<uint32_t*>(shared_data(last_use_, "last_use"))),
       expert_call_(num_experts, 0) {
-  check_layout(num_layers, num_experts, buffer_size, layer_pools, pool_bounds);
+  check_layout(num_layers, num_experts, buffer_size, layer_pools, pool_bounds, pool_volatile);
   if (slot_of_.dtype() != mx::int32 ||
       slot_of_.size() != static_cast<size_t>(num_layers) * num_experts) {
     throw std::invalid_argument("SlotLru: slot_of must be int32 [num_layers * num_experts]");
@@ -201,46 +209,51 @@ SlotAssignment SlotLru::resolve(
 }
 
 void SlotLru::invalidate_prefill_buffers() {
-  for (int32_t slot = 0; slot < 2 * buffer_size_; ++slot) {
-    if (id_of_slot_[slot] >= 0) {
-      slot_of_data_[id_of_slot_[slot]] = -1;
-      id_of_slot_[slot] = -1;
+  for (size_t pool = 0; pool < pool_volatile_.size(); ++pool) {
+    for (int32_t slot = pool_bounds_[pool]; slot < pool_bounds_[pool] + pool_volatile_[pool];
+         ++slot) {
+      if (id_of_slot_[slot] >= 0) {
+        slot_of_data_[id_of_slot_[slot]] = -1;
+        id_of_slot_[slot] = -1;
+      }
+      last_use_data_[slot] = 0;
     }
-    last_use_data_[slot] = 0;
   }
 }
 
 SlotAssignment SlotLru::prefill_slot_map(int layer_id) const {
   check_layer(layer_id, "prefill_slot_map");
   const int32_t* layer_slots = slot_of_data_ + static_cast<size_t>(layer_id) * num_experts_;
+  int32_t pool = layer_pools_[layer_id];
+  int32_t volatile_end = pool_bounds_[pool] + pool_volatile_[pool];
   int32_t absent = 0;
   for (int32_t expert = 0; expert < num_experts_; ++expert) {
     int32_t slot = layer_slots[expert];
     if (slot < 0) {
       ++absent;
-    } else if (slot < 2 * buffer_size_) {
+    } else if (slot < volatile_end) {
       throw std::logic_error(
           "SlotLru.prefill_slot_map: expert " + std::to_string(expert) + " of layer " +
-          std::to_string(layer_id) + " sits in prefill buffer slot " + std::to_string(slot) +
-          "; invalidate the prefill buffers first");
+          std::to_string(layer_id) + " sits in slot " + std::to_string(slot) +
+          " under the prefill buffers; invalidate them first");
     }
   }
   if (absent > buffer_size_) {
     throw std::logic_error(
         "SlotLru.prefill_slot_map: prefill buffers of " + std::to_string(buffer_size_) +
-        " slots cannot hold layer " + std::to_string(layer_id) + "'s " + std::to_string(absent) +
-        " absent experts");
+        " experts cannot hold layer " + std::to_string(layer_id) + "'s " +
+        std::to_string(absent) + " absent experts");
   }
   SlotAssignment assignment;
   assignment.slots.resize(num_experts_);
-  int32_t buffer_slot = (layer_id % 2) * buffer_size_;
+  int32_t row = 0;
   for (int32_t expert = 0; expert < num_experts_; ++expert) {
     int32_t slot = layer_slots[expert];
     if (slot >= 0) {
       assignment.slots[expert] = slot;
     } else {
-      assignment.slots[expert] = buffer_slot;
-      assignment.loads.emplace_back(expert, buffer_slot++);
+      assignment.slots[expert] = -1 - row;
+      assignment.loads.emplace_back(expert, row++);
     }
   }
   return assignment;

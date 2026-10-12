@@ -94,13 +94,13 @@ def mailbox_words(cache: OffloadMoeCache) -> npt.NDArray[np.uint32]:
 
 def chain(cache: OffloadMoeCache, case: Case, topk_ids: mx.array, moe_step: mx.array) -> mx.array:
     """uint32 [layers, T * top_k + E, SUMMARY_COLUMNS]: per layer, a summary row of each pair's
-    slot, then of each expert's slot map entry."""
-    gate_up = cache.banks["gate_up_proj.weight"]
-    down = cache.banks["down_proj.weight"]
-    half = gate_up.shape[1] // 2
+    slot in its pool, then of each expert's slot map entry."""
     after_previous = mx.zeros((1, 1), dtype=mx.int32)
     summaries = []
     for layer_id in range(case.num_layers):
+        gate_up = cache.layer_banks(layer_id)["gate_up_proj.weight"]
+        down = cache.layer_banks(layer_id)["down_proj.weight"]
+        half = gate_up.shape[1] // 2
         slots, slot_map = cache.lookup(
             layer_id, topk_ids[layer_id] + after_previous, moe_step, case.kind
         )
@@ -141,7 +141,9 @@ def check_step(
         loads: list[tuple[int, int]] = []
         if distinct:
             slots, loads = reference.resolve(layer_id, distinct, step)
-            slot_of = dict(zip(distinct, slots))
+            # The lookups return slots of the layer's pool.
+            first_slot = reference.pool_slots(layer_id).start
+            slot_of = {expert: slot - first_slot for expert, slot in zip(distinct, slots)}
         distinct_counts.append(len(distinct))
         load_counts.append(len(loads))
         pair_rows = summary[layer_id, :num_pairs]
@@ -156,7 +158,7 @@ def check_step(
             elif used_slots:
                 assert int(pair_rows[i, 0]) in used_slots, (step, layer_id, i)
             else:
-                assert 0 <= int(pair_rows[i, 0]) < len(reference.id_of_slot)
+                assert 0 <= int(pair_rows[i, 0]) < len(reference.pool_slots(layer_id))
         for expert in range(case.num_experts):
             if expert in slot_of:
                 expected = expected_row(layer_id, expert, slot_of[expert])
@@ -323,7 +325,7 @@ def test_hit_in_the_least_recently_used_slot_keeps_it(tmp_path: Path) -> None:
     )
     mx.eval(layer_1_slots, cache.mailbox)
     slots = lookup(cache, [[0, 4]], 1, 2)
-    gate_up = mx.take(cache.banks["gate_up_proj.weight"], slots.reshape(-1), axis=0)
+    gate_up = mx.take(cache.layer_banks(0)["gate_up_proj.weight"], slots.reshape(-1), axis=0)
     mx.eval(gate_up, cache.mailbox)
     slot_0, slot_4 = np.array(slots).reshape(-1).tolist()
     assert slot_0 == 3 and slot_4 != 3

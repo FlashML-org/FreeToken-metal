@@ -61,8 +61,14 @@ from ftmetal.models.blocks import BaseLLMModel, SupportsMultimodal
 from ftmetal.models.config import MoeStrategy
 from ftmetal.models.loader import WeightRules, checkpoint_bytes, load_weights
 from ftmetal.models.register import MODEL_REGISTRY, create_model, model_weight_rules
-from ftmetal.moe.offload_cache import STAGING_BYTES, OffloadMoeCache, slot_bytes
-from ftmetal.moe.slot_pools import HOT_EXPERTS_FILE, find_expert_counts, read_expert_counts
+from ftmetal.moe.offload_cache import STAGING_BYTES, OffloadMoeCache
+from ftmetal.moe.slot_pools import (
+    HOT_EXPERTS_FILE,
+    SlotLayout,
+    find_expert_counts,
+    plan_slot_layout,
+    read_expert_counts,
+)
 from ftmetal.moe.source import ExpertSource
 
 logger = logging.getLogger(__name__)
@@ -228,18 +234,35 @@ class Engine:
 
         moe_layers: list[OffloadMoELayer] = []
         expert_source: ExpertSource | None = None
+        expert_counts: np.ndarray | None = None
+        slot_layout: SlotLayout | None = None
         cache_size = 0
         experts_bytes = 0
         if is_offload:
             moe_layers = offload_layers(self.model)
-            layout = moe_layers[0].layout()
-            if any(layer.layout() != layout for layer in moe_layers[1:]):
-                raise ValueError(
-                    "MoE offload keeps every MoE layer's experts in one bank layout; this "
-                    "checkpoint stores them in different formats across layers"
-                )
+            layouts = [layer.layout() for layer in moe_layers]
             expert_source = ExpertSource(config.model_path, rules)
-            row_bytes = slot_bytes(layout)
+            if config.moe_pool_slots == "profile":
+                if config.moe_pool_profile is not None:
+                    table_path = Path(config.moe_pool_profile)
+                else:
+                    table_path = find_expert_counts(
+                        config.model_path,
+                        model_config.model_type,
+                        len(moe_layers),
+                        model_config.num_experts,
+                        model_config.hidden_size,
+                    )
+                if table_path is None:
+                    raise ValueError(
+                        f"--moe-pool-slots profile: no hot-expert table for this model (no "
+                        f"{HOT_EXPERTS_FILE} in its directory, none shipped); pass "
+                        f"profile:<path> or equal"
+                    )
+                expert_counts = read_expert_counts(
+                    table_path, len(moe_layers), model_config.num_experts
+                )
+                logger.info(f"MoE offload: pool slots from the hot-expert table {table_path}")
             total_experts = len(moe_layers) * model_config.num_experts
             cache_size = resolve_moe_cache_size(
                 config.moe_cache_size_flag(total_experts),
@@ -252,7 +275,10 @@ class Engine:
                     encoder=encoder_reserve,
                 ),
                 reserve_pages=kv_reserve_pages(config.kv_reserve_tokens, config.page_size),
-                slot_bytes=row_bytes,
+                # The widest row of each bank: the banks hold at most this much per slot.
+                slot_bytes=sum(
+                    max(layout[role].nbytes for layout in layouts) for role in layouts[0]
+                ),
                 staging_bytes=STAGING_BYTES,
                 num_layers=len(moe_layers),
                 num_experts=model_config.num_experts,
@@ -261,7 +287,17 @@ class Engine:
                 prefill_overlap=prefill_overlap,
                 buffer_placement=config.moe_prefill_buffer,
             )
-            experts_bytes = cache_size * row_bytes + STAGING_BYTES
+            slot_layout = plan_slot_layout(
+                cache_size,
+                layouts,
+                model_config.num_experts,
+                model_config.num_experts_per_tok,
+                grouping=config.moe_pool,
+                counts=expert_counts,
+                prefill_overlap=prefill_overlap,
+                buffer_placement=config.moe_prefill_buffer,
+            )
+            experts_bytes = sum(slot_layout.bank_bytes.values()) + STAGING_BYTES
             overlap_note = (
                 f"prefills of {config.moe_prefill_overlap_min_tokens} tokens or more read "
                 f"each layer ahead"
@@ -316,48 +352,22 @@ class Engine:
         }
         self.sampler = Sampler(model_config.vocab_size)
         self.moe_offload_cache: OffloadMoeCache | None = None
-        if expert_source is not None:
+        if expert_source is not None and slot_layout is not None:
             started = time.perf_counter()
-            counts = None
-            if config.moe_pool_slots == "profile":
-                if config.moe_pool_profile is not None:
-                    table_path = Path(config.moe_pool_profile)
-                else:
-                    table_path = find_expert_counts(
-                        config.model_path,
-                        model_config.model_type,
-                        len(moe_layers),
-                        model_config.num_experts,
-                        model_config.hidden_size,
-                    )
-                if table_path is None:
-                    raise ValueError(
-                        f"--moe-pool-slots profile: no hot-expert table for this model (no "
-                        f"{HOT_EXPERTS_FILE} in its directory, none shipped); pass "
-                        f"profile:<path> or equal"
-                    )
-                counts = read_expert_counts(table_path, len(moe_layers), model_config.num_experts)
-                logger.info(f"MoE offload: pool slots from the hot-expert table {table_path}")
             self.moe_offload_cache = OffloadMoeCache(
-                num_layers=len(moe_layers),
-                num_experts=model_config.num_experts,
-                top_k=model_config.num_experts_per_tok,
-                cache_size=cache_size,
+                slot_layout=slot_layout,
+                source=expert_source,
                 prefill_overlap=prefill_overlap,
                 prefill_overlap_min_tokens=config.moe_prefill_overlap_min_tokens,
-                layout=moe_layers[0].layout(),
-                source=expert_source,
-                grouping=config.moe_pool,
-                buffer_placement=config.moe_prefill_buffer,
-                expert_counts=counts,
+                expert_counts=expert_counts,
             )
-            layout = self.moe_offload_cache.slot_layout
-            pool_slots = [pool.num_slots for pool in layout.pools]
+            pool_slots = [pool.num_slots for pool in slot_layout.pools]
             logger.info(
                 f"MoE offload: {config.moe_pool} pools x{len(pool_slots)} of {min(pool_slots)}-"
                 f"{max(pool_slots)} slots ({config.moe_pool_slots}), prefill buffers of "
-                f"{layout.buffer_size} ({config.moe_prefill_buffer}), decode rows <= "
-                f"{layout.max_decode_rows}, looked-up prefill tokens <= {layout.max_lookup_tokens}"
+                f"{slot_layout.buffer_size} ({config.moe_prefill_buffer}), decode rows <= "
+                f"{slot_layout.max_decode_rows}, looked-up prefill tokens <= "
+                f"{slot_layout.max_lookup_tokens}"
             )
             self.moe_offload_cache.fill_initial()
             self.moe_offload_cache.probe()

@@ -47,6 +47,8 @@ struct LookupParams {
   int num_rows;
   int top_k;
   uint kind;
+  // The outputs are slots less this: the first slot of the layer's pool.
+  int slot_base;
 };
 
 inline void system_fence() {
@@ -187,7 +189,7 @@ inline void system_fence() {
   // GPU caches may hold it.
   const int first_id = num_real_rows > 0 ? topk_ids[0] : -1;
   const int first_slot = first_id >= 0 && first_id < num_experts ? expert_slot[first_id] : -1;
-  const int fallback_slot = max(first_slot, 0);
+  const int fallback_slot = max(first_slot, params.slot_base) - params.slot_base;
   if (expert == 0 && !is_probe) {
     hit_stats[2 * params.layer_id] += 1;
     hit_stats[2 * params.layer_id + 1] += num_hits;
@@ -196,10 +198,10 @@ inline void system_fence() {
     const int id = topk_ids[i];
     const bool is_real = i < num_real_rows * top_k && id >= 0 && id < num_experts;
     const int slot = is_real ? expert_slot[id] : -1;
-    slots[i] = slot >= 0 ? slot : fallback_slot;
+    slots[i] = slot >= 0 ? slot - params.slot_base : fallback_slot;
   }
   if (int(expert) < num_experts) {
     const int slot = expert_slot[expert];
-    slot_map[expert] = slot >= 0 && is_used ? slot : fallback_slot;
+    slot_map[expert] = slot >= 0 && is_used ? slot - params.slot_base : fallback_slot;
   }
 }

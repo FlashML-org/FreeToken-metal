@@ -20,6 +20,7 @@ struct LookupParams {
   int num_rows;
   int top_k;
   uint32_t kind;
+  int slot_base;
 };
 
 void check_array(
@@ -47,6 +48,7 @@ std::vector<mx::array> moe_lookup(
     const mx::array& last_use,
     const mx::array& hit_stats,
     int layer_id,
+    int slot_base,
     MoeLookupKind kind,
     mx::StreamOrDevice s) {
   if (topk_ids.dtype() != mx::int32 || topk_ids.ndim() != 2 || topk_ids.size() == 0) {
@@ -86,7 +88,8 @@ std::vector<mx::array> moe_lookup(
   return mx::array::make_arrays(
       {topk_ids.shape(), {num_experts}, mailbox.shape(), last_use.shape(), hit_stats.shape()},
       {mx::int32, mx::int32, mx::uint32, mx::uint32, mx::uint32},
-      std::make_shared<MoeLookup>(stream, MoeLookupConfig{layer_id, num_experts, kind}),
+      std::make_shared<MoeLookup>(
+          stream, MoeLookupConfig{layer_id, num_experts, kind, slot_base}),
       {mx::contiguous(topk_ids, false, stream),
        mx::contiguous(moe_step, false, stream),
        slot_of,
@@ -140,7 +143,8 @@ void MoeLookup::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::a
       config_.num_experts,
       inputs[0].shape(0),
       inputs[0].shape(1),
-      static_cast<uint32_t>(config_.kind)};
+      static_cast<uint32_t>(config_.kind),
+      config_.slot_base};
   encoder.set_bytes(params, 8);
   encoder.dispatch_threadgroups(MTL::Size(1, 1, 1), MTL::Size(MAX_LOOKUP_EXPERTS, 1, 1));
 }

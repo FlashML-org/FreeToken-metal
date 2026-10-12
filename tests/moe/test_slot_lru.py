@@ -5,9 +5,9 @@ last_use, no load may take a slot one of the same call's hits uses, and a miss t
 of its own layer's pool only, which layers of one pool share. A call that would evict a slot
 its pool used in the same step must raise, as must one naming more experts than the pool
 holds, and a fill beyond a pool. The prefill buffers: prefill_slot_map keeps resident
-experts and sends the others, in expert order, to the next slots of buffer layer_id % 2, and
-refuses more absent experts than a buffer holds; buffers over the pools must be invalidated
-first, which drops the experts their slots hold.
+experts and sends the others, in expert order, to the next rows of buffer layer_id % 2, and
+refuses more absent experts than a buffer holds; a pool's slots under the buffers must be
+invalidated first, which drops the experts they hold.
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ def first_experts(
 class Case:
     num_experts: int
     buffer_size: int
-    # Each layer's pool, and each pool's slots; the pools follow the buffers.
+    # Each layer's pool, and each pool's slots, the pools from slot 0.
     layer_pools: tuple[int, ...]
     pool_slots: tuple[int, ...]
     # Flat ids filled, each into the next slot of its layer's pool.
@@ -162,24 +162,29 @@ def make_lru(
     buffer_size: int,
     layer_pools: tuple[int, ...],
     pool_bounds: list[int],
+    pool_volatile: list[int] | None = None,
 ) -> tuple[_C.SlotLru, mx.array, mx.array]:
     num_layers = len(layer_pools)
     slot_of = mx.full((num_layers * num_experts,), -1, dtype=mx.int32)
     last_use = mx.zeros((pool_bounds[-1],), dtype=mx.uint32)
     mx.eval(slot_of, last_use)
+    volatile = [0] * (len(pool_bounds) - 1) if pool_volatile is None else pool_volatile
     lru = _C.SlotLru(
-        num_layers, num_experts, buffer_size, list(layer_pools), pool_bounds, slot_of, last_use
+        num_layers,
+        num_experts,
+        buffer_size,
+        list(layer_pools),
+        pool_bounds,
+        volatile,
+        slot_of,
+        last_use,
     )
     assert lru.num_slots == pool_bounds[-1]
     return lru, slot_of, last_use
 
 
-def bounds(first_slot: int, pool_slots: tuple[int, ...]) -> list[int]:
-    return [first_slot + sum(pool_slots[:pool]) for pool in range(len(pool_slots) + 1)]
-
-
 def check(case: Case) -> None:
-    pool_bounds = bounds(2 * case.buffer_size, case.pool_slots)
+    pool_bounds = [sum(case.pool_slots[:pool]) for pool in range(len(case.pool_slots) + 1)]
     lru, slot_of, last_use = make_lru(
         case.num_experts, case.buffer_size, case.layer_pools, pool_bounds
     )
@@ -225,29 +230,29 @@ def test_capacity_errors() -> None:
 
 
 def test_prefill_slot_map() -> None:
-    # Buffers [0, 3) and [3, 6) before the pools: layer 0's [6, 8), layer 1's [8, 9).
-    lru, _, _ = make_lru(4, 3, (0, 1), [6, 8, 9])
+    # Buffers of 3 rows beside layer 0's pool [0, 2) and layer 1's [2, 3).
+    lru, _, _ = make_lru(4, 3, (0, 1), [0, 2, 3])
     lru.fill([0, 1, 4])
-    assert lru.prefill_slot_map(0) == ([6, 7, 0, 1], [(2, 0), (3, 1)])
-    assert lru.prefill_slot_map(1) == ([8, 3, 4, 5], [(1, 3), (2, 4), (3, 5)])
-    too_small, _, _ = make_lru(4, 1, (0,), [2, 4])
+    assert lru.prefill_slot_map(0) == ([0, 1, -1, -2], [(2, 0), (3, 1)])
+    assert lru.prefill_slot_map(1) == ([2, -1, -2, -3], [(1, 0), (2, 1), (3, 2)])
+    too_small, _, _ = make_lru(4, 1, (0,), [0, 2])
     too_small.fill([0, 1])
-    with pytest.raises(RuntimeError, match="prefill buffers of 1 slots cannot hold layer 0's 2"):
+    with pytest.raises(RuntimeError, match="prefill buffers of 1 experts cannot hold layer 0's 2"):
         too_small.prefill_slot_map(0)
 
 
 def test_overlaid_prefill_buffers() -> None:
-    # Buffers [0, 4) and [4, 8) over layer 1's pool [0, 3), layer 2's [3, 6) and the start of
-    # layer 0's [6, 10).
-    lru, slot_of, last_use = make_lru(4, 4, (2, 0, 1), [0, 3, 6, 10])
+    # Layer 1's pool [0, 3) and layer 2's [3, 6) lie wholly under the buffers, layer 0's
+    # [6, 10) its first two slots.
+    lru, slot_of, last_use = make_lru(4, 4, (2, 0, 1), [0, 3, 6, 10], [3, 3, 2])
     lru.fill([4, 5, 6, 8, 9, 10, 0, 1, 2, 3])
     lru.resolve(0, [3], 1)
-    with pytest.raises(RuntimeError, match="sits in prefill buffer slot 6; invalidate"):
+    with pytest.raises(RuntimeError, match="sits in slot 6 under the prefill buffers"):
         lru.prefill_slot_map(0)
     lru.invalidate_prefill_buffers()
     assert np.array(slot_of).tolist() == [-1, -1, 8, 9] + [-1] * 8
     assert np.array(last_use).tolist() == [0] * 9 + [1]
-    assert lru.prefill_slot_map(0) == ([0, 1, 8, 9], [(0, 0), (1, 1)])
-    assert lru.prefill_slot_map(1) == ([4, 5, 6, 7], [(0, 4), (1, 5), (2, 6), (3, 7)])
+    assert lru.prefill_slot_map(0) == ([-1, -2, 8, 9], [(0, 0), (1, 1)])
+    assert lru.prefill_slot_map(1) == ([-1, -2, -3, -4], [(0, 0), (1, 1), (2, 2), (3, 3)])
     # The dropped slots are free again: a miss of layer 1 takes its pool's first.
     assert lru.resolve(1, [2], 2) == ([0], [(2, 0)])

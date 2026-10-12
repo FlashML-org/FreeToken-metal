@@ -4,12 +4,14 @@ Port of FreeToken layers/quantization (QuantConfig / QuantScheme), reduced to th
 kinds this engine serves: bf16 and MLX affine quantization. A module is affine
 quantized when the checkpoint holds its scales tensor; the per-module entries of the
 quantization section override the default bits and group size. BankSpec is FreeToken's
-(layers/quantization/moe/base.py); expert_bank_layout is its MoEKernel.layout per
-expert projection instead of per layer, and has no resident (non-bank) arrays.
+(layers/quantization/moe/base.py) with its projection's quant type added; expert_bank_layout
+is its MoEKernel.layout per expert projection instead of per layer, and has no resident
+(non-bank) arrays.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -23,10 +25,16 @@ class AffineScheme:
 
 @dataclass(frozen=True)
 class BankSpec:
-    """One array of an expert bank, per expert: the allocator prepends the expert or slot axis."""
+    """One array of an expert bank, per expert: the allocator prepends the expert or slot axis.
+    quant: the scheme of its projection (None: bf16)."""
 
     shape: tuple[int, ...]
     dtype: mx.Dtype
+    quant: AffineScheme | None = None
+
+    @property
+    def nbytes(self) -> int:
+        return math.prod(self.shape) * self.dtype.size
 
 
 def expert_bank_layout(
@@ -40,9 +48,9 @@ def expert_bank_layout(
         packed = input_size * scheme.bits // 32
         groups = input_size // scheme.group_size
         return {
-            "weight": BankSpec((output_size, packed), mx.uint32),
-            "scales": BankSpec((output_size, groups), dtype),
-            "biases": BankSpec((output_size, groups), dtype),
+            "weight": BankSpec((output_size, packed), mx.uint32, scheme),
+            "scales": BankSpec((output_size, groups), dtype, scheme),
+            "biases": BankSpec((output_size, groups), dtype, scheme),
         }
 
 

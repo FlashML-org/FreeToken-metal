@@ -139,12 +139,13 @@ NB_MODULE(_C, m) {
       "scales"_a,
       "biases"_a,
       "expert_offsets"_a,
-      "slot_of"_a,
+      "expert_bytes"_a,
+      "n"_a,
       "group_size"_a,
       "bits"_a,
       nb::kw_only(),
       "stream"_a = nb::none(),
-      "x[b] @ dequantize(w[slot_of[e]]).T for the rows b of each expert e; returns [B, 1, N].");
+      "x[b] @ dequantize(expert e's weights at its byte offsets).T for the rows b of each expert e; returns [B, 1, n].");
 
   m.attr("MAILBOX_WORDS") = ftmetal::MAILBOX_WORDS;
   m.attr("EXPERT_STAGING_BYTES") = ftmetal::EXPERT_STAGING_BYTES;
@@ -194,10 +195,11 @@ NB_MODULE(_C, m) {
       "last_use"_a,
       "hit_stats"_a,
       "layer_id"_a,
+      "slot_base"_a,
       "kind"_a,
       nb::kw_only(),
       "stream"_a = nb::none(),
-      "Bank slots of one MoE layer's routed experts, the absent read by the CPU first; returns (slots, slot_map, mailbox, last_use, hit_stats).");
+      "Pool slots of one MoE layer's routed experts, the absent read by the CPU first; returns (slots, slot_map, mailbox, last_use, hit_stats).");
 
   nb::class_<ftmetal::SlotLru>(m, "SlotLru")
       .def(
@@ -207,6 +209,7 @@ NB_MODULE(_C, m) {
               int,
               const std::vector<int32_t>&,
               const std::vector<int32_t>&,
+              const std::vector<int32_t>&,
               mx::array,
               mx::array>(),
           "num_layers"_a,
@@ -214,6 +217,7 @@ NB_MODULE(_C, m) {
           "buffer_size"_a,
           "layer_pools"_a,
           "pool_bounds"_a,
+          "pool_volatile"_a,
           "slot_of"_a,
           "last_use"_a,
           "Per-pool token-granular LRUs over the slots; writes slot_of and last_use in place.")
@@ -237,7 +241,7 @@ NB_MODULE(_C, m) {
       .def(
           "invalidate_prefill_buffers",
           &ftmetal::SlotLru::invalidate_prefill_buffers,
-          "Drop every expert held in a prefill buffer slot.")
+          "Drop every expert held in a slot under the prefill buffers.")
       .def(
           "prefill_slot_map",
           [](const ftmetal::SlotLru& lru, int layer_id) {
@@ -245,7 +249,7 @@ NB_MODULE(_C, m) {
             return std::make_pair(std::move(assignment.slots), std::move(assignment.loads));
           },
           "layer_id"_a,
-          "Every expert's slot, buffer layer_id % 2's for the absent; returns (slot_map, loads).");
+          "Every expert's slot, -1 - its buffer row if absent; returns (slot_map, loads).");
 
   nb::class_<ftmetal::ExpertServiceStats>(m, "ExpertServiceStats")
       .def_ro("hits", &ftmetal::ExpertServiceStats::hits)
@@ -258,7 +262,7 @@ NB_MODULE(_C, m) {
       .def_ro("lookups", &ftmetal::ExpertServiceStats::lookups)
       .def_ro("lookup_hits", &ftmetal::ExpertServiceStats::lookup_hits);
 
-  using SegmentTable = nb::ndarray<const int64_t, nb::ndim<3>, nb::c_contig, nb::device::cpu>;
+  using Int64Table3 = nb::ndarray<const int64_t, nb::ndim<3>, nb::c_contig, nb::device::cpu>;
   nb::class_<ftmetal::ExpertService>(m, "ExpertService")
       .def(
           "__init__",
@@ -268,24 +272,32 @@ NB_MODULE(_C, m) {
              int buffer_size,
              const std::vector<int32_t>& layer_pools,
              const std::vector<int32_t>& pool_bounds,
+             const std::vector<int32_t>& pool_volatile,
              mx::array slot_of,
              mx::array last_use,
              mx::array mailbox,
              mx::array hit_stats,
              std::vector<mx::array> banks,
              const std::vector<std::string>& files,
-             SegmentTable segments,
+             Int64Table3 segments,
+             Int64Table3 destinations,
+             const std::vector<int64_t>& buffer_bytes,
              int io_threads,
              double stall_timeout_s,
              bool run_coordinator) {
-            if (segments.shape(0) != static_cast<size_t>(num_layers) || segments.shape(2) != 5) {
-              throw std::invalid_argument("ExpertService: segments must be int64 [num_layers, n, 5]");
+            if (segments.shape(0) != static_cast<size_t>(num_layers) || segments.shape(2) != 6) {
+              throw std::invalid_argument("ExpertService: segments must be int64 [num_layers, n, 6]");
+            }
+            if (destinations.shape(0) != static_cast<size_t>(num_layers) ||
+                destinations.shape(1) != banks.size() || destinations.shape(2) != 2) {
+              throw std::invalid_argument(
+                  "ExpertService: destinations must be int64 [num_layers, num_banks, 2]");
             }
             std::vector<ftmetal::ExpertSegment> table(segments.shape(0) * segments.shape(1));
             const int64_t* row = segments.data();
             for (ftmetal::ExpertSegment& segment : table) {
-              segment = {row[0], row[1], row[2], row[3], row[4]};
-              row += 5;
+              segment = {row[0], row[1], row[2], row[3], row[4], row[5]};
+              row += 6;
             }
             new (service) ftmetal::ExpertService(
                 num_layers,
@@ -293,6 +305,7 @@ NB_MODULE(_C, m) {
                 buffer_size,
                 layer_pools,
                 pool_bounds,
+                pool_volatile,
                 std::move(slot_of),
                 std::move(last_use),
                 std::move(mailbox),
@@ -300,6 +313,8 @@ NB_MODULE(_C, m) {
                 std::move(banks),
                 files,
                 std::move(table),
+                std::vector<int64_t>(destinations.data(), destinations.data() + destinations.size()),
+                buffer_bytes,
                 io_threads,
                 stall_timeout_s,
                 run_coordinator);
@@ -309,6 +324,7 @@ NB_MODULE(_C, m) {
           "buffer_size"_a,
           "layer_pools"_a,
           "pool_bounds"_a,
+          "pool_volatile"_a,
           "slot_of"_a,
           "last_use"_a,
           "mailbox"_a,
@@ -316,6 +332,8 @@ NB_MODULE(_C, m) {
           "banks"_a,
           "files"_a,
           "segments"_a,
+          "destinations"_a,
+          "buffer_bytes"_a,
           "io_threads"_a,
           "stall_timeout_s"_a,
           "run_coordinator"_a,

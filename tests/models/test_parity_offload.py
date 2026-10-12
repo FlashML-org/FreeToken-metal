@@ -12,7 +12,8 @@ is 20 slots, a step per layer. Cases: decode replayed and eager; copy-miss and o
 prefills (the overlap threshold knob lowered so tiny prompts take it), the chunks of one
 prompt on both sides of the threshold, a prompt chunked through overlap prefills; two
 requests decoding together, and three; prefill overlap off, with no buffers; up in 8 bits
-(gate and up two banks) on a replayed decode and an overlap prefill.
+(the offload cache widens gate to them) on a replayed decode and an overlap prefill; the
+last layer's experts in 8 bits, one pool per layout or per layer.
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ EXPERT_GROUP_SIZE = 32
 EXPERT_BITS = 4
 CACHE_SIZE = 52
 STEPS = 10
+PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 # Absolute and relative: the paths differ in summation order only (a weighted sum against
 # moe_combine, the sorted tile kernel against the per-row matvec).
 LOGITS_TOLERANCE = 1e-4
@@ -60,6 +62,7 @@ class Case:
     # Whether some prefill reads layers ahead into the prefill buffers.
     reads_buffers: bool = False
     up_bits: int = EXPERT_BITS
+    last_layer_bits: int = EXPERT_BITS
 
 
 CASES = [
@@ -100,6 +103,23 @@ CASES = [
         max_decode_rows=1,
         reads_buffers=True,
     ),
+    # Pools of 13 (the last layer) and 39 (the others): three rows of every layer fit.
+    Case(
+        "mixed-layouts-overlap-prefill",
+        (40, 9),
+        overlap_min_tokens=16,
+        reads_buffers=True,
+        last_layer_bits=8,
+    ),
+    Case(
+        "mixed-layouts-per-layer",
+        (100, 9),
+        overlap_min_tokens=48,
+        grouping="per-layer",
+        reads_buffers=True,
+        up_bits=8,
+        last_layer_bits=8,
+    ),
 ]
 
 
@@ -107,15 +127,23 @@ def is_expert_projection(module_path: str, module: nn.Module) -> bool:
     return "switch_mlp" in module_path and hasattr(module, "to_quantized")
 
 
-def write_checkpoint(path: Path, up_bits: int) -> None:
-    """The reference model with its experts alone affine quantized, up in up_bits."""
+def write_checkpoint(path: Path, up_bits: int, last_layer_bits: int) -> None:
+    """The reference model with its experts alone affine quantized, up in up_bits, the last
+    layer's in last_layer_bits."""
     model = build_reference(seed=11, text_config=OFFLOAD_TEXT_CONFIG)
+    num_layers = OFFLOAD_TEXT_CONFIG["num_hidden_layers"]
+    assert isinstance(num_layers, int)
+    last_layer = f"language_model.model.layers.{num_layers - 1}.mlp.switch_mlp"
     up = {"group_size": EXPERT_GROUP_SIZE, "bits": up_bits}
+    last = {"group_size": EXPERT_GROUP_SIZE, "bits": last_layer_bits}
 
     def predicate(module_path: str, module: nn.Module) -> bool | dict[str, int]:
         if not is_expert_projection(module_path, module):
             return False
-        return up if module_path.endswith("up_proj") else True
+        elif module_path.startswith(last_layer):
+            return last
+        else:
+            return up if module_path.endswith("up_proj") else True
 
     nn.quantize(model, group_size=EXPERT_GROUP_SIZE, bits=EXPERT_BITS, class_predicate=predicate)
     mx.eval(model.parameters())
@@ -124,11 +152,10 @@ def write_checkpoint(path: Path, up_bits: int) -> None:
         "bits": EXPERT_BITS,
         "mode": "affine",
     }
-    num_layers = OFFLOAD_TEXT_CONFIG["num_hidden_layers"]
-    assert isinstance(num_layers, int)
     quantization.update(
         {f"language_model.model.layers.{i}.mlp.switch_mlp.up_proj": up for i in range(num_layers)}
     )
+    quantization.update({f"{last_layer}.{projection}": last for projection in PROJECTIONS})
     save_checkpoint(model, path, quantization=quantization)
 
 
@@ -181,7 +208,7 @@ def test_offload_matches_resident_experts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: Case
 ) -> None:
     monkeypatch.setenv("FTMETAL_MOE_PREFILL_OVERLAP_MIN_TOKENS", str(case.overlap_min_tokens))
-    write_checkpoint(tmp_path, case.up_bits)
+    write_checkpoint(tmp_path, case.up_bits, case.last_layer_bits)
     rng = np.random.default_rng(len(case.name))
     prompts = [[int(t) for t in rng.integers(1, 120, size=n)] for n in case.prompt_lens]
 
@@ -191,8 +218,12 @@ def test_offload_matches_resident_experts(
     assert mx.allclose(logits, resident_logits, atol=LOGITS_TOLERANCE, rtol=LOGITS_TOLERANCE)
 
     cache = scheduler.engine.moe_offload_cache
-    assert cache is not None and cache.cache_size == case.cache_size
-    assert ("gate_up_proj.up_proj.weight" in cache.layout) == (case.up_bits != EXPERT_BITS)
+    assert cache is not None
+    # Dedicated buffers take two layers of the slots out of the pools.
+    dedicated = 2 * NUM_EXPERTS if case.buffer_placement == "dedicated" else 0
+    assert cache.cache_size == case.cache_size - dedicated
+    # Gate and up in one scheme, the wider.
+    assert all("gate_up_proj.weight" in pool.layout for pool in cache.slot_layout.pools)
     assert cache.slot_layout.max_decode_rows == case.max_decode_rows
     max_running = max(2, len(case.prompt_lens))
     assert len(scheduler.table_manager.free_slots) == min(max_running, case.max_decode_rows)

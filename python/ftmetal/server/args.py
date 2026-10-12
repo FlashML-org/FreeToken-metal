@@ -413,7 +413,7 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         choices=list(get_args(MoePoolGrouping)),
         default=ServerArgs.moe_pool,
         help="which MoE layers share a pool of the offload cache's slots, with one LRU: every "
-        "layer of an expert layout (unified) or each layer alone (per-layer)",
+        "layer of one quant type (unified) or each layer alone (per-layer)",
     )
     parser.add_argument(
         "--moe-pool-slots",

@@ -1,7 +1,8 @@
 """gather_qmm_sorted against mx.gather_qmm(..., transpose=True, sorted_indices=True).
 
-Each case runs on a resident bank (slot_of = arange(E)) or on a larger bank that holds
-expert e's rows at a random slot and other random rows everywhere else. Where MLX itself
+Each case runs on a resident bank (expert e's rows at row e) or on a larger bank that holds
+expert e's rows at a random slot and other random rows everywhere else, read through each
+expert's byte offsets, also with the bank behind other bytes in one raw buffer. Where MLX itself
 takes its rhs-sorted kernel (B >= 16 and B // E >= 4 on a GPU without matrix units) the
 two run the same tile math, so the outputs must be equal bit for bit: these cases fail if
 an MLX upgrade changes the kernel the vendored copy came from. Everywhere else MLX runs one
@@ -78,7 +79,7 @@ CASES = [
     Case(12, 100, bits=5, group_size=128),
     Case(12, 100, bits=6, dtype=mx.float32),
     Case(256, 1024, output_size=96, input_size=512),  # a Qwen3.6 layer's 256 experts
-    # A larger bank through the slot table.
+    # A larger bank at the experts' byte offsets.
     Case(4, 64, bank_size=64),
     Case(12, 100, bank_size=300, output_size=80, bits=8, group_size=32),
     Case(8, 40, bank_size=50, dtype=mx.float16, pattern="single"),
@@ -104,6 +105,20 @@ def make_bank(
     scales = mx.array(0.02 * rng.standard_normal((*shape, groups), dtype=np.float32))
     biases = mx.array(0.02 * rng.standard_normal((*shape, groups), dtype=np.float32))
     return w, scales.astype(case.dtype), biases.astype(case.dtype)
+
+
+def expert_bytes(
+    slots: np.ndarray, bank: tuple[mx.array, mx.array, mx.array], pads: tuple[int, ...] = (0, 0, 0)
+) -> mx.array:
+    """int64 [E, 3]: the byte offset of each slot's weight, scales and biases rows in the bank
+    arrays, each behind pad bytes."""
+    rows = [array[0].nbytes for array in bank]
+    return mx.array(np.stack([pad + slots * row for pad, row in zip(pads, rows)], axis=1))
+
+
+def behind(array: mx.array, pad: int) -> mx.array:
+    """One raw byte buffer: pad zero bytes, then array's."""
+    return mx.concatenate([mx.zeros((pad,), dtype=mx.uint8), array.view(mx.uint8).reshape(-1)])
 
 
 def expert_rows(rng: np.random.Generator, case: Case) -> np.ndarray:
@@ -136,19 +151,22 @@ def test_matches_mlx_gather_qmm(case: Case) -> None:
         bits=case.bits,
         sorted_indices=True,
     )
-    identity = mx.arange(case.num_experts, dtype=mx.int32)
+    options = {"n": case.output_size, "group_size": case.group_size, "bits": case.bits}
+    identity = np.arange(case.num_experts, dtype=np.int64)
     out = gather_qmm_sorted(
-        x, *resident, expert_offsets, identity, group_size=case.group_size, bits=case.bits
+        x, *resident, expert_offsets, expert_bytes(identity, resident), **options
     )
     if case.bank_size is not None:
-        slots = mx.array(rng.permutation(case.bank_size)[: case.num_experts].astype(np.int32))
+        slots = rng.permutation(case.bank_size)[: case.num_experts].astype(np.int64)
         bank = make_bank(rng, case, case.bank_size)
         for array, rows in zip(bank, resident):
-            array[slots] = rows
-        remapped = gather_qmm_sorted(
-            x, *bank, expert_offsets, slots, group_size=case.group_size, bits=case.bits
-        )
+            array[mx.array(slots)] = rows
+        remapped = gather_qmm_sorted(x, *bank, expert_offsets, expert_bytes(slots, bank), **options)
         assert mx.array_equal(remapped, out)
+        pads = (4096, 768, 256)
+        raw = [behind(array, pad) for array, pad in zip(bank, pads)]
+        offsets = expert_bytes(slots, bank, pads)
+        assert mx.array_equal(gather_qmm_sorted(x, *raw, expert_offsets, offsets, **options), out)
     assert out.shape == (case.num_rows, 1, case.output_size) and out.dtype == case.dtype
     if case.is_bit_exact:
         assert mx.array_equal(out, expected)
@@ -165,25 +183,30 @@ def test_rejects_unsupported_arguments() -> None:
     w, scales, biases = make_bank(rng, case, case.num_experts)
     x = mx.zeros((case.num_rows, 1, case.input_size), dtype=case.dtype)
     offsets = mx.zeros((case.num_experts + 1,), dtype=mx.int32)
-    slots = mx.arange(case.num_experts, dtype=mx.int32)
+    expert_offsets = expert_bytes(np.arange(case.num_experts), (w, scales, biases))
+
+    def call(
+        x: mx.array = x,
+        offsets: mx.array = offsets,
+        byte_offsets: mx.array = expert_offsets,
+        n: int = case.output_size,
+        group_size: int = 64,
+        bits: int = 4,
+    ) -> mx.array:
+        return gather_qmm_sorted(
+            x, w, scales, biases, offsets, byte_offsets, n=n, group_size=group_size, bits=bits
+        )
+
     rejected = [
-        lambda: gather_qmm_sorted(x, w, scales, biases, offsets, slots, group_size=48, bits=4),
-        lambda: gather_qmm_sorted(x, w, scales, biases, offsets, slots, group_size=64, bits=7),
-        lambda: gather_qmm_sorted(x, w, scales, biases, offsets, slots, group_size=32, bits=4),
-        lambda: gather_qmm_sorted(
-            x[:, 0], w, scales, biases, offsets, slots, group_size=64, bits=4
-        ),
-        lambda: gather_qmm_sorted(
-            x, w, scales.astype(mx.float16), biases, offsets, slots, group_size=64, bits=4
-        ),
-        lambda: gather_qmm_sorted(
-            x, w, scales, biases, offsets.astype(mx.uint32), slots, group_size=64, bits=4
-        ),
-        lambda: gather_qmm_sorted(x, w, scales, biases, offsets[:-1], slots, group_size=64, bits=4),
-        lambda: gather_qmm_sorted(
-            x, w, scales, biases, offsets, slots.astype(mx.uint32), group_size=64, bits=4
-        ),
+        lambda: call(group_size=48),
+        lambda: call(bits=7),
+        lambda: call(x=x[:, 0]),
+        lambda: call(n=0),
+        lambda: call(offsets=offsets.astype(mx.uint32)),
+        lambda: call(offsets=offsets[:-1]),
+        lambda: call(byte_offsets=expert_offsets.astype(mx.int32)),
+        lambda: call(byte_offsets=expert_offsets[:, :2]),
     ]
-    for call in rejected:
+    for rejected_call in rejected:
         with pytest.raises(ValueError):
-            call()
+            rejected_call()

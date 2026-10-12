@@ -46,6 +46,7 @@ ExpertService::ExpertService(
     int buffer_size,
     const std::vector<int32_t>& layer_pools,
     const std::vector<int32_t>& pool_bounds,
+    const std::vector<int32_t>& pool_volatile,
     mx::array slot_of,
     mx::array last_use,
     mx::array mailbox,
@@ -53,6 +54,8 @@ ExpertService::ExpertService(
     std::vector<mx::array> banks,
     const std::vector<std::string>& files,
     std::vector<ExpertSegment> segments,
+    std::vector<int64_t> destinations,
+    std::vector<int64_t> buffer_bytes,
     int io_threads,
     double stall_timeout_s,
     bool run_coordinator)
@@ -62,11 +65,14 @@ ExpertService::ExpertService(
           buffer_size,
           layer_pools,
           pool_bounds,
+          pool_volatile,
           std::move(slot_of),
           std::move(last_use)),
       num_layers_(num_layers),
       num_experts_(num_experts),
       banks_(std::move(banks)),
+      destinations_(std::move(destinations)),
+      buffer_bytes_(std::move(buffer_bytes)),
       files_(files),
       segments_(std::move(segments)),
       segments_per_layer_(static_cast<int>(segments_.size()) / num_layers),
@@ -91,14 +97,34 @@ ExpertService::ExpertService(
   if (segments_.empty() || segments_.size() % num_layers != 0) {
     throw std::invalid_argument("ExpertService: segments must hold the same count per layer");
   }
-  for (size_t b = 0; b < banks_.size(); ++b) {
-    const mx::array& bank = banks_[b];
+  int64_t num_banks = static_cast<int64_t>(banks_.size());
+  if (destinations_.size() != static_cast<size_t>(num_layers * num_banks * 2) ||
+      buffer_bytes_.size() != static_cast<size_t>(num_banks)) {
+    throw std::invalid_argument(
+        "ExpertService: destinations must be [num_layers, num_banks, 2] and buffer_bytes "
+        "[num_banks]");
+  }
+  for (int64_t b = 0; b < num_banks; ++b) {
     std::string name = "bank " + std::to_string(b);
-    if (bank.ndim() < 1 || bank.shape(0) != lru_.num_slots()) {
-      throw std::invalid_argument("ExpertService: " + name + " must be [num_slots, ...]");
+    bank_data_.push_back(static_cast<uint8_t*>(shared_data(banks_[b], name)));
+    if (2 * buffer_bytes_[b] > static_cast<int64_t>(banks_[b].nbytes())) {
+      throw std::invalid_argument("ExpertService: the prefill buffers outgrow a bank");
     }
-    bank_data_.push_back(static_cast<uint8_t*>(shared_data(bank, name)));
-    bank_row_bytes_.push_back(static_cast<int64_t>(bank.nbytes()) / lru_.num_slots());
+  }
+  // Every slot of a layer's pool, and a whole layer in each prefill buffer, inside the bank.
+  for (int layer_id = 0; layer_id < num_layers; ++layer_id) {
+    int32_t pool = layer_pools[layer_id];
+    for (int64_t b = 0; b < num_banks; ++b) {
+      int64_t offset = destinations_[2 * (layer_id * num_banks + b)];
+      int64_t row = destinations_[2 * (layer_id * num_banks + b) + 1];
+      if (row < 1 || offset + pool_bounds[pool] * row < 0 ||
+          offset + pool_bounds[pool + 1] * row > static_cast<int64_t>(banks_[b].nbytes()) ||
+          buffer_size * row > buffer_bytes_[b]) {
+        throw std::invalid_argument(
+            "ExpertService: layer " + std::to_string(layer_id) + "'s rows of bank " +
+            std::to_string(b) + " fall outside it or its prefill buffers");
+      }
+    }
   }
   // Each layer's segments must tile every bank row exactly, so a read expert is whole.
   for (int layer_id = 0; layer_id < num_layers; ++layer_id) {
@@ -106,22 +132,27 @@ ExpertService::ExpertService(
     for (int s = 0; s < segments_per_layer_; ++s) {
       const ExpertSegment& segment = segments_[layer_id * segments_per_layer_ + s];
       if (segment.file_index < 0 || segment.file_index >= static_cast<int64_t>(files.size()) ||
-          segment.bank_index < 0 || segment.bank_index >= static_cast<int64_t>(banks_.size()) ||
-          segment.file_offset < 0 || segment.expert_bytes < 1) {
+          segment.bank_index < 0 || segment.bank_index >= num_banks ||
+          segment.file_offset < 0 || segment.expert_bytes < 1 ||
+          (segment.widens != 0 && segment.widens != 1)) {
         throw std::invalid_argument(
             "ExpertService: segment " + std::to_string(s) + " of layer " +
-            std::to_string(layer_id) + " names no file or bank, or an empty range");
+            std::to_string(layer_id) + " names no file or bank, an empty range or no widening");
       }
-      pieces.emplace_back(segment.bank_index, segment.row_offset, segment.expert_bytes);
+      int64_t row_bytes = segment.expert_bytes * (segment.widens ? 2 : 1);
+      pieces.emplace_back(segment.bank_index, segment.row_offset, row_bytes);
     }
     std::sort(pieces.begin(), pieces.end());
-    std::vector<int64_t> covered(banks_.size(), 0);
+    std::vector<int64_t> covered(num_banks, 0);
     bool is_tiled = true;
-    for (const auto& [bank_index, row_offset, expert_bytes] : pieces) {
+    for (const auto& [bank_index, row_offset, row_bytes] : pieces) {
       is_tiled = is_tiled && row_offset == covered[bank_index];
-      covered[bank_index] += expert_bytes;
+      covered[bank_index] += row_bytes;
     }
-    if (!is_tiled || covered != bank_row_bytes_) {
+    for (int64_t b = 0; b < num_banks; ++b) {
+      is_tiled = is_tiled && covered[b] == destinations_[2 * (layer_id * num_banks + b) + 1];
+    }
+    if (!is_tiled) {
       throw std::invalid_argument(
           "ExpertService: the segments of layer " + std::to_string(layer_id) +
           " do not tile every bank row exactly once");
@@ -223,12 +254,17 @@ void ExpertService::check_layer(int layer_id, const char* method) const {
   }
 }
 
-void ExpertService::submit(ReadBatch& batch, int layer_id, const std::vector<ExpertLoad>& loads) {
+void ExpertService::submit(
+    ReadBatch& batch,
+    int layer_id,
+    const std::vector<ExpertLoad>& loads,
+    int buffer) {
   batch.layer_id = layer_id;
+  batch.buffer = buffer;
   batch.experts_read = static_cast<int64_t>(loads.size());
-  batch.slot_of_expert.assign(num_experts_, -1);
-  for (const auto& [expert, slot] : loads) {
-    batch.slot_of_expert[expert] = slot;
+  batch.index_of_expert.assign(num_experts_, -1);
+  for (const auto& [expert, index] : loads) {
+    batch.index_of_expert[expert] = index;
   }
   batch.bytes_read.store(0, std::memory_order_relaxed);
   batch.error.clear();
@@ -236,12 +272,12 @@ void ExpertService::submit(ReadBatch& batch, int layer_id, const std::vector<Exp
   for (int s = 0; s < segments_per_layer_; ++s) {
     const ExpertSegment& segment = segments_[layer_id * segments_per_layer_ + s];
     for (int32_t first = 0; first < num_experts_;) {
-      if (batch.slot_of_expert[first] < 0) {
+      if (batch.index_of_expert[first] < 0) {
         ++first;
         continue;
       }
       int32_t last = first + 1;
-      while (last < num_experts_ && batch.slot_of_expert[last] >= 0) {
+      while (last < num_experts_ && batch.index_of_expert[last] >= 0) {
         ++last;
       }
       int64_t run_end = segment.file_offset + last * segment.expert_bytes;
@@ -309,19 +345,31 @@ void ExpertService::read(const ReadTask& task, uint8_t* staging) {
     done += count;
   }
   batch.bytes_read.fetch_add(done, std::memory_order_relaxed);
-  uint8_t* bank = bank_data_[segment.bank_index];
-  int64_t row_bytes = bank_row_bytes_[segment.bank_index];
+  size_t destination = 2 * (batch.layer_id * banks_.size() + segment.bank_index);
+  int64_t row_bytes = destinations_[destination + 1];
+  int64_t row_zero = batch.buffer < 0 ? destinations_[destination]
+                                      : batch.buffer * buffer_bytes_[segment.bank_index];
   int64_t first = (task.begin - segment.file_offset) / segment.expert_bytes;
   int64_t last = (task.end - 1 - segment.file_offset) / segment.expert_bytes;
   for (int64_t expert = first; expert <= last; ++expert) {
     int64_t expert_begin = segment.file_offset + expert * segment.expert_bytes;
     int64_t piece_begin = std::max(task.begin, expert_begin);
     int64_t piece_end = std::min(task.end, expert_begin + segment.expert_bytes);
-    int64_t slot = batch.slot_of_expert[expert];
-    std::memcpy(
-        bank + slot * row_bytes + segment.row_offset + (piece_begin - expert_begin),
-        staging + (piece_begin - aligned_begin),
-        piece_end - piece_begin);
+    const uint8_t* source = staging + (piece_begin - aligned_begin);
+    int64_t row = row_zero + batch.index_of_expert[expert] * row_bytes + segment.row_offset;
+    if (segment.widens) {
+      // MLX packs code i of a row into bits 4 * (i % 8) of word i / 8: low nibble first.
+      uint8_t* target = bank_data_[segment.bank_index] + row + 2 * (piece_begin - expert_begin);
+      for (int64_t i = 0; i < piece_end - piece_begin; ++i) {
+        target[2 * i] = source[i] & 0xF;
+        target[2 * i + 1] = source[i] >> 4;
+      }
+    } else {
+      std::memcpy(
+          bank_data_[segment.bank_index] + row + (piece_begin - expert_begin),
+          source,
+          piece_end - piece_begin);
+    }
   }
 }
 
@@ -441,7 +489,7 @@ std::vector<int32_t> ExpertService::prefetch_prefill_layer(int layer_id) {
   buffer.layer_id = layer_id;
   buffer.slot_map = std::move(assignment.slots);
   buffer.is_waited = false;
-  submit(*buffer.batch, layer_id, assignment.loads);
+  submit(*buffer.batch, layer_id, assignment.loads, layer_id % 2);
   return buffer.slot_map;
 }
 

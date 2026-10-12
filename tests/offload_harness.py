@@ -23,11 +23,11 @@ from typing import Literal
 import mlx.core as mx
 import numpy as np
 
-from ftmetal.layers.moe import ExpertSchemes, moe_layout
-from ftmetal.layers.quantization.config import AffineScheme
+from ftmetal.layers.moe import ExpertSchemes, align_gate_up, moe_layout
+from ftmetal.layers.quantization.config import AffineScheme, BankSpec
 from ftmetal.models.loader import FuseRule, WeightRules
 from ftmetal.moe.offload_cache import STALL_TIMEOUT_S, OffloadMoeCache
-from ftmetal.moe.slot_pools import MoePoolGrouping, PrefillBufferPlacement
+from ftmetal.moe.slot_pools import MoePoolGrouping, PrefillBufferPlacement, plan_slot_layout
 from ftmetal.moe.source import ExpertSource
 
 Naming = Literal["qwen", "gemma4"]
@@ -76,6 +76,23 @@ def weight_rules(naming: Naming) -> WeightRules:
             fuses=(gate_up,),
             expert_segment="experts",
         )
+
+
+def layer_layouts(spec: CheckpointSpec) -> list[dict[str, BankSpec]]:
+    """Each layer's bank arrays per expert as the offload cache holds them, gate and up in one
+    scheme."""
+    layouts = []
+    for layer_id in range(spec.num_layers):
+        schemes = spec.expert_schemes
+        if layer_id == spec.num_layers - 1 and spec.last_layer_bits is not None:
+            assert spec.scheme is not None, "a last layer in other bits is affine"
+            schemes = ExpertSchemes.uniform(
+                AffineScheme(spec.last_layer_bits, spec.scheme.group_size)
+            )
+        if schemes.gate is not None:
+            schemes = align_gate_up(schemes)
+        layouts.append(moe_layout(spec.hidden_size, spec.intermediate_size, schemes, mx.bfloat16))
+    return layouts
 
 
 def checkpoint_rules(spec: CheckpointSpec) -> WeightRules:
@@ -162,19 +179,21 @@ def build_cache(
     """The cache over a new checkpoint of spec written to directory, and its source."""
     write_checkpoint(directory, spec)
     source = ExpertSource(str(directory), checkpoint_rules(spec))
+    slot_layout = plan_slot_layout(
+        cache_size,
+        layer_layouts(spec),
+        spec.num_experts,
+        TOP_K,
+        grouping=grouping,
+        counts=None,
+        prefill_overlap=prefill_overlap,
+        buffer_placement=buffer_placement,
+    )
     cache = OffloadMoeCache(
-        num_layers=spec.num_layers,
-        num_experts=spec.num_experts,
-        top_k=TOP_K,
-        cache_size=cache_size,
+        slot_layout=slot_layout,
+        source=source,
         prefill_overlap=prefill_overlap,
         prefill_overlap_min_tokens=PREFILL_OVERLAP_MIN_TOKENS,
-        layout=moe_layout(
-            spec.hidden_size, spec.intermediate_size, spec.expert_schemes, mx.bfloat16
-        ),
-        source=source,
-        grouping=grouping,
-        buffer_placement=buffer_placement,
         stall_timeout_s=stall_timeout_s,
         run_coordinator=run_coordinator,
     )

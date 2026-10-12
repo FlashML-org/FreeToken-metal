@@ -1,21 +1,25 @@
 """The slot layout of the routed-expert offload cache: pools of slots and prefill buffers.
 
-The MoE layers are grouped into pools (unified: every layer of an expert layout, of which the
-cache holds one; per-layer: one layer each), each a run of slots with an LRU of its own
-(SlotLru), sized evenly per layer or by a hot-expert table (how often each layer's experts
-are routed: the model directory's own, profiled locally, else the one shipped for the model)
-summed over its layers. The two prefill buffers hold a whole layer each, over the first
-slots or before the pools.
+The MoE layers are grouped into pools (unified: every layer of one quant type in each bank;
+per-layer: one layer each), each a run of slots with an LRU of its own (SlotLru), sized evenly
+per layer or by a hot-expert table (how often each layer's experts are routed: the model
+directory's own, profiled locally, else the one shipped for the model) summed over its layers.
+Every bank (an array role of the layouts) is one raw byte buffer: the two prefill buffers of a
+whole layer of its widest rows each, over the pools that come first or before them, then each
+pool's rows in its own layout, pools of the widest slots first.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 import numpy as np
+
+from ftmetal.layers.quantization.config import BankSpec
 
 # A hot-expert table in a model's directory: {"num_layers", "num_experts", "counts"}, counts
 # [num_layers][num_experts] the times each expert was routed.
@@ -32,20 +36,32 @@ PrefillBufferPlacement = Literal["overlay", "dedicated"]
 
 @dataclass(frozen=True, kw_only=True)
 class SlotPool:
+    """Its layers, of one quant type and so one expert layout, its slots [first_slot,
+    first_slot + num_slots), the byte offset of its first row in each bank, and how many of its
+    first slots lie under the prefill buffers."""
+
     layers: list[int]
+    layout: dict[str, BankSpec]
     first_slot: int
     num_slots: int
+    offsets: dict[str, int]
+    volatile_slots: int
 
 
 @dataclass(frozen=True, kw_only=True)
 class SlotLayout:
-    """The pools in slot order and the slots of each prefill buffer (0: none); the buffers
-    take slots [0, 2 * buffer_size), over the first pools or before them."""
+    """The pools in slot order, the experts of each prefill buffer (0: none) and its bytes in
+    each bank (from byte 0, the second right after the first), and each bank's bytes and
+    width: a bank is [bank_bytes / width, width] bytes, every row of it a whole number of
+    width (MLX sizes an axis in int32)."""
 
     pools: list[SlotPool]
     buffer_size: int
     num_experts: int
     top_k: int
+    buffer_bytes: dict[str, int]
+    bank_bytes: dict[str, int]
+    bank_widths: dict[str, int]
 
     @property
     def num_slots(self) -> int:
@@ -165,7 +181,7 @@ def min_cache_size(
 
 def plan_slot_layout(
     cache_size: int,
-    num_layers: int,
+    layouts: list[dict[str, BankSpec]],
     num_experts: int,
     top_k: int,
     *,
@@ -174,8 +190,12 @@ def plan_slot_layout(
     prefill_overlap: bool,
     buffer_placement: PrefillBufferPlacement,
 ) -> SlotLayout:
-    """cache_size slots (fewer once every expert fits) as pools and, with prefill overlap
-    unless every expert fits, two prefill buffers of a whole layer each."""
+    """cache_size slots (fewer once every expert fits) of the layers of layouts (their bank
+    arrays per expert, one set of roles) as pools and, with prefill overlap unless every
+    expert fits, two prefill buffers of a whole layer each."""
+    num_layers = len(layouts)
+    roles = list(layouts[0])
+    assert all(list(layout) == roles for layout in layouts), "the layouts share their banks"
     floor = min_cache_size(
         num_layers,
         num_experts,
@@ -201,21 +221,61 @@ def plan_slot_layout(
         top_k,
         counts,
     )
-    if grouping == "unified":
-        groups = [list(range(num_layers))]
-    else:
-        groups = [[layer_id] for layer_id in range(num_layers)]
+    # By quant type, not row format, which two types can share (GGUF's Q4_0 and Q4_K).
+    quants = [[spec.quant for spec in layout.values()] for layout in layouts]
+    groups: list[list[int]] = []
+    for layer_id, layout in enumerate(layouts):
+        group = next((group for group in groups if quants[group[0]] == quants[layer_id]), None)
+        if grouping == "unified" and group is not None:
+            assert layouts[group[0]] == layout, "the layers of one quant type share a layout"
+            group.append(layer_id)
+        else:
+            groups.append([layer_id])
     pool_slots = [sum(runs[layer_id] for layer_id in group) for group in groups]
-    # Smallest first: overlaid buffers cover the runs whose experts their layers miss least.
-    order = sorted(range(len(groups)), key=lambda pool_id: (pool_slots[pool_id], groups[pool_id]))
-    first_slot = 2 * buffer_size if is_dedicated else 0
+    slot_bytes = [sum(spec.nbytes for spec in layouts[group[0]].values()) for group in groups]
+    # Widest slots first, so the buffers cover the fewest; then the smallest pools, whose
+    # experts their layers miss least.
+    order = sorted(
+        range(len(groups)),
+        key=lambda pool_id: (-slot_bytes[pool_id], pool_slots[pool_id], groups[pool_id]),
+    )
+    # Every row of a bank is a whole number of its width, so is every offset below.
+    widths = {role: math.gcd(*(layout[role].nbytes for layout in layouts)) for role in roles}
+    buffer_bytes = {
+        role: buffer_size * max(layout[role].nbytes for layout in layouts) for role in roles
+    }
+    bank_end = {role: 2 * buffer_bytes[role] if is_dedicated else 0 for role in roles}
     pools: list[SlotPool] = []
+    first_slot = 0
     for pool_id in order:
+        layout, num_slots = layouts[groups[pool_id][0]], pool_slots[pool_id]
+        offsets = dict(bank_end)
+        volatile_slots = 0
+        for role, spec in layout.items():
+            bank_end[role] = offsets[role] + num_slots * spec.nbytes
+            if not is_dedicated:
+                rows_under = -(-(2 * buffer_bytes[role] - offsets[role]) // spec.nbytes)
+                volatile_slots = max(volatile_slots, min(max(rows_under, 0), num_slots))
         pools.append(
-            SlotPool(layers=groups[pool_id], first_slot=first_slot, num_slots=pool_slots[pool_id])
+            SlotPool(
+                layers=groups[pool_id],
+                layout=layout,
+                first_slot=first_slot,
+                num_slots=num_slots,
+                offsets=offsets,
+                volatile_slots=volatile_slots,
+            )
         )
-        first_slot += pool_slots[pool_id]
-    return SlotLayout(pools=pools, buffer_size=buffer_size, num_experts=num_experts, top_k=top_k)
+        first_slot += num_slots
+    return SlotLayout(
+        pools=pools,
+        buffer_size=buffer_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        buffer_bytes=buffer_bytes,
+        bank_bytes={role: max(bank_end[role], 2 * buffer_bytes[role]) for role in roles},
+        bank_widths=widths,
+    )
 
 
 def initial_experts(layout: SlotLayout, counts: np.ndarray | None) -> list[int]:

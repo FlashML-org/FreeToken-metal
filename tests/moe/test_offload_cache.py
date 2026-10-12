@@ -22,16 +22,15 @@ import numpy as np
 import pytest
 from mlx.utils import tree_flatten
 
-from ftmetal.core import host_ints
 from ftmetal.engine.config import EngineConfig
-from ftmetal.layers.moe import ExpertSchemes, MoELayer, moe_layout
+from ftmetal.layers.moe import ExpertSchemes, MoELayer, align_gate_up, moe_layout
 from ftmetal.layers.quantization.config import AffineScheme
 from ftmetal.models.loader import apply_rules, load_checkpoint
 from ftmetal.models.qwen3_5_moe.model import schemes_of
 from ftmetal.models.qwen3_5_moe.weight import GATE_UP_PARTS
 from ftmetal.models.register import model_weight_rules
 from ftmetal.moe.offload_cache import OffloadMoeCache
-from ftmetal.moe.slot_pools import MoePoolGrouping, PrefillBufferPlacement
+from ftmetal.moe.slot_pools import MoePoolGrouping, PrefillBufferPlacement, plan_slot_layout
 from ftmetal.moe.source import ExpertSource
 from offload_harness import (
     CheckpointSpec,
@@ -43,6 +42,8 @@ from offload_harness import (
 )
 
 MODEL_PATH = os.environ.get("FTMETAL_TEST_MODEL_PATH")
+# The parts of gate_up_proj when the checkpoint keeps them apart.
+GATE_UP = ("gate_proj", "up_proj")
 # One decode step: the (layer, distinct expert ids) calls of ensure_experts, in order.
 Step = tuple[tuple[int, tuple[int, ...]], ...]
 
@@ -171,6 +172,46 @@ CASES = [
         grouping="unified",
         buffer_placement="overlay",
     ),
+    # The last layer in 8 bits: one pool per layout, the 8-bit one first under the buffers.
+    Case(
+        3,
+        8,
+        192,
+        64,
+        18,
+        True,
+        script=(
+            ((0, (0, 5, 6)), (1, (7,)), (2, (1, 2, 6, 7))),
+            Prefill((0, 1, 2)),
+            ((0, (5, 7, 3)), (2, (6, 0)), (1, (3, 4))),
+        ),
+        last_layer_bits=8,
+        grouping="unified",
+    ),
+    # Gate in 8 bits, up widened to them: the widened part ends the row.
+    Case(
+        3,
+        8,
+        192,
+        64,
+        18,
+        True,
+        script=(((0, (0, 5)), (2, (1, 2))), Prefill((0, 1, 2)), ((2, (6, 0)), (1, (3,)))),
+        scheme=AffineScheme(8, 64),
+        up_bits=4,
+    ),
+    # Up in 8 bits, gate widened to them, and the last layer in 8 bits too.
+    Case(
+        3,
+        8,
+        192,
+        64,
+        18,
+        True,
+        script=(((0, (0, 5)), (2, (1, 2))), Prefill((0, 1, 2)), ((2, (6, 0)), (1, (3,)))),
+        up_bits=8,
+        last_layer_bits=8,
+    ),
     # Runs of 6 per layer, the buffers over layers 0 and 1 and the start of layer 2's.
     Case(
         3,
@@ -216,48 +257,102 @@ def resident_rows(cache: OffloadMoeCache) -> dict[tuple[int, int], int]:
     return rows
 
 
-def check_rows(
+def expected_rows(
     cache: OffloadMoeCache,
     reference: dict[str, mx.array],
     prefixes: list[str],
-    rows: dict[tuple[int, int], int],
+    layers: list[int] | None = None,
+) -> dict[int, dict[str, np.ndarray]]:
+    """Per layer (of layers, all by default), role -> uint8 [E, row bytes]: each expert's bank
+    row as the cache holds it, gate and up fused, a 4-bit part widened to 8 bits (one code per
+    byte)."""
+    rows = {}
+    for layer_id in range(cache.num_layers) if layers is None else layers:
+        layout = cache.slot_layout.pools[cache.layer_pools[layer_id]].layout
+        experts = f"{prefixes[layer_id]}.experts"
+        layer_rows = {}
+        for role, spec in layout.items():
+            projection, _, leaf = role.rpartition(".")
+            if f"{experts}.{role}" in reference:
+                parts = [reference[f"{experts}.{role}"]]
+            else:
+                # The checkpoint stores gate and up in two formats.
+                parts = [reference[f"{experts}.{projection}.{part}.{leaf}"] for part in GATE_UP]
+            row_parts = []
+            for part in parts:
+                data = np.array(part.view(mx.uint8)).reshape(part.shape[0], -1)
+                if spec.dtype == mx.uint32 and part.shape[2] != spec.shape[1]:
+                    data = np.stack([data & 0xF, data >> 4], axis=-1).reshape(part.shape[0], -1)
+                row_parts.append(data)
+            layer_rows[role] = np.concatenate(row_parts, axis=1)
+        rows[layer_id] = layer_rows
+    return rows
+
+
+def slot_offsets(cache: OffloadMoeCache, layer_id: int, slot: int) -> np.ndarray:
+    """The byte offset of the layer's row at slot in every bank."""
+    return cache.destinations[layer_id, :, 0] + slot * cache.destinations[layer_id, :, 1]
+
+
+def check_rows(
+    cache: OffloadMoeCache,
+    expected: dict[int, dict[str, np.ndarray]],
+    located: dict[tuple[int, int], np.ndarray],
 ) -> None:
-    """Each (layer, expert) -> slot of rows holds the expert's checkpoint row in every bank."""
-    for role, bank in cache.bank_views().items():
-        for (layer_id, expert), slot in rows.items():
-            expected = reference[f"{prefixes[layer_id]}.experts.{role}"][expert]
-            assert mx.array_equal(bank[slot], expected), (role, layer_id, expert, slot)
+    """Each (layer, expert) -> its byte offsets in every bank holds the expert's row there."""
+    banks = {role: np.array(bank).reshape(-1) for role, bank in cache.banks.items()}
+    for (layer_id, expert), offsets in located.items():
+        for (role, rows), offset in zip(expected[layer_id].items(), offsets, strict=True):
+            row = banks[role][offset : offset + rows.shape[1]]
+            assert (row == rows[expert]).all(), (role, layer_id, expert, offset)
 
 
 @pytest.mark.parametrize("case", CASES, ids=str)
 def test_rows_match_checkpoint(tmp_path: Path, case: Case) -> None:
     cache, reference, source = build(tmp_path / "checkpoint", case)
-    prefixes = source.layer_prefixes
-    assert (source.segment_table(cache.layout)[..., 1] % 4096 != 0).any(), "all experts aligned"
+    expected = expected_rows(cache, reference, source.layer_prefixes)
+    layouts = [cache.slot_layout.pools[pool].layout for pool in cache.layer_pools]
+    assert (source.segment_table(layouts)[..., 1] % 4096 != 0).any(), "all aligned"
     cache.fill_initial()
     rows = resident_rows(cache)
     assert len(rows) == sum(pool.num_slots for pool in cache.slot_layout.pools)
-    check_rows(cache, reference, prefixes, rows)
+
+    def located(rows: dict[tuple[int, int], int]) -> dict[tuple[int, int], np.ndarray]:
+        return {key: slot_offsets(cache, key[0], slot) for key, slot in rows.items()}
+
+    check_rows(cache, expected, located(rows))
+    pools = cache.slot_layout.pools
     calls_with_misses = 0
     for step, entry in enumerate(case.script, start=1):
         if isinstance(entry, Prefill):
             cache.begin_prefill()
             resident = resident_rows(cache)
-            assert all(slot >= 2 * cache.slot_layout.buffer_size for slot in resident.values())
+            for (layer_id, _), slot in resident.items():
+                pool = pools[cache.layer_pools[layer_id]]
+                assert slot - pool.first_slot >= pool.volatile_slots, "a slot under the buffers"
             for layer_id in entry.layers[:2]:
                 cache.prefetch_prefill_layer(layer_id)
             for i, layer_id in enumerate(entry.layers):
-                slot_map = host_ints(cache.prefetch_prefill_layer(layer_id))
+                expert_bytes = cache.prefetch_prefill_layer(layer_id)
                 cache.wait_prefill_layer(layer_id)
-                buffer_slot = (layer_id % 2) * cache.slot_layout.buffer_size
-                for expert, slot in enumerate(slot_map):
+                offsets = np.concatenate([np.array(v) for v in expert_bytes.values()], axis=1)
+                buffer_row = 0
+                for expert in range(cache.num_experts):
                     if (layer_id, expert) in resident:
-                        assert slot == resident[(layer_id, expert)]
+                        expected_offsets = slot_offsets(
+                            cache, layer_id, resident[(layer_id, expert)]
+                        )
                     else:
-                        assert slot == buffer_slot
-                        buffer_slot += 1
-                layer_rows = {(layer_id, expert): slot for expert, slot in enumerate(slot_map)}
-                check_rows(cache, reference, prefixes, layer_rows)
+                        expected_offsets = (layer_id % 2) * cache.buffer_bytes + buffer_row * (
+                            cache.destinations[layer_id, :, 1]
+                        )
+                        buffer_row += 1
+                    assert (offsets[expert] == expected_offsets).all(), (layer_id, expert)
+                check_rows(
+                    cache,
+                    expected,
+                    {(layer_id, expert): offsets[expert] for expert in range(cache.num_experts)},
+                )
                 if i + 2 < len(entry.layers):
                     cache.prefetch_prefill_layer(entry.layers[i + 2])
         else:
@@ -267,7 +362,7 @@ def test_rows_match_checkpoint(tmp_path: Path, case: Case) -> None:
                 calls_with_misses += sum(cache.stats().misses) > misses_before
                 rows = resident_rows(cache)
                 assert slots == [rows[(layer_id, expert)] for expert in expert_ids]
-                check_rows(cache, reference, prefixes, rows)
+                check_rows(cache, expected, located(rows))
     stats = cache.stats()
     calls = [call for entry in case.script if not isinstance(entry, Prefill) for call in entry]
     assert sum(stats.hits) + sum(stats.misses) == sum(len(expert_ids) for _, expert_ids in calls)
@@ -282,7 +377,7 @@ def test_source_rejects_a_layer_in_another_format(tmp_path: Path) -> None:
         case.hidden_size, case.intermediate_size, ExpertSchemes.uniform(case.scheme), mx.bfloat16
     )
     with pytest.raises(ValueError, match="model.layers.2.mlp.experts.gate_up_proj.weight"):
-        source.segment_table(layout)
+        source.segment_table([layout] * case.num_layers)
 
 
 def test_prefill_buffer_protocol(tmp_path: Path) -> None:
@@ -300,9 +395,8 @@ def test_prefill_buffer_protocol(tmp_path: Path) -> None:
     cache.wait_prefill_layer(0)
     cache.prefetch_prefill_layer(2)
     cache.begin_prefill()
-    # Buffers [0, 16); layer 1's pool [19, 22) holds experts 2, 1, 0: expert 0 (lowest id)
-    # goes.
-    assert cache.ensure_experts(1, [3], 1) == [21]
+    # Layer 1's pool [3, 6) holds experts 2, 1, 0: expert 0 (lowest id) goes.
+    assert cache.ensure_experts(1, [3], 1) == [5]
 
 
 def test_read_failure_poisons_the_cache(tmp_path: Path) -> None:
@@ -365,31 +459,51 @@ def test_real_checkpoint_rows() -> None:
     model_config = config.model_config
     rules = model_weight_rules(config.architecture, model_config)
     source = ExpertSource(MODEL_PATH, rules)
-    schemes = ExpertSchemes(
-        *schemes_of(model_config, "model.layers.0.mlp.experts", (*GATE_UP_PARTS, "down_proj"))
-    )
-    layout = moe_layout(
-        model_config.hidden_size, model_config.moe_intermediate_size, schemes, mx.bfloat16
-    )
+    layouts = [
+        moe_layout(
+            model_config.hidden_size,
+            model_config.moe_intermediate_size,
+            align_gate_up(
+                ExpertSchemes(
+                    *schemes_of(
+                        model_config,
+                        f"model.layers.{layer_id}.mlp.experts",
+                        (*GATE_UP_PARTS, "down_proj"),
+                    )
+                )
+            ),
+            mx.bfloat16,
+        )
+        for layer_id in range(source.num_layers)
+    ]
+    top_k = model_config.num_experts_per_tok
     cache = OffloadMoeCache(
-        num_layers=source.num_layers,
-        num_experts=source.num_experts,
-        top_k=model_config.num_experts_per_tok,
-        cache_size=source.num_layers * model_config.num_experts_per_tok,
+        slot_layout=plan_slot_layout(
+            source.num_layers * top_k,
+            layouts,
+            source.num_experts,
+            top_k,
+            grouping="unified",
+            counts=None,
+            prefill_overlap=False,
+            buffer_placement="overlay",
+        ),
+        source=source,
         prefill_overlap=False,
         prefill_overlap_min_tokens=128,
-        layout=layout,
-        source=source,
-        grouping="unified",
-        buffer_placement="overlay",
     )
     reference = apply_rules(load_checkpoint(MODEL_PATH), rules)
-    last = source.num_layers - 1
-    for layer_id, expert_ids in [(0, [0, 1, 2, source.num_experts - 1]), (last, [17, 18, 100])]:
+    checked = [(0, [0, 1, 2, source.num_experts - 1])]
+    checked += [(layer_id, [17, 18, 100]) for layer_id in range(1, source.num_layers)]
+    for layer_id, expert_ids in checked:
+        # One layer's experts at a time: the whole checkpoint is tens of GiB.
+        expected = expected_rows(cache, reference, source.layer_prefixes, [layer_id])
         slots = cache.ensure_experts(layer_id, expert_ids, 1)
         check_rows(
             cache,
-            reference,
-            source.layer_prefixes,
-            {(layer_id, expert): slot for expert, slot in zip(expert_ids, slots)},
+            expected,
+            {
+                (layer_id, expert): slot_offsets(cache, layer_id, slot)
+                for expert, slot in zip(expert_ids, slots)
+            },
         )

@@ -1,8 +1,9 @@
 // ExpertService: the CPU side of the routed-expert slot cache. It owns the SlotLru and a
 // pool of IO threads that read expert rows straight from the checkpoint into the bank
 // slots: raw read-around (each read widened to 4 KiB boundaries, F_NOCACHE, no read-ahead)
-// into a per-thread aligned staging buffer, then one memcpy per expert into its row. A run
-// of consecutive experts of one checkpoint segment is one read. Idle threads block; a
+// into a per-thread aligned staging buffer, then one memcpy per expert into its row (a
+// widening copy for a 4-bit part of an 8-bit row). A run of consecutive experts of one
+// checkpoint segment is one read. Idle threads block; a
 // caller waits for its reads by spinning on a completion counter. A coordinator thread
 // answers the GPU lookups' mailbox requests (see moe_lookup.h) with the same reads, and a
 // watchdog thread fails a request the coordinator leaves unanswered. Public methods other
@@ -31,13 +32,15 @@ constexpr int64_t EXPERT_STAGING_BYTES = 8 << 20;
 
 // One checkpoint part of one bank, per MoE layer: expert e's bytes are
 // [file_offset + e * expert_bytes, file_offset + (e + 1) * expert_bytes) of file
-// file_index, and land at row_offset in a row of bank bank_index.
+// file_index, and land at row_offset in a row of bank bank_index; widens 1 widens each
+// 4-bit code to a byte (twice the bytes in the row), 0 copies them as they are.
 struct ExpertSegment {
   int64_t file_index;
   int64_t file_offset;
   int64_t expert_bytes;
   int64_t bank_index;
   int64_t row_offset;
+  int64_t widens;
 };
 
 // Per MoE layer. hits and misses count the experts of ensure_experts and of the answered
@@ -63,12 +66,15 @@ struct ReadError : std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
-// The reads of some of one layer's experts.
+// The reads of some of one layer's experts, into slots or into the rows of one prefill
+// buffer.
 struct ReadBatch {
   int layer_id = -1;
+  // The prefill buffer read into, -1 for slots.
+  int buffer = -1;
   int64_t experts_read = 0;
-  // Bank slot of each expert being read, -1 for the others.
-  std::vector<int32_t> slot_of_expert;
+  // The slot (or buffer row) of each expert being read, -1 for the others.
+  std::vector<int32_t> index_of_expert;
   std::atomic<int64_t> remaining{0};
   std::atomic<int64_t> bytes_read{0};
   std::mutex error_mutex;
@@ -94,17 +100,21 @@ struct PrefillBuffer {
 
 class ExpertService {
  public:
-  // buffer_size, layer_pools and pool_bounds lay out the slots (SlotLru); mailbox uint32
-  // [MAILBOX_WORDS] and hit_stats uint32 [num_layers, 2] are the lookups'; banks: one
-  // evaluated row-contiguous [num_slots, ...] array per bank; segments: num_layers *
-  // segments-per-layer entries, layer-major. The watchdog fails a request left unanswered for
-  // stall_timeout_s; without run_coordinator nobody answers (a stalled coordinator, for tests).
+  // buffer_size, layer_pools, pool_bounds and pool_volatile lay out the slots (SlotLru);
+  // mailbox uint32 [MAILBOX_WORDS] and hit_stats uint32 [num_layers, 2] are the lookups';
+  // banks: one evaluated row-contiguous byte buffer per bank; segments: num_layers *
+  // segments-per-layer entries, layer-major; destinations: per layer and bank, the byte
+  // offset of slot 0's row and the row's bytes (slot s at offset + s * row); buffer_bytes:
+  // each prefill buffer's bytes in each bank, from byte 0. The watchdog fails a request left
+  // unanswered for stall_timeout_s; without run_coordinator nobody answers (a stalled
+  // coordinator, for tests).
   ExpertService(
       int num_layers,
       int num_experts,
       int buffer_size,
       const std::vector<int32_t>& layer_pools,
       const std::vector<int32_t>& pool_bounds,
+      const std::vector<int32_t>& pool_volatile,
       mx::array slot_of,
       mx::array last_use,
       mx::array mailbox,
@@ -112,6 +122,8 @@ class ExpertService {
       std::vector<mx::array> banks,
       const std::vector<std::string>& files,
       std::vector<ExpertSegment> segments,
+      std::vector<int64_t> destinations,
+      std::vector<int64_t> buffer_bytes,
       int io_threads,
       double stall_timeout_s,
       bool run_coordinator);
@@ -162,7 +174,12 @@ class ExpertService {
   void coordinate();
   void answer();
   void watch();
-  void submit(ReadBatch& batch, int layer_id, const std::vector<ExpertLoad>& loads);
+  // Read loads (expert, slot) into slots, or (expert, row) into prefill buffer buffer.
+  void submit(
+      ReadBatch& batch,
+      int layer_id,
+      const std::vector<ExpertLoad>& loads,
+      int buffer = -1);
   void finish_buffer(PrefillBuffer& buffer, int64_t wait_ns);
   void work(int thread_index);
   void read(const ReadTask& task, uint8_t* staging);
@@ -172,7 +189,9 @@ class ExpertService {
   int num_experts_;
   std::vector<mx::array> banks_;
   std::vector<uint8_t*> bank_data_;
-  std::vector<int64_t> bank_row_bytes_;
+  // [num_layers][num_banks] (slot 0's row offset, row bytes), flat.
+  std::vector<int64_t> destinations_;
+  std::vector<int64_t> buffer_bytes_;
   std::vector<std::string> files_;
   std::vector<int> file_descriptors_;
   std::vector<ExpertSegment> segments_;

@@ -3,12 +3,14 @@
 No FreeToken donor: FreeToken copies expert rows from host banks it loaded, while here
 the slot cache reads them from the checkpoint files. MLX checkpoints stack each expert
 projection as [experts, rows, ...], so expert e of a part is one contiguous byte range;
-a fused bank row (gate_up = gate then up) is its parts' ranges back to back. Only the
-safetensors headers are read.
+a fused bank row (gate_up = gate then up) is its parts' ranges back to back, also when the
+checkpoint stores gate and up apart: a 4-bit part of an 8-bit bank row is widened as it is
+read. Only the safetensors headers are read.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import re
@@ -55,6 +57,8 @@ class ExpertSource:
     def __init__(self, model_path: str, rules: WeightRules) -> None:
         if rules.expert_segment is None:
             raise ValueError(f"{model_path}: the model's weight rules name no expert banks")
+        # The cache fuses every layer's gate and up (align_gate_up): their parts in one row.
+        rules = dataclasses.replace(rules, unfused=frozenset())
         self.expert_infix = f".{rules.expert_segment}."
         self.files = weight_files(model_path)
         # model key prefix -> bank role -> part index -> tensor, and each role's part count
@@ -124,38 +128,53 @@ class ExpertSource:
     def num_layers(self) -> int:
         return len(self.layer_prefixes)
 
-    def segment_table(self, layout: dict[str, BankSpec]) -> np.ndarray:
-        """int64 [num_layers, num_segments, 5]: one row per checkpoint part of each bank, banks
-        in layout order: (file index, file offset of expert 0, bytes per expert, bank index,
-        byte offset in the bank row)."""
-        table: list[list[tuple[int, int, int, int, int]]] = []
-        for prefix, roles in zip(self.layer_prefixes, self.parts):
+    def segment_table(self, layouts: list[dict[str, BankSpec]]) -> np.ndarray:
+        """int64 [num_layers, num_segments, 6]: one row per checkpoint part of each bank of
+        each layer's layout, banks in layout order: (file index, file offset of expert 0,
+        bytes per expert, bank index, byte offset in the bank row, 1 when the part's 4-bit
+        codes widen to the bank's 8 bits, else 0)."""
+        table: list[list[tuple[int, int, int, int, int, int]]] = []
+        for prefix, roles, layout in zip(self.layer_prefixes, self.parts, layouts, strict=True):
             if set(roles) != set(layout):
                 raise ValueError(
                     f"{prefix}{self.expert_infix}: banks {sorted(roles)} are not the layout's "
                     f"{sorted(layout)}"
                 )
-            segments: list[tuple[int, int, int, int, int]] = []
+            segments: list[tuple[int, int, int, int, int, int]] = []
             for bank_index, (role, spec) in enumerate(layout.items()):
                 parts = roles[role]
-                if (
-                    any(part.dtype != spec.dtype for part in parts)
-                    or any(part.shape[2:] != spec.shape[1:] for part in parts)
-                    or sum(part.shape[1] for part in parts) != spec.shape[0]
-                ):
+                row_offset = 0
+                for part in parts:
+                    # align_gate_up leaves 4-bit codes under an 8-bit packed weight row.
+                    widens = spec.dtype == mx.uint32 and part.shape[2] != spec.shape[1]
+                    if (
+                        part.dtype != spec.dtype
+                        or (widens and 2 * part.shape[2] != spec.shape[1])
+                        or (not widens and part.shape[2:] != spec.shape[1:])
+                    ):
+                        raise ValueError(
+                            f"{prefix}{self.expert_infix}{role}: checkpoint part "
+                            f"{part.shape} {part.dtype} does not fit a {spec.shape} {spec.dtype} "
+                            f"bank row"
+                        )
+                    expert_bytes = part.nbytes // self.num_experts
+                    segments.append(
+                        (
+                            part.file_index,
+                            part.offset,
+                            expert_bytes,
+                            bank_index,
+                            row_offset,
+                            int(widens),
+                        )
+                    )
+                    row_offset += expert_bytes * (2 if widens else 1)
+                if row_offset != spec.nbytes:
                     raise ValueError(
                         f"{prefix}{self.expert_infix}{role}: checkpoint parts "
                         f"{[(part.shape, part.dtype) for part in parts]} do not make a "
-                        f"{spec.shape} {spec.dtype} bank row; offload needs every MoE layer's "
-                        f"experts in that one format"
+                        f"{spec.shape} {spec.dtype} bank row"
                     )
-                row_offset = 0
-                for part in parts:
-                    expert_bytes = part.nbytes // self.num_experts
-                    segments.append(
-                        (part.file_index, part.offset, expert_bytes, bank_index, row_offset)
-                    )
-                    row_offset += expert_bytes
             table.append(segments)
         if len({len(segments) for segments in table}) != 1:
             raise ValueError("MoE layers split their expert banks into different checkpoint parts")
