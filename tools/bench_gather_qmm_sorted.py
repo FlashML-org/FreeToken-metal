@@ -8,18 +8,18 @@ and down (512 -> 2048). The B rows are (token, expert) pairs with ascending expe
 uniformly over 256 experts. The variants:
   A  mx.gather_qmm(..., sorted_indices=True) on a resident 256-row bank (MLX's rhs kernel
      from B = 1024 up), what MoELayer runs today;
-  B  copy the used experts' rows from their bank slots into a 256-row window, then A on the
-     window: all 256 experts copied (worst) or 128 (half already in the window). The copy
-     runs three ways, timed alone: mx.take into fresh arrays (always all 256), a slice
-     update of a preallocated window, and ftmetal's in-place copy_rows into a window that
-     is the bank's first 256 rows; the totals take the fastest;
+  B  copy the used experts' rows from their bank slots into a 256-row prefill buffer, then
+     A on the buffer: all 256 experts copied (worst) or 128 (half already in the buffer).
+     The copy runs three ways, timed alone: mx.take into fresh arrays (always all 256), a
+     slice update of a preallocated buffer, and ftmetal's in-place copy_rows into a buffer
+     that is the bank's first 256 rows; the totals take the fastest;
   C  gather_qmm_sorted on the large bank through the slot table (and on the resident bank);
   E  mx.gather_qmm on the large bank with ascending slot ids (rhs kernel only at B / E >= 4,
      else one matvec per row).
-The large bank tiles the resident one; expert e sits at a random slot past the window for
-B and C, and at an ascending one for E. Each figure is the median ms per call (the call and
-its eval) over the repeats, the calls interleaved, with its ratio to A. exact: C, B and E
-equal A bit for bit.
+The large bank tiles the resident one; expert e sits at a random slot past the prefill
+buffer for B and C, and at an ascending one for E. Each figure is the median ms per call
+(the call and its eval) over the repeats, the calls interleaved, with its ratio to A.
+exact: C, B and E equal A bit for bit.
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ class ProjectionCall(Protocol):
     def __call__(self) -> mx.array: ...
 
 
-class WindowCopy(Protocol):
+class BufferCopy(Protocol):
     def __call__(self) -> tuple[mx.array, ...]: ...
 
 
@@ -86,7 +86,7 @@ def large_bank(resident: Bank, bank_size: int, slot_lists: list[mx.array]) -> Ba
     return large
 
 
-def median_ms(calls: Sequence[ProjectionCall | WindowCopy], repeats: int) -> list[float]:
+def median_ms(calls: Sequence[ProjectionCall | BufferCopy], repeats: int) -> list[float]:
     """Median ms per call of each call, the calls interleaved so drift hits them alike."""
     times: list[list[float]] = [[] for _ in calls]
     for repeat in range(WARMUP_CALLS + repeats):
@@ -108,41 +108,41 @@ def bench_bank(
     rng: np.random.Generator,
 ) -> None:
     """The copy methods once, then one table row per B, against a large bank; freed on return."""
-    # Slots past the in-place window (rows [0, 256)): a random one per expert for B and C,
+    # Slots past the in-place prefill buffer (rows [0, 256)): a random one per expert for B and C,
     # an ascending one for E.
     chosen = NUM_EXPERTS + rng.choice(bank_size - NUM_EXPERTS, 2 * NUM_EXPERTS, replace=False)
     random_slots = mx.array(chosen[:NUM_EXPERTS].astype(np.int32))
     ascending_slots = mx.array(np.sort(chosen[NUM_EXPERTS:]).astype(np.int32))
     large = large_bank(resident, bank_size, [random_slots, ascending_slots])
-    window = Bank(*(mx.zeros_like(array) for array in resident))
-    window_rows = mx.arange(NUM_EXPERTS, dtype=mx.int32)
+    buffer = Bank(*(mx.zeros_like(array) for array in resident))
+    buffer_rows = mx.arange(NUM_EXPERTS, dtype=mx.int32)
     half = mx.array(np.sort(rng.permutation(NUM_EXPERTS)[: NUM_EXPERTS // 2]).astype(np.int32))
-    mx.eval(window, half)
+    mx.eval(buffer, half)
 
-    def take_window() -> tuple[mx.array, ...]:
+    def take_buffer() -> tuple[mx.array, ...]:
         return tuple(mx.take(array, random_slots, axis=0) for array in large)
 
-    def update_window(experts: mx.array) -> tuple[mx.array, ...]:
+    def update_buffer(experts: mx.array) -> tuple[mx.array, ...]:
         source_slots = random_slots[experts]
-        for window_array, array in zip(window, large):
-            window_array[experts] = mx.take(array, source_slots, axis=0)
-        return window
+        for buffer_array, array in zip(buffer, large):
+            buffer_array[experts] = mx.take(array, source_slots, axis=0)
+        return buffer
 
-    def bank_window() -> tuple[mx.array, ...]:
+    def bank_buffer() -> tuple[mx.array, ...]:
         return tuple(array[:NUM_EXPERTS] for array in large)
 
     def copy_into_bank(experts: mx.array) -> tuple[mx.array, ...]:
         nonlocal large
         source_slots = random_slots[experts]
         large = Bank(*(copy_rows(array, source_slots, experts) for array in large))
-        return bank_window()
+        return bank_buffer()
 
-    # Each returns the filled window; mx.take always copies all 256 experts.
-    copies: dict[str, WindowCopy] = {
-        "take 256": take_window,
-        "update 256": lambda: update_window(window_rows),
-        "update 128": lambda: update_window(half),
-        "copy_rows 256": lambda: copy_into_bank(window_rows),
+    # Each returns the filled prefill buffer; mx.take always copies all 256 experts.
+    copies: dict[str, BufferCopy] = {
+        "take 256": take_buffer,
+        "update 256": lambda: update_buffer(buffer_rows),
+        "update 128": lambda: update_buffer(half),
+        "copy_rows 256": lambda: copy_into_bank(buffer_rows),
         "copy_rows 128": lambda: copy_into_bank(half),
     }
     copy_ms = dict(zip(copies, median_ms(list(copies.values()), repeats)))
@@ -164,25 +164,25 @@ def bench_bank(
         x = mx.random.normal((rows, 1, input_size)).astype(DTYPE)
         mx.eval(x, expert_ids, expert_offsets, slot_ids)
 
-        def window_gather(arrays: tuple[mx.array, ...]) -> mx.array:
+        def buffer_gather(arrays: tuple[mx.array, ...]) -> mx.array:
             return mx.gather_qmm(
                 x, *arrays, rhs_indices=expert_ids, sorted_indices=True, **QUANTIZATION
             )
 
         calls: list[ProjectionCall] = [
-            lambda: window_gather(resident),
+            lambda: buffer_gather(resident),
             lambda: gather_qmm_sorted(
                 x, *large, expert_offsets, random_slots, group_size=GROUP_SIZE, bits=BITS
             ),
             lambda: gather_qmm_sorted(
-                x, *resident, expert_offsets, window_rows, group_size=GROUP_SIZE, bits=BITS
+                x, *resident, expert_offsets, buffer_rows, group_size=GROUP_SIZE, bits=BITS
             ),
             lambda: mx.gather_qmm(
                 x, *large, rhs_indices=slot_ids, sorted_indices=True, **QUANTIZATION
             ),
-            lambda: window_gather(bank_window()),
-            lambda: window_gather(copies[worst_copy]()),
-            lambda: window_gather(copies[half_copy]()),
+            lambda: buffer_gather(bank_buffer()),
+            lambda: buffer_gather(copies[worst_copy]()),
+            lambda: buffer_gather(copies[half_copy]()),
         ]
         reference = calls[0]()
         exact = [bool(mx.array_equal(reference, calls[i]())) for i in (1, 4, 3)]

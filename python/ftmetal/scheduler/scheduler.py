@@ -109,18 +109,18 @@ class Scheduler:
         # The engine's MoE offload cache, for the idle line's hit rate; None while resident.
         self.moe_offload_cache = self.engine.moe_offload_cache
         self.eos_token_ids = eos_token_ids
-        # An offload cache holds every layer's experts of a lookup forward at once only up to
-        # max_rows rows: the decode rows are capped through the requests admitted, a looked-up
-        # prefill's tokens through its budget (prefill_budget).
+        # An offload cache holds a decode's experts in one step only up to max_decode_rows
+        # rows, capped through the requests admitted; a looked-up prefill's tokens are capped
+        # through its budget (prefill_budget).
         max_admitted = config.max_running_req
         cache = self.moe_offload_cache
-        if cache is not None and cache.max_rows is not None and cache.max_rows < max_admitted:
+        max_rows = None if cache is None else cache.max_decode_rows
+        if max_rows is not None and max_rows < max_admitted:
             logger.warning(
-                f"MoE offload: {cache.max_rows} requests run at once, not "
-                f"{config.max_running_req}: a decode of more rows could route more experts than "
-                f"the smallest layer's {min(cache.layer_slots)} cache slots hold"
+                f"MoE offload: {max_rows} requests run at once, not {config.max_running_req}: a "
+                f"decode of more rows could route more experts than a pool of the cache holds"
             )
-            max_admitted = cache.max_rows
+            max_admitted = max_rows
         self.table_manager = TableManager(
             config.max_running_req, self.engine.page_table, max_admitted=max_admitted
         )
@@ -374,17 +374,18 @@ class Scheduler:
     def prefill_budget(self) -> int:
         """max_extend_tokens, or with an offload cache, for a prefill that will look its experts
         up (no prefill overlap, or fewer pending tokens than its threshold), the cache's
-        max_rows; the cache reads a longer one's layers ahead whatever its length."""
+        max_lookup_tokens; the cache reads a longer one's layers ahead whatever its length."""
         budget = self.config.max_extend_tokens
         cache = self.moe_offload_cache
-        if cache is None or cache.max_rows is None:
+        if cache is None or cache.max_lookup_tokens is None:
             return budget
-        if (
+        elif (
             cache.prefill_overlap
             and self.prefill_manager.pending_tokens >= cache.prefill_overlap_min_tokens
         ):
             return budget
-        return min(budget, cache.max_rows)
+        else:
+            return min(budget, cache.max_lookup_tokens)
 
     def prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)

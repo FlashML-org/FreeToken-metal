@@ -43,8 +43,9 @@ std::string error_text(int error_number) {
 ExpertService::ExpertService(
     int num_layers,
     int num_experts,
-    int window_size,
-    const std::vector<int32_t>& layer_slots,
+    int buffer_size,
+    const std::vector<int32_t>& layer_pools,
+    const std::vector<int32_t>& pool_bounds,
     mx::array slot_of,
     mx::array last_use,
     mx::array mailbox,
@@ -55,7 +56,14 @@ ExpertService::ExpertService(
     int io_threads,
     double stall_timeout_s,
     bool run_coordinator)
-    : lru_(num_layers, num_experts, window_size, layer_slots, std::move(slot_of), std::move(last_use)),
+    : lru_(
+          num_layers,
+          num_experts,
+          buffer_size,
+          layer_pools,
+          pool_bounds,
+          std::move(slot_of),
+          std::move(last_use)),
       num_layers_(num_layers),
       num_experts_(num_experts),
       banks_(std::move(banks)),
@@ -317,9 +325,9 @@ void ExpertService::read(const ReadTask& task, uint8_t* staging) {
   }
 }
 
-void ExpertService::finish_window(PrefillWindow& window, int64_t wait_ns) {
-  window.is_waited = true;
-  ReadBatch& batch = *window.batch;
+void ExpertService::finish_buffer(PrefillBuffer& buffer, int64_t wait_ns) {
+  buffer.is_waited = true;
+  ReadBatch& batch = *buffer.batch;
   stats_.read_wait_ns[batch.layer_id] += wait_ns;
   stats_.experts_read[batch.layer_id] += batch.experts_read;
   stats_.bytes_read[batch.layer_id] += batch.bytes_read.load(std::memory_order_relaxed);
@@ -328,13 +336,13 @@ void ExpertService::finish_window(PrefillWindow& window, int64_t wait_ns) {
 void ExpertService::fill_initial(const std::vector<int32_t>& flat_ids) {
   std::lock_guard<std::mutex> lock(call_mutex_);
   check_healthy();
-  for (PrefillWindow& window : windows_) {
-    if (!window.is_waited) {
+  for (PrefillBuffer& buffer : buffers_) {
+    if (!buffer.is_waited) {
       auto started = std::chrono::steady_clock::now();
-      wait_for(*window.batch);
-      finish_window(window, nanoseconds_since(started));
+      wait_for(*buffer.batch);
+      finish_buffer(buffer, nanoseconds_since(started));
     }
-    window.layer_id = -1;
+    buffer.layer_id = -1;
   }
   std::vector<int32_t> slots = lru_.fill(flat_ids);
   std::vector<std::vector<ExpertLoad>> loads(num_layers_);
@@ -374,11 +382,11 @@ SlotAssignment ExpertService::serve(
     int layer_id,
     const std::vector<int32_t>& expert_ids,
     uint32_t step) {
-  for (const PrefillWindow& window : windows_) {
-    if (!window.is_waited) {
+  for (const PrefillBuffer& buffer : buffers_) {
+    if (!buffer.is_waited) {
       throw std::logic_error(
-          "ExpertService: prefill layer " + std::to_string(window.layer_id) +
-          " is still being read into its window; wait for it first");
+          "ExpertService: prefill layer " + std::to_string(buffer.layer_id) +
+          " is still being read into its prefill buffer; wait for it first");
     }
   }
   SlotAssignment assignment = lru_.resolve(layer_id, expert_ids, step);
@@ -405,56 +413,57 @@ SlotAssignment ExpertService::serve(
 void ExpertService::begin_prefill() {
   std::lock_guard<std::mutex> lock(call_mutex_);
   check_healthy();
-  for (PrefillWindow& window : windows_) {
-    if (!window.is_waited) {
+  for (PrefillBuffer& buffer : buffers_) {
+    if (!buffer.is_waited) {
       auto started = std::chrono::steady_clock::now();
-      wait_for(*window.batch);
-      finish_window(window, nanoseconds_since(started));
+      wait_for(*buffer.batch);
+      finish_buffer(buffer, nanoseconds_since(started));
     }
-    window.layer_id = -1;
+    buffer.layer_id = -1;
   }
+  lru_.invalidate_prefill_buffers();
 }
 
 std::vector<int32_t> ExpertService::prefetch_prefill_layer(int layer_id) {
   std::lock_guard<std::mutex> lock(call_mutex_);
   check_healthy();
   check_layer(layer_id, "prefetch_prefill_layer");
-  PrefillWindow& window = windows_[layer_id % 2];
-  if (window.layer_id == layer_id) {
-    return window.slot_map;
+  PrefillBuffer& buffer = buffers_[layer_id % 2];
+  if (buffer.layer_id == layer_id) {
+    return buffer.slot_map;
   }
-  if (!window.is_waited) {
+  if (!buffer.is_waited) {
     throw std::logic_error(
-        "ExpertService.prefetch_prefill_layer: window " + std::to_string(layer_id % 2) +
-        " still reads layer " + std::to_string(window.layer_id) + ", which was never waited");
+        "ExpertService.prefetch_prefill_layer: prefill buffer " + std::to_string(layer_id % 2) +
+        " still reads layer " + std::to_string(buffer.layer_id) + ", which was never waited");
   }
   SlotAssignment assignment = lru_.prefill_slot_map(layer_id);
-  window.layer_id = layer_id;
-  window.slot_map = std::move(assignment.slots);
-  window.is_waited = false;
-  submit(*window.batch, layer_id, assignment.loads);
-  return window.slot_map;
+  buffer.layer_id = layer_id;
+  buffer.slot_map = std::move(assignment.slots);
+  buffer.is_waited = false;
+  submit(*buffer.batch, layer_id, assignment.loads);
+  return buffer.slot_map;
 }
 
 void ExpertService::wait_prefill_layer(int layer_id) {
   std::lock_guard<std::mutex> lock(call_mutex_);
   check_healthy();
   check_layer(layer_id, "wait_prefill_layer");
-  PrefillWindow& window = windows_[layer_id % 2];
-  if (window.layer_id != layer_id) {
+  PrefillBuffer& buffer = buffers_[layer_id % 2];
+  if (buffer.layer_id != layer_id) {
     throw std::logic_error(
         "ExpertService.wait_prefill_layer: layer " + std::to_string(layer_id) +
         " is not prefetched");
   }
-  if (window.is_waited) {
+  if (buffer.is_waited) {
     return;
   }
   auto started = std::chrono::steady_clock::now();
-  wait_for(*window.batch);
-  finish_window(window, nanoseconds_since(started));
-  if (!window.batch->error.empty()) {
-    window.layer_id = -1;
-    throw std::runtime_error(window.batch->error);
+  wait_for(*buffer.batch);
+  finish_buffer(buffer, nanoseconds_since(started));
+  if (!buffer.batch->error.empty()) {
+    buffer.layer_id = -1;
+    throw std::runtime_error(buffer.batch->error);
   }
 }
 

@@ -1,13 +1,13 @@
-// SlotLru: the bookkeeping of the routed-expert slot cache. Each MoE layer owns a run of
-// bank slots and keeps a token-granular LRU over them. An expert is named by its flat id
-// layer_id * num_experts + expert. slot_of [num_layers * num_experts] int32 (-1: absent)
-// and last_use [num_slots] uint32 (the step a slot was last used, 0: never) are mx.arrays
-// the GPU reads, written here in place through their data pointers; id_of_slot (-1: free)
-// lives only here. Slots [0, 2 * window_size) are the two prefill windows (window_size 0:
-// none), which hold an overlap prefill layer's absent experts and nothing else; the layers'
-// runs follow, layer 0 first, layer_slots[l] slots each. A miss evicts a slot of its own
-// layer, which no other layer reads: a step that resolves each layer once (one command
-// buffer) never rewrites a slot it has read, whatever the victim order.
+// SlotLru: the bookkeeping of the routed-expert slot cache. The MoE layers are grouped into
+// pools, each a run of bank slots with a token-granular LRU of its own over its layers'
+// experts. An expert is named by its flat id layer_id * num_experts + expert. slot_of
+// [num_layers * num_experts] int32 (-1: absent) and last_use [num_slots] uint32 (the step a
+// slot was last used, 0: never) are mx.arrays the GPU reads, written here in place through
+// their data pointers; id_of_slot (-1: free) lives only here. Slots [0, 2 * buffer_size) are
+// the two prefill buffers (buffer_size 0: none), which hold an overlap prefill layer's absent
+// experts: before the pools, or over the first pools' slots, whose experts are dropped as
+// each overlap prefill begins. A miss evicts a slot of its own pool, never one used earlier
+// in the same step: the step's command buffer could read the old row from the GPU caches.
 #pragma once
 
 #include <compare>
@@ -38,28 +38,33 @@ struct SlotAssignment {
 
 class SlotLru {
  public:
+  // layer_pools: each layer's pool; pool_bounds: the pools' first slots in slot order, then
+  // the slot count. The pools start at slot 0 (the buffers over them) or 2 * buffer_size.
   SlotLru(
       int num_layers,
       int num_experts,
-      int window_size,
-      const std::vector<int32_t>& layer_slots,
+      int buffer_size,
+      const std::vector<int32_t>& layer_pools,
+      const std::vector<int32_t>& pool_bounds,
       mx::array slot_of,
       mx::array last_use);
 
-  // 2 * window_size + the sum of layer_slots.
   int num_slots() const {
-    return num_slots_;
+    return pool_bounds_.back();
   }
 
-  // Empty the cache, then place each of flat_ids in the next slot of its layer's run;
+  // Empty the cache, then place each of flat_ids in the next slot of its layer's pool;
   // returns their slots.
   std::vector<int32_t> fill(const std::vector<int32_t>& flat_ids);
 
   // The slot of each of one layer's distinct experts at step (from 1), loading the misses
-  // into the least recently used slots of the layer's run that this call does not use.
+  // into the least recently used slots of the layer's pool that this call does not use.
   SlotAssignment resolve(int layer_id, const std::vector<int32_t>& expert_ids, uint32_t step);
 
-  // Every expert of the layer: its slot when resident, else the next slot of window
+  // Drop every expert held in a prefill buffer slot.
+  void invalidate_prefill_buffers();
+
+  // Every expert of the layer: its slot when resident, else the next slot of prefill buffer
   // layer_id % 2, which the loads list. The LRU is not touched.
   SlotAssignment prefill_slot_map(int layer_id) const;
 
@@ -78,10 +83,9 @@ class SlotLru {
 
   int num_layers_;
   int num_experts_;
-  int window_size_;
-  // layer_base_[l]: the first slot of layer l's run; layer_base_[num_layers]: num_slots.
-  std::vector<int32_t> layer_base_;
-  int num_slots_;
+  int buffer_size_;
+  std::vector<int32_t> layer_pools_;
+  std::vector<int32_t> pool_bounds_;
   mx::array slot_of_;
   mx::array last_use_;
   int32_t* slot_of_data_;

@@ -32,6 +32,7 @@ from ftmetal.engine.config import (
 )
 from ftmetal.kvcache.linear_state_pool import CONVERSATION_SNAPSHOTS, DEFAULT_GDN_SNAPSHOTS
 from ftmetal.mm.config import ENCODER_KINDS, EncoderKind, MultimodalConfig
+from ftmetal.moe.slot_pools import MoePoolGrouping, MoePoolSlots
 from ftmetal.tokenizer import read_json_object
 
 TOOL_CALL_PARSER_CHOICES = (
@@ -108,6 +109,19 @@ def non_negative_int(value: str) -> int:
     if number < 0:
         raise argparse.ArgumentTypeError(f"expected a non-negative integer, got {value}")
     return number
+
+
+def moe_pool_slots(value: str) -> tuple[MoePoolSlots, str | None]:
+    """--moe-pool-slots: equal, profile (the model's hot-expert table) or profile:<path>."""
+    prefix = "profile:"
+    if value == "equal":
+        return "equal", None
+    elif value == "profile":
+        return "profile", None
+    elif value.startswith(prefix) and len(value) > len(prefix):
+        return "profile", value[len(prefix) :]
+    else:
+        raise argparse.ArgumentTypeError(f"expected equal, profile or profile:<path>, got {value}")
 
 
 def unit_fraction(value: str) -> float:
@@ -395,20 +409,28 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         help="the MoE offload cache's eviction policy",
     )
     parser.add_argument(
-        "--moe-layer-slots",
-        choices=["hot", "equal"],
-        default=ServerArgs.moe_layer_slots,
-        help="how the MoE offload cache splits its slots among the layers: by the model's "
-        "hot-expert table (expert_hot_rank.json in its directory, else the one shipped for the "
-        "model) or evenly",
+        "--moe-pool",
+        choices=list(get_args(MoePoolGrouping)),
+        default=ServerArgs.moe_pool,
+        help="which MoE layers share a pool of the offload cache's slots, with one LRU: every "
+        "layer of an expert layout (unified) or each layer alone (per-layer)",
+    )
+    parser.add_argument(
+        "--moe-pool-slots",
+        type=moe_pool_slots,
+        metavar="{equal,profile,profile:PATH}",
+        default=(ServerArgs.moe_pool_slots, ServerArgs.moe_pool_profile),
+        help="how the offload cache splits its slots among the pools: evenly per layer, or by "
+        "a hot-expert table (PATH, else expert_hot_rank.json in the model directory, else the "
+        "one shipped for the model)",
     )
     parser.add_argument(
         "--disable-moe-prefill-overlap",
         action="store_false",
         dest="moe_prefill_overlap",
         help="look up every prefill's experts like a decode's, instead of reading each layer's "
-        "ahead into two windows of the cache once a prefill is long; lowers the cache's "
-        "floor from twice a layer's experts to once",
+        "ahead into two prefill buffers once a prefill is long; lowers the cache's floor "
+        "from two layers' experts to one token's per layer",
     )
     parser.add_argument(
         "--expert-load",
@@ -573,7 +595,9 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         moe_cache_auto=moe_cache_auto,
         kv_reserve_tokens=namespace.kv_reserve_tokens,
         moe_cache_policy=namespace.moe_cache_policy,
-        moe_layer_slots=namespace.moe_layer_slots,
+        moe_pool=namespace.moe_pool,
+        moe_pool_slots=namespace.moe_pool_slots[0],
+        moe_pool_profile=namespace.moe_pool_slots[1],
         moe_prefill_overlap=namespace.moe_prefill_overlap,
         mm=MultimodalConfig(
             disabled_encoders=frozenset(disabled_encoders),
@@ -596,6 +620,7 @@ __all__ = [
     "infer_tool_call_parser",
     "memory_fraction",
     "model_family_marker",
+    "moe_pool_slots",
     "non_negative_int",
     "parse_args",
     "positive_int",

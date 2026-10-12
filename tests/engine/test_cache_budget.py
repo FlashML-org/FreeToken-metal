@@ -46,6 +46,7 @@ from ftmetal.models.gemma4.model import Gemma4ForCausalLM
 from ftmetal.models.qwen3_5_moe.config import parse_config
 from ftmetal.models.register import model_weight_rules
 from ftmetal.moe.offload_cache import STAGING_BYTES
+from ftmetal.moe.slot_pools import MoePoolGrouping, PrefillBufferPlacement
 from tiny_model import TINY_TEXT_CONFIG, build_reference, save_checkpoint
 
 # The text_config fields of Qwen3.6-35B-A3B that its attention groups are parsed from.
@@ -352,6 +353,8 @@ class OffloadBudgetCase(NamedTuple):
     auto_strategy: MoeStrategy
     cache_size: int
     lines: list[str]
+    moe_pool: MoePoolGrouping = "unified"
+    moe_prefill_buffer: PrefillBufferPlacement = "overlay"
 
 
 OFFLOAD_BUDGET_CASES = [
@@ -428,7 +431,8 @@ OFFLOAD_BUDGET_CASES = [
         ],
     ),
     # The floors: one token's experts per layer (40 x 8) plus, with prefill overlap, the two
-    # windows those runs need (2 x 248).
+    # dedicated buffers per-layer runs of 8 need (2 x 248), or two whole layers of buffers
+    # over the pools (2 x 256).
     OffloadBudgetCase(
         0.185,
         0,
@@ -444,6 +448,25 @@ OFFLOAD_BUDGET_CASES = [
             "activations     2.62 GiB",
             "graphs          0.01 GiB",
             "kv pages        0.09 GiB",
+        ],
+        moe_pool="per-layer",
+        moe_prefill_buffer="dedicated",
+    ),
+    OffloadBudgetCase(
+        0.17,
+        0,
+        None,
+        True,
+        "offload",
+        512,
+        [
+            "budget          6.36 GiB",
+            "weights         1.28 GiB",
+            "experts         0.91 GiB",
+            "gdn slots       1.51 GiB",
+            "activations     2.62 GiB",
+            "graphs          0.01 GiB",
+            "kv pages        0.03 GiB",
         ],
     ),
     OffloadBudgetCase(
@@ -523,7 +546,9 @@ def offload_budget(
         num_experts=NUM_EXPERTS,
         top_k=TOP_K,
         total_experts=TOTAL_EXPERTS,
+        grouping=config.moe_pool,
         prefill_overlap=config.moe_prefill_overlap,
+        buffer_placement=config.moe_prefill_buffer,
     )
     report = plan_budget(
         budget,
@@ -544,6 +569,8 @@ def test_qwen3_6_offload_budget(case: OffloadBudgetCase) -> None:
         moe_cache_size=case.moe_cache_size,
         moe_cache_rate=case.moe_cache_rate,
         moe_prefill_overlap=case.moe_prefill_overlap,
+        moe_pool=case.moe_pool,
+        moe_prefill_buffer=case.moe_prefill_buffer,
     )
     auto_strategy, cache_size, report = offload_budget(config)
     assert (auto_strategy, cache_size) == (case.auto_strategy, case.cache_size)
@@ -551,8 +578,12 @@ def test_qwen3_6_offload_budget(case: OffloadBudgetCase) -> None:
 
 
 # (EngineConfig fields, the refusal)
-REFUSED_OFFLOAD_CASES: list[tuple[dict[str, float | int | bool | None], str]] = [
-    ({"moe_cache_size": 300}, "and the two prefill overlap windows: give at least 816"),
+REFUSED_OFFLOAD_CASES: list[tuple[dict[str, float | int | bool | str | None], str]] = [
+    ({"moe_cache_size": 300}, "and the two prefill buffers: give at least 512"),
+    (
+        {"moe_cache_size": 600, "moe_pool": "per-layer", "moe_prefill_buffer": "dedicated"},
+        "and the two prefill buffers: give at least 816",
+    ),
     ({"moe_cache_size": 200, "moe_prefill_overlap": False}, "give at least 320 slots$"),
     ({"memory_ratio": 0.15, "moe_prefill_overlap": False}, "does not fit the memory budget"),
     ({"moe_cache_size": 512, "moe_cache_rate": 0.5}, "moe_cache_size and moe_cache_rate are"),
@@ -563,7 +594,9 @@ REFUSED_OFFLOAD_CASES: list[tuple[dict[str, float | int | bool | None], str]] = 
 
 
 @pytest.mark.parametrize(("fields", "error"), REFUSED_OFFLOAD_CASES)
-def test_refused_offload_budgets(fields: dict[str, float | int | bool | None], error: str) -> None:
+def test_refused_offload_budgets(
+    fields: dict[str, float | int | bool | str | None], error: str
+) -> None:
     with pytest.raises((ValueError, RuntimeError), match=error):
         offload_budget(EngineConfig(model_path="unused", **fields))
 

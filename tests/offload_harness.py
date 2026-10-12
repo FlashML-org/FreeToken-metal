@@ -8,10 +8,10 @@ layer's projections split across the files. An identifying checkpoint (affine on
 every packed weight word of an expert's projection with expert_code(layer, projection,
 expert) instead, so a bank row read anywhere names the expert it holds.
 
-ReferenceLru is the offload simulation's token-granular LRU: per slot, the expert it holds
-and the step it was last used. A call first marks its hits used at this step, then gives
-each miss the slot least recently used before this step: a free slot first, then the
-lowest flat expert id.
+ReferenceLru is the offload simulation's token-granular LRU per pool: per slot, the expert
+it holds and the step it was last used. A call first marks its hits used at this step, then
+gives each miss the slot of its layer's pool least recently used before this step: a free
+slot first, then the lowest flat expert id.
 """
 
 from __future__ import annotations
@@ -27,12 +27,13 @@ from ftmetal.layers.moe import ExpertSchemes, moe_layout
 from ftmetal.layers.quantization.config import AffineScheme
 from ftmetal.models.loader import FuseRule, WeightRules
 from ftmetal.moe.offload_cache import STALL_TIMEOUT_S, OffloadMoeCache
+from ftmetal.moe.slot_pools import MoePoolGrouping, PrefillBufferPlacement
 from ftmetal.moe.source import ExpertSource
 
 Naming = Literal["qwen", "gemma4"]
 PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 # What a cache built here tells a forward's prepare (which these caches never see) and the
-# slot split (each layer's run holds at least this many): the lookups take any top-k.
+# slot split (each layer gets at least this many): the lookups take any top-k.
 TOP_K = 2
 PREFILL_OVERLAP_MIN_TOKENS = 128
 
@@ -153,6 +154,8 @@ def build_cache(
     *,
     cache_size: int,
     prefill_overlap: bool,
+    grouping: MoePoolGrouping = "per-layer",
+    buffer_placement: PrefillBufferPlacement = "dedicated",
     stall_timeout_s: float = STALL_TIMEOUT_S,
     run_coordinator: bool = True,
 ) -> tuple[OffloadMoeCache, ExpertSource]:
@@ -170,6 +173,8 @@ def build_cache(
             spec.hidden_size, spec.intermediate_size, spec.expert_schemes, mx.bfloat16
         ),
         source=source,
+        grouping=grouping,
+        buffer_placement=buffer_placement,
         stall_timeout_s=stall_timeout_s,
         run_coordinator=run_coordinator,
     )
@@ -177,22 +182,30 @@ def build_cache(
 
 
 class ReferenceLru:
-    """SlotLru's victim choice, slot by slot: per-layer runs after two windows."""
+    """SlotLru's victim choice, slot by slot: each layer's pool is the slot range
+    pool_bounds[layer_pools[layer]:][:2]."""
 
     def __init__(
-        self, num_experts: int, window_size: int, layer_slots: list[int], fill: tuple[int, ...]
+        self,
+        num_experts: int,
+        layer_pools: list[int],
+        pool_bounds: list[int],
+        fill: tuple[int, ...],
     ) -> None:
         self.num_experts = num_experts
-        self.bases = [2 * window_size]
-        for num_slots in layer_slots:
-            self.bases.append(self.bases[-1] + num_slots)
-        self.id_of_slot = [-1] * self.bases[-1]
-        self.last_use = [0] * self.bases[-1]
-        next_slot = self.bases[:-1]
+        self.layer_pools = layer_pools
+        self.pool_bounds = pool_bounds
+        self.id_of_slot = [-1] * pool_bounds[-1]
+        self.last_use = [0] * pool_bounds[-1]
+        next_slot = pool_bounds[:-1]
         for flat_id in fill:
-            layer_id = flat_id // num_experts
-            self.id_of_slot[next_slot[layer_id]] = flat_id
-            next_slot[layer_id] += 1
+            pool = layer_pools[flat_id // num_experts]
+            self.id_of_slot[next_slot[pool]] = flat_id
+            next_slot[pool] += 1
+
+    def pool_slots(self, layer_id: int) -> range:
+        pool = self.layer_pools[layer_id]
+        return range(self.pool_bounds[pool], self.pool_bounds[pool + 1])
 
     def resolve(
         self, layer_id: int, expert_ids: list[int], step: int
@@ -206,9 +219,8 @@ class ReferenceLru:
         loads: list[tuple[int, int]] = []
         for expert, flat_id in zip(expert_ids, flat_ids):
             if flat_id not in slot_of:
-                run = range(self.bases[layer_id], self.bases[layer_id + 1])
                 victim = min(
-                    (slot for slot in run if self.last_use[slot] < step),
+                    (slot for slot in self.pool_slots(layer_id) if self.last_use[slot] < step),
                     key=lambda slot: (self.last_use[slot], self.id_of_slot[slot], slot),
                 )
                 slot_of.pop(self.id_of_slot[victim], None)

@@ -201,20 +201,28 @@ NB_MODULE(_C, m) {
 
   nb::class_<ftmetal::SlotLru>(m, "SlotLru")
       .def(
-          nb::init<int, int, int, const std::vector<int32_t>&, mx::array, mx::array>(),
+          nb::init<
+              int,
+              int,
+              int,
+              const std::vector<int32_t>&,
+              const std::vector<int32_t>&,
+              mx::array,
+              mx::array>(),
           "num_layers"_a,
           "num_experts"_a,
-          "window_size"_a,
-          "layer_slots"_a,
+          "buffer_size"_a,
+          "layer_pools"_a,
+          "pool_bounds"_a,
           "slot_of"_a,
           "last_use"_a,
-          "Per-layer token-granular LRUs over the slots; writes slot_of and last_use in place.")
+          "Per-pool token-granular LRUs over the slots; writes slot_of and last_use in place.")
       .def_prop_ro("num_slots", &ftmetal::SlotLru::num_slots)
       .def(
           "fill",
           &ftmetal::SlotLru::fill,
           "flat_ids"_a,
-          "Empty the cache and place each of flat_ids in its layer's run; returns their slots.")
+          "Empty the cache and place each of flat_ids in its layer's pool; returns their slots.")
       .def(
           "resolve",
           [](ftmetal::SlotLru& lru, int layer_id, const std::vector<int32_t>& expert_ids,
@@ -227,13 +235,17 @@ NB_MODULE(_C, m) {
           "step"_a,
           "Slots of the layer's distinct experts at step; returns (slots, [(expert, slot)] to load).")
       .def(
+          "invalidate_prefill_buffers",
+          &ftmetal::SlotLru::invalidate_prefill_buffers,
+          "Drop every expert held in a prefill buffer slot.")
+      .def(
           "prefill_slot_map",
           [](const ftmetal::SlotLru& lru, int layer_id) {
             ftmetal::SlotAssignment assignment = lru.prefill_slot_map(layer_id);
             return std::make_pair(std::move(assignment.slots), std::move(assignment.loads));
           },
           "layer_id"_a,
-          "Every expert's slot, window layer_id % 2's for the absent; returns (slot_map, loads).");
+          "Every expert's slot, prefill buffer layer_id % 2's for the absent; returns (slot_map, loads).");
 
   nb::class_<ftmetal::ExpertServiceStats>(m, "ExpertServiceStats")
       .def_ro("hits", &ftmetal::ExpertServiceStats::hits)
@@ -253,8 +265,9 @@ NB_MODULE(_C, m) {
           [](ftmetal::ExpertService* service,
              int num_layers,
              int num_experts,
-             int window_size,
-             const std::vector<int32_t>& layer_slots,
+             int buffer_size,
+             const std::vector<int32_t>& layer_pools,
+             const std::vector<int32_t>& pool_bounds,
              mx::array slot_of,
              mx::array last_use,
              mx::array mailbox,
@@ -277,8 +290,9 @@ NB_MODULE(_C, m) {
             new (service) ftmetal::ExpertService(
                 num_layers,
                 num_experts,
-                window_size,
-                layer_slots,
+                buffer_size,
+                layer_pools,
+                pool_bounds,
                 std::move(slot_of),
                 std::move(last_use),
                 std::move(mailbox),
@@ -292,8 +306,9 @@ NB_MODULE(_C, m) {
           },
           "num_layers"_a,
           "num_experts"_a,
-          "window_size"_a,
-          "layer_slots"_a,
+          "buffer_size"_a,
+          "layer_pools"_a,
+          "pool_bounds"_a,
           "slot_of"_a,
           "last_use"_a,
           "mailbox"_a,
@@ -310,7 +325,7 @@ NB_MODULE(_C, m) {
           &ftmetal::ExpertService::fill_initial,
           "flat_ids"_a,
           nb::call_guard<nb::gil_scoped_release>(),
-          "Empty the cache, place each of flat_ids in its layer's run and read them.")
+          "Empty the cache, place each of flat_ids in its layer's pool and read them.")
       .def(
           "ensure_experts",
           &ftmetal::ExpertService::ensure_experts,
@@ -323,19 +338,19 @@ NB_MODULE(_C, m) {
           "begin_prefill",
           &ftmetal::ExpertService::begin_prefill,
           nb::call_guard<nb::gil_scoped_release>(),
-          "Drain the window reads and drop the experts the window slots hold.")
+          "Drain the prefill buffer reads and drop the experts the buffer slots hold.")
       .def(
           "prefetch_prefill_layer",
           &ftmetal::ExpertService::prefetch_prefill_layer,
           "layer_id"_a,
           nb::call_guard<nb::gil_scoped_release>(),
-          "Start reading the layer's absent experts into window layer_id % 2; returns its slot map.")
+          "Start reading the layer's absent experts into prefill buffer layer_id % 2; returns its slot map.")
       .def(
           "wait_prefill_layer",
           &ftmetal::ExpertService::wait_prefill_layer,
           "layer_id"_a,
           nb::call_guard<nb::gil_scoped_release>(),
-          "Wait for the layer's window reads.")
+          "Wait for the layer's prefill buffer reads.")
       .def(
           "stats",
           &ftmetal::ExpertService::stats,

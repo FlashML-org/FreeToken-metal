@@ -1,6 +1,6 @@
-"""MoeLookup and its mailbox handshake with the coordinator, on offload_harness's
-identifying checkpoints: every packed weight word of an expert's projection names
-(layer, projection, expert).
+"""MoeLookup and its mailbox handshake with the coordinator, on offload_harness's identifying
+checkpoints: every packed weight word of an expert's projection names (layer, projection,
+expert).
 
 A chain of layers, each a lookup of the step's routed ids followed by gathers of the
 gate_up and down bank rows at its slots and at its slot map, runs one step per eval; each
@@ -10,13 +10,14 @@ layers of one command buffer. Every real pair's and used expert's rows must name
 slots and the cache's slot_of and last_use must equal the reference LRU's for the same
 calls (the GPU's hit marks reach the victim choice, and no slot the request uses is a
 victim), padding rows and unused experts must read a slot the layer uses, and the counts
-must add up. The chain runs eagerly, and captured once as a command graph (banks and
-slot_of external, mailbox, last_use and hit_stats pools, moe_step and the ids step inputs)
-and replayed. Then the handshake's edges: no real rows post nothing, a probe round trip, a
-hit in the least recently used slot keeps it, a failed read and a layer routing more
-experts than its run holds fail their requests, a corrupted sequence is a protocol error, a
-shutdown releases a waiting lookup, also one whose post overwrote the shutdown's refusal,
-and the watchdog fails a request nobody answers.
+must add up; with one pool for every layer, the layers of a step share its slots. The chain
+runs eagerly, and captured once as a command graph (banks and slot_of external, mailbox,
+last_use and hit_stats pools, moe_step and the ids step inputs) and replayed. Then the
+handshake's edges: no real rows post nothing, a probe round trip, a hit in the least
+recently used slot keeps it, a failed read and a layer routing more experts than its pool
+holds fail their requests, a corrupted sequence is a protocol error, a shutdown releases a
+waiting lookup, also one whose post overwrote the shutdown's refusal, and the watchdog
+fails a request nobody answers.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import pytest
 from ftmetal.command_graph import capture, replay
 from ftmetal.kernel._ext import _C
 from ftmetal.moe.offload_cache import STALL_TIMEOUT_S, OffloadMoeCache
+from ftmetal.moe.slot_pools import MoePoolGrouping
 from offload_harness import CheckpointSpec, Naming, ReferenceLru, build_cache, expert_code
 
 Word = _C.MailboxWord
@@ -58,11 +60,12 @@ class Case:
     naming: Naming = "qwen"
     is_filled: bool = True
     is_replayed: bool = False
+    grouping: MoePoolGrouping = "per-layer"
 
     def __str__(self) -> str:
         return (
             f"{self.naming}-L{self.num_layers}-E{self.num_experts}-k{self.top_k}"
-            f"-T{self.num_rows}-S{self.cache_size}-{self.kind.name.lower()}"
+            f"-T{self.num_rows}-S{self.cache_size}-{self.grouping}-{self.kind.name.lower()}"
             f"{'' if self.is_filled else '-empty'}{'-replay' if self.is_replayed else '-eager'}"
         )
 
@@ -77,6 +80,10 @@ CASES = [
     Case(3, 128, 8, 8, 200, 200, naming="gemma4"),
     # A copy-miss prefill of 128 rows on an empty cache: requests name a whole layer.
     Case(2, 256, 8, 128, 520, 8, kind=Kind.PREFILL_COPY_MISS, is_filled=False),
+    # One pool: a step's 4 x 12 experts fit its 56 slots, which every layer's misses share.
+    Case(4, 32, 4, 3, 56, 1000, grouping="unified"),
+    Case(4, 32, 4, 3, 56, 1000, is_replayed=True, grouping="unified"),
+    Case(3, 256, 8, 4, 288, 200, grouping="unified"),
 ]
 
 
@@ -170,14 +177,19 @@ def test_chain_matches_reference(tmp_path: Path, case: Case) -> None:
         is_identifying=True,
     )
     cache, _ = build_cache(
-        tmp_path / "checkpoint", spec, cache_size=case.cache_size, prefill_overlap=False
+        tmp_path / "checkpoint",
+        spec,
+        cache_size=case.cache_size,
+        prefill_overlap=False,
+        grouping=case.grouping,
     )
     fill: tuple[int, ...] = ()
     if case.is_filled:
         cache.fill_initial()
         slot_of = np.array(cache.slot_of)
         fill = tuple(int(np.flatnonzero(slot_of == slot)[0]) for slot in range(cache.cache_size))
-    reference = ReferenceLru(case.num_experts, cache.window_size, cache.layer_slots, fill)
+    layout = cache.slot_layout
+    reference = ReferenceLru(case.num_experts, layout.layer_pools, layout.pool_bounds, fill)
     shape = (case.num_layers, case.num_rows, case.top_k)
 
     graph = None
@@ -302,7 +314,7 @@ def test_hit_in_the_least_recently_used_slot_keeps_it(tmp_path: Path) -> None:
     cache = small_cache(tmp_path)
     cache.fill_initial()
     slot_of = np.array(cache.slot_of)
-    assert slot_of[:4].tolist() == [0, 1, 2, 3], "layer 0's experts 0-3 fill its run"
+    assert slot_of[:4].tolist() == [0, 1, 2, 3], "layer 0's experts 0-3 fill its pool"
     # Step 1 uses every resident expert but layer 0's expert 0, which becomes the least
     # recently used; step 2's request hits it and misses expert 4.
     mx.eval(lookup(cache, [[1, 2], [3, 1]], 2, 1), cache.mailbox)
@@ -337,14 +349,14 @@ def test_failed_read_fails_the_request(tmp_path: Path) -> None:
         cache.check_healthy()
 
 
-def test_layer_beyond_its_run_fails_the_request(tmp_path: Path) -> None:
+def test_layer_beyond_its_pool_fails_the_request(tmp_path: Path) -> None:
     cache = small_cache(tmp_path)
-    # Layer 0's run is 4 of the 8 slots: a step routing 5 of its experts cannot fit.
+    # Layer 0's pool is 4 of the 8 slots: a step routing 5 of its experts cannot fit.
     mx.eval(lookup(cache, [[0, 1, 2, 3], [4, 0, 1, 2]], 2, 1), cache.mailbox)
     words = mailbox_words(cache)
     assert words[Word.SEQUENCE] == words[Word.ACKNOWLEDGED] == 1
     assert words[Word.ERROR] == _C.MailboxError.CAPACITY
-    with pytest.raises(RuntimeError, match="4 slots cannot hold its 5 experts"):
+    with pytest.raises(RuntimeError, match="pool 0's 4 slots cannot hold layer 0's 5 experts"):
         cache.check_healthy()
 
 

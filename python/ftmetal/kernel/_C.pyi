@@ -68,8 +68,9 @@ class SlotLru:
         self,
         num_layers: int,
         num_experts: int,
-        window_size: int,
-        layer_slots: list[int],
+        buffer_size: int,
+        layer_pools: list[int],
+        pool_bounds: list[int],
         slot_of: mx.array,
         last_use: mx.array,
     ) -> None: ...
@@ -79,6 +80,7 @@ class SlotLru:
     def resolve(
         self, layer_id: int, expert_ids: list[int], step: int
     ) -> tuple[list[int], list[tuple[int, int]]]: ...
+    def invalidate_prefill_buffers(self) -> None: ...
     def prefill_slot_map(self, layer_id: int) -> tuple[list[int], list[tuple[int, int]]]: ...
 
 class ExpertServiceStats:
@@ -106,8 +108,9 @@ class ExpertService:
         self,
         num_layers: int,
         num_experts: int,
-        window_size: int,
-        layer_slots: list[int],
+        buffer_size: int,
+        layer_pools: list[int],
+        pool_bounds: list[int],
         slot_of: mx.array,
         last_use: mx.array,
         mailbox: mx.array,

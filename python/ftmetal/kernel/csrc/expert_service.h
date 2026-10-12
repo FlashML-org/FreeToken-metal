@@ -42,7 +42,7 @@ struct ExpertSegment {
 
 // Per MoE layer. hits and misses count the experts of ensure_experts and of the answered
 // lookup requests; experts_read and bytes_read (read-around included) count their reads and
-// the prefill windows', not the initial fill; read_wait_ns is the time spent waiting for
+// the prefill buffers', not the initial fill; read_wait_ns is the time spent waiting for
 // them. lookups and lookup_hits are the GPU's counts: lookups run, experts found resident.
 struct ExpertServiceStats {
   std::vector<int64_t> hits;
@@ -84,8 +84,8 @@ struct ReadTask {
   int64_t end = 0;
 };
 
-// The window of the prefill layers of one parity: the layer it holds or is reading.
-struct PrefillWindow {
+// The prefill buffer of the layers of one parity: the layer it holds or is reading.
+struct PrefillBuffer {
   int layer_id = -1;
   bool is_waited = true;
   std::vector<int32_t> slot_map;
@@ -94,17 +94,17 @@ struct PrefillWindow {
 
 class ExpertService {
  public:
-  // window_size and layer_slots lay out the slots (SlotLru); mailbox uint32 [MAILBOX_WORDS]
-  // and hit_stats uint32 [num_layers, 2] are the lookups'; banks: one evaluated
-  // row-contiguous [num_slots, ...] array per bank; segments:
-  // num_layers * segments-per-layer entries, layer-major. The watchdog fails a request left
-  // unanswered for stall_timeout_s; without run_coordinator nobody answers (a stalled
-  // coordinator, for tests).
+  // buffer_size, layer_pools and pool_bounds lay out the slots (SlotLru); mailbox uint32
+  // [MAILBOX_WORDS] and hit_stats uint32 [num_layers, 2] are the lookups'; banks: one
+  // evaluated row-contiguous [num_slots, ...] array per bank; segments: num_layers *
+  // segments-per-layer entries, layer-major. The watchdog fails a request left unanswered for
+  // stall_timeout_s; without run_coordinator nobody answers (a stalled coordinator, for tests).
   ExpertService(
       int num_layers,
       int num_experts,
-      int window_size,
-      const std::vector<int32_t>& layer_slots,
+      int buffer_size,
+      const std::vector<int32_t>& layer_pools,
+      const std::vector<int32_t>& pool_bounds,
       mx::array slot_of,
       mx::array last_use,
       mx::array mailbox,
@@ -129,14 +129,15 @@ class ExpertService {
       const std::vector<int32_t>& expert_ids,
       uint32_t step);
 
-  // Drain the windows' reads and forget the layers they hold.
+  // Drain the prefill buffers' reads, forget the layers they hold and drop the experts their
+  // slots hold.
   void begin_prefill();
 
-  // Start reading the layer's non-resident experts into window layer_id % 2; returns its
+  // Start reading the layer's non-resident experts into prefill buffer layer_id % 2; returns its
   // slot map (SlotLru::prefill_slot_map).
   std::vector<int32_t> prefetch_prefill_layer(int layer_id);
 
-  // Wait for the layer's window reads.
+  // Wait for the layer's prefill buffer reads.
   void wait_prefill_layer(int layer_id);
 
   ExpertServiceStats stats();
@@ -162,7 +163,7 @@ class ExpertService {
   void answer();
   void watch();
   void submit(ReadBatch& batch, int layer_id, const std::vector<ExpertLoad>& loads);
-  void finish_window(PrefillWindow& window, int64_t wait_ns);
+  void finish_buffer(PrefillBuffer& buffer, int64_t wait_ns);
   void work(int thread_index);
   void read(const ReadTask& task, uint8_t* staging);
 
@@ -179,7 +180,7 @@ class ExpertService {
 
   std::mutex call_mutex_;
   ReadBatch ensure_batch_;
-  PrefillWindow windows_[2];
+  PrefillBuffer buffers_[2];
   ExpertServiceStats stats_;
 
   std::mutex queue_mutex_;

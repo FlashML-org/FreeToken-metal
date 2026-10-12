@@ -75,7 +75,7 @@ enum class MailboxError : uint32_t {
   // The request broke the protocol (sequence, counts, ids) or the host ordering.
   Protocol = 3,
   Shutdown = 4,
-  // The layer's run of slots cannot hold the request's experts.
+  // The layer's pool cannot hold the request's experts.
   Capacity = 5,
 };
 

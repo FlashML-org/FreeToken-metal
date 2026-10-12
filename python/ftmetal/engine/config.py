@@ -33,6 +33,7 @@ from ftmetal.models.loader import (
     read_model_config,
 )
 from ftmetal.models.register import parse_model_config
+from ftmetal.moe.slot_pools import MoePoolGrouping, MoePoolSlots, PrefillBufferPlacement
 
 # Prefix reuse: radix (the hybrid radix on a model with linear attention) or naive (none).
 CacheTypeChoice = Literal["naive", "radix"]
@@ -51,6 +52,18 @@ def command_graph_from_env() -> bool:
     if value not in (None, "0", "1"):
         raise ValueError(f"FTMETAL_COMMAND_GRAPH must be 0 or 1, got {value!r}")
     return value != "0"
+
+
+def moe_prefill_buffer_from_env() -> PrefillBufferPlacement:
+    """FTMETAL_MOE_PREFILL_BUFFER: overlay (default) lays the prefill buffers over the first
+    pools' slots, dedicated gives them slots of their own."""
+    value = read_env("MOE_PREFILL_BUFFER")
+    if value is None or value == "overlay":
+        return "overlay"
+    elif value == "dedicated":
+        return "dedicated"
+    else:
+        raise ValueError(f"FTMETAL_MOE_PREFILL_BUFFER must be overlay or dedicated, got {value!r}")
 
 
 def moe_prefill_overlap_min_tokens_from_env() -> int:
@@ -103,11 +116,15 @@ class EngineConfig:
     # KV tokens auto keeps before the experts: auto's fused fit check and cache sizing.
     kv_reserve_tokens: int = 8192
     moe_cache_policy: Literal["lru"] = "lru"
-    # How the offload cache sizes each MoE layer's run of slots: by the model's hot-expert
-    # table (its directory's, else the shipped one; even without one), or evenly.
-    moe_layer_slots: Literal["hot", "equal"] = "hot"
-    # Long prefills read each layer's absent experts ahead into two windows of the cache.
+    # How the offload cache groups the MoE layers into pools of slots, and splits its slots
+    # among them: evenly per layer, or by a hot-expert table (moe_pool_profile, else the model
+    # directory's, else the one shipped for the model).
+    moe_pool: MoePoolGrouping = "unified"
+    moe_pool_slots: MoePoolSlots = "equal"
+    moe_pool_profile: str | None = None
+    # Long prefills read each layer's absent experts ahead into two prefill buffers.
     moe_prefill_overlap: bool = True
+    moe_prefill_buffer: PrefillBufferPlacement = field(default_factory=moe_prefill_buffer_from_env)
     moe_prefill_overlap_min_tokens: int = field(
         default_factory=moe_prefill_overlap_min_tokens_from_env
     )
@@ -198,5 +215,6 @@ __all__ = [
     "EngineConfig",
     "MoeStrategyChoice",
     "command_graph_from_env",
+    "moe_prefill_buffer_from_env",
     "moe_prefill_overlap_min_tokens_from_env",
 ]

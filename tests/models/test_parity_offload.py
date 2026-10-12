@@ -1,15 +1,18 @@
 """Numeric parity of MoE offload against resident experts on a tiny Qwen3.5 MoE model.
 
-One checkpoint (affine 4-bit experts, 16 per layer, top-4) is served with every expert
-resident and from an offload cache of 52 slots (four runs of 10, two windows of 6), which
-misses and evicts at most steps: the fp32 greedy tokens must agree and the logits of the
-first prompt's last prefill chunk must match. A run of 10 holds two rows' experts, so at
-most two requests run at once and a looked-up prefill takes two tokens per forward. Cases:
-decode replayed and eager; copy-miss and overlap prefills (the overlap threshold knob
-lowered so tiny prompts take it), the chunks of one prompt on both sides of the threshold,
-a prompt chunked through overlap prefills; two requests decoding together, and three, of
-which two run at once; prefill overlap off, with no windows; up in 8 bits (gate and up two
-banks) on a replayed decode and an overlap prefill.
+One checkpoint (affine 4-bit experts, 16 per layer over four layers, top-4) is served with
+every expert resident and from an offload cache of 52 slots, which misses and evicts at
+most steps: the fp32 greedy tokens must agree and the logits of the first prompt's last
+prefill chunk must match. The cache is one pool with the prefill buffers over its first 32
+slots unless a case says otherwise: a decode then fits three rows, and a looked-up prefill
+of four tokens or more runs as two steps (a step holds three layers' 16 experts). Per-layer
+pools with dedicated buffers are runs of 10 beside buffers of 6 (two rows, two tokens per
+looked-up forward); with overlaid buffers runs of 13; one pool beside dedicated buffers is
+20 slots, a step per layer. Cases: decode replayed and eager; copy-miss and overlap
+prefills (the overlap threshold knob lowered so tiny prompts take it), the chunks of one
+prompt on both sides of the threshold, a prompt chunked through overlap prefills; two
+requests decoding together, and three; prefill overlap off, with no buffers; up in 8 bits
+(gate and up two banks) on a replayed decode and an overlap prefill.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ import pytest
 from ftmetal.core import SamplingParams
 from ftmetal.engine.config import EngineConfig
 from ftmetal.models.config import MoeStrategy
+from ftmetal.moe.slot_pools import MoePoolGrouping, PrefillBufferPlacement
 from ftmetal.scheduler.scheduler import Scheduler
 from tiny_model import TINY_TEXT_CONFIG, build_reference, save_checkpoint
 
@@ -49,24 +53,60 @@ class Case:
     command_graph: bool = True
     prefill_overlap: bool = True
     cache_size: int = CACHE_SIZE
-    # Whether some prefill reads layers ahead into the windows.
-    reads_windows: bool = False
+    grouping: MoePoolGrouping = "unified"
+    buffer_placement: PrefillBufferPlacement = "overlay"
+    # The rows a decode may take: the requests that run at once.
+    max_decode_rows: int = 3
+    # Whether some prefill reads layers ahead into the prefill buffers.
+    reads_buffers: bool = False
     up_bits: int = EXPERT_BITS
 
 
 CASES = [
     Case("replayed-decode-copy-miss-prefill", (9,)),
     Case("eager-decode", (9,), command_graph=False),
-    Case("overlap-prefill", (40,), overlap_min_tokens=16, reads_windows=True),
-    # 64 tokens through the windows, then 36 looked up.
-    Case("chunks-across-the-threshold", (100,), overlap_min_tokens=48, reads_windows=True),
-    # 64, 64 and 22 tokens through the windows.
-    Case("chunked-overlap-prefill", (150,), overlap_min_tokens=16, reads_windows=True),
+    Case("overlap-prefill", (40,), overlap_min_tokens=16, reads_buffers=True),
+    # 64 tokens through the buffers, then 36 looked up.
+    Case("chunks-across-the-threshold", (100,), overlap_min_tokens=48, reads_buffers=True),
+    # 64, 64 and 22 tokens through the buffers.
+    Case("chunked-overlap-prefill", (150,), overlap_min_tokens=16, reads_buffers=True),
     Case("two-requests", (13, 29)),
     Case("three-requests", (9, 17, 26)),
-    Case("overlap-off", (40,), prefill_overlap=False, cache_size=32),
+    Case("overlap-off", (40,), prefill_overlap=False, cache_size=32, max_decode_rows=2),
     Case("up-8-bit-replayed-decode", (9,), up_bits=8),
-    Case("up-8-bit-overlap-prefill", (40,), overlap_min_tokens=16, reads_windows=True, up_bits=8),
+    Case("up-8-bit-overlap-prefill", (40,), overlap_min_tokens=16, reads_buffers=True, up_bits=8),
+    Case(
+        "per-layer-dedicated-decode-copy-miss-prefill",
+        (9, 17, 26),
+        grouping="per-layer",
+        buffer_placement="dedicated",
+        max_decode_rows=2,
+    ),
+    Case(
+        "per-layer-dedicated-chunks-across-the-threshold",
+        (100,),
+        overlap_min_tokens=48,
+        grouping="per-layer",
+        buffer_placement="dedicated",
+        max_decode_rows=2,
+        reads_buffers=True,
+    ),
+    Case(
+        "per-layer-overlaid-chunked-overlap-prefill",
+        (150, 9),
+        overlap_min_tokens=16,
+        grouping="per-layer",
+        max_decode_rows=3,
+        reads_buffers=True,
+    ),
+    Case(
+        "unified-dedicated-chunks-across-the-threshold",
+        (100,),
+        overlap_min_tokens=48,
+        buffer_placement="dedicated",
+        max_decode_rows=1,
+        reads_buffers=True,
+    ),
 ]
 
 
@@ -110,7 +150,9 @@ def make_scheduler(path: Path, case: Case, strategy: MoeStrategy) -> Scheduler:
         command_graph=case.command_graph,
         moe_strategy=strategy,
         moe_cache_size=case.cache_size if strategy == "offload" else 0,
+        moe_pool=case.grouping,
         moe_prefill_overlap=case.prefill_overlap,
+        moe_prefill_buffer=case.buffer_placement,
     )
     return Scheduler(config, eos_token_ids={127})
 
@@ -158,11 +200,11 @@ def test_offload_matches_resident_experts(
     cache = scheduler.engine.moe_offload_cache
     assert cache is not None and cache.cache_size == case.cache_size
     assert ("gate_up_proj.up_proj.weight" in cache.layout) == (case.up_bits != EXPERT_BITS)
-    assert cache.max_rows == 2
+    assert cache.max_decode_rows == case.max_decode_rows
     max_running = max(2, len(case.prompt_lens))
-    assert len(scheduler.table_manager.free_slots) == min(max_running, cache.max_rows)
+    assert len(scheduler.table_manager.free_slots) == min(max_running, case.max_decode_rows)
     stats = cache.stats()
     assert sum(stats.misses) > 0
-    # A window read counts as an expert read but not as a miss.
-    assert (sum(stats.experts_read) > sum(stats.misses)) == case.reads_windows
+    # A prefill buffer read counts as an expert read but not as a miss.
+    assert (sum(stats.experts_read) > sum(stats.misses)) == case.reads_buffers
     cache.check_healthy()

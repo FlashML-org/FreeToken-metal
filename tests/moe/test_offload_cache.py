@@ -5,9 +5,10 @@ equal, byte for byte, the expert's row of apply_rules(load_checkpoint(...)): aft
 initial fill, after each ensure_experts call of a hand-written script (each returned slot,
 and every slot slot_of maps), and at every slot of a prefetched prefill layer's slot map,
 whose resident experts keep their slots. Large experts make one run of reads longer than
-a staging buffer; gate and up in different bits load as two banks. Errors: a layer in
-another format, the window protocol, a file cut short under the cache. The
-real-checkpoint case needs FTMETAL_TEST_MODEL_PATH.
+a staging buffer; gate and up in different bits load as two banks; one pool for every layer
+and prefill buffers over the pools (which drop the experts under them as a prefill begins)
+take the same checks. Errors: a layer in another format, the prefill buffer protocol, a
+file cut short under the cache. The real-checkpoint case needs FTMETAL_TEST_MODEL_PATH.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from ftmetal.models.qwen3_5_moe.model import schemes_of
 from ftmetal.models.qwen3_5_moe.weight import GATE_UP_PARTS
 from ftmetal.models.register import model_weight_rules
 from ftmetal.moe.offload_cache import OffloadMoeCache
+from ftmetal.moe.slot_pools import MoePoolGrouping, PrefillBufferPlacement
 from ftmetal.moe.source import ExpertSource
 from offload_harness import (
     CheckpointSpec,
@@ -67,6 +69,8 @@ class Case:
     last_layer_bits: int | None = None
     # Bits of every layer's up projection, if not the scheme's.
     up_bits: int | None = None
+    grouping: MoePoolGrouping = "per-layer"
+    buffer_placement: PrefillBufferPlacement = "dedicated"
 
     @property
     def spec(self) -> CheckpointSpec:
@@ -85,10 +89,10 @@ class Case:
         scheme = "bf16" if self.scheme is None else f"q{self.scheme.bits}g{self.scheme.group_size}"
         if self.up_bits is not None:
             scheme += f"-up{self.up_bits}"
+        overlap = f"-{self.buffer_placement}" if self.prefill_overlap else ""
         return (
             f"{self.naming}-L{self.num_layers}-E{self.num_experts}-H{self.hidden_size}"
-            f"-I{self.intermediate_size}-S{self.cache_size}"
-            f"{'-overlap' if self.prefill_overlap else ''}-{scheme}"
+            f"-I{self.intermediate_size}-S{self.cache_size}-{self.grouping}{overlap}-{scheme}"
         )
 
 
@@ -148,13 +152,53 @@ CASES = [
         naming="gemma4",
         up_bits=8,
     ),
+    # One pool of 12 for every layer, the buffers over its first 8 slots.
+    Case(
+        4,
+        4,
+        128,
+        64,
+        12,
+        True,
+        script=(
+            ((0, (1, 2)), (1, (3,)), (3, (0, 3))),
+            ((0, (0, 3)), (1, (0, 1, 2)), (2, (2,)), (3, (1,))),
+            Prefill((0, 1, 2, 3)),
+            ((1, (3, 1)), (2, (0, 1, 2, 3))),
+            Prefill((1, 2)),
+            ((2, (0, 1)),),
+        ),
+        grouping="unified",
+        buffer_placement="overlay",
+    ),
+    # Runs of 6 per layer, the buffers over layers 0 and 1 and the start of layer 2's.
+    Case(
+        3,
+        8,
+        192,
+        64,
+        18,
+        True,
+        script=(
+            ((0, (0, 5, 6)), (1, (7,)), (2, (1, 2, 6, 7))),
+            Prefill((0, 1, 2)),
+            ((0, (5, 7, 3)), (2, (6, 0))),
+        ),
+        grouping="per-layer",
+        buffer_placement="overlay",
+    ),
 ]
 
 
 def build(directory: Path, case: Case) -> tuple[OffloadMoeCache, dict[str, mx.array], ExpertSource]:
     """The cache over the case's checkpoint, the fused reference state and the source."""
     cache, source = build_cache(
-        directory, case.spec, cache_size=case.cache_size, prefill_overlap=case.prefill_overlap
+        directory,
+        case.spec,
+        cache_size=case.cache_size,
+        prefill_overlap=case.prefill_overlap,
+        grouping=case.grouping,
+        buffer_placement=case.buffer_placement,
     )
     reference = apply_rules(load_checkpoint(str(directory)), checkpoint_rules(case.spec))
     return cache, reference, source
@@ -192,26 +236,26 @@ def test_rows_match_checkpoint(tmp_path: Path, case: Case) -> None:
     assert (source.segment_table(cache.layout)[..., 1] % 4096 != 0).any(), "all experts aligned"
     cache.fill_initial()
     rows = resident_rows(cache)
-    assert len(rows) == sum(cache.layer_slots)
+    assert len(rows) == sum(pool.num_slots for pool in cache.slot_layout.pools)
     check_rows(cache, reference, prefixes, rows)
     calls_with_misses = 0
     for step, entry in enumerate(case.script, start=1):
         if isinstance(entry, Prefill):
             cache.begin_prefill()
             resident = resident_rows(cache)
-            assert all(slot >= cache.window_slots for slot in resident.values())
+            assert all(slot >= 2 * cache.buffer_size for slot in resident.values())
             for layer_id in entry.layers[:2]:
                 cache.prefetch_prefill_layer(layer_id)
             for i, layer_id in enumerate(entry.layers):
                 slot_map = host_ints(cache.prefetch_prefill_layer(layer_id))
                 cache.wait_prefill_layer(layer_id)
-                window_slot = (layer_id % 2) * cache.window_size
+                buffer_slot = (layer_id % 2) * cache.buffer_size
                 for expert, slot in enumerate(slot_map):
                     if (layer_id, expert) in resident:
                         assert slot == resident[(layer_id, expert)]
                     else:
-                        assert slot == window_slot
-                        window_slot += 1
+                        assert slot == buffer_slot
+                        buffer_slot += 1
                 layer_rows = {(layer_id, expert): slot for expert, slot in enumerate(slot_map)}
                 check_rows(cache, reference, prefixes, layer_rows)
                 if i + 2 < len(entry.layers):
@@ -241,7 +285,7 @@ def test_source_rejects_a_layer_in_another_format(tmp_path: Path) -> None:
         source.segment_table(layout)
 
 
-def test_window_protocol(tmp_path: Path) -> None:
+def test_prefill_buffer_protocol(tmp_path: Path) -> None:
     case = Case(4, 4, 128, 64, 14, True)
     cache, _, _ = build(tmp_path / "checkpoint", case)
     cache.fill_initial()
@@ -256,7 +300,7 @@ def test_window_protocol(tmp_path: Path) -> None:
     cache.wait_prefill_layer(0)
     cache.prefetch_prefill_layer(2)
     cache.begin_prefill()
-    # Windows [0, 2); layer 1's run [5, 8) holds experts 0-2, expert 0 (lowest id) goes.
+    # Buffers [0, 2); layer 1's pool [5, 8) holds experts 0-2, expert 0 (lowest id) goes.
     assert cache.ensure_experts(1, [3], 1) == [5]
 
 
@@ -335,6 +379,8 @@ def test_real_checkpoint_rows() -> None:
         prefill_overlap_min_tokens=128,
         layout=layout,
         source=source,
+        grouping="unified",
+        buffer_placement="overlay",
     )
     reference = apply_rules(load_checkpoint(MODEL_PATH), rules)
     last = source.num_layers - 1

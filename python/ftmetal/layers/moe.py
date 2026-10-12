@@ -11,8 +11,9 @@ differ only in where a projection gathers its experts' weights from.
 OffloadMoELayer serves affine experts only, from the slot banks of the context's
 offload cache: a decode or copy-miss forward gathers the slots its lookup returns, unsorted
 (below four rows per expert the per-row matvec is the fast path); an overlap prefill sorts
-its pairs and reads each expert at its slot map entry (gather_qmm_sorted), its windows and
-the order of its reads and layers kept by the host, where FreeToken waits on CUDA events.
+its pairs and reads each expert at its slot map entry (gather_qmm_sorted), its prefill
+buffers and the order of its reads and layers kept by the host, where FreeToken waits on
+CUDA events.
 """
 
 from __future__ import annotations
@@ -252,7 +253,7 @@ class OffloadMoELayer(MoELayer):
         if cache.mode == "overlap":
             return self.prefill_forward(cache, hidden_states, topk_weights, topk_ids)
         else:
-            slots = cache.lookup_slots(self.moe_layer_id, topk_ids)
+            slots = cache.lookup_slots(self.moe_layer_id, topk_ids, hidden_states)
             x = mx.expand_dims(hidden_states, (-2, -3))
             y = self.glu(x, lambda projection, h: self.gather(cache, projection, h, slots))
             return (y.squeeze(-2) * topk_weights[..., None]).sum(axis=-2)
@@ -264,8 +265,8 @@ class OffloadMoELayer(MoELayer):
         topk_weights: mx.array,
         topk_ids: mx.array,
     ) -> mx.array:
-        """An overlap prefill layer: the layer's input runs while its window is read, its MoE
-        runs as a command buffer of its own once the window is in."""
+        """An overlap prefill layer: the layer's input runs while its prefill buffer is read,
+        its MoE runs as a command buffer of its own once the buffer is in."""
         if self.moe_layer_id == 0:
             cache.begin_prefill_forward()
         mx.async_eval(hidden_states, topk_weights, topk_ids)
