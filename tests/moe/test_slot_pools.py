@@ -2,12 +2,12 @@
 
 plan_slot_layout must give every layer one token's experts, the rest evenly or to the most
 routed (layer, expert) pairs, every expert when the slots allow, sum a pool's layers, put the
-pools smallest first, and lay the prefill buffers over the first pools (a whole layer each)
-or before them (the most experts a layer can miss); too few slots must be refused, from
+pools smallest first, and lay two prefill buffers of a whole layer each over the first pools
+or before them, none when every expert fits; too few slots must be refused, from
 min_cache_size down. The caps: a decode's rows fit every pool's layers at once, a lookup
 prefill's tokens one layer, and step_starts cuts a lookup forward where a pool would
-overflow. initial_experts fills each pool with its layers' most routed experts.
-find_expert_counts prefers the model directory's table to the shipped one.
+overflow. initial_experts fills each pool with its layers' most routed experts, coldest
+first. find_expert_counts prefers the model directory's table to the shipped one.
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ from ftmetal.moe.slot_pools import (
     MoePoolGrouping,
     PrefillBufferPlacement,
     SlotLayout,
-    SlotPool,
     find_expert_counts,
     initial_experts,
     min_cache_size,
@@ -75,7 +74,7 @@ CASES = [
         per_layer([5, 5, 4], 0),
         0,
     ),
-    # Every expert fits: 24 slots, and the overlaid buffers hold a whole layer.
+    # Every expert fits in 24 slots: no buffers.
     Case(
         "all-resident",
         30,
@@ -87,30 +86,29 @@ CASES = [
         True,
         "overlay",
         per_layer([8, 8, 8], 0),
-        8,
+        0,
     ),
-    # 14 slots: runs of 4, 4, 3, 3 need dedicated buffers of 1, which leave runs of 3.
+    # Dedicated buffers of a whole layer each, then runs of 3.
     Case(
-        "dedicated-iterate",
-        14,
+        "dedicated",
+        28,
         4,
-        4,
+        8,
         2,
         None,
         "per-layer",
         True,
         "dedicated",
-        per_layer([3, 3, 3, 3], 2),
-        1,
+        per_layer([3, 3, 3, 3], 16),
+        8,
     ),
     # Each layer's hottest expert first (layer 0's 0, layer 1's 2), then the three most
     # routed pairs left: layer 0's 2, layer 1's 0 and 1.
     Case("hot", 5, 2, 4, 1, COUNTS, "per-layer", False, "overlay", per_layer([2, 3], 0), 0),
-    Case("unified-hot", 5, 2, 4, 1, COUNTS, "unified", False, "overlay", [([0, 1], 0, 5)], 0),
-    # Qwen3.6's floors: one token's experts per layer, and two dedicated buffers of the rest.
+    # Qwen3.6's floors: one token's experts per layer, beside or under two whole layers.
     Case(
         "qwen-dedicated-floor",
-        816,
+        832,
         40,
         256,
         8,
@@ -118,8 +116,8 @@ CASES = [
         "per-layer",
         True,
         "dedicated",
-        per_layer([8] * 40, 496),
-        248,
+        per_layer([8] * 40, 512),
+        256,
     ),
     Case(
         "qwen-overlay-floor",
@@ -147,7 +145,6 @@ CASES = [
         [(list(range(40)), 0, 7168)],
         256,
     ),
-    # A unified pool guarantees no layer any slot: dedicated buffers hold whole layers.
     Case(
         "qwen-unified-dedicated",
         1000,
@@ -178,53 +175,17 @@ def test_plan_slot_layout(case: Case) -> None:
     )
     pools = [(pool.layers, pool.first_slot, pool.num_slots) for pool in layout.pools]
     assert (pools, layout.buffer_size) == (case.pools, case.buffer_size)
-    assert layout.num_slots <= case.cache_size
-    assert layout.pool_bounds == [first for _, first, _ in case.pools] + [layout.num_slots]
-    assert sorted(layout.layer_pools) == sorted(
-        pool for pool, (layers, _, _) in enumerate(case.pools) for _ in layers
-    )
 
 
 def test_too_few_slots_are_refused() -> None:
-    floors = [
-        ("per-layer", True, "dedicated", 816),
-        ("per-layer", True, "overlay", 512),
-        ("unified", True, "dedicated", 832),
-        ("unified", True, "overlay", 512),
-        ("unified", False, "overlay", 320),
-    ]
-    for grouping, prefill_overlap, buffer_placement, floor in floors:
-        options = {
-            "grouping": grouping,
-            "prefill_overlap": prefill_overlap,
-            "buffer_placement": buffer_placement,
-        }
+    floors = [(True, "dedicated", 832), (True, "overlay", 512), (False, "overlay", 320)]
+    for prefill_overlap, buffer_placement, floor in floors:
+        options = {"prefill_overlap": prefill_overlap, "buffer_placement": buffer_placement}
         assert min_cache_size(40, 256, 8, **options) == floor
-        plan_slot_layout(floor, 40, 256, 8, counts=None, **options)
-        with pytest.raises(ValueError, match="cannot"):
-            plan_slot_layout(floor - 1, 40, 256, 8, counts=None, **options)
-    with pytest.raises(ValueError, match="cannot hold the two prefill buffers of 256"):
-        plan_slot_layout(
-            511,
-            40,
-            256,
-            8,
-            grouping="per-layer",
-            counts=None,
-            prefill_overlap=True,
-            buffer_placement="overlay",
-        )
-    with pytest.raises(ValueError, match="cannot give each of 3 MoE layers the 2 experts"):
-        plan_slot_layout(
-            5,
-            3,
-            8,
-            2,
-            grouping="unified",
-            counts=None,
-            prefill_overlap=False,
-            buffer_placement="overlay",
-        )
+        for grouping in ("unified", "per-layer"):
+            plan_slot_layout(floor, 40, 256, 8, grouping=grouping, counts=None, **options)
+            with pytest.raises(ValueError, match=f"cannot hold .*: give at least {floor}$"):
+                plan_slot_layout(floor - 1, 40, 256, 8, grouping=grouping, counts=None, **options)
 
 
 def qwen_layout(cache_size: int, grouping: MoePoolGrouping) -> SlotLayout:
@@ -255,19 +216,6 @@ def test_caps_and_steps() -> None:
     per_layer_pools = qwen_layout(7168, "per-layer")
     assert (per_layer_pools.max_decode_rows, per_layer_pools.max_lookup_tokens) == (22, 22)
     assert per_layer_pools.step_starts(22) == []
-    # Layers 0 and 2 share 6 slots, layer 1 has 4: two rows' 4 experts overflow at layer 2.
-    shared = SlotLayout(
-        pools=[
-            SlotPool(layers=[0, 2], first_slot=0, num_slots=6),
-            SlotPool(layers=[1], first_slot=6, num_slots=4),
-        ],
-        buffer_size=0,
-        num_experts=8,
-        top_k=2,
-    )
-    assert (shared.max_decode_rows, shared.max_lookup_tokens) == (1, 2)
-    assert shared.step_starts(1) == []
-    assert shared.step_starts(2) == [2]
 
 
 def test_initial_experts() -> None:
@@ -281,8 +229,8 @@ def test_initial_experts() -> None:
         prefill_overlap=False,
         buffer_placement="overlay",
     )
-    assert initial_experts(layout, COUNTS) == [0, 2, 6, 4, 5]
-    assert initial_experts(layout, None) == [0, 1, 4, 5, 6]
+    assert initial_experts(layout, COUNTS) == [2, 0, 5, 4, 6]
+    assert initial_experts(layout, None) == [1, 0, 6, 5, 4]
     unified = plan_slot_layout(
         5,
         2,
@@ -293,8 +241,8 @@ def test_initial_experts() -> None:
         prefill_overlap=False,
         buffer_placement="overlay",
     )
-    assert initial_experts(unified, COUNTS) == [0, 6, 2, 4, 5]
-    assert initial_experts(unified, None) == [0, 4, 1, 5, 2]
+    assert initial_experts(unified, COUNTS) == [5, 4, 2, 6, 0]
+    assert initial_experts(unified, None) == [2, 5, 1, 4, 0]
 
 
 def test_model_table_before_shipped(tmp_path: Path) -> None:

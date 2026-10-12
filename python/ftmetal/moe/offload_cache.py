@@ -3,7 +3,8 @@
 Port of FreeToken moe/offload_cache.py (OffloadMoeCache). Divergences: memory is unified,
 so there are no host banks: one bank per layout role holds the cache's expert rows, filled
 straight from the checkpoint files by _C.ExpertService (in C++: a token-granular LRU per
-pool of slots, the IO threads, the two prefill buffers), laid out by moe/slot_pools.py;
+pool of slots, the IO threads, the two prefill buffers), laid out by moe/slot_pools.py
+(FreeToken's slot pool design, its pools placed smallest first, not in layer order);
 slot_of and last_use are shared arrays the C++ side writes in place; ensure_experts takes
 the forward's step and returns the slots; prefetch_prefill_layer returns the layer's slot
 map (resident experts keep their slots, only the absent are read into the prefill buffer)
@@ -15,9 +16,10 @@ decode, or a prefill below prefill_overlap_min_tokens, looks its experts up (a c
 prefill: its misses join the LRU, where FreeToken's prefill streams whole layers); a longer
 prefill reads each layer's absent experts into a prefill buffer one layer ahead, ordered by
 the host. No slot a step reads may be rewritten within the step, since the GPU caches may
-keep its old row: a decode's rows are capped so that it runs as one step (a graph replay
-must), and a copy-miss prefill whose experts may not all fit the pools at once runs as
-several steps, each its own command buffer.
+keep its old row: a decode's rows are capped so that each pool holds its layers' experts
+of the whole decode at once (FreeToken caps per layer), one step as a graph replay must,
+and a copy-miss prefill whose experts may not all fit the pools at once runs as several
+steps, each its own command buffer.
 """
 
 from __future__ import annotations
@@ -101,11 +103,9 @@ class OffloadMoeCache:
         )
         self.num_layers = num_layers
         self.num_experts = num_experts
-        self.top_k = top_k
         self.expert_counts = expert_counts
         # The pools hold at most every expert: the cache may come out below cache_size.
         self.cache_size = self.slot_layout.num_slots
-        self.buffer_size = self.slot_layout.buffer_size
         self.prefill_overlap = prefill_overlap
         self.prefill_overlap_min_tokens = prefill_overlap_min_tokens
         self.layout = layout
@@ -125,7 +125,7 @@ class OffloadMoeCache:
         self.service = _C.ExpertService(
             num_layers,
             num_experts,
-            self.buffer_size,
+            self.slot_layout.buffer_size,
             self.slot_layout.layer_pools,
             self.slot_layout.pool_bounds,
             self.slot_of,
@@ -156,18 +156,10 @@ class OffloadMoeCache:
     def nbytes(self) -> int:
         return sum(bank.nbytes for bank in self.banks.values())
 
-    @property
-    def max_decode_rows(self) -> int | None:
-        return self.slot_layout.max_decode_rows
-
-    @property
-    def max_lookup_tokens(self) -> int | None:
-        return self.slot_layout.max_lookup_tokens
-
     def prepare(self, batch: Batch) -> None:
         """Choose the forward's mode and start its first step; before the model builds it. A
         prefill too long to look up reads its layers ahead whatever its length."""
-        max_tokens = self.max_lookup_tokens
+        max_tokens = self.slot_layout.max_lookup_tokens
         if batch.is_decode:
             self.begin_lookups("decode", batch.size)
         elif self.prefill_overlap and (
@@ -183,7 +175,10 @@ class OffloadMoeCache:
         self.begin_lookups("decode", 0)
 
     def begin_lookups(self, mode: MoeForwardMode, num_rows: int) -> None:
-        max_rows = self.max_decode_rows if mode == "decode" else self.max_lookup_tokens
+        if mode == "decode":
+            max_rows = self.slot_layout.max_decode_rows
+        else:
+            max_rows = self.slot_layout.max_lookup_tokens
         if max_rows is not None and num_rows > max_rows:
             raise RuntimeError(
                 f"a {mode} forward of {num_rows} rows may route more experts than the cache's "
@@ -191,8 +186,8 @@ class OffloadMoeCache:
             )
         self.mode = mode
         self.num_rows = num_rows
-        self.step_starts = self.slot_layout.step_starts(num_rows)
-        assert mode != "decode" or not self.step_starts, "a decode runs as one step"
+        # The decode cap keeps a decode one step.
+        self.step_starts = [] if mode == "decode" else self.slot_layout.step_starts(num_rows)
         self.advance_step()
 
     def advance_step(self) -> None:

@@ -70,7 +70,7 @@ class Case:
     # Bits of every layer's up projection, if not the scheme's.
     up_bits: int | None = None
     grouping: MoePoolGrouping = "per-layer"
-    buffer_placement: PrefillBufferPlacement = "dedicated"
+    buffer_placement: PrefillBufferPlacement = "overlay"
 
     @property
     def spec(self) -> CheckpointSpec:
@@ -243,13 +243,13 @@ def test_rows_match_checkpoint(tmp_path: Path, case: Case) -> None:
         if isinstance(entry, Prefill):
             cache.begin_prefill()
             resident = resident_rows(cache)
-            assert all(slot >= 2 * cache.buffer_size for slot in resident.values())
+            assert all(slot >= 2 * cache.slot_layout.buffer_size for slot in resident.values())
             for layer_id in entry.layers[:2]:
                 cache.prefetch_prefill_layer(layer_id)
             for i, layer_id in enumerate(entry.layers):
                 slot_map = host_ints(cache.prefetch_prefill_layer(layer_id))
                 cache.wait_prefill_layer(layer_id)
-                buffer_slot = (layer_id % 2) * cache.buffer_size
+                buffer_slot = (layer_id % 2) * cache.slot_layout.buffer_size
                 for expert, slot in enumerate(slot_map):
                     if (layer_id, expert) in resident:
                         assert slot == resident[(layer_id, expert)]
@@ -286,7 +286,7 @@ def test_source_rejects_a_layer_in_another_format(tmp_path: Path) -> None:
 
 
 def test_prefill_buffer_protocol(tmp_path: Path) -> None:
-    case = Case(4, 4, 128, 64, 14, True)
+    case = Case(4, 8, 128, 64, 28, True, buffer_placement="dedicated")
     cache, _, _ = build(tmp_path / "checkpoint", case)
     cache.fill_initial()
     cache.begin_prefill()
@@ -300,8 +300,9 @@ def test_prefill_buffer_protocol(tmp_path: Path) -> None:
     cache.wait_prefill_layer(0)
     cache.prefetch_prefill_layer(2)
     cache.begin_prefill()
-    # Buffers [0, 2); layer 1's pool [5, 8) holds experts 0-2, expert 0 (lowest id) goes.
-    assert cache.ensure_experts(1, [3], 1) == [5]
+    # Buffers [0, 16); layer 1's pool [19, 22) holds experts 2, 1, 0: expert 0 (lowest id)
+    # goes.
+    assert cache.ensure_experts(1, [3], 1) == [21]
 
 
 def test_read_failure_poisons_the_cache(tmp_path: Path) -> None:

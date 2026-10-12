@@ -114,7 +114,7 @@ class Scheduler:
         # through its budget (prefill_budget).
         max_admitted = config.max_running_req
         cache = self.moe_offload_cache
-        max_rows = None if cache is None else cache.max_decode_rows
+        max_rows = None if cache is None else cache.slot_layout.max_decode_rows
         if max_rows is not None and max_rows < max_admitted:
             logger.warning(
                 f"MoE offload: {max_rows} requests run at once, not {config.max_running_req}: a "
@@ -377,15 +377,15 @@ class Scheduler:
         max_lookup_tokens; the cache reads a longer one's layers ahead whatever its length."""
         budget = self.config.max_extend_tokens
         cache = self.moe_offload_cache
-        if cache is None or cache.max_lookup_tokens is None:
+        max_tokens = None if cache is None else cache.slot_layout.max_lookup_tokens
+        if cache is None or max_tokens is None:
             return budget
-        elif (
-            cache.prefill_overlap
-            and self.prefill_manager.pending_tokens >= cache.prefill_overlap_min_tokens
+        elif cache.prefill_overlap and self.prefill_manager.has_pending_tokens(
+            cache.prefill_overlap_min_tokens
         ):
             return budget
         else:
-            return min(budget, cache.max_lookup_tokens)
+            return min(budget, max_tokens)
 
     def prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)

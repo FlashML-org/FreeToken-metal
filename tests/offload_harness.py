@@ -155,7 +155,7 @@ def build_cache(
     cache_size: int,
     prefill_overlap: bool,
     grouping: MoePoolGrouping = "per-layer",
-    buffer_placement: PrefillBufferPlacement = "dedicated",
+    buffer_placement: PrefillBufferPlacement = "overlay",
     stall_timeout_s: float = STALL_TIMEOUT_S,
     run_coordinator: bool = True,
 ) -> tuple[OffloadMoeCache, ExpertSource]:

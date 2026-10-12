@@ -283,9 +283,9 @@ class PrefillManager:
             )
         )
 
-    @property
-    def pending_tokens(self) -> int:
-        """The prompt tokens still to prefill, past each new prompt's prefix-cache hit."""
+    def has_pending_tokens(self, count: int) -> bool:
+        """Whether count prompt tokens or more are still to prefill, past each new prompt's
+        prefix-cache hit; prompts are matched only until the count is reached."""
         total = 0
         for pending in self.pending_list:
             if pending.chunked_req is not None:
@@ -293,7 +293,9 @@ class PrefillManager:
             else:
                 handle = self.cache_manager.match_req(pending.input_ids).handle
                 total += pending.input_len - (0 if handle is None else handle.cached_len)
-        return total
+            if total >= count:
+                return True
+        return False
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
         if not self.pending_list:

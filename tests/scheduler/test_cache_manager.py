@@ -482,12 +482,12 @@ def test_pending_tokens_count_past_the_cached_prefix() -> None:
     params = SamplingParams(max_tokens=1)
     prefill.add_one_req(1, np.array(prompt, dtype=np.int32), params)
     # The cached 40 tokens are not pending.
-    assert prefill.pending_tokens == 19
+    assert prefill.has_pending_tokens(19) and not prefill.has_pending_tokens(20)
     prefill.add_one_req(2, np.arange(500, 530, dtype=np.int32), params)
-    assert prefill.pending_tokens == 19 + 30
+    assert prefill.has_pending_tokens(49) and not prefill.has_pending_tokens(50)
     batch = prefill.schedule_next_batch(10)
     assert batch is not None and [req.extend_len for req in batch.reqs] == [10]
-    assert prefill.pending_tokens == 9 + 30
+    assert prefill.has_pending_tokens(39) and not prefill.has_pending_tokens(40)
 
 
 WINDOW = 8

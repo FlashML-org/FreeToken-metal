@@ -258,7 +258,6 @@ class Engine:
                 num_experts=model_config.num_experts,
                 top_k=model_config.num_experts_per_tok,
                 total_experts=total_experts,
-                grouping=config.moe_pool,
                 prefill_overlap=prefill_overlap,
                 buffer_placement=config.moe_prefill_buffer,
             )
@@ -352,14 +351,13 @@ class Engine:
                 buffer_placement=config.moe_prefill_buffer,
                 expert_counts=counts,
             )
-            pools = self.moe_offload_cache.slot_layout.pools
+            layout = self.moe_offload_cache.slot_layout
+            pool_slots = [pool.num_slots for pool in layout.pools]
             logger.info(
-                f"MoE offload: {config.moe_pool} pools x{len(pools)} of "
-                f"{min(pool.num_slots for pool in pools)}-{max(pool.num_slots for pool in pools)} "
-                f"slots ({config.moe_pool_slots}), prefill buffers of "
-                f"{self.moe_offload_cache.buffer_size} ({config.moe_prefill_buffer}), decode rows "
-                f"<= {self.moe_offload_cache.max_decode_rows}, looked-up prefill tokens <= "
-                f"{self.moe_offload_cache.max_lookup_tokens}"
+                f"MoE offload: {config.moe_pool} pools x{len(pool_slots)} of {min(pool_slots)}-"
+                f"{max(pool_slots)} slots ({config.moe_pool_slots}), prefill buffers of "
+                f"{layout.buffer_size} ({config.moe_prefill_buffer}), decode rows <= "
+                f"{layout.max_decode_rows}, looked-up prefill tokens <= {layout.max_lookup_tokens}"
             )
             self.moe_offload_cache.fill_initial()
             self.moe_offload_cache.probe()

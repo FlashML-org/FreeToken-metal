@@ -6,9 +6,9 @@ most steps: the fp32 greedy tokens must agree and the logits of the first prompt
 prefill chunk must match. The cache is one pool with the prefill buffers over its first 32
 slots unless a case says otherwise: a decode then fits three rows, and a looked-up prefill
 of four tokens or more runs as two steps (a step holds three layers' 16 experts). Per-layer
-pools with dedicated buffers are runs of 10 beside buffers of 6 (two rows, two tokens per
-looked-up forward); with overlaid buffers runs of 13; one pool beside dedicated buffers is
-20 slots, a step per layer. Cases: decode replayed and eager; copy-miss and overlap
+pools under the buffers are runs of 13 (three rows, three tokens per looked-up forward);
+beside dedicated buffers runs of 5 (one row, one token); one pool beside dedicated buffers
+is 20 slots, a step per layer. Cases: decode replayed and eager; copy-miss and overlap
 prefills (the overlap threshold knob lowered so tiny prompts take it), the chunks of one
 prompt on both sides of the threshold, a prompt chunked through overlap prefills; two
 requests decoding together, and three; prefill overlap off, with no buffers; up in 8 bits
@@ -76,19 +76,12 @@ CASES = [
     Case("up-8-bit-replayed-decode", (9,), up_bits=8),
     Case("up-8-bit-overlap-prefill", (40,), overlap_min_tokens=16, reads_buffers=True, up_bits=8),
     Case(
-        "per-layer-dedicated-decode-copy-miss-prefill",
-        (9, 17, 26),
-        grouping="per-layer",
-        buffer_placement="dedicated",
-        max_decode_rows=2,
-    ),
-    Case(
         "per-layer-dedicated-chunks-across-the-threshold",
-        (100,),
+        (100, 9),
         overlap_min_tokens=48,
         grouping="per-layer",
         buffer_placement="dedicated",
-        max_decode_rows=2,
+        max_decode_rows=1,
         reads_buffers=True,
     ),
     Case(
@@ -200,7 +193,7 @@ def test_offload_matches_resident_experts(
     cache = scheduler.engine.moe_offload_cache
     assert cache is not None and cache.cache_size == case.cache_size
     assert ("gate_up_proj.up_proj.weight" in cache.layout) == (case.up_bits != EXPERT_BITS)
-    assert cache.max_decode_rows == case.max_decode_rows
+    assert cache.slot_layout.max_decode_rows == case.max_decode_rows
     max_running = max(2, len(case.prompt_lens))
     assert len(scheduler.table_manager.free_slots) == min(max_running, case.max_decode_rows)
     stats = cache.stats()

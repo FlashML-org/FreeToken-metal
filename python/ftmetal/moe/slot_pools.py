@@ -1,17 +1,11 @@
 """The slot layout of the routed-expert offload cache: pools of slots and prefill buffers.
 
-No FreeToken donor file; this follows FreeToken's slot pool design (group, split). The MoE
-layers are grouped into pools (unified: every layer of an expert layout, of which the cache
-holds one; per-layer: one layer each), each a run of slots with an LRU of its own (SlotLru).
-The slots are split evenly per layer or by a hot-expert table (how often each layer's experts
-are routed: the model directory's own, profiled locally, else the one shipped for the model),
-summed over a pool's layers. The two prefill buffers overlay the first 2 * num_experts slots,
-or take slots of their own before the pools. Divergences: the pools sit smallest first
-(FreeToken: layer order), so the overlaid buffers cover the runs a layer misses least; a
-decode's rows are capped so that each pool holds its layers' experts of the whole decode at
-once (FreeToken caps per layer), since a slot a command buffer reads must not be rewritten
-in it; a lookup prefill's tokens are capped per layer and its forward split into steps
-instead.
+The MoE layers are grouped into pools (unified: every layer of an expert layout, of which the
+cache holds one; per-layer: one layer each), each a run of slots with an LRU of its own
+(SlotLru), sized evenly per layer or by a hot-expert table (how often each layer's experts
+are routed: the model directory's own, profiled locally, else the one shipped for the model)
+summed over its layers. The two prefill buffers hold a whole layer each, over the first
+slots or before the pools.
 """
 
 from __future__ import annotations
@@ -97,23 +91,15 @@ class SlotLayout:
     def step_starts(self, num_rows: int) -> list[int]:
         """The layers that start a new step of a lookup forward of num_rows rows: each step's
         layers hold their worst case, all-distinct experts, in their pools at once."""
-        worst = min(self.num_experts, num_rows * self.top_k)
+        experts_per_layer = min(self.num_experts, num_rows * self.top_k)
         used = [0] * len(self.pools)
         starts: list[int] = []
         for layer_id, pool_id in enumerate(self.layer_pools):
-            pool = self.pools[pool_id]
-            assert worst <= pool.num_slots, f"{num_rows} rows outgrow pool {pool_id}"
-            if used[pool_id] + worst > pool.num_slots:
+            if used[pool_id] + experts_per_layer > self.pools[pool_id].num_slots:
                 starts.append(layer_id)
                 used = [0] * len(self.pools)
-            used[pool_id] += worst
+            used[pool_id] += experts_per_layer
         return starts
-
-
-def builtin_hot_experts(
-    model_type: str, num_layers: int, num_experts: int, hidden_size: int
-) -> Path:
-    return BUILTIN_HOT_EXPERTS / f"{model_type}-{num_layers}x{num_experts}-h{hidden_size}.json"
 
 
 def find_expert_counts(
@@ -122,7 +108,7 @@ def find_expert_counts(
     """The model directory's hot-expert table, else the one shipped for this model."""
     for path in (
         Path(model_path) / HOT_EXPERTS_FILE,
-        builtin_hot_experts(model_type, num_layers, num_experts, hidden_size),
+        BUILTIN_HOT_EXPERTS / f"{model_type}-{num_layers}x{num_experts}-h{hidden_size}.json",
     ):
         if path.exists():
             return path
@@ -146,21 +132,35 @@ def split_runs(
 ) -> list[int]:
     """num_slots over the layers: one token's experts each, then the rest to the most routed
     (layer, expert) pairs of counts beyond those, or evenly without counts."""
-    floor = min(top_k, num_experts)
-    if num_slots < num_layers * floor:
-        raise ValueError(
-            f"{num_slots} expert slots cannot give each of {num_layers} MoE layers the "
-            f"{floor} experts of one token"
-        )
     if num_slots >= num_layers * num_experts:
         return [num_experts] * num_layers
     if counts is None:
         base, extra = divmod(num_slots, num_layers)
         return [base + (layer_id < extra) for layer_id in range(num_layers)]
+    floor = min(top_k, num_experts)
     rank_in_layer = np.argsort(np.argsort(-counts, axis=1, kind="stable"), axis=1, kind="stable")
     rest = np.where(rank_in_layer < floor, -1, counts).ravel()
     hottest = np.argsort(-rest, kind="stable")[: num_slots - num_layers * floor]
     return (floor + np.bincount(hottest // num_experts, minlength=num_layers)).tolist()
+
+
+def min_cache_size(
+    num_layers: int,
+    num_experts: int,
+    top_k: int,
+    *,
+    prefill_overlap: bool,
+    buffer_placement: PrefillBufferPlacement,
+) -> int:
+    """The fewest slots a layout takes: one token's experts per layer, and the two prefill
+    buffers of a whole layer each over them or beside them."""
+    floor = num_layers * min(top_k, num_experts)
+    if not prefill_overlap:
+        return floor
+    elif buffer_placement == "overlay":
+        return max(floor, 2 * num_experts)
+    else:
+        return floor + 2 * num_experts
 
 
 def plan_slot_layout(
@@ -174,40 +174,39 @@ def plan_slot_layout(
     prefill_overlap: bool,
     buffer_placement: PrefillBufferPlacement,
 ) -> SlotLayout:
-    """cache_size slots (fewer once every expert fits) as pools and, with prefill overlap,
-    two prefill buffers. Overlaid buffers hold a whole layer; dedicated ones the most experts
-    a layer can miss, which a smaller pool raises, so the split iterates."""
+    """cache_size slots (fewer once every expert fits) as pools and, with prefill overlap
+    unless every expert fits, two prefill buffers of a whole layer each."""
+    floor = min_cache_size(
+        num_layers,
+        num_experts,
+        top_k,
+        prefill_overlap=prefill_overlap,
+        buffer_placement=buffer_placement,
+    )
+    if cache_size < floor:
+        buffers = " and the two prefill buffers" if prefill_overlap else ""
+        raise ValueError(
+            f"{cache_size} expert slots cannot hold one token's experts per layer{buffers}: give "
+            f"at least {floor}"
+        )
+    if prefill_overlap and cache_size < num_layers * num_experts:
+        buffer_size = num_experts
+    else:
+        buffer_size = 0
+    is_dedicated = buffer_placement == "dedicated"
+    runs = split_runs(
+        cache_size - (2 * buffer_size if is_dedicated else 0),
+        num_layers,
+        num_experts,
+        top_k,
+        counts,
+    )
     if grouping == "unified":
         groups = [list(range(num_layers))]
     else:
         groups = [[layer_id] for layer_id in range(num_layers)]
-    is_dedicated = prefill_overlap and buffer_placement == "dedicated"
-    if prefill_overlap and not is_dedicated and cache_size < 2 * num_experts:
-        raise ValueError(
-            f"{cache_size} expert slots cannot hold the two prefill buffers of {num_experts}"
-        )
-    buffer_size = 0
-    while True:
-        runs = split_runs(
-            cache_size - (2 * buffer_size if is_dedicated else 0),
-            num_layers,
-            num_experts,
-            top_k,
-            counts,
-        )
-        pool_slots = [sum(runs[layer_id] for layer_id in group) for group in groups]
-        if not prefill_overlap:
-            needed = 0
-        elif not is_dedicated:
-            needed = num_experts
-        else:
-            # A pool of one layer always holds as many of its experts as it has slots.
-            needed = num_experts - min(
-                num_slots if len(group) == 1 else 0 for group, num_slots in zip(groups, pool_slots)
-            )
-        if needed <= buffer_size:
-            break
-        buffer_size = needed
+    pool_slots = [sum(runs[layer_id] for layer_id in group) for group in groups]
+    # Smallest first: overlaid buffers cover the runs whose experts their layers miss least.
     order = sorted(range(len(groups)), key=lambda pool_id: (pool_slots[pool_id], groups[pool_id]))
     first_slot = 2 * buffer_size if is_dedicated else 0
     pools: list[SlotPool] = []
@@ -219,31 +218,10 @@ def plan_slot_layout(
     return SlotLayout(pools=pools, buffer_size=buffer_size, num_experts=num_experts, top_k=top_k)
 
 
-def min_cache_size(
-    num_layers: int,
-    num_experts: int,
-    top_k: int,
-    *,
-    grouping: MoePoolGrouping,
-    prefill_overlap: bool,
-    buffer_placement: PrefillBufferPlacement,
-) -> int:
-    """The fewest slots plan_slot_layout accepts: one token's experts per layer, and the
-    prefill buffers over them or beside them."""
-    floor = min(top_k, num_experts)
-    if not prefill_overlap:
-        return num_layers * floor
-    elif buffer_placement == "overlay":
-        return max(num_layers * floor, 2 * num_experts)
-    elif grouping == "per-layer":
-        return num_layers * floor + 2 * (num_experts - floor)
-    else:
-        return num_layers * floor + 2 * num_experts
-
-
 def initial_experts(layout: SlotLayout, counts: np.ndarray | None) -> list[int]:
-    """Flat ids filling every pool: its layers' most routed experts (the lowest-numbered,
-    layer by layer, without counts), pool by pool."""
+    """Flat ids filling every pool with its layers' most routed experts (the lowest-numbered,
+    layer by layer, without counts), coldest first: an overlaid buffer covers a pool's first
+    slots."""
     num_experts = layout.num_experts
     flat_ids: list[int] = []
     for pool in layout.pools:
@@ -251,24 +229,22 @@ def initial_experts(layout: SlotLayout, counts: np.ndarray | None) -> list[int]:
         if counts is not None:
             pairs.sort(key=lambda pair: (-counts[pair], pair))
         flat_ids += [
-            layer_id * num_experts + expert for layer_id, expert in pairs[: pool.num_slots]
+            layer_id * num_experts + expert
+            for layer_id, expert in reversed(pairs[: pool.num_slots])
         ]
     return flat_ids
 
 
 __all__ = [
-    "BUILTIN_HOT_EXPERTS",
     "HOT_EXPERTS_FILE",
     "MoePoolGrouping",
     "MoePoolSlots",
     "PrefillBufferPlacement",
     "SlotLayout",
     "SlotPool",
-    "builtin_hot_experts",
     "find_expert_counts",
     "initial_experts",
     "min_cache_size",
     "plan_slot_layout",
     "read_expert_counts",
-    "split_runs",
 ]

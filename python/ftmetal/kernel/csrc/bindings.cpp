@@ -245,7 +245,7 @@ NB_MODULE(_C, m) {
             return std::make_pair(std::move(assignment.slots), std::move(assignment.loads));
           },
           "layer_id"_a,
-          "Every expert's slot, prefill buffer layer_id % 2's for the absent; returns (slot_map, loads).");
+          "Every expert's slot, buffer layer_id % 2's for the absent; returns (slot_map, loads).");
 
   nb::class_<ftmetal::ExpertServiceStats>(m, "ExpertServiceStats")
       .def_ro("hits", &ftmetal::ExpertServiceStats::hits)
@@ -344,7 +344,7 @@ NB_MODULE(_C, m) {
           &ftmetal::ExpertService::prefetch_prefill_layer,
           "layer_id"_a,
           nb::call_guard<nb::gil_scoped_release>(),
-          "Start reading the layer's absent experts into prefill buffer layer_id % 2; returns its slot map.")
+          "Start reading the layer's absent experts into its prefill buffer; returns its slot map.")
       .def(
           "wait_prefill_layer",
           &ftmetal::ExpertService::wait_prefill_layer,

@@ -314,7 +314,7 @@ def test_hit_in_the_least_recently_used_slot_keeps_it(tmp_path: Path) -> None:
     cache = small_cache(tmp_path)
     cache.fill_initial()
     slot_of = np.array(cache.slot_of)
-    assert slot_of[:4].tolist() == [0, 1, 2, 3], "layer 0's experts 0-3 fill its pool"
+    assert slot_of[:4].tolist() == [3, 2, 1, 0], "layer 0's experts 0-3 fill its pool"
     # Step 1 uses every resident expert but layer 0's expert 0, which becomes the least
     # recently used; step 2's request hits it and misses expert 4.
     mx.eval(lookup(cache, [[1, 2], [3, 1]], 2, 1), cache.mailbox)
@@ -326,7 +326,7 @@ def test_hit_in_the_least_recently_used_slot_keeps_it(tmp_path: Path) -> None:
     gate_up = mx.take(cache.banks["gate_up_proj.weight"], slots.reshape(-1), axis=0)
     mx.eval(gate_up, cache.mailbox)
     slot_0, slot_4 = np.array(slots).reshape(-1).tolist()
-    assert slot_0 == 0 and slot_4 != 0
+    assert slot_0 == 3 and slot_4 != 3
     codes = np.array(gate_up)[:, 0, 0].tolist()
     assert codes == [expert_code(0, 0, 0), expert_code(0, 0, 4)]
     assert mailbox_words(cache)[Word.NUM_LOADED] == 1

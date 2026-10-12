@@ -24,11 +24,7 @@ from ftmetal.kvcache.base import PoolCost
 from ftmetal.models.config import MoeStrategy
 from ftmetal.models.loader import config_int
 from ftmetal.models.qwen3_5_moe.vision import MLP_ROWS
-from ftmetal.moe.slot_pools import (
-    MoePoolGrouping,
-    PrefillBufferPlacement,
-    min_cache_size,
-)
+from ftmetal.moe.slot_pools import PrefillBufferPlacement, min_cache_size
 
 logger = logging.getLogger(__name__)
 
@@ -194,7 +190,6 @@ def resolve_moe_cache_size(
     num_experts: int,
     top_k: int,
     total_experts: int,
-    grouping: MoePoolGrouping,
     prefill_overlap: bool,
     buffer_placement: PrefillBufferPlacement,
 ) -> int:
@@ -206,7 +201,6 @@ def resolve_moe_cache_size(
         num_layers,
         num_experts,
         top_k,
-        grouping=grouping,
         prefill_overlap=prefill_overlap,
         buffer_placement=buffer_placement,
     )

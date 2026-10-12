@@ -1,6 +1,7 @@
 #include "expert_lru.h"
 
 #include <algorithm>
+#include <functional>
 #include <stdexcept>
 
 namespace ftmetal {
@@ -17,7 +18,7 @@ void* shared_data(const mx::array& array, const std::string& name) {
 
 namespace {
 
-// Throw unless SlotLru can take this layout.
+// Throw unless the layout's slots and pools are in range.
 void check_layout(
     int num_layers,
     int num_experts,
@@ -35,22 +36,15 @@ void check_layout(
         "SlotLru: layer_pools must hold one pool per layer and pool_bounds a pool or more");
   }
   int32_t num_pools = static_cast<int32_t>(pool_bounds.size()) - 1;
-  std::vector<int32_t> pool_layers(num_pools, 0);
   for (int32_t pool : layer_pools) {
     if (pool < 0 || pool >= num_pools) {
       throw std::invalid_argument("SlotLru: a layer's pool is out of range");
     }
-    ++pool_layers[pool];
   }
-  if (pool_bounds[0] != 0 && pool_bounds[0] != 2 * buffer_size) {
-    throw std::invalid_argument("SlotLru: the pools must start at slot 0 or after the buffers");
-  }
-  for (int32_t pool = 0; pool < num_pools; ++pool) {
-    int32_t count = pool_bounds[pool + 1] - pool_bounds[pool];
-    if (pool_layers[pool] == 0 || count < 1 || count > pool_layers[pool] * num_experts) {
-      throw std::invalid_argument(
-          "SlotLru: every pool needs a layer and 1 to its layers' experts of slots");
-    }
+  if (pool_bounds[0] < 0 ||
+      std::adjacent_find(pool_bounds.begin(), pool_bounds.end(), std::greater_equal<int32_t>()) !=
+          pool_bounds.end()) {
+    throw std::invalid_argument("SlotLru: pool_bounds must rise from slot 0 or later");
   }
   if (2 * buffer_size > pool_bounds.back()) {
     throw std::invalid_argument("SlotLru: the prefill buffers outgrow the slots");
@@ -89,11 +83,7 @@ SlotLru::SlotLru(
   slot_call_.assign(num_slots(), 0);
   std::fill(slot_of_data_, slot_of_data_ + slot_of_.size(), -1);
   std::fill(last_use_data_, last_use_data_ + num_slots(), 0u);
-  int32_t largest_pool = 0;
-  for (size_t pool = 0; pool + 1 < pool_bounds_.size(); ++pool) {
-    largest_pool = std::max(largest_pool, pool_bounds_[pool + 1] - pool_bounds_[pool]);
-  }
-  candidates_.reserve(largest_pool);
+  candidates_.reserve(num_slots());
 }
 
 void SlotLru::check_layer(int layer_id, const char* method) const {

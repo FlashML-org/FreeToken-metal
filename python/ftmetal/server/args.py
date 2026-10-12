@@ -420,9 +420,9 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         type=moe_pool_slots,
         metavar="{equal,profile,profile:PATH}",
         default=(ServerArgs.moe_pool_slots, ServerArgs.moe_pool_profile),
-        help="how the offload cache splits its slots among the pools: evenly per layer, or by "
-        "a hot-expert table (PATH, else expert_hot_rank.json in the model directory, else the "
-        "one shipped for the model)",
+        help="how the offload cache splits its slots among the pools and which experts fill "
+        "them first: evenly per layer and the lowest-numbered, or by a hot-expert table (PATH, "
+        "else expert_hot_rank.json in the model directory, else the one shipped for the model)",
     )
     parser.add_argument(
         "--disable-moe-prefill-overlap",
