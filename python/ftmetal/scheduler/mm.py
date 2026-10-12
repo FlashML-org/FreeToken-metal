@@ -1,10 +1,11 @@
 """Scheduler-side multimodal planning: the embedding rows a chunk gathers, the items it
-encodes, and the mrope positions of a batch.
+encodes, the image block each token sits in, and the mrope positions of a batch.
 
 Port of FreeToken scheduler/mm.py, with _make_mrope_positions of scheduler/scheduler.py.
-Divergences: no mm_chunk_end or cut_image_spans and no block ends (bidirectional image
-blocks are Gemma4's, which serves no images); gather rows are MMGatherRows; the positions
-are a host numpy array; an item this request will not encode drops its pixels at planning
+Divergences: no mm_chunk_end or cut_image_spans (chunks may end inside an image span);
+gather rows are MMGatherRows; the block ends are their own pass (mm_block_ends), clamped to
+each request's keys, and are None for a batch without image tokens; the positions are a
+host numpy array; an item this request will not encode drops its pixels at planning
 (FreeToken frees them only after an encode, which a cache or prefix hit never runs).
 """
 
@@ -87,6 +88,22 @@ def plan_mm_batch(
     return jobs, plan, rows
 
 
+def mm_block_ends(reqs: list[Req]) -> np.ndarray | None:
+    """Per batch token over the reqs in batch order (each spans [cached_len, device_len)),
+    int32: the end of the image span holding it, clamped to its request's keys, 0 for text;
+    None when no token is an image token."""
+    block_ends = np.zeros(sum(req.extend_len for req in reqs), dtype=np.int32)
+    offset = 0
+    for req in reqs:
+        for item in req.mm_items or []:
+            for span_lo, span_hi in item.offsets:
+                lo, hi = max(span_lo, req.cached_len), min(span_hi, req.device_len)
+                if lo < hi:
+                    block_ends[offset + lo - req.cached_len : offset + hi - req.cached_len] = hi
+        offset += req.extend_len
+    return block_ends if block_ends.any() else None
+
+
 def make_mrope_positions(reqs: list[Req]) -> np.ndarray:
     """int32 [3, N] rope rows: an image request's prompt tokens use their precomputed
     columns, everything else is the sequence index plus the request's delta."""
@@ -101,4 +118,10 @@ def make_mrope_positions(reqs: list[Req]) -> np.ndarray:
     return np.ascontiguousarray(np.concatenate(columns, axis=1), dtype=np.int32)
 
 
-__all__ = ["make_mrope_positions", "mm_rows_after", "plan_mm_batch", "plan_mm_chunk"]
+__all__ = [
+    "make_mrope_positions",
+    "mm_block_ends",
+    "mm_rows_after",
+    "plan_mm_batch",
+    "plan_mm_chunk",
+]

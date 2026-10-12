@@ -60,6 +60,8 @@ class KVCacheGroupSpec:
     head_dim: int = 0
     # The keys a query attends to, its own included (SWA).
     sliding_window: int | None = None
+    # Image tokens also attend to their image's later tokens at prefill (batch.mm_block_ends).
+    bidirectional_mm_blocks: bool = False
     # Per-slot state per layer (LINEAR); () when the type has none.
     conv_shape: tuple[int, ...] = ()
     state_shape: tuple[int, ...] = ()
@@ -109,6 +111,8 @@ class SWAAttentionGroupConfig(BaseAttentionGroupConfig):
     head_dim: int
     rotary_config: RotaryConfig
     sliding_window: int
+    # Image tokens also attend to their image's later tokens at prefill (Gemma4's window layers).
+    bidirectional_mm_blocks: bool = False
 
 
 @dataclass(frozen=True)
@@ -183,6 +187,14 @@ class ModelConfig:
         return self.vision_config is not None
 
     @property
+    def has_bidirectional_mm_blocks(self) -> bool:
+        """Whether some layer attends within an image in both directions at prefill."""
+        return any(
+            isinstance(group, SWAAttentionGroupConfig) and group.bidirectional_mm_blocks
+            for group in self.attention_groups
+        )
+
+    @property
     def is_mrope(self) -> bool:
         """Whether attention takes 3-axis (t/h/w) rope positions."""
         return self.rotary_config.mrope_section is not None
@@ -246,6 +258,7 @@ class ModelConfig:
                     num_kv_heads=group.num_kv_heads,
                     head_dim=group.head_dim,
                     sliding_window=group.sliding_window,
+                    bidirectional_mm_blocks=group.bidirectional_mm_blocks,
                 )
             else:
                 # A conv ring over q, k and v; the state is [Hv, Dv, Dk] as the GDN kernels read it.

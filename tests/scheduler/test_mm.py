@@ -1,5 +1,6 @@
 """Chunk-window planning over image spans (rows, jobs, cache hits, multi-span items, a
-repeated image across a cut) and the mrope positions of a batch."""
+repeated image across a cut), the block ends of a batch and the mrope positions of a
+batch."""
 
 from __future__ import annotations
 
@@ -10,7 +11,13 @@ import pytest
 from ftmetal.core import Req, SamplingParams
 from ftmetal.mm.encoder_cache import EncoderCache
 from ftmetal.mm.item import MMGatherRow, MMItem
-from ftmetal.scheduler.mm import make_mrope_positions, mm_rows_after, plan_mm_batch, plan_mm_chunk
+from ftmetal.scheduler.mm import (
+    make_mrope_positions,
+    mm_block_ends,
+    mm_rows_after,
+    plan_mm_batch,
+    plan_mm_chunk,
+)
 
 
 def image(item_hash: int, offsets: list[tuple[int, int]]) -> MMItem:
@@ -154,3 +161,17 @@ def test_mrope_positions_take_the_prompt_columns_then_index_plus_delta() -> None
     positions = make_mrope_positions([prompt, decoding, text])
     assert positions.dtype == np.int32 and positions.flags.c_contiguous
     assert positions.tolist() == [[1, 4, 5, 3, 0, 1], [2, 4, 5, 3, 0, 1], [3, 4, 5, 3, 0, 1]]
+
+
+def test_block_ends_mark_each_token_with_its_image_end_within_the_chunk() -> None:
+    """Text is 0; an image token holds its span's end, clamped to the chunk; a request
+    resuming inside an image keeps its span's end; no image token gives None."""
+    reqs = [
+        request(1, 0, 8, [image(1, [(2, 5)]), image(2, [(6, 12)])]),
+        request(2, 3, 7, [image(3, [(1, 5)])]),
+        request(3, 0, 2, None),
+    ]
+    block_ends = mm_block_ends(reqs)
+    assert block_ends is not None
+    assert block_ends.tolist() == [0, 0, 5, 5, 5, 0, 8, 8] + [5, 5, 0, 0] + [0, 0]
+    assert mm_block_ends([request(1, 0, 4, [image(1, [(6, 9)])]), reqs[2]]) is None

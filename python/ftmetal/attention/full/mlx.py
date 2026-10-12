@@ -4,7 +4,8 @@ gathered pages.
 The parity oracle and bring-up backend: decode gathers every request's pages into a
 padded [size, max_seqlen_k] window and masks the tail; prefill runs one SDPA per
 request over its cached prefix plus the fresh keys, causal or, for a window row (which
-starts at its oldest visible key), banded to the window.
+starts at its oldest visible key), banded to the window, and with block ends also open to
+each image span's later keys.
 """
 
 from __future__ import annotations
@@ -62,13 +63,22 @@ class FullAttnMLXBackend(FullAttnBackend):
                 values = mx.concatenate([v_cache[prefix], fresh_v])
             else:
                 keys, values = fresh_k, fresh_v
-            if self.sliding_window is None:
+            block_ends = metadata.block_ends
+            if self.sliding_window is None and block_ends is None:
                 visible: mx.array | str = "causal"
             else:
                 positions = mx.arange(cached_len, cached_len + extend_len)[:, None]
                 key_positions = mx.arange(cached_len + extend_len)[None, :]
-                visible = (key_positions <= positions) & (
-                    key_positions > positions - self.sliding_window
+                causal = key_positions <= positions
+                seen = (
+                    causal
+                    if block_ends is None
+                    else causal | (key_positions < block_ends[start : start + extend_len, None])
+                )
+                visible = (
+                    seen
+                    if self.sliding_window is None
+                    else seen & (key_positions > positions - self.sliding_window)
                 )
             out = mx.fast.scaled_dot_product_attention(
                 q[start : start + extend_len].transpose(1, 0, 2)[None],
