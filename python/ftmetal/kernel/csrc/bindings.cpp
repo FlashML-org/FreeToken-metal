@@ -127,6 +127,7 @@ NB_MODULE(_C, m) {
       "sliding_window"_a,
       "mpp"_a,
       "scale"_a,
+      "block_ends"_a.none() = nb::none(),
       nb::kw_only(),
       "stream"_a = nb::none(),
       "Paged causal flash-attention of each tile's queries over its request's keys; returns [T, Hq, D].");

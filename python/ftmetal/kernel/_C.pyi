@@ -208,6 +208,7 @@ def flash_prefill(
     sliding_window: int,
     mpp: bool,
     scale: float,
+    block_ends: mx.array | None = None,
     *,
     stream: Stream = None,
 ) -> mx.array: ...

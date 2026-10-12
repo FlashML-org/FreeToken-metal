@@ -42,6 +42,7 @@ mx::array flash_prefill(
     int sliding_window,
     bool mpp,
     float scale,
+    const std::optional<mx::array>& block_ends,
     mx::StreamOrDevice s) {
   if (q.ndim() != 3 || k_cache.ndim() != 3 || v_cache.ndim() != 3 || page_table.ndim() != 2 ||
       tiles.ndim() != 2 || tiles.shape(1) != 4) {
@@ -96,6 +97,10 @@ mx::array flash_prefill(
   if (sliding_window < 0) {
     throw std::invalid_argument("ftmetal fprefill: sliding_window must be >= 0 (0: none)");
   }
+  if (block_ends && (block_ends->ndim() != 1 || block_ends->shape(0) != q.shape(0) ||
+                     block_ends->dtype() != mx::int32)) {
+    throw std::invalid_argument("ftmetal fprefill: block_ends must be int32 [num_tokens]");
+  }
   auto stream = mx::to_stream(s);
   FlashPrefillConfig config{
       head_dim,
@@ -110,12 +115,14 @@ mx::array flash_prefill(
       num_partitions,
       sliding_window,
       mpp,
-      scale};
+      scale,
+      block_ends.has_value()};
+  auto inputs = paged_attention_inputs(q, k_cache, v_cache, page_table, tiles, stream);
+  if (block_ends) {
+    inputs.push_back(mx::contiguous(*block_ends, false, stream));
+  }
   return mx::array(
-      q.shape(),
-      q.dtype(),
-      std::make_shared<FlashPrefill>(stream, config),
-      paged_attention_inputs(q, k_cache, v_cache, page_table, tiles, stream));
+      q.shape(), q.dtype(), std::make_shared<FlashPrefill>(stream, config), std::move(inputs));
 }
 
 bool FlashPrefill::is_equivalent(const mx::Primitive& other) const {
@@ -148,7 +155,8 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
       std::to_string(c.page_size) + "_" + std::to_string(c.num_row_groups) + "_" +
       std::to_string(c.head_split) + "_" + std::to_string(c.block_k) + "_" +
       std::to_string(c.kv_shared) + "_" + std::to_string(c.num_passes) + "_" +
-      std::to_string(c.sliding_window) + (c.mpp ? "_mpp" : "_simdgroup");
+      std::to_string(c.sliding_window) + (c.mpp ? "_mpp" : "_simdgroup") +
+      (c.has_block_ends ? "_blocks" : "");
 
   auto s = stream();
   auto& d = mx::metal::device(s.device);
@@ -166,6 +174,7 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
     replace_all(source, "{{KV_SHARED}}", c.kv_shared ? "true" : "false");
     replace_all(source, "{{NPASS}}", std::to_string(c.num_passes));
     replace_all(source, "{{MMA}}", c.mpp ? "MMA_MPP" : "MMA_SIMDGROUP");
+    replace_all(source, "{{BLOCKS}}", c.has_block_ends ? "1" : "0");
     return source;
   });
 
@@ -182,6 +191,9 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
     encoder.set_output_array(out, 5);
     encoder.set_bytes(max_pages, 7);
     encoder.set_bytes(scale_log2e, 8);
+    if (c.has_block_ends) {
+      encoder.set_input_array(inputs[5], 9);
+    }
     encoder.dispatch_threadgroups(MTL::Size(num_tiles, c.num_kv_heads, 1), tile_group);
     return;
   }
@@ -197,6 +209,9 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
   encoder.set_output_array(part_ml, 6);
   encoder.set_bytes(max_pages, 7);
   encoder.set_bytes(scale_log2e, 8);
+  if (c.has_block_ends) {
+    encoder.set_input_array(inputs[5], 9);
+  }
   encoder.dispatch_threadgroups(
       MTL::Size(num_tiles, c.num_kv_heads, c.num_partitions), tile_group);
 

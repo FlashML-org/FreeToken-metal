@@ -15,6 +15,9 @@
 // key, so a caller may start the row at the oldest key the batch's windows reach. With
 // KV_SHARED, V is staged into K's buffer once S is computed; NPASS > 1 stages each block
 // in NPASS column slices, a simdgroup multiplying while its own slice is staged.
+// With BLOCKS, a query also sees the keys before its block end (buffer 9, per query token:
+// where its image span ends in row positions, 0 for text), so a tile streams up to its
+// largest block end; the window still applies. Without it the kernel is the causal one.
 // MMA picks how the two GEMMs run: on 8x8 simdgroup matrices (P rounded to the input
 // type), or as MetalPerformancePrimitives matmul2d on cooperative tensors (P in fp32),
 // which uses the GPU's matrix units where it has them. Everything else is shared: a
@@ -46,6 +49,7 @@ using namespace metal;
 #define W {{W}}
 #define KV_SHARED {{KV_SHARED}}
 #define NPASS {{NPASS}}
+#define BLOCKS {{BLOCKS}}
 #define M (8 * NSG / DS)
 #define DH (D / DS)
 // Columns staged per pass.
@@ -230,7 +234,16 @@ inline void stage_value(
 // Buffers: 0 q [num_tokens, HKV * G, D], 1 k_cache / 2 v_cache [num_pages * BS, HKV, D],
 // 3 page_table [B, max_pages] int32, 4 tiles [num_tiles] int4, 5 out [num_tokens, HKV * G,
 // D] (one pass) or part_acc [num_tiles, HKV, P, M, D] fp32 with 6 part_ml [num_tiles,
-// HKV, P, M, 2] fp32 (split-KV), 7 max_pages, 8 scale * log2(e).
+// HKV, P, M, 2] fp32 (split-KV), 7 max_pages, 8 scale * log2(e), 9 block_ends
+// [num_tokens] int32 (BLOCKS only).
+#if BLOCKS
+#define BLOCK_ENDS_ARG , device const int* block_ends [[buffer(9)]]
+#define BLOCK_ENDS block_ends
+#else
+#define BLOCK_ENDS_ARG
+#define BLOCK_ENDS nullptr
+#endif
+
 template <bool SPLIT>
 inline void fprefill_tile(
     device const T* q,
@@ -238,6 +251,7 @@ inline void fprefill_tile(
     device const T* v_cache,
     device const int* page_table,
     device const int4* tiles,
+    device const int* block_ends,
     device T* out,
     device float* part_acc,
     device float* part_ml,
@@ -257,7 +271,10 @@ inline void fprefill_tile(
   const uint q_row0 = tile.y;
   const uint q_count = tile.z;
   const uint q_pos0 = tile.w;
-  const uint kv_end = q_pos0 + q_count;
+  uint kv_end = q_pos0 + q_count;
+  if (BLOCKS) {
+    for (uint t = 0; t < q_count; ++t) kv_end = max(kv_end, (uint)block_ends[q_row0 + t]);
+  }
   const uint num_blocks = (kv_end + BK - 1) / BK;
   // The first query's window starts the tile's keys.
   const uint first_block = W > 0 && q_pos0 + 1 > W ? (q_pos0 + 1 - W) / BK : 0;
@@ -279,6 +296,8 @@ inline void fprefill_tile(
   const uint token = min(row / G, q_count - 1);
   const uint head = kv_head * G + row % G;
   const uint position = q_pos0 + token;
+  // Keys before it are visible past the diagonal; 0 hides none of them.
+  const uint row_block_end = BLOCKS ? (uint)block_ends[q_row0 + token] : 0;
   const uint group_first_position = q_pos0 + min(row_group * 8 / G, q_count - 1);
   const uint group_last_position = q_pos0 + min((row_group * 8 + 7) / G, q_count - 1);
   const size_t q_offset = ((size_t)(q_row0 + token) * HKV * G + head) * D + column0;
@@ -348,7 +367,8 @@ inline void fprefill_tile(
     UNROLL for (int i = 0; i < S_LANE; ++i) {
       float score = s[i] * scale_log2e;
       const uint key = k0 + element_coord<STile>(lane, i).x;
-      if (needs_mask && (key > position || (W > 0 && key + W <= position))) {
+      if (needs_mask &&
+          ((key > position && key >= row_block_end) || (W > 0 && key + W <= position))) {
         score = -INFINITY;
       }
       s[i] = score;
@@ -413,15 +433,16 @@ inline void fprefill_tile(
     device const int4* tiles [[buffer(4)]],
     device T* out [[buffer(5)]],
     constant const int& max_pages [[buffer(7)]],
-    constant const float& scale_log2e [[buffer(8)]],
+    constant const float& scale_log2e [[buffer(8)]] BLOCK_ENDS_ARG,
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
   threadgroup T kv_tg[KV_SHARED ? KV_SHARED_SIZE : K_SIZE + V_SIZE];
   threadgroup float2 s_tg[DS > 1 ? NSG * S_LANE / 2 * 32 : 1];
   fprefill_tile<false>(
-      q, k_cache, v_cache, page_table, tiles, out, nullptr, nullptr, max_pages, scale_log2e,
-      tgpig.x, tgpig.y, 0, 1, sg, lane, kv_tg, kv_tg + (KV_SHARED ? 0 : K_SIZE), s_tg);
+      q, k_cache, v_cache, page_table, tiles, BLOCK_ENDS, out, nullptr, nullptr, max_pages,
+      scale_log2e, tgpig.x, tgpig.y, 0, 1, sg, lane, kv_tg, kv_tg + (KV_SHARED ? 0 : K_SIZE),
+      s_tg);
 }
 
 [[kernel, max_total_threads_per_threadgroup(NSG * 32)]] void fprefill_partials(
@@ -433,7 +454,7 @@ inline void fprefill_tile(
     device float* part_acc [[buffer(5)]],
     device float* part_ml [[buffer(6)]],
     constant const int& max_pages [[buffer(7)]],
-    constant const float& scale_log2e [[buffer(8)]],
+    constant const float& scale_log2e [[buffer(8)]] BLOCK_ENDS_ARG,
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint3 tptg [[threadgroups_per_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
@@ -441,7 +462,7 @@ inline void fprefill_tile(
   threadgroup T kv_tg[KV_SHARED ? KV_SHARED_SIZE : K_SIZE + V_SIZE];
   threadgroup float2 s_tg[DS > 1 ? NSG * S_LANE / 2 * 32 : 1];
   fprefill_tile<true>(
-      q, k_cache, v_cache, page_table, tiles, nullptr, part_acc, part_ml, max_pages,
+      q, k_cache, v_cache, page_table, tiles, BLOCK_ENDS, nullptr, part_acc, part_ml, max_pages,
       scale_log2e, tgpig.x, tgpig.y, tgpig.z, tptg.z, sg, lane, kv_tg,
       kv_tg + (KV_SHARED ? 0 : K_SIZE), s_tg);
 }

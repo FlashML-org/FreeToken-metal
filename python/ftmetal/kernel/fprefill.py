@@ -175,6 +175,7 @@ def flash_prefill(
     scale: float,
     sliding_window: int | None = None,
     mma: FprefillMma | None = None,
+    block_ends: mx.array | None = None,
 ) -> mx.array:
     """Causal attention of each request's queries over its paged keys.
 
@@ -182,8 +183,10 @@ def flash_prefill(
     prefill_tiles; page_table [B, max_pages] int32 page ids, k_cache / v_cache
     [num_pages * page_size, Hkv, D] in q's dtype, already holding the queries' own keys.
     A sliding_window W limits a query at position p to keys (p - W, p], positions counted
-    from each page-table row's first key. mma picks the GEMMs (default_mma when None).
-    Returns [T, Hq, D].
+    from each page-table row's first key. block_ends int32 [T], when given, also shows a
+    query the keys before its entry (the end of its image span, at most its request's key
+    count; 0 for text), the window still applying. mma picks the GEMMs (default_mma when
+    None). Returns [T, Hq, D].
     """
     num_heads, head_dim = q.shape[1:]
     num_kv_heads = k_cache.shape[1]
@@ -207,6 +210,7 @@ def flash_prefill(
         0 if sliding_window is None else sliding_window,
         mma == "mpp",
         scale,
+        block_ends,
     )
 
 
