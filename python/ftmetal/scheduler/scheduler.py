@@ -140,6 +140,7 @@ class Scheduler:
             self.table_manager,
             self.decode_manager,
             encoder_cache=self.engine.encoder_cache,
+            keep_images_whole=self.engine.model_config.has_bidirectional_mm_blocks,
         )
         self.finished_reqs: set[Req] = set()
         self.status_reporter = SchedulerStatusReporter(

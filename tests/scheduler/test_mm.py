@@ -1,6 +1,6 @@
 """Chunk-window planning over image spans (rows, jobs, cache hits, multi-span items, a
-repeated image across a cut), the block ends of a batch and the mrope positions of a
-batch."""
+repeated image across a cut), chunk ends kept off image spans, the span a chunk end cuts, the
+block ends of a batch and the mrope positions of a batch."""
 
 from __future__ import annotations
 
@@ -12,8 +12,10 @@ from ftmetal.core import Req, SamplingParams
 from ftmetal.mm.encoder_cache import EncoderCache
 from ftmetal.mm.item import MMGatherRow, MMItem
 from ftmetal.scheduler.mm import (
+    cut_image_span,
     make_mrope_positions,
     mm_block_ends,
+    mm_chunk_end,
     mm_rows_after,
     plan_mm_batch,
     plan_mm_chunk,
@@ -161,6 +163,34 @@ def test_mrope_positions_take_the_prompt_columns_then_index_plus_delta() -> None
     positions = make_mrope_positions([prompt, decoding, text])
     assert positions.dtype == np.int32 and positions.flags.c_contiguous
     assert positions.tolist() == [[1, 4, 5, 3, 0, 1], [2, 4, 5, 3, 0, 1], [3, 4, 5, 3, 0, 1]]
+
+
+# (chunk start, budget end, alignment, the chunk end): images on [10, 20) and [24, 30).
+CHUNK_END_CASES = [
+    (0, 16, 1, 10),  # pulled back before the cut image
+    (0, 16, 4, 8),  # and aligned down
+    (0, 22, 1, 22),  # between the images
+    (0, 28, 1, 24),  # before the second image, the first whole in the chunk
+    (10, 16, 1, 16),  # the image starts the chunk: longer than the budget, cut
+    (12, 26, 1, 24),  # from inside the first image (a cached prefix), before the second
+    (0, 12, 16, 12),  # aligning down reaches the chunk start: cut
+]
+
+
+@pytest.mark.parametrize(("chunk_lo", "end", "align", "expected"), CHUNK_END_CASES)
+def test_chunk_end_keeps_images_whole(chunk_lo: int, end: int, align: int, expected: int) -> None:
+    items = [image(1, [(10, 20)]), image(2, [(24, 30)])]
+    assert mm_chunk_end(items, chunk_lo, end, align) == expected
+
+
+@pytest.mark.parametrize(
+    ("end", "expected"), [(10, None), (11, (10, 20)), (20, None), (22, None), (29, (24, 30))]
+)
+def test_cut_image_span_is_the_span_a_chunk_end_falls_inside(
+    end: int, expected: tuple[int, int] | None
+) -> None:
+    items = [image(1, [(10, 20)]), image(2, [(24, 30)])]
+    assert cut_image_span(items, end) == expected
 
 
 def test_block_ends_mark_each_token_with_its_image_end_within_the_chunk() -> None:

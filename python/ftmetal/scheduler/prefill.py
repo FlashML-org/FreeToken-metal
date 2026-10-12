@@ -14,12 +14,14 @@ slot here; naive allocates its live slot here too (SGLang's HybridReqToTokenPool
 where FreeToken's naive keys it by table_idx; the cached part of the token pool row is not
 written (only the extended tokens are ever gathered); a continuation chunk inherits the
 pending track snapshot of the chunk before it; every chunk carries the prompt's reuse_len;
-no keep_images_whole (no bidirectional image blocks are served), so a chunk may end inside
-an image span.
+keep_images_whole aligns a pulled-back chunk end to the GDN snapshot unit only (chunks are
+not page-aligned here), and a first chunk it defers releases its admission; an image longer
+than a chunk is still cut, with one warning per manager.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -31,8 +33,10 @@ from ftmetal.mm.encoder_cache import EncoderCache
 from ftmetal.mm.item import MMItem
 from ftmetal.scheduler.cache import CacheManager, div_ceil
 from ftmetal.scheduler.decode import DecodeManager
-from ftmetal.scheduler.mm import mm_rows_after
+from ftmetal.scheduler.mm import cut_image_span, mm_chunk_end, mm_rows_after
 from ftmetal.scheduler.table import TableManager
+
+logger = logging.getLogger(__name__)
 
 # GDN slots a hybrid radix request takes at admission: the live slot and the ping-pong pair.
 HYBRID_ADMISSION_SLOTS = LIVE_SLOTS + TRACK_SLOTS
@@ -92,9 +96,17 @@ class PrefillAdder:
     reserved_size: int
     cache_manager: CacheManager
     table_manager: TableManager
+    # End a chunk before an image it would cut: the model's image tokens attend to each other
+    # in both directions.
+    keep_images_whole: bool = False
     # Window slots of the chunks admitted so far this pass: allocate_paged takes them after
     # the pass, so the pool's free count does not drop as they are admitted.
     reserved_swa: int = 0
+    # The whole token budget of this pass; token_budget shrinks as chunks are admitted.
+    pass_budget: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.pass_budget = self.token_budget
 
     def kv_reservation_size(self, total_len: int, cached_len: int) -> int:
         page_size = self.cache_manager.page_size
@@ -173,6 +185,20 @@ class PrefillAdder:
             # budget left cannot fill one unit rather than stall the request.
             aligned = align_down(cached_len + chunk_size, align) - cached_len
             chunk_size = aligned if aligned > 0 else chunk_size
+        if self.keep_images_whole and pending.mm_items and chunk_size < remain_len:
+            # A cut image's earlier rows would attend within only the part already cached:
+            # end the chunk before it. Decided last, as the caps above only pull the end in.
+            end = mm_chunk_end(pending.mm_items, cached_len, cached_len + chunk_size, align)
+            cut = cut_image_span(pending.mm_items, end)
+            if (
+                cut is not None
+                and self.token_budget < self.pass_budget
+                and cut[1] - cached_len <= self.pass_budget
+            ):
+                # Other requests took part of this pass; a pass of its own holds the image.
+                return None
+            else:
+                chunk_size = end - cached_len
         is_chunked = chunk_size < remain_len
         self.token_budget -= chunk_size
         if has_window:
@@ -248,7 +274,16 @@ class PrefillAdder:
             last_track_seqlen=None,
             swa_evicted_seqlen=0,
         )
-        assert req is not None, "admission seats the first chunk's window slots"
+        if req is None:
+            # Only an image waiting for a pass of its own defers a fresh admission: undo it.
+            assert self.keep_images_whole and pending.mm_items, (
+                "admission seats the first chunk's window slots"
+            )
+            self.cache_manager.unlock(resources.cache_handle)
+            self.table_manager.free(resources.table_idx)
+            pool = self.cache_manager.linear_state_pool
+            if pool is not None and resources.linear_slot_idx is not None:
+                pool.free([resources.linear_slot_idx, *(resources.ping_pong or ())])
         return req
 
 
@@ -259,7 +294,11 @@ class PrefillManager:
     decode_manager: DecodeManager
     # Where the encoded images wait between chunks; None when the model serves none.
     encoder_cache: EncoderCache | None = None
+    # PrefillAdder.keep_images_whole of every pass.
+    keep_images_whole: bool = False
     pending_list: list[PendingReq] = field(default_factory=list)
+    # Whether a chunk has cut an image longer than the chunk budget (warned once).
+    has_cut_image: bool = False
 
     def add_one_req(
         self,
@@ -305,6 +344,7 @@ class PrefillManager:
             reserved_size=self.decode_manager.inflight_tokens,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
+            keep_images_whole=self.keep_images_whole,
         )
         reqs: list[Req] = []
         chunked_list: list[PendingReq] = []
@@ -318,6 +358,18 @@ class PrefillManager:
             if isinstance(req, ChunkedReq):
                 pending.chunked_req = req
                 chunked_list.append(pending)
+                cut = (
+                    cut_image_span(req.mm_items or [], req.device_len)
+                    if self.keep_images_whole and not self.has_cut_image
+                    else None
+                )
+                if cut is not None:
+                    self.has_cut_image = True
+                    logger.warning(
+                        f"an image of {cut[1] - cut[0]} tokens does not fit one prefill chunk "
+                        f"(--max-extend-tokens, or the sliding-window slots left): its earlier "
+                        f"rows attend within the part cached before them"
+                    )
             reqs.append(req)
             if not is_continuation:
                 prompt_admissions.append((req.uid, pending.input_len, req.cached_len))
