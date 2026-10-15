@@ -59,6 +59,7 @@ class ScriptedScheduler(Scheduler):
         self.prompt_admissions: list[PromptAdmittedMsg] = []
         self.live_uids: set[int] = set()
         self.status_reporter = SchedulerStatusReporter(lambda line: None)
+        self.moe_offload_cache = None
         # uid -> (tokens left, whether the last one is EOS)
         self.running: dict[int, tuple[list[int], bool]] = {}
         self.admitted: dict[int, tuple[list[int], SamplingParams]] = {}

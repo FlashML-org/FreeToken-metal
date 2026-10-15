@@ -15,9 +15,14 @@ from ftmetal.kernel.inplace import scatter_rows
 
 
 class TableManager:
-    def __init__(self, max_running_reqs: int, page_table: np.ndarray) -> None:
+    def __init__(
+        self, max_running_reqs: int, page_table: np.ndarray, max_admitted: int | None = None
+    ) -> None:
+        """max_admitted: the most requests holding a slot at once (default max_running_reqs);
+        the tables keep their max_running_reqs rows either way."""
         self.max_running_reqs = max_running_reqs
-        self.free_slots = list(range(max_running_reqs))
+        num_free = max_running_reqs if max_admitted is None else min(max_admitted, max_running_reqs)
+        self.free_slots = list(range(num_free))
         self.page_table = page_table
         self.aligned_max_seq_len = page_table.shape[1]
         self.scratch_row = max_running_reqs

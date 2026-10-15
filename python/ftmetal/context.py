@@ -4,7 +4,8 @@ Port of FreeToken core.py (Context, set_global_ctx, get_global_ctx), in its own
 module because core.py cannot import the backends. Divergences: the pools and the
 attention backends are one per AttnType (kv_cache, swa_pool and linear_state_pool are
 views of the pools); the batch is not here (it is passed to BaseLLMModel.forward) and neither
-is the page table (the CacheManager owns it).
+is the page table (the CacheManager owns it); the offload MoE layers read their cache here
+(FreeToken's hold it), and it carries the forward's mode (FreeToken's read the batch's).
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from ftmetal.attention.base import AttnType, BaseAttnBackend
 from ftmetal.kvcache.base import BaseKVCachePool, BasePool
 from ftmetal.kvcache.linear_state_pool import LinearStatePool
 from ftmetal.kvcache.swa_pool import SWAKVCache
+from ftmetal.moe.offload_cache import OffloadMoeCache
 
 
 @dataclass
@@ -22,6 +24,8 @@ class Context:
     page_size: int
     pools: dict[AttnType, BasePool]
     attn_backends: dict[AttnType, BaseAttnBackend]
+    # The routed-expert slot cache of an offload MoE model; None while experts are resident.
+    moe_offload_cache: OffloadMoeCache | None = None
 
     @property
     def kv_cache(self) -> BaseKVCachePool:

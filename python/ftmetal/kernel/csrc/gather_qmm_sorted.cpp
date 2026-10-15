@@ -37,7 +37,8 @@ mx::array gather_qmm_sorted(
     const mx::array& scales,
     const mx::array& biases,
     const mx::array& expert_offsets,
-    const mx::array& slot_of,
+    const mx::array& expert_bytes,
+    int n,
     int group_size,
     int bits,
     mx::StreamOrDevice s) {
@@ -53,29 +54,23 @@ mx::array gather_qmm_sorted(
         "ftmetal gather_qmm_sorted: group size must be 32, 64 or 128 and bits 2-6 or 8, not (" +
         std::to_string(group_size) + ", " + std::to_string(bits) + ")");
   }
-  if (w.dtype() != mx::uint32 || w.ndim() != 3 || scales.dtype() != x.dtype() ||
-      biases.dtype() != x.dtype()) {
+  if (n < 1 || K % group_size != 0 || K * bits % 32 != 0) {
     throw std::invalid_argument(
-        "ftmetal gather_qmm_sorted: w must be uint32, scales and biases in x's dtype");
-  }
-  if (scales.ndim() != 3 || biases.shape() != scales.shape() ||
-      scales.shape(0) != w.shape(0) || scales.shape(1) != w.shape(1) ||
-      K % group_size != 0 || scales.shape(2) != K / group_size ||
-      static_cast<int64_t>(w.shape(2)) * 32 != static_cast<int64_t>(K) * bits) {
-    throw std::invalid_argument(
-        "ftmetal gather_qmm_sorted: w and scales (and biases) must be [S, N, K * bits / 32] "
-        "and [S, N, K / group_size] for x's K");
+        "ftmetal gather_qmm_sorted: n must be positive and x's K a whole number of groups and "
+        "packed words");
   }
   if (expert_offsets.dtype() != mx::int32 || expert_offsets.ndim() != 1 ||
-      slot_of.dtype() != mx::int32 || slot_of.ndim() != 1 || slot_of.shape(0) < 1 ||
-      expert_offsets.shape(0) != slot_of.shape(0) + 1) {
+      expert_bytes.dtype() != mx::int64 || expert_bytes.ndim() != 2 ||
+      expert_bytes.shape(0) < 1 || expert_bytes.shape(1) != 3 ||
+      expert_offsets.shape(0) != expert_bytes.shape(0) + 1) {
     throw std::invalid_argument(
-        "ftmetal gather_qmm_sorted: expert_offsets must be [E + 1] int32 and slot_of [E] int32");
+        "ftmetal gather_qmm_sorted: expert_offsets must be [E + 1] int32 and expert_bytes "
+        "[E, 3] int64");
   }
   auto stream = mx::to_stream(s);
-  // The bank is taken as it is: mx::contiguous copies a slice of a larger buffer whole.
+  // The banks are taken as they are: mx::contiguous copies a slice of a larger buffer whole.
   return mx::array(
-      {x.shape(0), 1, w.shape(1)},
+      {x.shape(0), 1, n},
       x.dtype(),
       std::make_shared<GatherQMMSorted>(stream, GatherQMMSortedConfig{group_size, bits}),
       {mx::contiguous(x, false, stream),
@@ -83,7 +78,7 @@ mx::array gather_qmm_sorted(
        scales,
        biases,
        mx::contiguous(expert_offsets, false, stream),
-       mx::contiguous(slot_of, false, stream)});
+       mx::contiguous(expert_bytes, false, stream)});
 }
 
 bool GatherQMMSorted::is_equivalent(const mx::Primitive& other) const {
@@ -98,7 +93,7 @@ void GatherQMMSorted::eval_cpu(const std::vector<mx::array>&, std::vector<mx::ar
 void GatherQMMSorted::eval_gpu(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
-  // inputs: x, w, scales, biases, expert_offsets, slot_of.
+  // inputs: x, w, scales, biases, expert_offsets, expert_bytes.
   for (int i = 1; i <= 3; ++i) {
     if (!inputs[i].flags().row_contiguous) {
       throw std::runtime_error(

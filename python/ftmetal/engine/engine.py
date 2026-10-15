@@ -6,12 +6,20 @@ scheduler owns through the CacheManager; one pool and one attention backend per
 attention type, created from the model's group specs, in the global Context (FreeToken
 builds one KV family and special-cases the GDN state pool); the forward returns lazy
 sampled tokens and the caller issues the step's async_eval; the encoder cache holds
-mx.arrays in unified memory.
+mx.arrays in unified memory. MoE offload: the offload cache reads its experts from the
+checkpoint (no host banks, so no --expert-load or CPU and hybrid strategies); auto keeps
+the experts resident when they fit (resolve_moe_strategy); the strategy and the cache size
+are settled before the model is built, and the size from the measured weights after it;
+the cache's health is checked once per forward by the caller, after the forward's tokens
+land (check_healthy), not right after its launch.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
+import time
+from pathlib import Path
 from typing import NamedTuple
 
 import mlx.core as mx
@@ -27,23 +35,41 @@ from ftmetal.context import Context, set_global_ctx
 from ftmetal.core import Batch, Req, SamplingParams
 from ftmetal.engine.cache_budget import (
     GIB,
+    IN_FLIGHT_STEPS,
+    OFFLOAD_IN_FLIGHT_STEPS,
+    BudgetReport,
     activation_reserve_bytes,
+    choose_moe_strategy,
     encoder_reserve_bytes,
     graph_reserve_bytes,
+    kv_reserve_pages,
     memory_budget_bytes,
     plan_budget,
+    resolve_moe_cache_size,
     solve_num_pages,
 )
 from ftmetal.engine.config import EngineConfig
 from ftmetal.engine.graph import GraphRunner, determine_graph_bs
 from ftmetal.engine.sample import BatchSamplingArgs, Sampler
 from ftmetal.kvcache import create_pools, pool_arrays, pool_costs
+from ftmetal.kvcache.base import PoolCost
+from ftmetal.layers.moe import OffloadMoELayer
 from ftmetal.mm.config import ENCODER_SECTIONS
 from ftmetal.mm.encoder_cache import EncoderCache
 from ftmetal.mm.processor import MMProcessor, get_mm_processor
-from ftmetal.models.blocks import SupportsMultimodal
-from ftmetal.models.loader import load_weights
+from ftmetal.models.blocks import BaseLLMModel, SupportsMultimodal
+from ftmetal.models.config import MoeStrategy
+from ftmetal.models.loader import WeightRules, checkpoint_bytes, load_weights
 from ftmetal.models.register import MODEL_REGISTRY, create_model, model_weight_rules
+from ftmetal.moe.offload_cache import STAGING_BYTES, OffloadMoeCache
+from ftmetal.moe.slot_pools import (
+    HOT_EXPERTS_FILE,
+    SlotLayout,
+    find_expert_counts,
+    plan_slot_layout,
+    read_expert_counts,
+)
+from ftmetal.moe.source import ExpertSource
 
 logger = logging.getLogger(__name__)
 
@@ -62,34 +88,90 @@ class ForwardOutput(NamedTuple):
     next_tokens: mx.array
 
 
+def resolve_moe_strategy(
+    config: EngineConfig,
+    rules: WeightRules,
+    *,
+    budget: int,
+    graphs: int,
+    costs: dict[AttnType, PoolCost],
+    encoder: int,
+) -> MoeStrategy:
+    """FreeToken's MoE strategy resolution: an explicit strategy stands; auto offloads when a
+    cache size flag is given, else keeps the experts resident when the checkpoint's weights
+    leave the paged pools kv_reserve_tokens (choose_moe_strategy)."""
+    model_config = config.model_config
+    has_cache_flag = (
+        config.moe_cache_size_flag(model_config.num_moe_layers * model_config.num_experts) > 0
+        or config.moe_cache_auto
+    )
+    if not model_config.is_moe and config.moe_strategy == "offload":
+        raise ValueError(f"--moe-strategy offload: {config.model_path} routes no experts")
+    elif not model_config.is_moe:
+        return "fused"
+    elif config.moe_strategy == "fused":
+        if has_cache_flag:
+            logger.warning(
+                "--moe-strategy fused keeps the experts resident: the MoE cache size flags are "
+                "ignored (--moe-strategy offload serves the experts from a slot cache)"
+            )
+        return "fused"
+    elif config.moe_strategy == "offload" or has_cache_flag:
+        return "offload"
+    else:
+        checkpoint = checkpoint_bytes(config.model_path, rules)
+        resident = BudgetReport(
+            budget=budget,
+            weights=checkpoint.non_expert + checkpoint.experts,
+            activations=activation_reserve_bytes(
+                config.max_extend_tokens, model_config.num_qo_heads, IN_FLIGHT_STEPS
+            ),
+            graphs=graphs,
+            costs=costs,
+            encoder=encoder,
+        )
+        strategy = choose_moe_strategy(
+            resident, kv_reserve_pages(config.kv_reserve_tokens, config.page_size)
+        )
+        logger.info(
+            f"Auto-selected MoE strategy: {strategy} ({checkpoint.experts / GIB:.2f} GiB of "
+            f"experts beside {config.kv_reserve_tokens} tokens of KV; "
+            f"{resident.paged_bytes / GIB:.2f} GiB left for the KV pools if resident)"
+        )
+        return strategy
+
+
+def offload_layers(model: BaseLLMModel) -> list[OffloadMoELayer]:
+    """The model's offload MoE layers in MoE layer order."""
+    layers = sorted(
+        (module for module in model.modules() if isinstance(module, OffloadMoELayer)),
+        key=lambda layer: layer.moe_layer_id,
+    )
+    assert [layer.moe_layer_id for layer in layers] == list(range(len(layers))), (
+        "the MoE layer indices run from 0"
+    )
+    return layers
+
+
 class Engine:
     def __init__(self, config: EngineConfig) -> None:
         self.config = config
-        model_config = config.model_config
-        self.model_config = model_config
         self.dtype = config.dtype
         # Fail on a page size the backend's kernels reject before any pool is allocated.
         check_attention_backend(config.attention_backend, config.page_size)
 
-        # Delta, not the total: an earlier engine's pools may still be alive in the process.
-        resident_before = mx.get_active_memory()
-        self.model = create_model(config.architecture, model_config, config.dtype)
-        load_weights(
-            self.model, config.model_path, model_weight_rules(config.architecture, model_config)
-        )
-        self.weights_bytes = mx.get_active_memory() - resident_before
-        logger.info(f"weights resident: {self.weights_bytes / 2**30:.2f} GiB")
         # The image processor of a served vision tower: the warm-up's dummy image and the
         # largest image the encoder's reserve covers.
         self.mm_processor: MMProcessor | None = None
         self.encoder_cache: EncoderCache | None = None
         encoder_reserve = 0
-        if model_config.vision_config is not None:
+        vision_config = config.model_config.vision_config
+        if vision_config is not None:
             self.mm_processor = get_mm_processor(config.model_path, config.mm)
             assert self.mm_processor is not None, "a built vision tower has a processor"
             self.encoder_cache = EncoderCache()
             encoder_reserve = encoder_reserve_bytes(
-                model_config.vision_config, config.dtype, self.mm_processor.max_patches
+                vision_config, config.dtype, self.mm_processor.max_patches
             )
         elif any(config.raw_config.get(key) is not None for key in ENCODER_SECTIONS):
             configured = [
@@ -118,12 +200,122 @@ class Engine:
 
         working_set = mx.device_info()["max_recommended_working_set_size"]
         assert isinstance(working_set, int)
-        budget = memory_budget_bytes(working_set)
-        specs = model_config.kv_cache_group_specs()
-        activations = activation_reserve_bytes(config.max_extend_tokens, model_config.num_qo_heads)
+        budget = memory_budget_bytes(working_set, config.memory_ratio)
+        specs = config.model_config.kv_cache_group_specs()
         costs = pool_costs(specs, config)
+        rules = model_weight_rules(config.architecture, config.model_config)
+        moe_strategy = resolve_moe_strategy(
+            config,
+            rules,
+            budget=budget,
+            graphs=graph_reserve,
+            costs=costs,
+            encoder=encoder_reserve,
+        )
+        model_config = dataclasses.replace(config.model_config, moe_strategy=moe_strategy)
+        self.model_config = model_config
+        is_offload = moe_strategy == "offload"
+        # Prefill overlap reads layer L + 1 into one prefill buffer while layer L reads the other.
+        prefill_overlap = (
+            is_offload and config.moe_prefill_overlap and model_config.num_moe_layers >= 2
+        )
+        in_flight_steps = OFFLOAD_IN_FLIGHT_STEPS if prefill_overlap else IN_FLIGHT_STEPS
+        activations = activation_reserve_bytes(
+            config.max_extend_tokens, model_config.num_qo_heads, in_flight_steps
+        )
+
+        # Delta, not the total: an earlier engine's pools may still be alive in the process.
+        resident_before = mx.get_active_memory()
+        self.model = create_model(config.architecture, model_config, config.dtype)
+        load_weights(self.model, config.model_path, rules, skip_experts=is_offload)
+        # Under offload the experts are the cache's, not weights.
+        self.weights_bytes = mx.get_active_memory() - resident_before
+        logger.info(f"weights resident: {self.weights_bytes / 2**30:.2f} GiB")
+
+        moe_layers: list[OffloadMoELayer] = []
+        expert_source: ExpertSource | None = None
+        expert_counts: np.ndarray | None = None
+        slot_layout: SlotLayout | None = None
+        cache_size = 0
+        experts_bytes = 0
+        if is_offload:
+            moe_layers = offload_layers(self.model)
+            layouts = [layer.layout() for layer in moe_layers]
+            expert_source = ExpertSource(config.model_path, rules)
+            if config.moe_pool_slots == "profile":
+                if config.moe_pool_profile is not None:
+                    table_path = Path(config.moe_pool_profile)
+                else:
+                    table_path = find_expert_counts(
+                        config.model_path,
+                        model_config.model_type,
+                        len(moe_layers),
+                        model_config.num_experts,
+                        model_config.hidden_size,
+                    )
+                if table_path is None:
+                    raise ValueError(
+                        f"--moe-pool-slots profile: no hot-expert table for this model (no "
+                        f"{HOT_EXPERTS_FILE} in its directory, none shipped); pass "
+                        f"profile:<path> or equal"
+                    )
+                expert_counts = read_expert_counts(
+                    table_path, len(moe_layers), model_config.num_experts
+                )
+                logger.info(f"MoE offload: pool slots from the hot-expert table {table_path}")
+            total_experts = len(moe_layers) * model_config.num_experts
+            cache_size = resolve_moe_cache_size(
+                config.moe_cache_size_flag(total_experts),
+                report=BudgetReport(
+                    budget=budget,
+                    weights=self.weights_bytes,
+                    activations=activations,
+                    graphs=graph_reserve,
+                    costs=costs,
+                    encoder=encoder_reserve,
+                ),
+                reserve_pages=kv_reserve_pages(config.kv_reserve_tokens, config.page_size),
+                # The widest row of each bank: the banks hold at most this much per slot.
+                slot_bytes=sum(
+                    max(layout[role].nbytes for layout in layouts) for role in layouts[0]
+                ),
+                staging_bytes=STAGING_BYTES,
+                num_layers=len(moe_layers),
+                num_experts=model_config.num_experts,
+                top_k=model_config.num_experts_per_tok,
+                total_experts=total_experts,
+                prefill_overlap=prefill_overlap,
+                buffer_placement=config.moe_prefill_buffer,
+            )
+            slot_layout = plan_slot_layout(
+                cache_size,
+                layouts,
+                model_config.num_experts,
+                model_config.num_experts_per_tok,
+                grouping=config.moe_pool,
+                counts=expert_counts,
+                prefill_overlap=prefill_overlap,
+                buffer_placement=config.moe_prefill_buffer,
+            )
+            experts_bytes = sum(slot_layout.bank_bytes.values()) + STAGING_BYTES
+            overlap_note = (
+                f"prefills of {config.moe_prefill_overlap_min_tokens} tokens or more read "
+                f"each layer ahead"
+                if prefill_overlap
+                else "no prefill overlap"
+            )
+            logger.info(
+                f"MoE offload: {cache_size} expert slots of {total_experts} "
+                f"({cache_size / total_experts:.2f}), {config.moe_cache_policy}; {overlap_note}"
+            )
         report = plan_budget(
-            budget, self.weights_bytes, activations, graph_reserve, costs, encoder_reserve
+            budget,
+            self.weights_bytes,
+            activations,
+            graph_reserve,
+            costs,
+            encoder_reserve,
+            experts_bytes,
         )
         for line in report.lines():
             logger.info(line)
@@ -159,8 +351,35 @@ class Engine:
             for spec in specs
         }
         self.sampler = Sampler(model_config.vocab_size)
+        self.moe_offload_cache: OffloadMoeCache | None = None
+        if expert_source is not None and slot_layout is not None:
+            started = time.perf_counter()
+            self.moe_offload_cache = OffloadMoeCache(
+                slot_layout=slot_layout,
+                source=expert_source,
+                prefill_overlap=prefill_overlap,
+                prefill_overlap_min_tokens=config.moe_prefill_overlap_min_tokens,
+                expert_counts=expert_counts,
+            )
+            pool_slots = [pool.num_slots for pool in slot_layout.pools]
+            logger.info(
+                f"MoE offload: {config.moe_pool} pools x{len(pool_slots)} of {min(pool_slots)}-"
+                f"{max(pool_slots)} slots ({config.moe_pool_slots}), prefill buffers of "
+                f"{slot_layout.buffer_size} ({config.moe_prefill_buffer}), decode rows <= "
+                f"{slot_layout.max_decode_rows}, looked-up prefill tokens <= "
+                f"{slot_layout.max_lookup_tokens}"
+            )
+            self.moe_offload_cache.fill_initial()
+            self.moe_offload_cache.probe()
+            logger.info(
+                f"MoE offload cache filled in {time.perf_counter() - started:.1f} s; the "
+                f"coordinator answers"
+            )
         self.ctx = Context(
-            page_size=config.page_size, pools=self.pools, attn_backends=self.attn_backends
+            page_size=config.page_size,
+            pools=self.pools,
+            attn_backends=self.attn_backends,
+            moe_offload_cache=self.moe_offload_cache,
         )
         set_global_ctx(self.ctx)
         mx.set_wired_limit(budget)
@@ -179,6 +398,7 @@ class Engine:
             self.aligned_max_seq_len,
             graph_reserve,
             model_config.is_mrope,
+            self.moe_offload_cache,
         )
         logger.info(
             f"memory after graphs: {mx.get_active_memory() / GIB:.2f} GiB, "
@@ -196,6 +416,8 @@ class Engine:
     def prepare_metadata(self, batch: Batch) -> None:
         for backend in self.attn_backends.values():
             backend.prepare_metadata(batch)
+        if self.moe_offload_cache is not None:
+            self.moe_offload_cache.prepare(batch)
 
     def run_mm_encoder(self, batch: Batch) -> None:
         """Encode the chunk's cache-miss images and gather its embedding rows into
@@ -220,6 +442,9 @@ class Engine:
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         if batch.mm_gather_plan:
             self.run_mm_encoder(batch)
+        cache = self.moe_offload_cache
+        if cache is not None and cache.mode != "overlap":
+            cache.arm()
         if self.graph_runner.can_replay(batch):
             logits = self.graph_runner.replay(batch)
         else:
@@ -228,8 +453,23 @@ class Engine:
             req.complete_one()
         return ForwardOutput(self.sampler.sample(logits, args))
 
+    def check_healthy(self) -> None:
+        """Raise the offload cache's first failure (FreeToken raise_if_unhealthy): a forward
+        whose lookups failed computed with stand-in experts, so its tokens must not be used."""
+        if self.moe_offload_cache is not None:
+            self.moe_offload_cache.check_healthy()
+
     def pool_arrays(self) -> list[mx.array]:
-        return pool_arrays(self.pools)
+        """The arrays a step updates in place: the pools and the offload cache's tables."""
+        tables = [] if self.moe_offload_cache is None else self.moe_offload_cache.table_arrays()
+        return [*pool_arrays(self.pools), *tables]
 
 
-__all__ = ["PAGE_TABLE_ALIGN", "Engine", "ForwardOutput", "page_table_width"]
+__all__ = [
+    "PAGE_TABLE_ALIGN",
+    "Engine",
+    "ForwardOutput",
+    "offload_layers",
+    "page_table_width",
+    "resolve_moe_strategy",
+]

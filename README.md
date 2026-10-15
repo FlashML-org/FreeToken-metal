@@ -49,6 +49,14 @@ thinking, `/reset` clears the conversation, `/exit` or Ctrl-D quits, Ctrl-C canc
 reply. Environment knobs are read as `FTMETAL_<NAME>`, falling back to
 `FREETOKEN_<NAME>`.
 
+A Qwen3.6 MoE checkpoint with affine 4-bit experts whose experts do not fit the memory
+budget serves them from an offload cache that reads them from the checkpoint on demand
+(`--moe-strategy auto|fused|offload`, FreeToken's flags): `--moe-cache-size`,
+`--moe-cache-rate` or `--moe-cache-auto` size it (auto, the default, gives the KV pools
+`--kv-reserve-tokens` first and the experts the rest), `--disable-moe-prefill-overlap`
+stops long prefills from reading each layer's experts ahead, and `--memory-ratio` sets the
+budget as a fraction of Metal's recommended working set, which also emulates a smaller Mac.
+
 ```bash
 FTMETAL_TEST_MODEL_PATH=/path/to/Qwen3.6-35B-A3B-MLX uv run pytest tests/server tests/test_tokenizer.py -q
 ```

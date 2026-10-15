@@ -40,6 +40,7 @@ def weight_rules(model_config: ModelConfig) -> WeightRules:
         segments=(("switch_mlp", "experts"),),
         drops=drops,
         fuses=tuple(fuses),
+        expert_segment="experts",
     )
 
 

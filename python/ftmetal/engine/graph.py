@@ -10,7 +10,10 @@ at max_running_req, on the ladder or not; the arena is the graphs' shared pool, 
 GraphArena: every capture's intermediates and temporaries are planned into it, it is
 allocated after the captures, and each capture batch's replay on it must give its clean
 replay's logits; graphs outgrowing the memory budget's graph reserve fail the startup
-like a failed capture.
+like a failed capture. Under MoE offload (FreeToken passes the cache to the runner too)
+the banks and slot_of are externals, the lookups' tables are pools and moe_step is the last
+step input; captures run on dummy rows only, so their lookups post nothing; a decode whose
+experts may not fit the cache in one step runs eagerly.
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ from ftmetal.core import Batch, Req
 from ftmetal.kvcache import pool_arrays, set_pool_arrays
 from ftmetal.kvcache.base import BasePool
 from ftmetal.models.blocks import BaseLLMModel
+from ftmetal.moe.offload_cache import OffloadMoeCache
 
 logger = logging.getLogger(__name__)
 
@@ -56,12 +60,14 @@ class GraphRunner:
         max_seq_len: int,
         reserve_bytes: int,
         is_mrope: bool,
+        moe_offload_cache: OffloadMoeCache | None,
     ) -> None:
         """An empty graph_bs_list turns replay off; max_seq_len is the page-table row width;
         the graphs may keep reserve_bytes (their arena and pinned buffers); an mrope model
         takes [3, bs] rope positions as a step input."""
         self.model = model
         self.is_mrope = is_mrope
+        self.moe_offload_cache = moe_offload_cache
         self.attn_backends = attn_backends
         self.pools = pools
         self.dummy_req = dummy_req
@@ -111,14 +117,16 @@ class GraphRunner:
         for backend in self.attn_backends.values():
             backend.prepare_metadata(batch)
             backend.prepare_for_capture(batch)
+        if self.moe_offload_cache is not None:
+            self.moe_offload_cache.prepare_for_capture()
         return batch
 
     def check_replay(self, graph: _C.Graph, step_inputs: list[mx.array]) -> mx.array:
         """Logits of a replay of a capture batch, from the state reset_capture_state leaves."""
         for backend in self.attn_backends.values():
             backend.reset_capture_state()
-        logits, pools = replay(graph, step_inputs, pool_arrays(self.pools))
-        set_pool_arrays(self.pools, pools)
+        logits, pools = replay(graph, step_inputs, self.pool_arrays())
+        self.set_pool_arrays(pools)
         mx.eval(logits, *pools)
         return logits
 
@@ -127,22 +135,42 @@ class GraphRunner:
         under the recorder."""
         parameters = tree_flatten(self.model.parameters())
         externals = [value for _, value in parameters if isinstance(value, mx.array)]
+        if self.moe_offload_cache is not None:
+            externals += self.moe_offload_cache.graph_externals()
         step_inputs = self.step_inputs(batch)
         mx.eval(*step_inputs)
-        pools = pool_arrays(self.pools)
+        pools = self.pool_arrays()
         logits = self.model.forward(batch)
-        return capture([logits, *pool_arrays(self.pools)], step_inputs, pools, externals)
+        return capture([logits, *self.pool_arrays()], step_inputs, pools, externals)
 
     def step_inputs(self, batch: Batch) -> list[mx.array]:
-        """input_ids, positions, out_loc, the mrope positions of an mrope model, then each
-        backend's metadata arrays, in capture order."""
+        """input_ids, positions, out_loc, the mrope positions of an mrope model, each
+        backend's metadata arrays, then the offload cache's moe_step, in capture order."""
         arrays = [batch.input_ids, batch.positions, batch.out_loc]
         if self.is_mrope:
             assert batch.mrope_positions is not None
             arrays.append(batch.mrope_positions)
         for attn_type in self.attn_backends:
             arrays += batch.attn_metadata[attn_type].step_inputs()
+        if self.moe_offload_cache is not None:
+            arrays.append(self.moe_offload_cache.moe_step)
         return arrays
+
+    def pool_arrays(self) -> list[mx.array]:
+        """The pools, then the offload cache's lookup tables: what a replay takes and returns."""
+        if self.moe_offload_cache is None:
+            return pool_arrays(self.pools)
+        else:
+            return [*pool_arrays(self.pools), *self.moe_offload_cache.table_arrays()]
+
+    def set_pool_arrays(self, arrays: list[mx.array]) -> None:
+        """Rebind the pools and the offload cache's tables to a replay's, in pool_arrays order."""
+        if self.moe_offload_cache is None:
+            set_pool_arrays(self.pools, arrays)
+        else:
+            num_tables = len(self.moe_offload_cache.table_arrays())
+            set_pool_arrays(self.pools, arrays[:-num_tables])
+            self.moe_offload_cache.set_table_arrays(arrays[-num_tables:])
 
     def can_replay(self, batch: Batch) -> bool:
         return batch.is_decode and batch.size <= self.max_graph_bs
@@ -153,8 +181,8 @@ class GraphRunner:
         for backend in self.attn_backends.values():
             backend.prepare_for_replay(batch)
         graph = self.graphs[batch.padded_size]
-        logits, pools = replay(graph, self.step_inputs(batch), pool_arrays(self.pools))
-        set_pool_arrays(self.pools, pools)
+        logits, pools = replay(graph, self.step_inputs(batch), self.pool_arrays())
+        self.set_pool_arrays(pools)
         return logits[: batch.size]
 
     def pad_batch(self, batch: Batch) -> None:

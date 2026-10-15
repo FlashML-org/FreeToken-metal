@@ -8,7 +8,8 @@ add_request and results leave through send_result as TokenEvents; run_forever is
 server's scheduler thread body over the message queues. A padded decode batch's dummy
 rows read the token pool's scratch row; only real requests allocate pages and write
 sampled tokens. The multimodal gather plan and the mrope positions are built in numpy by
-scheduler/mm.py.
+scheduler/mm.py. A drained step's tokens are used only once the engine's offload cache
+passes its health check (a failed expert read leaves stand-in experts behind).
 """
 
 from __future__ import annotations
@@ -105,8 +106,24 @@ class Scheduler:
             )
         self.engine = Engine(config)
         self.config = config
+        # The engine's MoE offload cache, for the idle line's hit rate; None while resident.
+        self.moe_offload_cache = self.engine.moe_offload_cache
         self.eos_token_ids = eos_token_ids
-        self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
+        # An offload cache holds a decode's experts in one step only up to max_decode_rows
+        # rows, capped through the requests admitted; a looked-up prefill's tokens are capped
+        # through its budget (prefill_budget).
+        max_admitted = config.max_running_req
+        cache = self.moe_offload_cache
+        max_rows = None if cache is None else cache.slot_layout.max_decode_rows
+        if max_rows is not None and max_rows < max_admitted:
+            logger.warning(
+                f"MoE offload: {max_rows} requests run at once, not {config.max_running_req}: a "
+                f"decode of more rows could route more experts than a pool of the cache holds"
+            )
+            max_admitted = max_rows
+        self.table_manager = TableManager(
+            config.max_running_req, self.engine.page_table, max_admitted=max_admitted
+        )
         assert self.engine.dummy_req.table_idx == self.table_manager.scratch_row
         self.cache_manager = CacheManager(
             self.engine.num_pages,
@@ -316,7 +333,10 @@ class Scheduler:
                 send_tokenizer.put(BatchTokenizerMsg(data=replies))
 
             if data is None and not self.runnable:
-                self.status_reporter.report_idle()
+                cache = self.moe_offload_cache
+                self.status_reporter.report_idle(
+                    moe_experts=None if cache is None else cache.hit_counts()
+                )
 
     def send_result(self, events: list[TokenEvent]) -> None:
         self.results.extend(events)
@@ -338,7 +358,7 @@ class Scheduler:
 
     def schedule_next_batch(self) -> ForwardInput | None:
         batch = (
-            self.prefill_manager.schedule_next_batch(self.config.max_extend_tokens)
+            self.prefill_manager.schedule_next_batch(self.prefill_budget())
             or self.decode_manager.schedule_next_batch()
         )
         if batch is None:
@@ -350,6 +370,22 @@ class Scheduler:
             for uid, prompt_tokens, cached_tokens in batch.prompt_admissions
         )
         return forward_input
+
+    def prefill_budget(self) -> int:
+        """max_extend_tokens, or with an offload cache, for a prefill that will look its experts
+        up (no prefill overlap, or fewer pending tokens than its threshold), the cache's
+        max_lookup_tokens; the cache reads a longer one's layers ahead whatever its length."""
+        budget = self.config.max_extend_tokens
+        cache = self.moe_offload_cache
+        max_tokens = None if cache is None else cache.slot_layout.max_lookup_tokens
+        if cache is None or max_tokens is None:
+            return budget
+        elif cache.prefill_overlap and self.prefill_manager.has_pending_tokens(
+            cache.prefill_overlap_min_tokens
+        ):
+            return budget
+        else:
+            return min(budget, max_tokens)
 
     def prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
@@ -417,6 +453,7 @@ class Scheduler:
             return
         batch = last_data.forward_input.batch
         next_tokens = host_ints(last_data.forward_output.next_tokens)
+        self.engine.check_healthy()
         events: list[TokenEvent] = []
         new_finished: set[Req] = set()
         with self.cache_manager.lazy_free_region():

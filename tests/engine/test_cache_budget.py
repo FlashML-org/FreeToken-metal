@@ -1,6 +1,9 @@
 """Memory budget on the Qwen3.6-35B-A3B geometry: report lines, page and GDN slot counts,
 for the hybrid radix cache and naive; and Gemma4-26B-A4B's window pool, a fixed cost beside
-the global pages for naive and for the SWA radix cache.
+the global pages for naive and for the SWA radix cache. MoE offload on Qwen3.6-35B-A3B's
+checkpoint: what auto picks, the cache size each flag gives, and the experts line, on this
+box's budget and on fractions of it standing for 24 GB and 32 GB Macs; refused cache sizes
+and configs; the strategy resolution on a tiny checkpoint; Gemma4's refusal of offload.
 
 The expected numbers were computed by the engine's sizing before pools were created per
 attention type; the dispatch must reproduce them exactly from the same fixed budget.
@@ -8,7 +11,10 @@ attention type; the dispatch must reproduce them exactly from the same fixed bud
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import logging
+from pathlib import Path
 from typing import Literal, NamedTuple
 
 import mlx.core as mx
@@ -17,18 +23,30 @@ import pytest
 from ftmetal.attention.metadata import AttnType
 from ftmetal.engine.cache_budget import (
     GIB,
+    IN_FLIGHT_STEPS,
+    OFFLOAD_IN_FLIGHT_STEPS,
+    BudgetReport,
     activation_reserve_bytes,
+    choose_moe_strategy,
     encoder_reserve_bytes,
     graph_reserve_bytes,
+    kv_reserve_pages,
     memory_budget_bytes,
     plan_budget,
+    resolve_moe_cache_size,
     solve_num_pages,
 )
-from ftmetal.engine.config import EngineConfig
+from ftmetal.engine.config import EngineConfig, MoeStrategyChoice
+from ftmetal.engine.engine import resolve_moe_strategy
 from ftmetal.kvcache import pool_costs
 from ftmetal.kvcache.base import PoolCost
+from ftmetal.models.config import MoeStrategy
 from ftmetal.models.gemma4.config import parse_config as parse_gemma4_config
+from ftmetal.models.gemma4.model import Gemma4ForCausalLM
 from ftmetal.models.qwen3_5_moe.config import parse_config
+from ftmetal.models.register import model_weight_rules
+from ftmetal.moe.offload_cache import STAGING_BYTES
+from tiny_model import TINY_TEXT_CONFIG, build_reference, save_checkpoint
 
 # The text_config fields of Qwen3.6-35B-A3B that its attention groups are parsed from.
 QWEN3_6_TEXT_CONFIG: dict[str, object] = {
@@ -161,8 +179,10 @@ def test_qwen3_6_budget_reproduces_pages_and_slots(
     costs = pool_costs(model_config.kv_cache_group_specs(), config)
     assert costs[AttnType.LINEAR] == PoolCost(0, case.num_slots * GDN_SLOT_BYTES)
 
-    activations = activation_reserve_bytes(config.max_extend_tokens, model_config.num_qo_heads)
-    budget = memory_budget_bytes(WORKING_SET_BYTES)
+    activations = activation_reserve_bytes(
+        config.max_extend_tokens, model_config.num_qo_heads, IN_FLIGHT_STEPS
+    )
+    budget = memory_budget_bytes(WORKING_SET_BYTES, None)
     report = plan_budget(budget, WEIGHTS_BYTES, activations, 0, costs)
     assert report.lines() == case.lines
     caplog.set_level(logging.INFO)
@@ -175,8 +195,10 @@ def test_graph_reserve_comes_off_the_paged_pools() -> None:
     model_config = parse_config(QWEN3_6_TEXT_CONFIG)
     config = EngineConfig(model_path="unused", max_running_req=8)
     costs = pool_costs(model_config.kv_cache_group_specs(), config)
-    activations = activation_reserve_bytes(config.max_extend_tokens, model_config.num_qo_heads)
-    budget = memory_budget_bytes(WORKING_SET_BYTES)
+    activations = activation_reserve_bytes(
+        config.max_extend_tokens, model_config.num_qo_heads, IN_FLIGHT_STEPS
+    )
+    budget = memory_budget_bytes(WORKING_SET_BYTES, None)
     graphs = graph_reserve_bytes(8)
     without = plan_budget(budget, WEIGHTS_BYTES, activations, 0, costs)
     with_graphs = plan_budget(budget, WEIGHTS_BYTES, activations, graphs, costs)
@@ -215,7 +237,7 @@ def test_encoder_reserve_comes_off_the_paged_pools() -> None:
     model_config = parse_config(QWEN3_6_TEXT_CONFIG)
     config = EngineConfig(model_path="unused", max_running_req=8)
     costs = pool_costs(model_config.kv_cache_group_specs(), config)
-    budget = memory_budget_bytes(WORKING_SET_BYTES)
+    budget = memory_budget_bytes(WORKING_SET_BYTES, None)
     without = plan_budget(budget, WEIGHTS_BYTES, 0, 0, costs)
     with_encoder = plan_budget(budget, WEIGHTS_BYTES, 0, 0, costs, reserve)
     assert without.paged_bytes - with_encoder.paged_bytes == reserve
@@ -298,5 +320,301 @@ def test_gemma4_window_pool_beside_the_global_pages() -> None:
         )
         costs = pool_costs(model_config.kv_cache_group_specs(), config)
         assert costs == {AttnType.FULL: PoolCost(20 * 1024, 0), AttnType.SWA: case.window_cost}
-        report = plan_budget(memory_budget_bytes(WORKING_SET_BYTES), 13 * GIB, 0, 0, costs)
+        report = plan_budget(memory_budget_bytes(WORKING_SET_BYTES, None), 13 * GIB, 0, 0, costs)
         assert report.lines() == case.lines, case.cache_type
+
+
+def test_gemma4_refuses_moe_offload() -> None:
+    model_config = parse_gemma4_config(
+        {**GEMMA4_26B_TEXT_CONFIG, "enable_moe_block": True, "num_experts": 128}
+    )
+    with pytest.raises(ValueError, match="not supported for Gemma4 yet"):
+        Gemma4ForCausalLM(dataclasses.replace(model_config, moe_strategy="offload"))
+
+
+# Qwen3.6-35B-A3B's checkpoint, from its safetensors headers: the weights besides the routed
+# experts, the experts, and one affine 4-bit group-64 expert over the gate_up and down banks.
+NON_EXPERT_BYTES = 1_378_867_456
+EXPERT_BYTES = 18_119_393_280
+EXPERT_SLOT_BYTES = 1_769_472
+NUM_LAYERS = 40
+NUM_EXPERTS = 256
+TOP_K = 8
+TOTAL_EXPERTS = NUM_LAYERS * NUM_EXPERTS
+
+
+class OffloadBudgetCase(NamedTuple):
+    memory_ratio: float | None
+    moe_cache_size: int
+    moe_cache_rate: float | None
+    moe_prefill_overlap: bool
+    # What auto picks with no cache size flag.
+    auto_strategy: MoeStrategy
+    cache_size: int
+    lines: list[str]
+
+
+OFFLOAD_BUDGET_CASES = [
+    # A 24 GB Mac's budget: the experts do not fit resident; cache-auto gives the KV pools
+    # 8192 tokens and the experts the rest.
+    OffloadBudgetCase(
+        0.43,
+        0,
+        None,
+        True,
+        "offload",
+        6342,
+        [
+            "budget         16.10 GiB",
+            "weights         1.28 GiB",
+            "experts        10.51 GiB",
+            "gdn slots       1.51 GiB",
+            "activations     2.62 GiB",
+            "graphs          0.01 GiB",
+            "kv pages        0.16 GiB",
+        ],
+    ),
+    OffloadBudgetCase(
+        0.43,
+        0,
+        0.5,
+        True,
+        "offload",
+        5120,
+        [
+            "budget         16.10 GiB",
+            "weights         1.28 GiB",
+            "experts         8.50 GiB",
+            "gdn slots       1.51 GiB",
+            "activations     2.62 GiB",
+            "graphs          0.01 GiB",
+            "kv pages        2.17 GiB",
+        ],
+    ),
+    # A 32 GB Mac's budget at rate 0.7.
+    OffloadBudgetCase(
+        0.58,
+        0,
+        0.7,
+        True,
+        "offload",
+        7168,
+        [
+            "budget         21.72 GiB",
+            "weights         1.28 GiB",
+            "experts        11.88 GiB",
+            "gdn slots       1.51 GiB",
+            "activations     2.62 GiB",
+            "graphs          0.01 GiB",
+            "kv pages        4.41 GiB",
+        ],
+    ),
+    # Without prefill overlap two steps of activations count.
+    OffloadBudgetCase(
+        0.43,
+        4000,
+        None,
+        False,
+        "offload",
+        4000,
+        [
+            "budget         16.10 GiB",
+            "weights         1.28 GiB",
+            "experts         6.65 GiB",
+            "gdn slots       1.51 GiB",
+            "activations     5.25 GiB",
+            "graphs          0.01 GiB",
+            "kv pages        1.39 GiB",
+        ],
+    ),
+    # The floors: one token's experts per layer (40 x 8) and, with prefill overlap, two whole
+    # layers of buffers over them (2 x 256).
+    OffloadBudgetCase(
+        0.17,
+        0,
+        None,
+        True,
+        "offload",
+        512,
+        [
+            "budget          6.36 GiB",
+            "weights         1.28 GiB",
+            "experts         0.91 GiB",
+            "gdn slots       1.51 GiB",
+            "activations     2.62 GiB",
+            "graphs          0.01 GiB",
+            "kv pages        0.03 GiB",
+        ],
+    ),
+    OffloadBudgetCase(
+        0.235,
+        0,
+        None,
+        False,
+        "offload",
+        320,
+        [
+            "budget          8.80 GiB",
+            "weights         1.28 GiB",
+            "experts         0.59 GiB",
+            "gdn slots       1.51 GiB",
+            "activations     5.25 GiB",
+            "graphs          0.01 GiB",
+            "kv pages        0.15 GiB",
+        ],
+    ),
+    # This box keeps every expert resident under auto; an offload's cache-auto takes them all.
+    OffloadBudgetCase(
+        None,
+        0,
+        None,
+        True,
+        "fused",
+        TOTAL_EXPERTS,
+        [
+            "budget         36.44 GiB",
+            "weights         1.28 GiB",
+            "experts        16.94 GiB",
+            "gdn slots       1.51 GiB",
+            "activations     2.62 GiB",
+            "graphs          0.01 GiB",
+            "kv pages       14.07 GiB",
+        ],
+    ),
+]
+
+
+def offload_budget(
+    config: EngineConfig,
+) -> tuple[MoeStrategy, int, BudgetReport]:
+    """What auto picks, the offload cache size and the offload's budget report, as the
+    engine composes them for Qwen3.6-35B-A3B under config."""
+    model_config = parse_config(QWEN3_6_TEXT_CONFIG)
+    costs = pool_costs(model_config.kv_cache_group_specs(), config)
+    budget = memory_budget_bytes(WORKING_SET_BYTES, config.memory_ratio)
+    graphs = graph_reserve_bytes(config.max_running_req)
+    reserve_pages = kv_reserve_pages(config.kv_reserve_tokens, config.page_size)
+    resident = BudgetReport(
+        budget=budget,
+        weights=NON_EXPERT_BYTES + EXPERT_BYTES,
+        activations=activation_reserve_bytes(
+            config.max_extend_tokens, model_config.num_qo_heads, IN_FLIGHT_STEPS
+        ),
+        graphs=graphs,
+        costs=costs,
+    )
+    in_flight_steps = OFFLOAD_IN_FLIGHT_STEPS if config.moe_prefill_overlap else IN_FLIGHT_STEPS
+    activations = activation_reserve_bytes(
+        config.max_extend_tokens, model_config.num_qo_heads, in_flight_steps
+    )
+    cache_size = resolve_moe_cache_size(
+        config.moe_cache_size_flag(TOTAL_EXPERTS),
+        report=BudgetReport(
+            budget=budget,
+            weights=NON_EXPERT_BYTES,
+            activations=activations,
+            graphs=graphs,
+            costs=costs,
+        ),
+        reserve_pages=reserve_pages,
+        slot_bytes=EXPERT_SLOT_BYTES,
+        staging_bytes=STAGING_BYTES,
+        num_layers=NUM_LAYERS,
+        num_experts=NUM_EXPERTS,
+        top_k=TOP_K,
+        total_experts=TOTAL_EXPERTS,
+        prefill_overlap=config.moe_prefill_overlap,
+        buffer_placement=config.moe_prefill_buffer,
+    )
+    report = plan_budget(
+        budget,
+        NON_EXPERT_BYTES,
+        activations,
+        graphs,
+        costs,
+        experts=cache_size * EXPERT_SLOT_BYTES + STAGING_BYTES,
+    )
+    return choose_moe_strategy(resident, reserve_pages), cache_size, report
+
+
+@pytest.mark.parametrize("case", OFFLOAD_BUDGET_CASES)
+def test_qwen3_6_offload_budget(case: OffloadBudgetCase) -> None:
+    config = EngineConfig(
+        model_path="unused",
+        memory_ratio=case.memory_ratio,
+        moe_cache_size=case.moe_cache_size,
+        moe_cache_rate=case.moe_cache_rate,
+        moe_prefill_overlap=case.moe_prefill_overlap,
+    )
+    auto_strategy, cache_size, report = offload_budget(config)
+    assert (auto_strategy, cache_size) == (case.auto_strategy, case.cache_size)
+    assert report.lines() == case.lines
+
+
+# (EngineConfig fields, the refusal)
+REFUSED_OFFLOAD_CASES: list[tuple[dict[str, float | int | bool | None], str]] = [
+    ({"moe_cache_size": 300}, "and the two prefill buffers: give at least 512"),
+    ({"moe_cache_size": 200, "moe_prefill_overlap": False}, "give at least 320 slots$"),
+    ({"memory_ratio": 0.15, "moe_prefill_overlap": False}, "does not fit the memory budget"),
+    ({"moe_cache_size": 512, "moe_cache_rate": 0.5}, "moe_cache_size and moe_cache_rate are"),
+    ({"moe_cache_rate": 0.5, "moe_cache_auto": True}, "moe_cache_rate and moe_cache_auto are"),
+    ({"moe_cache_rate": 1.5}, r"moe_cache_rate must be in \[0, 1\]"),
+    ({"memory_ratio": 0.0}, r"memory_ratio must be in \(0, 1\]"),
+]
+
+
+@pytest.mark.parametrize(("fields", "error"), REFUSED_OFFLOAD_CASES)
+def test_refused_offload_budgets(fields: dict[str, float | int | bool | None], error: str) -> None:
+    with pytest.raises((ValueError, RuntimeError), match=error):
+        offload_budget(EngineConfig(model_path="unused", **fields))
+
+
+# (--moe-strategy, cache size flags, budget, the strategy resolved) on a tiny checkpoint: its
+# weights take a few MiB beside an activation reserve of two 0.75 GiB steps.
+STRATEGY_CASES: list[tuple[MoeStrategyChoice, dict[str, float | bool], int, MoeStrategy]] = [
+    ("auto", {}, 2 * GIB, "fused"),
+    ("auto", {}, 1 * GIB, "offload"),
+    ("auto", {"moe_cache_rate": 0.5}, 2 * GIB, "offload"),
+    ("auto", {"moe_cache_auto": True}, 2 * GIB, "offload"),
+    ("fused", {"moe_cache_rate": 0.5}, 1 * GIB, "fused"),
+    ("offload", {}, 2 * GIB, "offload"),
+]
+
+
+def resolve_tiny_strategy(
+    path: Path, strategy: MoeStrategyChoice, flags: dict[str, float | bool], budget: int
+) -> MoeStrategy:
+    config = EngineConfig(
+        model_path=str(path), max_extend_tokens=256, moe_strategy=strategy, **flags
+    )
+    model_config = config.model_config
+    return resolve_moe_strategy(
+        config,
+        model_weight_rules(config.architecture, model_config),
+        budget=budget,
+        graphs=0,
+        costs=pool_costs(model_config.kv_cache_group_specs(), config),
+        encoder=0,
+    )
+
+
+@pytest.mark.parametrize(("strategy", "flags", "budget", "expected"), STRATEGY_CASES)
+def test_moe_strategy_resolution(
+    tmp_path: Path,
+    strategy: MoeStrategyChoice,
+    flags: dict[str, float | bool],
+    budget: int,
+    expected: MoeStrategy,
+) -> None:
+    save_checkpoint(build_reference(seed=0), tmp_path, quantization=None)
+    assert resolve_tiny_strategy(tmp_path, strategy, flags, budget) == expected
+
+
+def test_dense_model_refuses_moe_offload(tmp_path: Path) -> None:
+    save_checkpoint(build_reference(seed=0), tmp_path, quantization=None)
+    checkpoint_config = json.loads((tmp_path / "config.json").read_text())
+    checkpoint_config["text_config"] = {**TINY_TEXT_CONFIG, "num_experts": 0}
+    (tmp_path / "config.json").write_text(json.dumps(checkpoint_config))
+    assert resolve_tiny_strategy(tmp_path, "auto", {}, 2 * GIB) == "fused"
+    with pytest.raises(ValueError, match="routes no experts"):
+        resolve_tiny_strategy(tmp_path, "offload", {}, 2 * GIB)

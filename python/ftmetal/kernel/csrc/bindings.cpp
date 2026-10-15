@@ -1,13 +1,18 @@
 #include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
+#include "expert_lru.h"
+#include "expert_service.h"
 #include "fdecode.h"
 #include "fprefill.h"
 #include "gather_qmm_sorted.h"
 #include "gdn_step.h"
+#include "moe_lookup.h"
 #include "rows.h"
 #include "sample.h"
 
@@ -23,6 +28,7 @@ NB_MODULE(_C, m) {
   m.def("init_fprefill_library", &ftmetal::init_fprefill_library, "source"_a);
   m.def("init_gather_qmm_sorted_library", &ftmetal::init_gather_qmm_sorted_library, "source"_a);
   m.def("init_sample_library", &ftmetal::init_sample_library, "source"_a);
+  m.def("init_moe_lookup_library", &ftmetal::init_moe_lookup_library, "source"_a);
 
   m.def(
       "scatter_rows",
@@ -133,12 +139,254 @@ NB_MODULE(_C, m) {
       "scales"_a,
       "biases"_a,
       "expert_offsets"_a,
-      "slot_of"_a,
+      "expert_bytes"_a,
+      "n"_a,
       "group_size"_a,
       "bits"_a,
       nb::kw_only(),
       "stream"_a = nb::none(),
-      "x[b] @ dequantize(w[slot_of[e]]).T for the rows b of each expert e; returns [B, 1, N].");
+      "x[b] @ dequantize(expert e's weights at its byte offsets).T for the rows b of each expert e; returns [B, 1, n].");
+
+  m.attr("MAILBOX_WORDS") = ftmetal::MAILBOX_WORDS;
+  m.attr("EXPERT_STAGING_BYTES") = ftmetal::EXPERT_STAGING_BYTES;
+  nb::enum_<ftmetal::MailboxWord>(m, "MailboxWord", nb::is_arithmetic())
+      .value("STATE", ftmetal::MailboxWord::State)
+      .value("SEQUENCE", ftmetal::MailboxWord::Sequence)
+      .value("ACKNOWLEDGED", ftmetal::MailboxWord::Acknowledged)
+      .value("SHUTDOWN", ftmetal::MailboxWord::Shutdown)
+      .value("KIND", ftmetal::MailboxWord::Kind)
+      .value("LAYER", ftmetal::MailboxWord::Layer)
+      .value("STEP", ftmetal::MailboxWord::Step)
+      .value("NUM_ROWS", ftmetal::MailboxWord::NumRows)
+      .value("NUM_IDS", ftmetal::MailboxWord::NumIds)
+      .value("NUM_MISSES", ftmetal::MailboxWord::NumMisses)
+      .value("IDS", ftmetal::MailboxWord::Ids)
+      .value("NUM_LOADED", ftmetal::MailboxWord::NumLoaded)
+      .value("NUM_EVICTED", ftmetal::MailboxWord::NumEvicted)
+      .value("ERROR", ftmetal::MailboxWord::Error)
+      .value("CLAIM_TIME", ftmetal::MailboxWord::ClaimTime)
+      .value("DONE_TIME", ftmetal::MailboxWord::DoneTime);
+  nb::enum_<ftmetal::MailboxState>(m, "MailboxState", nb::is_arithmetic())
+      .value("IDLE", ftmetal::MailboxState::Idle)
+      .value("POSTED", ftmetal::MailboxState::Posted)
+      .value("CLAIMED", ftmetal::MailboxState::Claimed)
+      .value("DONE", ftmetal::MailboxState::Done)
+      .value("FAILED", ftmetal::MailboxState::Failed)
+      .value("SHUTDOWN", ftmetal::MailboxState::Shutdown);
+  nb::enum_<ftmetal::MailboxError>(m, "MailboxError", nb::is_arithmetic())
+      .value("NONE", ftmetal::MailboxError::None)
+      .value("IO", ftmetal::MailboxError::Io)
+      .value("TIMEOUT", ftmetal::MailboxError::Timeout)
+      .value("PROTOCOL", ftmetal::MailboxError::Protocol)
+      .value("SHUTDOWN", ftmetal::MailboxError::Shutdown)
+      .value("CAPACITY", ftmetal::MailboxError::Capacity);
+  nb::enum_<ftmetal::MoeLookupKind>(m, "MoeLookupKind", nb::is_arithmetic())
+      .value("DECODE", ftmetal::MoeLookupKind::Decode)
+      .value("PREFILL_COPY_MISS", ftmetal::MoeLookupKind::PrefillCopyMiss)
+      .value("PROBE", ftmetal::MoeLookupKind::Probe);
+
+  m.def(
+      "moe_lookup",
+      &ftmetal::moe_lookup,
+      "topk_ids"_a,
+      "moe_step"_a,
+      "slot_of"_a,
+      "mailbox"_a,
+      "last_use"_a,
+      "hit_stats"_a,
+      "layer_id"_a,
+      "slot_base"_a,
+      "kind"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      "Pool slots of one MoE layer's routed experts, the absent read by the CPU first; returns (slots, slot_map, mailbox, last_use, hit_stats).");
+
+  nb::class_<ftmetal::SlotLru>(m, "SlotLru")
+      .def(
+          nb::init<
+              int,
+              int,
+              int,
+              const std::vector<int32_t>&,
+              const std::vector<int32_t>&,
+              const std::vector<int32_t>&,
+              mx::array,
+              mx::array>(),
+          "num_layers"_a,
+          "num_experts"_a,
+          "buffer_size"_a,
+          "layer_pools"_a,
+          "pool_bounds"_a,
+          "pool_volatile"_a,
+          "slot_of"_a,
+          "last_use"_a,
+          "Per-pool token-granular LRUs over the slots; writes slot_of and last_use in place.")
+      .def_prop_ro("num_slots", &ftmetal::SlotLru::num_slots)
+      .def(
+          "fill",
+          &ftmetal::SlotLru::fill,
+          "flat_ids"_a,
+          "Empty the cache and place each of flat_ids in its layer's pool; returns their slots.")
+      .def(
+          "resolve",
+          [](ftmetal::SlotLru& lru, int layer_id, const std::vector<int32_t>& expert_ids,
+             uint32_t step) {
+            ftmetal::SlotAssignment assignment = lru.resolve(layer_id, expert_ids, step);
+            return std::make_pair(std::move(assignment.slots), std::move(assignment.loads));
+          },
+          "layer_id"_a,
+          "expert_ids"_a,
+          "step"_a,
+          "Slots of the layer's distinct experts at step; returns (slots, [(expert, slot)] to load).")
+      .def(
+          "invalidate_prefill_buffers",
+          &ftmetal::SlotLru::invalidate_prefill_buffers,
+          "Drop every expert held in a slot under the prefill buffers.")
+      .def(
+          "prefill_slot_map",
+          [](const ftmetal::SlotLru& lru, int layer_id) {
+            ftmetal::SlotAssignment assignment = lru.prefill_slot_map(layer_id);
+            return std::make_pair(std::move(assignment.slots), std::move(assignment.loads));
+          },
+          "layer_id"_a,
+          "Every expert's slot, -1 - its buffer row if absent; returns (slot_map, loads).");
+
+  nb::class_<ftmetal::ExpertServiceStats>(m, "ExpertServiceStats")
+      .def_ro("hits", &ftmetal::ExpertServiceStats::hits)
+      .def_ro("misses", &ftmetal::ExpertServiceStats::misses)
+      .def_ro("requests", &ftmetal::ExpertServiceStats::requests)
+      .def_ro("experts_read", &ftmetal::ExpertServiceStats::experts_read)
+      .def_ro("bytes_read", &ftmetal::ExpertServiceStats::bytes_read)
+      .def_ro("read_wait_ns", &ftmetal::ExpertServiceStats::read_wait_ns)
+      .def_ro("serve_ns", &ftmetal::ExpertServiceStats::serve_ns)
+      .def_ro("lookups", &ftmetal::ExpertServiceStats::lookups)
+      .def_ro("lookup_hits", &ftmetal::ExpertServiceStats::lookup_hits);
+
+  using Int64Table3 = nb::ndarray<const int64_t, nb::ndim<3>, nb::c_contig, nb::device::cpu>;
+  nb::class_<ftmetal::ExpertService>(m, "ExpertService")
+      .def(
+          "__init__",
+          [](ftmetal::ExpertService* service,
+             int num_layers,
+             int num_experts,
+             int buffer_size,
+             const std::vector<int32_t>& layer_pools,
+             const std::vector<int32_t>& pool_bounds,
+             const std::vector<int32_t>& pool_volatile,
+             mx::array slot_of,
+             mx::array last_use,
+             mx::array mailbox,
+             mx::array hit_stats,
+             std::vector<mx::array> banks,
+             const std::vector<std::string>& files,
+             Int64Table3 segments,
+             Int64Table3 destinations,
+             const std::vector<int64_t>& buffer_bytes,
+             int io_threads,
+             double stall_timeout_s,
+             bool run_coordinator) {
+            if (segments.shape(0) != static_cast<size_t>(num_layers) || segments.shape(2) != 6) {
+              throw std::invalid_argument("ExpertService: segments must be int64 [num_layers, n, 6]");
+            }
+            if (destinations.shape(0) != static_cast<size_t>(num_layers) ||
+                destinations.shape(1) != banks.size() || destinations.shape(2) != 2) {
+              throw std::invalid_argument(
+                  "ExpertService: destinations must be int64 [num_layers, num_banks, 2]");
+            }
+            std::vector<ftmetal::ExpertSegment> table(segments.shape(0) * segments.shape(1));
+            const int64_t* row = segments.data();
+            for (ftmetal::ExpertSegment& segment : table) {
+              segment = {row[0], row[1], row[2], row[3], row[4], row[5]};
+              row += 6;
+            }
+            new (service) ftmetal::ExpertService(
+                num_layers,
+                num_experts,
+                buffer_size,
+                layer_pools,
+                pool_bounds,
+                pool_volatile,
+                std::move(slot_of),
+                std::move(last_use),
+                std::move(mailbox),
+                std::move(hit_stats),
+                std::move(banks),
+                files,
+                std::move(table),
+                std::vector<int64_t>(destinations.data(), destinations.data() + destinations.size()),
+                buffer_bytes,
+                io_threads,
+                stall_timeout_s,
+                run_coordinator);
+          },
+          "num_layers"_a,
+          "num_experts"_a,
+          "buffer_size"_a,
+          "layer_pools"_a,
+          "pool_bounds"_a,
+          "pool_volatile"_a,
+          "slot_of"_a,
+          "last_use"_a,
+          "mailbox"_a,
+          "hit_stats"_a,
+          "banks"_a,
+          "files"_a,
+          "segments"_a,
+          "destinations"_a,
+          "buffer_bytes"_a,
+          "io_threads"_a,
+          "stall_timeout_s"_a,
+          "run_coordinator"_a,
+          "The slot cache's LRU, IO threads, lookup coordinator and watchdog.")
+      .def(
+          "fill_initial",
+          &ftmetal::ExpertService::fill_initial,
+          "flat_ids"_a,
+          nb::call_guard<nb::gil_scoped_release>(),
+          "Empty the cache, place each of flat_ids in its layer's pool and read them.")
+      .def(
+          "ensure_experts",
+          &ftmetal::ExpertService::ensure_experts,
+          "layer_id"_a,
+          "expert_ids"_a,
+          "step"_a,
+          nb::call_guard<nb::gil_scoped_release>(),
+          "Slots of the layer's distinct experts at step, the misses read before it returns.")
+      .def(
+          "begin_prefill",
+          &ftmetal::ExpertService::begin_prefill,
+          nb::call_guard<nb::gil_scoped_release>(),
+          "Drain the prefill buffer reads and drop the experts the buffer slots hold.")
+      .def(
+          "prefetch_prefill_layer",
+          &ftmetal::ExpertService::prefetch_prefill_layer,
+          "layer_id"_a,
+          nb::call_guard<nb::gil_scoped_release>(),
+          "Start reading the layer's absent experts into its prefill buffer; returns its slot map.")
+      .def(
+          "wait_prefill_layer",
+          &ftmetal::ExpertService::wait_prefill_layer,
+          "layer_id"_a,
+          nb::call_guard<nb::gil_scoped_release>(),
+          "Wait for the layer's prefill buffer reads.")
+      .def(
+          "stats",
+          &ftmetal::ExpertService::stats,
+          nb::call_guard<nb::gil_scoped_release>(),
+          "Per-layer hits, misses, experts and bytes read, read wait, GPU lookups and hits.")
+      .def(
+          "arm",
+          &ftmetal::ExpertService::arm,
+          "Keep the coordinator spinning through the forward about to be submitted.")
+      .def(
+          "check_healthy",
+          &ftmetal::ExpertService::check_healthy,
+          "Raise the first failure: a read, a broken or unanswered request, the shutdown.")
+      .def(
+          "shutdown",
+          &ftmetal::ExpertService::shutdown,
+          nb::call_guard<nb::gil_scoped_release>(),
+          "Answer a waiting lookup with SHUTDOWN, refuse later ones and stop the threads.");
 
   m.def(
       "sample_tokens",

@@ -16,6 +16,7 @@ from ftmetal.core import Batch
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.embedding import Embedding
 from ftmetal.layers.linear import Linear
+from ftmetal.layers.moe import ExpertSchemes
 from ftmetal.layers.norm import RMSNorm
 from ftmetal.layers.quantization.config import AffineScheme
 from ftmetal.mm.item import MMItem
@@ -40,13 +41,13 @@ def scheme_of(config: ModelConfig, model_key: str) -> AffineScheme | None:
     return config.quant.scheme_for(checkpoint_module(model_key))
 
 
-def fused_scheme_of(
+def schemes_of(
     config: ModelConfig, model_prefix: str, parts: tuple[str, ...]
-) -> AffineScheme | None:
+) -> list[AffineScheme | None]:
+    """The scheme of each part of a fused module; they fuse only when all agree."""
     if config.quant is None:
-        return None
-    names = [checkpoint_module(f"{model_prefix}.{part}") for part in parts]
-    return config.quant.scheme_for_fused(names)
+        return [None] * len(parts)
+    return config.quant.schemes_for([checkpoint_module(f"{model_prefix}.{part}") for part in parts])
 
 
 class Qwen3_5DecoderLayer(BaseOP):
@@ -63,8 +64,8 @@ class Qwen3_5DecoderLayer(BaseOP):
                 group,
                 config.rms_norm_eps,
                 layer_id,
-                qkvz_scheme=fused_scheme_of(config, gdn_prefix, IN_PROJ_QKVZ_PARTS),
-                ba_scheme=fused_scheme_of(config, gdn_prefix, IN_PROJ_BA_PARTS),
+                qkvz_schemes=schemes_of(config, gdn_prefix, IN_PROJ_QKVZ_PARTS),
+                ba_schemes=schemes_of(config, gdn_prefix, IN_PROJ_BA_PARTS),
                 out_scheme=scheme_of(config, f"{gdn_prefix}.out_proj"),
                 dtype=dtype,
             )
@@ -73,19 +74,19 @@ class Qwen3_5DecoderLayer(BaseOP):
             self.self_attn = Qwen3_5Attention(
                 config,
                 layer_id,
-                qkv_scheme=fused_scheme_of(config, attn_prefix, QKV_PARTS),
+                qkv_schemes=schemes_of(config, attn_prefix, QKV_PARTS),
                 o_scheme=scheme_of(config, f"{attn_prefix}.o_proj"),
                 dtype=dtype,
             )
         mlp_prefix = f"{prefix}.mlp"
         self.mlp = Qwen3_5MoE(
             config,
-            experts_gate_up_scheme=fused_scheme_of(config, f"{mlp_prefix}.experts", GATE_UP_PARTS),
-            experts_down_scheme=scheme_of(config, f"{mlp_prefix}.experts.down_proj"),
-            gate_scheme=scheme_of(config, f"{mlp_prefix}.gate"),
-            shared_gate_up_scheme=fused_scheme_of(
-                config, f"{mlp_prefix}.shared_expert", GATE_UP_PARTS
+            layer_id,
+            experts_schemes=ExpertSchemes(
+                *schemes_of(config, f"{mlp_prefix}.experts", (*GATE_UP_PARTS, "down_proj"))
             ),
+            gate_scheme=scheme_of(config, f"{mlp_prefix}.gate"),
+            shared_gate_up_schemes=schemes_of(config, f"{mlp_prefix}.shared_expert", GATE_UP_PARTS),
             shared_down_scheme=scheme_of(config, f"{mlp_prefix}.shared_expert.down_proj"),
             shared_gate_scheme=scheme_of(config, f"{mlp_prefix}.shared_expert_gate"),
             dtype=dtype,

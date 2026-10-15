@@ -33,10 +33,14 @@ nanobind_add_module(
   NB_DOMAIN
   mlx
   ${CMAKE_CURRENT_LIST_DIR}/bindings.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/expert_lru.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/expert_mailbox.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/expert_service.cpp
   ${CMAKE_CURRENT_LIST_DIR}/fdecode.cpp
   ${CMAKE_CURRENT_LIST_DIR}/fprefill.cpp
   ${CMAKE_CURRENT_LIST_DIR}/gather_qmm_sorted.cpp
   ${CMAKE_CURRENT_LIST_DIR}/gdn_step.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/moe_lookup.cpp
   ${CMAKE_CURRENT_LIST_DIR}/rows.cpp
   ${CMAKE_CURRENT_LIST_DIR}/sample.cpp)
 

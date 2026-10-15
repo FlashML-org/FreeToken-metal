@@ -8,6 +8,7 @@ import dataclasses
 import http.client
 import json
 import logging
+import queue
 import struct
 import threading
 import time
@@ -21,7 +22,8 @@ from ftmetal import __version__
 from ftmetal.env import ENV_PREFIXES
 from ftmetal.mm.config import ENCODER_KINDS, EncoderKind, MultimodalConfig
 from ftmetal.server.access_log_filter import PollingAccessLogFilter
-from ftmetal.server.api_server import create_app
+from ftmetal.server.api_server import FrontendManager, create_app
+from ftmetal.server.control_api import MoeCacheGeometry, cache_geometry
 from scripted_server import (
     WAIT_SECONDS,
     ScriptedScheduler,
@@ -243,6 +245,27 @@ def test_cache_status_reports_the_pools_and_thinking_gears(
             "swa_tokens": {"min": 0, "max": 0},
         },
     }
+
+
+def test_cache_status_reports_the_moe_offload_cache(tiny_model_dir: Path) -> None:
+    """The geometry the scheduler thread reports for an offload cache: Qwen3.6's 40 layers of
+    256 experts at rate 0.7."""
+    frontend = FrontendManager(
+        config=tiny_server_args(tiny_model_dir),
+        send_tokenizer=queue.Queue(),
+        moe_cache=MoeCacheGeometry(
+            num_experts=256, num_moe_layers=40, moe_cache_size=7168, moe_cache_policy="lru"
+        ),
+    )
+    frontend.thinking_profile = frontend.warm_frontend_tokenizer()
+    geometry = cache_geometry(frontend)
+    assert (
+        geometry["num_experts"],
+        geometry["num_moe_layers"],
+        geometry["moe_cache_size"],
+        geometry["moe_cache_policy"],
+    ) == (256, 40, 7168, "lru")
+    assert geometry["limits"]["moe_experts"] == {"min": 256, "max": 0}
 
 
 def post(port: int, route: str, body: dict[str, JsonValue]) -> http.client.HTTPResponse:

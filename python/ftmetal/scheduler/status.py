@@ -2,7 +2,8 @@
 
 Port of FreeToken scheduler/status.py (SchedulerStatusReporter). Divergences: reported
 at schedule time, before the launch, so the batch's cached/new token counts are read
-straight from the reqs; and an idle line summarising the burst since the last idle.
+straight from the reqs; and an idle line summarising the burst since the last idle, with
+the MoE offload cache's hit rate over it.
 """
 
 from __future__ import annotations
@@ -29,6 +30,8 @@ class SchedulerStatusReporter:
     _burst_decode_tokens: int = field(default=0, init=False)
     _burst_decode_time: float = field(default=0.0, init=False)
     _last_step_time: float | None = field(default=None, init=False)
+    # The offload cache's (hit, missed) expert counts at the last idle line.
+    _last_moe_experts: tuple[int, int] = field(default=(0, 0), init=False)
 
     def __post_init__(self) -> None:
         now = self.clock()
@@ -84,8 +87,9 @@ class SchedulerStatusReporter:
                 swa_tokens=swa_tokens,
             )
 
-    def report_idle(self) -> None:
-        """One line for the burst since the last idle; no-op if nothing ran."""
+    def report_idle(self, moe_experts: tuple[int, int] | None = None) -> None:
+        """One line for the burst since the last idle; no-op if nothing ran. moe_experts: the
+        offload cache's (hit, missed) expert counts so far."""
         if self._burst_start is None:
             return
         elapsed = self.clock() - self._burst_start
@@ -94,9 +98,15 @@ class SchedulerStatusReporter:
             if self._burst_decode_time > 0
             else 0.0
         )
+        moe_msg = ""
+        if moe_experts is not None:
+            hits = moe_experts[0] - self._last_moe_experts[0]
+            misses = moe_experts[1] - self._last_moe_experts[1]
+            self._last_moe_experts = moe_experts
+            moe_msg = f", moe hit rate: {_usage_ratio(hits, hits + misses):.3f}"
         self.log(
             f"Idle after {self._burst_steps} steps in {elapsed:.1f} s, "
-            f"decode throughput (token/s): {decode_tok_s:.1f}"
+            f"decode throughput (token/s): {decode_tok_s:.1f}{moe_msg}"
         )
         self._burst_start = None
         self._burst_steps = 0

@@ -4,7 +4,8 @@ CacheManager.
 Every page returns and rows hold page-aligned slots; a window pool backs every new token
 and keeps only a request's window live as it slides. The radix type commits a request's
 prefix at its prefill and its finish, frees and re-points duplicates and evicts unlocked
-leaves under pressure; with a GDN state pool the hybrid radix commit donates the track
+leaves under pressure, and the prefill manager counts a prompt's pending tokens past its
+prefix hit; with a GDN state pool the hybrid radix commit donates the track
 snapshot, which stays at or below the prompt's reusable prefix end so a next turn resumes
 there, a finish donates its live slot, and both currencies evict under pressure; with a
 window pool the SWA radix commit keeps the windows a next prompt can resume from, and the
@@ -466,6 +467,27 @@ def test_radix_admission_writes_the_cached_row_and_keeps_unaligned_chunks() -> N
     assert isinstance(req, ChunkedReq) and (req.cached_len, req.extend_len) == (40, 10)
     assert req.cache_handle is not None
     assert page_table[req.table_idx, :40].tolist() == req.cache_handle.kv_indices.tolist()
+
+
+def test_pending_tokens_count_past_the_cached_prefix() -> None:
+    page_table = np.zeros((4, 512), dtype=np.int32)
+    manager = CacheManager(128, 4, page_table, "radix")
+    prompt = list(range(1, 60))
+    seed = prefilled(manager, None, 0, prompt[:41], track_seqlen=None)
+    with manager.lazy_free_region():
+        manager.cache_req(seed, finished=True)
+
+    table = TableManager(max_running_reqs=4, page_table=page_table)
+    prefill = PrefillManager(manager, table, DecodeManager(4))
+    params = SamplingParams(max_tokens=1)
+    prefill.add_one_req(1, np.array(prompt, dtype=np.int32), params)
+    # The cached 40 tokens are not pending.
+    assert prefill.has_pending_tokens(19) and not prefill.has_pending_tokens(20)
+    prefill.add_one_req(2, np.arange(500, 530, dtype=np.int32), params)
+    assert prefill.has_pending_tokens(49) and not prefill.has_pending_tokens(50)
+    batch = prefill.schedule_next_batch(10)
+    assert batch is not None and [req.extend_len for req in batch.reqs] == [10]
+    assert prefill.has_pending_tokens(39) and not prefill.has_pending_tokens(40)
 
 
 WINDOW = 8

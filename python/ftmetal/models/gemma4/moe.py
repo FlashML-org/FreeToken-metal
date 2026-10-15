@@ -18,6 +18,7 @@ from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
 from ftmetal.layers.quantization.config import AffineScheme
 from ftmetal.models.config import ModelConfig
+from ftmetal.models.gemma4.weight import GATE_UP_PARTS
 
 
 class Gemma4GatedMLP(BaseOP):
@@ -26,13 +27,17 @@ class Gemma4GatedMLP(BaseOP):
         hidden_size: int,
         intermediate_size: int,
         *,
-        gate_up_scheme: AffineScheme | None,
+        gate_up_schemes: list[AffineScheme | None],
         down_scheme: AffineScheme | None,
         dtype: mx.Dtype,
     ) -> None:
         super().__init__()
         self.gate_up_proj = LinearMerged(
-            hidden_size, [intermediate_size, intermediate_size], scheme=gate_up_scheme, dtype=dtype
+            hidden_size,
+            [intermediate_size, intermediate_size],
+            schemes=gate_up_schemes,
+            part_names=GATE_UP_PARTS,
+            dtype=dtype,
         )
         self.down_proj = Linear(intermediate_size, hidden_size, scheme=down_scheme, dtype=dtype)
 
