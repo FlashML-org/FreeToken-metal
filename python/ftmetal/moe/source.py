@@ -3,9 +3,9 @@
 No FreeToken donor: FreeToken copies expert rows from host banks it loaded, while here
 the slot cache reads them from the checkpoint files. MLX checkpoints stack each expert
 projection as [experts, rows, ...], so expert e of a part is one contiguous byte range;
-a fused bank row (gate_up = gate then up) is its parts' ranges back to back, also when the
-checkpoint stores gate and up apart: a 4-bit part of an 8-bit bank row is widened as it is
-read. Only the safetensors headers are read.
+a fused bank row (gate_up = gate then up) is its parts' ranges back to back, and a layout
+that keeps the parts apart takes each as a bank of its own. Only the safetensors headers are
+read.
 """
 
 from __future__ import annotations
@@ -57,8 +57,9 @@ class ExpertSource:
     def __init__(self, model_path: str, rules: WeightRules) -> None:
         if rules.expert_segment is None:
             raise ValueError(f"{model_path}: the model's weight rules name no expert banks")
-        # The cache fuses every layer's gate and up (align_gate_up): their parts in one row.
+        # Every part under its fused role and index: segment_table maps layout banks onto them.
         rules = dataclasses.replace(rules, unfused=frozenset())
+        self.part_index = rules.part_index
         self.expert_infix = f".{rules.expert_segment}."
         self.files = weight_files(model_path)
         # model key prefix -> bank role -> part index -> tensor, and each role's part count
@@ -129,52 +130,57 @@ class ExpertSource:
         return len(self.layer_prefixes)
 
     def segment_table(self, layouts: list[dict[str, BankSpec]]) -> np.ndarray:
-        """int64 [num_layers, num_segments, 6]: one row per checkpoint part of each bank of
-        each layer's layout, banks in layout order: (file index, file offset of expert 0,
-        bytes per expert, bank index, byte offset in the bank row, 1 when the part's 4-bit
-        codes widen to the bank's 8 bits, else 0)."""
-        table: list[list[tuple[int, int, int, int, int, int]]] = []
+        """int64 [num_layers, num_segments, 5]: (file index, file offset of expert 0, bytes per
+        expert, bank index, byte offset in the bank row) per checkpoint part of each layout bank,
+        a fused role's parts back to back or one part (<fused>.<part>.<array>) kept apart."""
+        table: list[list[tuple[int, int, int, int, int]]] = []
         for prefix, roles, layout in zip(self.layer_prefixes, self.parts, layouts, strict=True):
-            if set(roles) != set(layout):
-                raise ValueError(
-                    f"{prefix}{self.expert_infix}: banks {sorted(roles)} are not the layout's "
-                    f"{sorted(layout)}"
-                )
-            segments: list[tuple[int, int, int, int, int, int]] = []
+            segments: list[tuple[int, int, int, int, int]] = []
+            taken: list[tuple[str, int]] = []
             for bank_index, (role, spec) in enumerate(layout.items()):
-                parts = roles[role]
-                row_offset = 0
-                for part in parts:
-                    # align_gate_up leaves 4-bit codes under an 8-bit packed weight row.
-                    widens = spec.dtype == mx.uint32 and part.shape[2] != spec.shape[1]
+                if role in roles:
+                    parts = [(role, index) for index in range(len(roles[role]))]
+                else:
+                    module, _, array = role.rpartition(".")
+                    fused, _, part_name = module.rpartition(".")
+                    hit = self.part_index.get(part_name)
+                    fused_role = f"{fused}.{array}"
                     if (
-                        part.dtype != spec.dtype
-                        or (widens and 2 * part.shape[2] != spec.shape[1])
-                        or (not widens and part.shape[2:] != spec.shape[1:])
+                        hit is None
+                        or hit[0].fused != fused
+                        or len(roles.get(fused_role, [])) != len(hit[0].parts)
                     ):
+                        raise ValueError(f"{prefix}{self.expert_infix}{role}: no checkpoint part")
+                    parts = [(fused_role, hit[1])]
+                row_offset = 0
+                for fused_role, index in parts:
+                    tensor = roles[fused_role][index]
+                    if tensor.dtype != spec.dtype or tensor.shape[2:] != spec.shape[1:]:
                         raise ValueError(
                             f"{prefix}{self.expert_infix}{role}: checkpoint part "
-                            f"{part.shape} {part.dtype} does not fit a {spec.shape} {spec.dtype} "
-                            f"bank row"
+                            f"{tensor.shape} {tensor.dtype} does not fit a {spec.shape} "
+                            f"{spec.dtype} bank row"
                         )
-                    expert_bytes = part.nbytes // self.num_experts
+                    expert_bytes = tensor.nbytes // self.num_experts
                     segments.append(
-                        (
-                            part.file_index,
-                            part.offset,
-                            expert_bytes,
-                            bank_index,
-                            row_offset,
-                            int(widens),
-                        )
+                        (tensor.file_index, tensor.offset, expert_bytes, bank_index, row_offset)
                     )
-                    row_offset += expert_bytes * (2 if widens else 1)
+                    row_offset += expert_bytes
+                    taken.append((fused_role, index))
                 if row_offset != spec.nbytes:
                     raise ValueError(
                         f"{prefix}{self.expert_infix}{role}: checkpoint parts "
-                        f"{[(part.shape, part.dtype) for part in parts]} do not make a "
-                        f"{spec.shape} {spec.dtype} bank row"
+                        f"{[roles[fused_role][index].shape for fused_role, index in parts]} do "
+                        f"not make a {spec.shape} {spec.dtype} bank row"
                     )
+            every_part = [
+                (role, index) for role, tensors in roles.items() for index in range(len(tensors))
+            ]
+            if sorted(taken) != sorted(every_part):
+                raise ValueError(
+                    f"{prefix}{self.expert_infix}: banks {sorted(layout)} do not take each "
+                    f"checkpoint part of {sorted(roles)} once"
+                )
             table.append(segments)
         if len({len(segments) for segments in table}) != 1:
             raise ValueError("MoE layers split their expert banks into different checkpoint parts")

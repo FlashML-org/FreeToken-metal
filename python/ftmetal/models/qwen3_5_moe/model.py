@@ -83,7 +83,8 @@ class Qwen3_5DecoderLayer(BaseOP):
             config,
             layer_id,
             experts_schemes=ExpertSchemes(
-                *schemes_of(config, f"{mlp_prefix}.experts", (*GATE_UP_PARTS, "down_proj"))
+                *schemes_of(config, f"{mlp_prefix}.experts", (*GATE_UP_PARTS, "down_proj")),
+                is_gate_up_apart=config.is_expert_gate_up_apart,
             ),
             gate_scheme=scheme_of(config, f"{mlp_prefix}.gate"),
             shared_gate_up_schemes=schemes_of(config, f"{mlp_prefix}.shared_expert", GATE_UP_PARTS),

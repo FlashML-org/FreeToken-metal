@@ -133,14 +133,12 @@ ExpertService::ExpertService(
       const ExpertSegment& segment = segments_[layer_id * segments_per_layer_ + s];
       if (segment.file_index < 0 || segment.file_index >= static_cast<int64_t>(files.size()) ||
           segment.bank_index < 0 || segment.bank_index >= num_banks ||
-          segment.file_offset < 0 || segment.expert_bytes < 1 ||
-          (segment.widens != 0 && segment.widens != 1)) {
+          segment.file_offset < 0 || segment.expert_bytes < 1) {
         throw std::invalid_argument(
             "ExpertService: segment " + std::to_string(s) + " of layer " +
-            std::to_string(layer_id) + " names no file or bank, an empty range or no widening");
+            std::to_string(layer_id) + " names no file or bank or an empty range");
       }
-      int64_t row_bytes = segment.expert_bytes * (segment.widens ? 2 : 1);
-      pieces.emplace_back(segment.bank_index, segment.row_offset, row_bytes);
+      pieces.emplace_back(segment.bank_index, segment.row_offset, segment.expert_bytes);
     }
     std::sort(pieces.begin(), pieces.end());
     std::vector<int64_t> covered(num_banks, 0);
@@ -355,21 +353,11 @@ void ExpertService::read(const ReadTask& task, uint8_t* staging) {
     int64_t expert_begin = segment.file_offset + expert * segment.expert_bytes;
     int64_t piece_begin = std::max(task.begin, expert_begin);
     int64_t piece_end = std::min(task.end, expert_begin + segment.expert_bytes);
-    const uint8_t* source = staging + (piece_begin - aligned_begin);
     int64_t row = row_zero + batch.index_of_expert[expert] * row_bytes + segment.row_offset;
-    if (segment.widens) {
-      // MLX packs code i of a row into bits 4 * (i % 8) of word i / 8: low nibble first.
-      uint8_t* target = bank_data_[segment.bank_index] + row + 2 * (piece_begin - expert_begin);
-      for (int64_t i = 0; i < piece_end - piece_begin; ++i) {
-        target[2 * i] = source[i] & 0xF;
-        target[2 * i + 1] = source[i] >> 4;
-      }
-    } else {
-      std::memcpy(
-          bank_data_[segment.bank_index] + row + (piece_begin - expert_begin),
-          source,
-          piece_end - piece_begin);
-    }
+    std::memcpy(
+        bank_data_[segment.bank_index] + row + (piece_begin - expert_begin),
+        staging + (piece_begin - aligned_begin),
+        piece_end - piece_begin);
   }
 }
 

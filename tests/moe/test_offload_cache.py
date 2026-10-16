@@ -5,16 +5,17 @@ equal, byte for byte, the expert's row of apply_rules(load_checkpoint(...)): aft
 initial fill, after each ensure_experts call of a hand-written script (each returned slot,
 and every slot slot_of maps), and at every slot of a prefetched prefill layer's slot map,
 whose resident experts keep their slots. Large experts make one run of reads longer than
-a staging buffer; gate and up in different bits load as two banks; one pool for every layer
-and prefill buffers over the pools (which drop the experts under them as a prefill begins)
-take the same checks. Errors: a layer in another format, the prefill buffer protocol, a
-file cut short under the cache. The real-checkpoint case needs FTMETAL_TEST_MODEL_PATH.
+a staging buffer; gate and up in different bits load as two banks in every layer; one pool
+for every layer and prefill buffers over the pools (which drop the experts under them as a
+prefill begins) take the same checks. Errors: a layer in another format, the prefill
+buffer protocol, a file cut short under the cache. The real-checkpoint case needs
+FTMETAL_TEST_MODEL_PATH.
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import mlx.core as mx
@@ -23,7 +24,7 @@ import pytest
 from mlx.utils import tree_flatten
 
 from ftmetal.engine.config import EngineConfig
-from ftmetal.layers.moe import ExpertSchemes, MoELayer, align_gate_up, moe_layout
+from ftmetal.layers.moe import ExpertSchemes, MoELayer, moe_layout
 from ftmetal.layers.quantization.config import AffineScheme
 from ftmetal.models.loader import apply_rules, load_checkpoint
 from ftmetal.models.qwen3_5_moe.model import schemes_of
@@ -42,8 +43,6 @@ from offload_harness import (
 )
 
 MODEL_PATH = os.environ.get("FTMETAL_TEST_MODEL_PATH")
-# The parts of gate_up_proj when the checkpoint keeps them apart.
-GATE_UP = ("gate_proj", "up_proj")
 # One decode step: the (layer, distinct expert ids) calls of ensure_experts, in order.
 Step = tuple[tuple[int, tuple[int, ...]], ...]
 
@@ -188,19 +187,7 @@ CASES = [
         last_layer_bits=8,
         grouping="unified",
     ),
-    # Gate in 8 bits, up widened to them: the widened part ends the row.
-    Case(
-        3,
-        8,
-        192,
-        64,
-        18,
-        True,
-        script=(((0, (0, 5)), (2, (1, 2))), Prefill((0, 1, 2)), ((2, (6, 0)), (1, (3,)))),
-        scheme=AffineScheme(8, 64),
-        up_bits=4,
-    ),
-    # Up in 8 bits, gate widened to them, and the last layer in 8 bits too.
+    # Up in 8 bits, and the last layer all in 8, its gate and up apart like the others'.
     Case(
         3,
         8,
@@ -264,27 +251,15 @@ def expected_rows(
     layers: list[int] | None = None,
 ) -> dict[int, dict[str, np.ndarray]]:
     """Per layer (of layers, all by default), role -> uint8 [E, row bytes]: each expert's bank
-    row as the cache holds it, gate and up fused, a 4-bit part widened to 8 bits (one code per
-    byte)."""
+    row as the cache holds it."""
     rows = {}
     for layer_id in range(cache.num_layers) if layers is None else layers:
         layout = cache.slot_layout.pools[cache.layer_pools[layer_id]].layout
         experts = f"{prefixes[layer_id]}.experts"
         layer_rows = {}
-        for role, spec in layout.items():
-            projection, _, leaf = role.rpartition(".")
-            if f"{experts}.{role}" in reference:
-                parts = [reference[f"{experts}.{role}"]]
-            else:
-                # The checkpoint stores gate and up in two formats.
-                parts = [reference[f"{experts}.{projection}.{part}.{leaf}"] for part in GATE_UP]
-            row_parts = []
-            for part in parts:
-                data = np.array(part.view(mx.uint8)).reshape(part.shape[0], -1)
-                if spec.dtype == mx.uint32 and part.shape[2] != spec.shape[1]:
-                    data = np.stack([data & 0xF, data >> 4], axis=-1).reshape(part.shape[0], -1)
-                row_parts.append(data)
-            layer_rows[role] = np.concatenate(row_parts, axis=1)
+        for role in layout:
+            bank = reference[f"{experts}.{role}"]
+            layer_rows[role] = np.array(bank.view(mx.uint8)).reshape(bank.shape[0], -1)
         rows[layer_id] = layer_rows
     return rows
 
@@ -435,11 +410,25 @@ def test_expert_bank_matches_moe_layout() -> None:
         "down_proj.scales": ((8, 128, 1), mx.bfloat16),
         "down_proj.biases": ((8, 128, 1), mx.bfloat16),
     }
+    # Gate and up in one scheme, kept apart: two 4-bit banks.
+    apart = {
+        **{
+            f"gate_up_proj.{part}.{array}": (shape, dtype)
+            for part in ("gate_proj", "up_proj")
+            for array, (shape, dtype) in [
+                ("weight", ((8, 64, 16), mx.uint32)),
+                ("scales", ((8, 64, 2), mx.bfloat16)),
+                ("biases", ((8, 64, 2), mx.bfloat16)),
+            ]
+        },
+        **{key: value for key, value in affine.items() if key.startswith("down_proj")},
+    }
     four, eight = AffineScheme(4, 64), AffineScheme(8, 64)
     for schemes, expected in [
         (ExpertSchemes.uniform(four), affine),
         (ExpertSchemes.uniform(None), bf16),
         (ExpertSchemes(four, eight, four), split),
+        (ExpertSchemes(four, four, four, is_gate_up_apart=True), apart),
     ]:
         layer = MoELayer(8, 2, 128, 64, schemes=schemes, dtype=mx.bfloat16)
         parameters = {
@@ -459,18 +448,19 @@ def test_real_checkpoint_rows() -> None:
     model_config = config.model_config
     rules = model_weight_rules(config.architecture, model_config)
     source = ExpertSource(MODEL_PATH, rules)
+    # The engine's offload layout: gate and up apart in every layer once one keeps them apart.
+    is_apart = any(rules.is_expert(module) for module in rules.unfused)
     layouts = [
         moe_layout(
             model_config.hidden_size,
             model_config.moe_intermediate_size,
-            align_gate_up(
-                ExpertSchemes(
-                    *schemes_of(
-                        model_config,
-                        f"model.layers.{layer_id}.mlp.experts",
-                        (*GATE_UP_PARTS, "down_proj"),
-                    )
-                )
+            ExpertSchemes(
+                *schemes_of(
+                    model_config,
+                    f"model.layers.{layer_id}.mlp.experts",
+                    (*GATE_UP_PARTS, "down_proj"),
+                ),
+                is_gate_up_apart=is_apart,
             ),
             mx.bfloat16,
         )
@@ -492,6 +482,9 @@ def test_real_checkpoint_rows() -> None:
         prefill_overlap=False,
         prefill_overlap_min_tokens=128,
     )
+    if is_apart:
+        apart = {f"{prefix}.experts.gate_up_proj" for prefix in source.layer_prefixes}
+        rules = replace(rules, unfused=rules.unfused | apart)
     reference = apply_rules(load_checkpoint(MODEL_PATH), rules)
     checked = [(0, [0, 1, 2, source.num_experts - 1])]
     checked += [(layer_id, [17, 18, 100]) for layer_id in range(1, source.num_layers)]

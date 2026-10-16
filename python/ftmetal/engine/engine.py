@@ -212,9 +212,17 @@ class Engine:
             costs=costs,
             encoder=encoder_reserve,
         )
-        model_config = dataclasses.replace(config.model_config, moe_strategy=moe_strategy)
-        self.model_config = model_config
         is_offload = moe_strategy == "offload"
+        # The offload cache's layers share one set of banks.
+        is_expert_gate_up_apart = is_offload and any(
+            rules.is_expert(module) for module in rules.unfused
+        )
+        model_config = dataclasses.replace(
+            config.model_config,
+            moe_strategy=moe_strategy,
+            is_expert_gate_up_apart=is_expert_gate_up_apart,
+        )
+        self.model_config = model_config
         # Prefill overlap reads layer L + 1 into one prefill buffer while layer L reads the other.
         prefill_overlap = (
             is_offload and config.moe_prefill_overlap and model_config.num_moe_layers >= 2

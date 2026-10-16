@@ -5,13 +5,12 @@ so there are no host banks: one raw byte buffer per bank role holds the cache's 
 (each pool's in its layers' layout), filled straight from the checkpoint files by
 _C.ExpertService (in C++: a token-granular LRU per pool of slots, the IO threads, the two
 prefill buffers), laid out by moe/slot_pools.py (FreeToken's slot pool design, its pools of
-one slot width placed smallest first, not in layer order); a layer whose gate and up the
-checkpoint stores in two formats gets them in the wider one (align_gate_up); slot_of and
-last_use are shared arrays the C++ side writes in place; ensure_experts takes the forward's
-step and returns the slots; prefetch_prefill_layer returns where each of the layer's
-experts lies (resident experts in their slots, only the absent read into the prefill
-buffer) instead of copying a whole layer, which the expert-sorted gather reads at byte
-offsets. Decode and short prefills look their experts up on the GPU (kernel/moe_lookup.py):
+one slot width placed smallest first, not in layer order; the layers' layouts share their
+banks); slot_of and last_use are shared arrays the C++ side writes in place; ensure_experts
+takes the forward's step and returns the slots; prefetch_prefill_layer returns where each
+of the layer's experts lies (resident experts in their slots, only the absent read into
+the prefill buffer) instead of copying a whole layer, which the expert-sorted gather reads
+at byte offsets. Decode and short prefills look their experts up on the GPU (kernel/moe_lookup.py):
 misses go to the C++ coordinator through a mailbox instead of FreeToken's per-layer
 ready/done flags, with a watchdog (FreeToken cpu_executor.py) failing an unanswered
 request. Each forward is prepared like an attention backend's metadata: a decode, or a

@@ -285,8 +285,8 @@ NB_MODULE(_C, m) {
              int io_threads,
              double stall_timeout_s,
              bool run_coordinator) {
-            if (segments.shape(0) != static_cast<size_t>(num_layers) || segments.shape(2) != 6) {
-              throw std::invalid_argument("ExpertService: segments must be int64 [num_layers, n, 6]");
+            if (segments.shape(0) != static_cast<size_t>(num_layers) || segments.shape(2) != 5) {
+              throw std::invalid_argument("ExpertService: segments must be int64 [num_layers, n, 5]");
             }
             if (destinations.shape(0) != static_cast<size_t>(num_layers) ||
                 destinations.shape(1) != banks.size() || destinations.shape(2) != 2) {
@@ -296,8 +296,8 @@ NB_MODULE(_C, m) {
             std::vector<ftmetal::ExpertSegment> table(segments.shape(0) * segments.shape(1));
             const int64_t* row = segments.data();
             for (ftmetal::ExpertSegment& segment : table) {
-              segment = {row[0], row[1], row[2], row[3], row[4], row[5]};
-              row += 6;
+              segment = {row[0], row[1], row[2], row[3], row[4]};
+              row += 5;
             }
             new (service) ftmetal::ExpertService(
                 num_layers,

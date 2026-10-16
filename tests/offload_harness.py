@@ -23,7 +23,7 @@ from typing import Literal
 import mlx.core as mx
 import numpy as np
 
-from ftmetal.layers.moe import ExpertSchemes, align_gate_up, moe_layout
+from ftmetal.layers.moe import ExpertSchemes, moe_layout
 from ftmetal.layers.quantization.config import AffineScheme, BankSpec
 from ftmetal.models.loader import FuseRule, WeightRules
 from ftmetal.moe.offload_cache import STALL_TIMEOUT_S, OffloadMoeCache
@@ -79,8 +79,9 @@ def weight_rules(naming: Naming) -> WeightRules:
 
 
 def layer_layouts(spec: CheckpointSpec) -> list[dict[str, BankSpec]]:
-    """Each layer's bank arrays per expert as the offload cache holds them, gate and up in one
-    scheme."""
+    """Each layer's bank arrays per expert as the offload cache holds them: gate and up apart
+    in every layer when up_bits sets them apart."""
+    is_apart = spec.expert_schemes.gate != spec.expert_schemes.up
     layouts = []
     for layer_id in range(spec.num_layers):
         schemes = spec.expert_schemes
@@ -89,14 +90,14 @@ def layer_layouts(spec: CheckpointSpec) -> list[dict[str, BankSpec]]:
             schemes = ExpertSchemes.uniform(
                 AffineScheme(spec.last_layer_bits, spec.scheme.group_size)
             )
-        if schemes.gate is not None:
-            schemes = align_gate_up(schemes)
+        schemes = replace(schemes, is_gate_up_apart=is_apart)
         layouts.append(moe_layout(spec.hidden_size, spec.intermediate_size, schemes, mx.bfloat16))
     return layouts
 
 
 def checkpoint_rules(spec: CheckpointSpec) -> WeightRules:
-    """The rules the engine derives for the checkpoint: gate and up apart when they differ."""
+    """The rules of the checkpoint's reference state: every layer's gate and up apart when
+    they differ, as the offload cache holds them."""
     rules = weight_rules(spec.naming)
     schemes = spec.expert_schemes
     if schemes.gate == schemes.up:

@@ -1,9 +1,8 @@
 // ExpertService: the CPU side of the routed-expert slot cache. It owns the SlotLru and a
 // pool of IO threads that read expert rows straight from the checkpoint into the bank
 // slots: raw read-around (each read widened to 4 KiB boundaries, F_NOCACHE, no read-ahead)
-// into a per-thread aligned staging buffer, then one memcpy per expert into its row (a
-// widening copy for a 4-bit part of an 8-bit row). A run of consecutive experts of one
-// checkpoint segment is one read. Idle threads block; a
+// into a per-thread aligned staging buffer, then one memcpy per expert into its row. A run
+// of consecutive experts of one checkpoint segment is one read. Idle threads block; a
 // caller waits for its reads by spinning on a completion counter. A coordinator thread
 // answers the GPU lookups' mailbox requests (see moe_lookup.h) with the same reads, and a
 // watchdog thread fails a request the coordinator leaves unanswered. Public methods other
@@ -32,15 +31,13 @@ constexpr int64_t EXPERT_STAGING_BYTES = 8 << 20;
 
 // One checkpoint part of one bank, per MoE layer: expert e's bytes are
 // [file_offset + e * expert_bytes, file_offset + (e + 1) * expert_bytes) of file
-// file_index, and land at row_offset in a row of bank bank_index; widens 1 widens each
-// 4-bit code to a byte (twice the bytes in the row), 0 copies them as they are.
+// file_index, and land at row_offset in a row of bank bank_index.
 struct ExpertSegment {
   int64_t file_index;
   int64_t file_offset;
   int64_t expert_bytes;
   int64_t bank_index;
   int64_t row_offset;
-  int64_t widens;
 };
 
 // Per MoE layer. hits and misses count the experts of ensure_experts and of the answered

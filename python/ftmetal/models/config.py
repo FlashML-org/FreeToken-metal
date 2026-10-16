@@ -165,6 +165,9 @@ class ModelConfig:
     image_token_id: int | None = None
     # Set by the engine before it builds the model; the checkpoint does not say.
     moe_strategy: MoeStrategy = "fused"
+    # Set with moe_strategy: routed gate and up apart in every layer, under offload when the
+    # checkpoint stores some layer's in two schemes.
+    is_expert_gate_up_apart: bool = False
 
     @property
     def is_moe(self) -> bool:

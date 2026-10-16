@@ -11,9 +11,10 @@ beside dedicated buffers runs of 5 (one row, one token); one pool beside dedicat
 is 20 slots, a step per layer. Cases: decode replayed and eager; copy-miss and overlap
 prefills (the overlap threshold knob lowered so tiny prompts take it), the chunks of one
 prompt on both sides of the threshold, a prompt chunked through overlap prefills; two
-requests decoding together, and three; prefill overlap off, with no buffers; up in 8 bits
-(the offload cache widens gate to them) on a replayed decode and an overlap prefill; the
-last layer's experts in 8 bits, one pool per layout or per layer.
+requests decoding together, and three; prefill overlap off, with no buffers; layer 0's up
+in 8 bits (its gate and up apart when resident, every layer's under offload) on a replayed
+decode and an overlap prefill; the last layer's experts in 8 bits, one pool per layout or
+per layer.
 """
 
 from __future__ import annotations
@@ -61,6 +62,7 @@ class Case:
     max_decode_rows: int = 3
     # Whether some prefill reads layers ahead into the prefill buffers.
     reads_buffers: bool = False
+    # Bits of layer 0's up projection.
     up_bits: int = EXPERT_BITS
     last_layer_bits: int = EXPERT_BITS
 
@@ -128,12 +130,13 @@ def is_expert_projection(module_path: str, module: nn.Module) -> bool:
 
 
 def write_checkpoint(path: Path, up_bits: int, last_layer_bits: int) -> None:
-    """The reference model with its experts alone affine quantized, up in up_bits, the last
-    layer's in last_layer_bits."""
+    """The reference model with its experts alone affine quantized, layer 0's up in up_bits,
+    the last layer's in last_layer_bits."""
     model = build_reference(seed=11, text_config=OFFLOAD_TEXT_CONFIG)
     num_layers = OFFLOAD_TEXT_CONFIG["num_hidden_layers"]
     assert isinstance(num_layers, int)
     last_layer = f"language_model.model.layers.{num_layers - 1}.mlp.switch_mlp"
+    first_up = "language_model.model.layers.0.mlp.switch_mlp.up_proj"
     up = {"group_size": EXPERT_GROUP_SIZE, "bits": up_bits}
     last = {"group_size": EXPERT_GROUP_SIZE, "bits": last_layer_bits}
 
@@ -143,7 +146,7 @@ def write_checkpoint(path: Path, up_bits: int, last_layer_bits: int) -> None:
         elif module_path.startswith(last_layer):
             return last
         else:
-            return up if module_path.endswith("up_proj") else True
+            return up if module_path == first_up else True
 
     nn.quantize(model, group_size=EXPERT_GROUP_SIZE, bits=EXPERT_BITS, class_predicate=predicate)
     mx.eval(model.parameters())
@@ -152,9 +155,7 @@ def write_checkpoint(path: Path, up_bits: int, last_layer_bits: int) -> None:
         "bits": EXPERT_BITS,
         "mode": "affine",
     }
-    quantization.update(
-        {f"language_model.model.layers.{i}.mlp.switch_mlp.up_proj": up for i in range(num_layers)}
-    )
+    quantization[first_up] = up
     quantization.update({f"{last_layer}.{projection}": last for projection in PROJECTIONS})
     save_checkpoint(model, path, quantization=quantization)
 
@@ -222,8 +223,11 @@ def test_offload_matches_resident_experts(
     # Dedicated buffers take two layers of the slots out of the pools.
     dedicated = 2 * NUM_EXPERTS if case.buffer_placement == "dedicated" else 0
     assert cache.cache_size == case.cache_size - dedicated
-    # Gate and up in one scheme, the wider.
-    assert all("gate_up_proj.weight" in pool.layout for pool in cache.slot_layout.pools)
+    # One layer's gate and up apart puts every layer's apart.
+    is_apart = case.up_bits != EXPERT_BITS
+    assert all(
+        ("gate_up_proj.weight" not in pool.layout) == is_apart for pool in cache.slot_layout.pools
+    )
     assert cache.slot_layout.max_decode_rows == case.max_decode_rows
     max_running = max(2, len(case.prompt_lens))
     assert len(scheduler.table_manager.free_slots) == min(max_running, case.max_decode_rows)
