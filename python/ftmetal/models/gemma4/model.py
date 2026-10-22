@@ -1,11 +1,13 @@
 """Gemma4 decoder: sliding-window and global attention, dense or shared + routed MoE.
 
-Port of FreeToken models/gemma4/model.py (and Gemma4MLP / Gemma4DenseMLP of its moe.py).
-Divergences: the batch flows through forward explicitly; the feed-forward sandwich runs
-unfused in the decoder layer, which holds its norms, router and experts as the
-checkpoint lays them out; each Linear takes its affine scheme from the checkpoint's
-quantization map at construction; the final logit softcap runs in the logits' dtype; the
-experts are always resident (no offload strategy yet).
+Port of FreeToken models/gemma4/model.py (and Gemma4MLP / Gemma4DenseMLP of its moe.py),
+with the encode of its Gemma4ForConditionalGeneration. Divergences: the batch flows through
+forward explicitly; the feed-forward sandwich runs unfused in the decoder layer, which holds
+its norms, router and experts as the checkpoint lays them out; each Linear takes its affine
+scheme from the checkpoint's quantization map at construction; the final logit softcap runs
+in the logits' dtype; the experts are always resident (no offload strategy yet); one class
+serves both architectures and builds the vision tower when the config has one, in the engine
+dtype.
 """
 
 from __future__ import annotations
@@ -20,34 +22,25 @@ from ftmetal.layers.embedding import Embedding
 from ftmetal.layers.linear import Linear
 from ftmetal.layers.moe import ExpertSchemes, MoELayer
 from ftmetal.layers.norm import RMSNorm
-from ftmetal.layers.quantization.config import AffineScheme
-from ftmetal.models.blocks import BaseLLMModel, select_last_rows
+from ftmetal.mm.item import MMItem
+from ftmetal.models.blocks import BaseLLMModel, embed_input_ids, select_last_rows
 from ftmetal.models.config import ModelConfig
 from ftmetal.models.gemma4.attention import Gemma4Attention
 from ftmetal.models.gemma4.moe import Gemma4GatedMLP, Gemma4Router
+from ftmetal.models.gemma4.vision import (
+    Gemma4MultimodalEmbedder,
+    Gemma4VisionModel,
+    parse_vision_config,
+)
 from ftmetal.models.gemma4.weight import (
     GATE_UP_PARTS,
     QK_PARTS,
     QKV_PARTS,
     checkpoint_prefix,
     k_eq_v_layer_ids,
+    scheme_of,
+    schemes_of,
 )
-
-
-def scheme_of(config: ModelConfig, checkpoint_module: str) -> AffineScheme | None:
-    if config.quant is None:
-        return None
-    return config.quant.scheme_for(checkpoint_module)
-
-
-def schemes_of(
-    config: ModelConfig, parent_module: str, parts: tuple[str, ...]
-) -> list[AffineScheme | None]:
-    """The scheme of each part (a checkpoint module name under parent_module) of a fused
-    module; they fuse only when all agree."""
-    if config.quant is None:
-        return [None] * len(parts)
-    return config.quant.schemes_for([f"{parent_module}.{part}" for part in parts])
 
 
 @partial(mx.compile, shapeless=True)
@@ -135,7 +128,7 @@ class Gemma4Model(BaseOP):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
 
     def forward(self, batch: Batch) -> mx.array:
-        x = self.embed_tokens.forward(batch.input_ids) * self.embedding_scale
+        x = embed_input_ids(self.embed_tokens, batch, self.embedding_scale)
         for layer in self.layers:
             x = layer.forward(x, batch)
         return self.norm.forward(x)
@@ -158,6 +151,10 @@ class Gemma4ForCausalLM(BaseLLMModel):
                 scheme=scheme_of(config, f"{checkpoint_prefix(config)}lm_head"),
                 dtype=dtype,
             )
+        if config.vision_config is not None:
+            vision = parse_vision_config(config.vision_config)
+            self.vision_tower = Gemma4VisionModel(config, vision, dtype=dtype)
+            self.embed_vision = Gemma4MultimodalEmbedder(config, vision, dtype=dtype)
 
     def forward(self, batch: Batch) -> mx.array:
         hidden = select_last_rows(self.model.forward(batch), batch)
@@ -169,6 +166,15 @@ class Gemma4ForCausalLM(BaseLLMModel):
         if cap is None:
             return logits
         return logit_softcap(logits, mx.array(cap, dtype=logits.dtype))
+
+    def encode(self, item: MMItem) -> mx.array:
+        """[item.num_soft_tokens, hidden] text-space embeddings of one image."""
+        assert item.feature is not None and item.position_ids is not None
+        assert item.num_soft_tokens is not None
+        soft_tokens = self.vision_tower.forward(
+            mx.array(item.feature), item.position_ids, item.num_soft_tokens
+        )
+        return self.embed_vision.forward(soft_tokens)
 
 
 __all__ = ["Gemma4DecoderLayer", "Gemma4ForCausalLM", "Gemma4Model"]

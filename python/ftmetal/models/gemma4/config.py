@@ -1,9 +1,10 @@
-"""Gemma4 config parsing from an MLX checkpoint's config.json (text model only).
+"""Gemma4 config parsing from an MLX checkpoint's config.json.
 
 Port of FreeToken models/gemma4/config.py. Divergences: reads the MLX checkpoint
-dictionary (text_config or top level) and its affine quantization map; the vision tower
-is not served; the global layers' kv heads follow the parity reference (the global count
-only with attention_k_eq_v); KV sharing and per-layer inputs (Gemma4-E2B/E4B) are refused.
+dictionary (text_config or top level) and its affine quantization map; vision_config stays
+the raw section, which the tower parses; the global layers' kv heads follow the parity
+reference (the global count only with attention_k_eq_v); KV sharing and per-layer inputs
+(Gemma4-E2B/E4B) and bidirectional attention on every token are refused.
 """
 
 from __future__ import annotations
@@ -62,6 +63,9 @@ def parse_config(config: dict[str, object], quant: QuantConfig | None = None) ->
         raise ValueError("Gemma4 KV sharing (num_kv_shared_layers) is not served")
     if config_int(text, "hidden_size_per_layer_input", 0) != 0:
         raise ValueError("Gemma4 per-layer inputs (hidden_size_per_layer_input) are not served")
+    bidirectional = config_optional_str(text, "use_bidirectional_attention")
+    if bidirectional not in (None, "vision"):
+        raise ValueError(f"Gemma4 use_bidirectional_attention {bidirectional!r} is not served")
     types = layer_types(text)
     full_ids = tuple(i for i, layer_type in enumerate(types) if layer_type == FULL_TYPE)
     swa_ids = tuple(i for i, layer_type in enumerate(types) if layer_type != FULL_TYPE)
@@ -96,6 +100,8 @@ def parse_config(config: dict[str, object], quant: QuantConfig | None = None) ->
             head_dim=swa_head_dim,
             rotary_config=swa_rotary,
             sliding_window=config_int(text, "sliding_window"),
+            # Only the window layers: the global layers stay causal over image tokens too.
+            bidirectional_mm_blocks=bidirectional == "vision",
         ),
     )
     num_experts = config_optional_int(text, "num_experts") or 0
@@ -126,6 +132,8 @@ def parse_config(config: dict[str, object], quant: QuantConfig | None = None) ->
         attn_sm_scale=1.0,
         final_logit_softcapping=config_optional_float(text, "final_logit_softcapping"),
         embedding_scale=float(hidden_size) ** 0.5,
+        vision_config=config_dict(config, "vision_config"),
+        image_token_id=config_optional_int(config, "image_token_id"),
     )
 
 
