@@ -90,6 +90,7 @@ class FullAttnMetalBackend(FullAttnBackend):
                 self.table_page_size,
                 self.scale,
                 self.sliding_window,
+                block_ends=metadata.block_ends,
             )
 
 

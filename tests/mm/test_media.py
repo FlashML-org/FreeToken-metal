@@ -18,7 +18,7 @@ from ftmetal.mm import media
 from ftmetal.mm.config import ENCODER_KINDS, EncoderKind, MultimodalConfig
 from ftmetal.mm.media import collect_image_refs, fetch_image_bytes, image_reject_reason
 from ftmetal.server.args import ServerArgs
-from tiny_vl_model import register_vision_encoder, write_gemma4_model
+from tiny_vl_model import drop_vision_encoder, write_gemma4_model
 
 
 def png_bytes() -> bytes:
@@ -70,8 +70,8 @@ def test_reject_reason_follows_the_served_modalities(
     reason: str | None,
 ) -> None:
     write_gemma4_model(tmp_path)
-    if has_encoder:
-        register_vision_encoder(monkeypatch, "Gemma4ForConditionalGeneration")
+    if not has_encoder:
+        drop_vision_encoder(monkeypatch, "Gemma4ForConditionalGeneration")
     config = ServerArgs(
         model_path=str(tmp_path), mm=MultimodalConfig(disabled_encoders=disabled_encoders)
     )

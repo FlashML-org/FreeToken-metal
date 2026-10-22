@@ -10,7 +10,8 @@ snapshot, which stays at or below the prompt's reusable prefix end so a next tur
 there, a finish donates its live slot, and both currencies evict under pressure; with a
 window pool the SWA radix commit keeps the windows a next prompt can resume from, and the
 window slots evict on their own; naive with a GDN state pool holds one zeroed live slot per
-running request and gives it back on finish and abort. Parts port FreeToken
+running request and gives it back on finish and abort; a fresh admission that gets no first
+chunk for any reason but an image waiting for its own pass fails. Parts port FreeToken
 tests/scheduler/test_hybrid_cache_manager.py, test_commit_repoints_page_table.py,
 test_swa_commit_lock_and_floor.py and test_swa_pagesize.py, on tiny real pools.
 """
@@ -317,6 +318,27 @@ def test_without_a_prefix_cache_chunks_are_not_aligned() -> None:
     )
     req = adder.try_add_one(pending)
     assert req is not None and req.extend_len == 100
+
+
+def test_a_fresh_admission_without_a_first_chunk_fails_loudly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Admission seats the first chunk's window slots, so a text prompt it admits always gets
+    one; if that breaks, the admission fails instead of being undone and retried each pass."""
+    page_table = np.zeros((4, 512), dtype=np.int32)
+    manager = CacheManager(64, 32, page_table, "naive")
+    table = TableManager(max_running_reqs=4, page_table=page_table)
+    adder = PrefillAdder(
+        token_budget=100,
+        reserved_size=0,
+        cache_manager=manager,
+        table_manager=table,
+        keep_images_whole=True,
+    )
+    monkeypatch.setattr(adder, "add_one_req", lambda *_args, **_kwargs: None)
+    pending = PendingReq(0, np.arange(300, dtype=np.int32), SamplingParams(max_tokens=1))
+    with pytest.raises(AssertionError, match="admission seats the first chunk's window slots"):
+        adder.try_add_one(pending)
 
 
 def radix_manager(num_pages: int = 16, page_size: int = 4) -> tuple[CacheManager, np.ndarray]:

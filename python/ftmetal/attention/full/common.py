@@ -8,11 +8,12 @@ fresh mx.arrays each step, out_loc is computed here, and the kernel implementati
 subclass's attend(); one backend instance serves one type, FULL over MHAKVCache or SWA
 over SWAKVCache, whose rows hold only the keys a step's windows reach, translated to
 window slots, so the kernels never see out-of-window keys (FreeToken translates the whole
-row and masks). prepare_for_replay swaps a decode batch's page table for its graph's
-fixed width (FULL: the requests' whole page-table rows; SWA: the window) and max_seqlen_k
-for that width (a window decode row is built that wide), so the flash-decode partition
-count is fixed per graph; entries past a request's keys are stale but in bounds and
-never read.
+row and masks); a window layer type that attends within images carries the batch's block
+ends in row positions on its metadata. prepare_for_replay swaps a decode batch's page table
+for its graph's fixed width (FULL: the requests' whole page-table rows; SWA: the window)
+and max_seqlen_k for that width (a window decode row is built that wide), so the
+flash-decode partition count is fixed per graph; entries past a request's keys are stale
+but in bounds and never read.
 """
 
 from __future__ import annotations
@@ -56,6 +57,9 @@ class FullAttnMetadata(BaseAttnMetadata):
     cached_lens_host: list[int]
     # SWA: the window slots this step's keys are stored at; FULL stores at batch.out_loc.
     out_loc: mx.array | None = None
+    # Prefill on a bidirectional layer type, int32 [num_tokens]: where each query's image span
+    # ends in its row's positions (0 for text); None when the step has no image token.
+    block_ends: mx.array | None = None
 
     def get_last_indices(self, bs: int) -> mx.array:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
@@ -82,6 +86,7 @@ class FullAttnBackend(BaseAttnBackend):
         self.config = config
         self.attn_type = spec.attn_type
         self.sliding_window = spec.sliding_window
+        self.bidirectional_mm_blocks = spec.bidirectional_mm_blocks
         self.kvcache = kvcache
         self.page_table_host = page_table
         self.page_size = page_size
@@ -129,7 +134,7 @@ class FullAttnBackend(BaseAttnBackend):
             offset += req.extend_len
         batch.out_loc = mx.array(out_loc)
         batch.attn_metadata[AttnType.FULL] = self.new_metadata(
-            page_table, seq_lens, extend_lens, cached_lens, None
+            page_table, seq_lens, extend_lens, cached_lens, None, None
         )
 
     def prepare_window_metadata(self, batch: Batch, pool: SWAKVCache) -> None:
@@ -148,8 +153,21 @@ class FullAttnBackend(BaseAttnBackend):
             page_table[i, : len(slots)] = slots
             out_loc[offset : offset + req.extend_len] = slots[cached_lens[i] :]
             offset += req.extend_len
+        block_ends = batch.mm_block_ends
+        if self.bidirectional_mm_blocks and block_ends is not None:
+            # In row positions: each row starts at its window's first key.
+            token_starts = np.repeat(starts, extend_lens)
+            row_block_ends = np.where(block_ends > 0, block_ends - token_starts, 0)
+            window_block_ends = mx.array(row_block_ends.astype(np.int32))
+        else:
+            window_block_ends = None
         batch.attn_metadata[AttnType.SWA] = self.new_metadata(
-            page_table, seq_lens, extend_lens, cached_lens, mx.array(out_loc)
+            page_table,
+            seq_lens,
+            extend_lens,
+            cached_lens,
+            mx.array(out_loc),
+            window_block_ends,
         )
 
     def new_metadata(
@@ -159,6 +177,7 @@ class FullAttnBackend(BaseAttnBackend):
         extend_lens: list[int],
         cached_lens: list[int],
         out_loc: mx.array | None,
+        block_ends: mx.array | None,
     ) -> FullAttnMetadata:
         cu = np.zeros(len(extend_lens) + 1, dtype=np.int32)
         np.cumsum(extend_lens, out=cu[1:])
@@ -172,6 +191,7 @@ class FullAttnBackend(BaseAttnBackend):
             extend_lens_host=extend_lens,
             cached_lens_host=cached_lens,
             out_loc=out_loc,
+            block_ends=block_ends,
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: list[int]) -> None:

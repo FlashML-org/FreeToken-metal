@@ -7,8 +7,8 @@ LINEAR entry); padded_reqs starts as reqs and only the graph runner pads it; a R
 cache_handle is None while it locks no cached prefix; a Req carries reuse_len, where its
 prompt's reusable prefix ends (FreeToken has none); SamplingParams is greedy at
 temperature 0 or top-k 1 whatever top_p is (FreeToken also requires top_p == 1); a
-gather plan row is an MMGatherRow (mm/item.py), not a tuple; no mm_block_ends (no
-bidirectional image blocks are served).
+gather plan row is an MMGatherRow (mm/item.py), not a tuple; mm_block_ends is a host
+array, clamped to each request's keys, that the attention backends translate.
 """
 
 from __future__ import annotations
@@ -149,6 +149,8 @@ class Batch:
     mm_gather_plan: list[MMGatherRow] = field(default_factory=list, init=False)
     mm_embeds: mx.array | None = field(default=None, init=False)
     mm_rows: mx.array | None = field(default=None, init=False)
+    # Per batch token, int32: where its image span ends in its request's keys (0 for text).
+    mm_block_ends: np.ndarray | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self.padded_reqs = self.reqs

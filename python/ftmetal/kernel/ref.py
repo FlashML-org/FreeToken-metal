@@ -199,10 +199,12 @@ def flash_prefill_ref(
     page_size: int,
     scale: float,
     sliding_window: int | None = None,
+    block_ends: list[int] | None = None,
 ) -> mx.array:
     """fp32 SDPA of each request's queries in q [T, Hq, D] over its paged keys, causal from
-    its cached prefix and, with a sliding window W, limited to the last W keys; at most
-    PREFILL_REF_QUERY_ROWS queries per call bound the scores."""
+    its cached prefix, also seeing the keys before its block_ends entry when given, and,
+    with a sliding window W, limited to keys past p - W; at most PREFILL_REF_QUERY_ROWS
+    queries per call bound the scores."""
     offsets = mx.arange(page_size, dtype=mx.int32)
     outputs = []
     row = 0
@@ -214,14 +216,22 @@ def flash_prefill_ref(
         for start in range(0, extend_len, PREFILL_REF_QUERY_ROWS):
             stop = min(extend_len, start + PREFILL_REF_QUERY_ROWS)
             queries = q[row + start : row + stop].astype(mx.float32).transpose(1, 0, 2)[None]
-            visible = cached_len + stop
-            if sliding_window is None:
+            ends = [] if block_ends is None else block_ends[row + start : row + stop]
+            visible = max([cached_len + stop, *ends])
+            if sliding_window is None and block_ends is None:
                 # The causal mask aligns the last query with the last key.
                 mask: mx.array | str = "causal"
             else:
-                positions = mx.arange(cached_len + start, visible)[:, None]
+                positions = mx.arange(cached_len + start, cached_len + stop)[:, None]
                 key_positions = mx.arange(visible)[None, :]
-                mask = (key_positions <= positions) & (key_positions > positions - sliding_window)
+                causal = key_positions <= positions
+                seen = (
+                    causal
+                    if block_ends is None
+                    else causal | (key_positions < mx.array(ends)[:, None])
+                )
+                in_window = key_positions > positions - (sliding_window or visible)
+                mask = seen & in_window
             out = mx.fast.scaled_dot_product_attention(
                 queries, keys[:, :, :visible], values[:, :, :visible], scale=scale, mask=mask
             )

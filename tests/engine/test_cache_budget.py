@@ -3,7 +3,8 @@ for the hybrid radix cache and naive; and Gemma4-26B-A4B's window pool, a fixed 
 the global pages for naive and for the SWA radix cache. MoE offload on Qwen3.6-35B-A3B's
 checkpoint: what auto picks, the cache size each flag gives, and the experts line, on this
 box's budget and on fractions of it standing for 24 GB and 32 GB Macs; refused cache sizes
-and configs; the strategy resolution on a tiny checkpoint; Gemma4's refusal of offload.
+and configs; the strategy resolution on a tiny checkpoint; Gemma4's refusal of offload. The
+vision towers' reserves, and that the budget and the image processor import no model package.
 
 The expected numbers were computed by the engine's sizing before pools were created per
 attention type; the dispatch must reproduce them exactly from the same fixed budget.
@@ -14,7 +15,10 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import subprocess
+import sys
 from pathlib import Path
+from types import ModuleType
 from typing import Literal, NamedTuple
 
 import mlx.core as mx
@@ -41,10 +45,12 @@ from ftmetal.engine.engine import resolve_moe_strategy
 from ftmetal.kvcache import pool_costs
 from ftmetal.kvcache.base import PoolCost
 from ftmetal.models.config import MoeStrategy
+from ftmetal.models.gemma4 import vision as gemma4_vision
 from ftmetal.models.gemma4.config import parse_config as parse_gemma4_config
 from ftmetal.models.gemma4.model import Gemma4ForCausalLM
+from ftmetal.models.qwen3_5_moe import vision as qwen_vision
 from ftmetal.models.qwen3_5_moe.config import parse_config
-from ftmetal.models.register import model_weight_rules
+from ftmetal.models.register import GEMMA4_VISION, QWEN_VISION, EncoderSpec, model_weight_rules
 from ftmetal.moe.offload_cache import STAGING_BYTES
 from tiny_model import TINY_TEXT_CONFIG, build_reference, save_checkpoint
 
@@ -208,32 +214,43 @@ def test_graph_reserve_comes_off_the_paged_pools() -> None:
     assert lines.index("graphs          0.01 GiB") == lines.index("activations     5.25 GiB") + 1
 
 
-# Qwen3.6-35B-A3B's vision_config fields the encoder reserve reads.
-QWEN3_6_VISION_CONFIG: dict[str, object] = {
-    "in_channels": 3,
-    "temporal_patch_size": 2,
-    "patch_size": 16,
-    "hidden_size": 1152,
-    "intermediate_size": 4304,
-}
+# The vision_config fields the encoder reserve reads, the same in Qwen3.6-35B-A3B's and
+# Gemma-4-26B-A4B's towers, and both processors' feature row: 1536 bf16 values (Qwen) or 768
+# float32 ones (Gemma4).
+VISION_CONFIG: dict[str, object] = {"hidden_size": 1152, "intermediate_size": 4304}
+FEATURE_BYTES = 3072
 
 
-# (patches, the peak above the weights and the float32 pixels measured on Qwen3.6's tower in
-# bf16, which holds the pixels' bf16 cast): the reserve must cover the peak and bf16 pixels.
-ENCODER_PEAK_CASES: list[tuple[int, float]] = [(16384, 482.6 * MIB), (65536, 1802.4 * MIB)]
+# (tower, patches, the measured peak the reserve must cover). Qwen3.6's in bf16 above the
+# weights and the float32 pixels, plus their bf16 cast it holds; Gemma4's evaluated layer by
+# layer, above the weights, with 5% to spare.
+ENCODER_PEAK_CASES: list[tuple[str, EncoderSpec, int, float]] = [
+    ("qwen", QWEN_VISION, 16384, 482.6 * MIB + 16384 * FEATURE_BYTES),
+    ("qwen", QWEN_VISION, 65536, 1802.4 * MIB + 65536 * FEATURE_BYTES),
+    ("gemma4", GEMMA4_VISION, 2520, 1.05 * 319 * MIB),
+    ("gemma4", GEMMA4_VISION, 10080, 1.05 * 715 * MIB),
+]
 
 
-@pytest.mark.parametrize(("patches", "peak"), ENCODER_PEAK_CASES)
-def test_encoder_reserve_covers_the_measured_peak(patches: int, peak: float) -> None:
-    pixels = patches * 1536 * 2
-    assert encoder_reserve_bytes(QWEN3_6_VISION_CONFIG, mx.bfloat16, patches) >= peak + pixels
+@pytest.mark.parametrize(("label", "encoder", "patches", "peak"), ENCODER_PEAK_CASES)
+def test_encoder_reserve_covers_the_measured_peak(
+    label: str, encoder: EncoderSpec, patches: int, peak: float
+) -> None:
+    reserve = encoder_reserve_bytes(encoder, VISION_CONFIG, mx.bfloat16, patches, FEATURE_BYTES)
+    assert reserve >= peak, label
 
 
 def test_encoder_reserve_comes_off_the_paged_pools() -> None:
-    """The checkpoint's 16384 tokens of 2x2 patches: per patch a bf16 1536-wide feature and
-    13 bf16 1152-wide activations, then one 4096-row chunk of two 4304-wide ones."""
-    reserve = encoder_reserve_bytes(QWEN3_6_VISION_CONFIG, mx.bfloat16, 16384 * 4)
+    """Qwen3.6's 16384 tokens of 2x2 patches: per patch a bf16 1536-wide feature and 13 bf16
+    1152-wide activations, then one 4096-row chunk of two 4304-wide ones; Gemma4's 280 tokens
+    of 3x3 patches: per patch a float32 768-wide feature and 24 activations, one 2560-row chunk
+    of three, and 160 MiB."""
+    reserve = encoder_reserve_bytes(
+        QWEN_VISION, VISION_CONFIG, mx.bfloat16, 16384 * 4, FEATURE_BYTES
+    )
     assert reserve == 65536 * (2 * 1536 + 2 * 13 * 1152) + 2 * 2 * 4096 * 4304 == 2_234_777_600
+    gemma4 = encoder_reserve_bytes(GEMMA4_VISION, VISION_CONFIG, mx.bfloat16, 2520, FEATURE_BYTES)
+    assert gemma4 == 2520 * (4 * 768 + 2 * 24 * 1152) + 2 * 3 * 2560 * 4304 + (160 << 20)
     model_config = parse_config(QWEN3_6_TEXT_CONFIG)
     config = EngineConfig(model_path="unused", max_running_req=8)
     costs = pool_costs(model_config.kv_cache_group_specs(), config)
@@ -242,6 +259,35 @@ def test_encoder_reserve_comes_off_the_paged_pools() -> None:
     with_encoder = plan_budget(budget, WEIGHTS_BYTES, 0, 0, costs, reserve)
     assert without.paged_bytes - with_encoder.paged_bytes == reserve
     assert "encoder         2.08 GiB" in with_encoder.lines()
+
+
+@pytest.mark.parametrize(
+    ("encoder", "tower"), [(QWEN_VISION, qwen_vision), (GEMMA4_VISION, gemma4_vision)]
+)
+def test_encoder_spec_mlp_rows_are_the_towers(encoder: EncoderSpec, tower: ModuleType) -> None:
+    assert encoder.mlp_rows == tower.MLP_ROWS
+
+
+# What the frontend and the budget must not import: the model packages and their kernels.
+MODEL_MODULES = (
+    "ftmetal.models.gemma4",
+    "ftmetal.models.qwen3_5_moe",
+    "ftmetal.kernel.gdn",
+    "ftmetal.kernel.gdn_chunk",
+    "ftmetal.kernel.router",
+)
+
+
+@pytest.mark.parametrize("module", ["ftmetal.mm.processor", "ftmetal.engine.cache_budget"])
+def test_registry_users_load_no_model_package(module: str) -> None:
+    probe = (
+        f"import json, sys, {module}\n"
+        f"print(json.dumps([name for name in {MODEL_MODULES!r} if name in sys.modules]))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+    )
+    assert json.loads(result.stdout) == []
 
 
 # The text_config fields of Gemma4-26B-A4B that its attention groups are parsed from.

@@ -7,9 +7,10 @@ copy in the launched graph, ordered by the pool arrays it rebinds); requests arr
 add_request and results leave through send_result as TokenEvents; run_forever is the
 server's scheduler thread body over the message queues. A padded decode batch's dummy
 rows read the token pool's scratch row; only real requests allocate pages and write
-sampled tokens. The multimodal gather plan and the mrope positions are built in numpy by
-scheduler/mm.py. A drained step's tokens are used only once the engine's offload cache
-passes its health check (a failed expert read leaves stand-in experts behind).
+sampled tokens. The multimodal gather plan, the image block ends and the mrope positions
+are built in numpy by scheduler/mm.py. A drained step's tokens are used only once the
+engine's offload cache passes its health check (a failed expert read leaves stand-in
+experts behind).
 """
 
 from __future__ import annotations
@@ -45,7 +46,7 @@ from ftmetal.message.tokenizer import (
 from ftmetal.mm.item import MMItem
 from ftmetal.scheduler.cache import CacheManager, resolve_cache_type
 from ftmetal.scheduler.decode import DecodeManager
-from ftmetal.scheduler.mm import make_mrope_positions, plan_mm_batch
+from ftmetal.scheduler.mm import make_mrope_positions, mm_block_ends, plan_mm_batch
 from ftmetal.scheduler.prefill import ChunkedReq, PrefillManager
 from ftmetal.scheduler.status import SchedulerStatusReporter
 from ftmetal.scheduler.table import TableManager
@@ -139,6 +140,7 @@ class Scheduler:
             self.table_manager,
             self.decode_manager,
             encoder_cache=self.engine.encoder_cache,
+            keep_images_whole=self.engine.model_config.has_bidirectional_mm_blocks,
         )
         self.finished_reqs: set[Req] = set()
         self.status_reporter = SchedulerStatusReporter(
@@ -418,6 +420,8 @@ class Scheduler:
                 batch.mm_encoder_jobs = jobs
                 batch.mm_gather_plan = plan
                 batch.mm_rows = mx.array(np.array(rows, dtype=np.int32))
+                if self.engine.model_config.has_bidirectional_mm_blocks:
+                    batch.mm_block_ends = mm_block_ends(batch.padded_reqs)
         if self.engine.model_config.is_mrope:
             batch.mrope_positions = mx.array(make_mrope_positions(batch.padded_reqs))
         self.engine.prepare_metadata(batch)

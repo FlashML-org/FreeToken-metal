@@ -23,7 +23,7 @@ from ftmetal.attention.metadata import AttnType
 from ftmetal.kvcache.base import PoolCost
 from ftmetal.models.config import MoeStrategy
 from ftmetal.models.loader import config_int
-from ftmetal.models.qwen3_5_moe.vision import MLP_ROWS
+from ftmetal.models.register import EncoderSpec
 from ftmetal.moe.slot_pools import PrefillBufferPlacement, min_cache_size
 
 logger = logging.getLogger(__name__)
@@ -46,12 +46,6 @@ OFFLOAD_IN_FLIGHT_STEPS = 1
 # partials (their partition count follows the page-table width).
 GRAPH_FIXED_BYTES = 4 << 20
 GRAPH_BYTES_PER_ROW = 5 << 18
-# Hidden widths per patch live in a vision tower block as it attends: the residual stream, the
-# normed copy, qkv and its bias-add copy (6), the rotated q and k halves and their
-# concatenation (4), and the attention output. Measured on Qwen3.6's tower in bf16, the peak
-# above the weights and the float32 pixels is 12.2 widths per patch plus 43 MiB (482.6 MiB at
-# 16384 patches, 1802.4 MiB at 65536).
-VISION_ACTIVATION_WIDTHS = 13
 # Each pool's budget line; the only LINEAR pool so far holds GDN state.
 POOL_LABELS: dict[AttnType, str] = {
     AttnType.FULL: "kv pages",
@@ -79,22 +73,21 @@ def activation_reserve_bytes(
 
 
 def encoder_reserve_bytes(
-    vision_config: dict[str, object], dtype: mx.Dtype, max_patches: int
+    encoder: EncoderSpec,
+    vision_config: dict[str, object],
+    dtype: mx.Dtype,
+    max_patches: int,
+    feature_bytes: int,
 ) -> int:
-    """The vision tower's peak above its weights for the largest image. Per patch: its bf16
-    feature and, in the tower dtype, VISION_ACTIVATION_WIDTHS hidden widths; then one MLP row
-    chunk's fc1 output and its gelu. A [patches, patches] score matrix is not counted: the
-    tower attends with a fused kernel."""
-    patch_dim = (
-        config_int(vision_config, "in_channels")
-        * config_int(vision_config, "temporal_patch_size")
-        * config_int(vision_config, "patch_size") ** 2
-    )
+    """The vision tower's peak above its weights for the largest image: per patch its
+    feature_bytes-long feature row and the encoder's activation widths of hidden in the tower
+    dtype, then one MLP chunk of its intermediate widths, and its fixed part. A [patches,
+    patches] score matrix is not counted: the towers attend with a fused kernel."""
     hidden = config_int(vision_config, "hidden_size")
     intermediate = config_int(vision_config, "intermediate_size")
-    per_patch = mx.bfloat16.size * patch_dim + dtype.size * VISION_ACTIVATION_WIDTHS * hidden
-    mlp_chunk = dtype.size * 2 * MLP_ROWS * intermediate
-    return max_patches * per_patch + mlp_chunk
+    per_patch = feature_bytes + dtype.size * encoder.activation_widths * hidden
+    mlp_chunk = dtype.size * encoder.mlp_widths * encoder.mlp_rows * intermediate
+    return encoder.fixed_bytes + max_patches * per_patch + mlp_chunk
 
 
 def graph_reserve_bytes(max_graph_bs: int) -> int:
@@ -269,7 +262,6 @@ __all__ = [
     "IN_FLIGHT_STEPS",
     "OFFLOAD_IN_FLIGHT_STEPS",
     "POOL_LABELS",
-    "VISION_ACTIVATION_WIDTHS",
     "BudgetReport",
     "activation_reserve_bytes",
     "choose_moe_strategy",

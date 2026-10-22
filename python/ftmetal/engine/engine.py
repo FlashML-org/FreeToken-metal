@@ -170,8 +170,19 @@ class Engine:
             self.mm_processor = get_mm_processor(config.model_path, config.mm)
             assert self.mm_processor is not None, "a built vision tower has a processor"
             self.encoder_cache = EncoderCache()
+            feature = self.mm_processor.dummy_items()[0].feature
+            assert feature is not None
+            vision_encoder = next(
+                encoder
+                for encoder in MODEL_REGISTRY[config.architecture].encoders
+                if encoder.kind == "vision"
+            )
             encoder_reserve = encoder_reserve_bytes(
-                vision_config, config.dtype, self.mm_processor.max_patches
+                vision_encoder,
+                vision_config,
+                config.dtype,
+                self.mm_processor.max_patches,
+                feature[0].nbytes,
             )
         elif any(config.raw_config.get(key) is not None for key in ENCODER_SECTIONS):
             configured = [

@@ -3,6 +3,7 @@
 // metal/fprefill.metal).
 #pragma once
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -26,7 +27,9 @@ void init_fprefill_library(const std::string& source);
 // split-KV partition count and whether the GEMMs run as MetalPerformancePrimitives
 // matmul2d (mpp, macOS 26) or on simdgroup matrices. A sliding_window W > 0 limits a query
 // at position p to keys (p - W, p]; positions count from the page table row's first key.
-// Returns [num_tokens, Hq, D].
+// block_ends [num_tokens] int32, when given, lets each query also see the keys before its
+// own entry (the end of its image span in row positions, 0 for text), the window still
+// applying. Returns [num_tokens, Hq, D].
 mx::array flash_prefill(
     const mx::array& q,
     const mx::array& k_cache,
@@ -43,6 +46,7 @@ mx::array flash_prefill(
     int sliding_window,
     bool mpp,
     float scale,
+    const std::optional<mx::array>& block_ends = std::nullopt,
     mx::StreamOrDevice s = {});
 
 struct FlashPrefillConfig {
@@ -59,6 +63,7 @@ struct FlashPrefillConfig {
   int sliding_window;
   bool mpp;
   float scale;
+  bool has_block_ends;
 
   bool operator==(const FlashPrefillConfig&) const = default;
 };

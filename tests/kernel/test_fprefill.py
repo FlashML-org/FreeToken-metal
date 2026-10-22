@@ -9,8 +9,9 @@ across the causal diagonal, a cached prefix ending inside a key block, a partial
 tile, a group whose heads leave padding rows, each staging plan of the head dim and
 dtype, the split-KV rule split and not, forced partitions with nothing to read. Under a
 sliding window, the keys before the batch's oldest window hold huge keys and values too,
-so a key the window should hide shows up in the output. Every case runs on both GEMM
-paths.
+so a key the window should hide shows up in the output. Image spans (block ends) let their
+queries see the span's later keys: spans across tiles, from a cached prefix, cut at the
+chunk end, longer than the window, and with split-KV. Every case runs on both GEMM paths.
 """
 
 from __future__ import annotations
@@ -57,6 +58,8 @@ class Case:
     # None: prefill_tiles' own split-KV rule.
     num_partitions: int | None = None
     window: int | None = None
+    # Per request, its image spans [start, end) in key positions.
+    spans: tuple[tuple[tuple[int, int], ...], ...] | None = None
 
     def __str__(self) -> str:
         lens = "+".join(f"{c}:{e}" for c, e in zip(self.cached_lens, self.extend_lens))
@@ -66,7 +69,21 @@ class Case:
             label += f"-parts{self.num_partitions}"
         if self.window is not None:
             label += f"-W{self.window}"
+        if self.spans is not None:
+            label += "-spans" + "+".join(f"{lo}:{hi}" for spans in self.spans for lo, hi in spans)
         return label
+
+    def block_ends(self) -> list[int] | None:
+        """Per query, its span's end clamped to its request's keys; 0 outside spans."""
+        if self.spans is None:
+            return None
+        ends: list[int] = []
+        for cached_len, extend_len, spans in zip(self.cached_lens, self.extend_lens, self.spans):
+            seq_len = cached_len + extend_len
+            for position in range(cached_len, seq_len):
+                inside = [min(hi, seq_len) for lo, hi in spans if lo <= position < hi]
+                ends.append(inside[0] if inside else 0)
+        return ends
 
 
 # Unequal requests in one batch: a prefix ending inside a key block, an empty prefix and a
@@ -126,6 +143,22 @@ CASES = [
     Case(*FAR_TURN, group=2, page_size=16, window=1024),  # split by the rule
     Case(*ACROSS, group=2, page_size=16, dtype=mx.float32, num_partitions=3, window=1024),
     Case(*ACROSS, head_dim=512, window=1024),
+    # Image spans: across many 4-query tiles; under a window shorter than the span; one from
+    # the cached prefix and one cut at the chunk end; split-KV; Gemma4's window shape.
+    Case((5,), (60,), spans=(((10, 37),),)),
+    Case((5,), (60,), page_size=16, window=13, spans=(((10, 37),),)),
+    Case(
+        (0, 30),
+        (50, 40),
+        head_dim=128,
+        group=1,
+        page_size=4,
+        dtype=mx.float32,
+        num_partitions=3,
+        spans=(((3, 20), (25, 60)), ((20, 45),)),
+    ),
+    Case((0,), (48,), group=2, page_size=16, num_partitions=3, window=8, spans=(((4, 40),),)),
+    Case((7,), (40,), head_dim=512, spans=(((8, 40),),)),
 ]
 
 
@@ -182,9 +215,20 @@ def test_matches_sdpa(case: Case, mma: FprefillMma) -> None:
         tiles = replace(tiles, num_partitions=case.num_partitions)
     table = mx.array(page_table)
     scale = case.head_dim**-0.5
-    out = flash_prefill(q, k_cache, v_cache, table, tiles, case.page_size, scale, window, mma)
+    block_ends = case.block_ends()
+    ends = None if block_ends is None else mx.array(block_ends, dtype=mx.int32)
+    out = flash_prefill(q, k_cache, v_cache, table, tiles, case.page_size, scale, window, mma, ends)
     expected = flash_prefill_ref(
-        q, k_cache, v_cache, table, extend_lens, cached_lens, case.page_size, scale, window
+        q,
+        k_cache,
+        v_cache,
+        table,
+        extend_lens,
+        cached_lens,
+        case.page_size,
+        scale,
+        window,
+        block_ends,
     )
     assert out.shape == q.shape and out.dtype == case.dtype
     error = mx.abs(out.astype(mx.float32) - expected).max(axis=2)
@@ -211,6 +255,20 @@ def test_donated_query_buffer_keeps_the_output(
     # q * 1 is q bit for bit, held by nothing but the call.
     donated = flash_prefill(q * 1, *args)
     assert mx.array_equal(kept, donated)
+
+
+@pytest.mark.parametrize("mma", MMAS)
+def test_text_only_block_ends_change_nothing(mma: FprefillMma) -> None:
+    """All-zero block ends (a batch without image tokens) give the causal kernel's output
+    bit for bit."""
+    cached_lens, extend_lens = list(ACROSS[0]), list(ACROSS[1])
+    seq_lens = [c + e for c, e in zip(cached_lens, extend_lens)]
+    k_cache, v_cache, page_table = filled_pool(seq_lens, 16, 256, mx.bfloat16, seed=2)
+    q = mx.random.normal((sum(extend_lens), NUM_KV_HEADS * 2, 256)).astype(mx.bfloat16)
+    tiles = prefill_tiles(extend_lens, cached_lens, NUM_KV_HEADS * 2, NUM_KV_HEADS, 1024)
+    args = (k_cache, v_cache, mx.array(page_table), tiles, 16, 256**-0.5, 1024, mma)
+    zeros = mx.zeros((sum(extend_lens),), dtype=mx.int32)
+    assert mx.array_equal(flash_prefill(q, *args), flash_prefill(q, *args, zeros))
 
 
 def test_window_partitions_follow_the_window_not_the_context() -> None:

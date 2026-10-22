@@ -42,16 +42,18 @@ class SupportsMultimodal(Protocol):
         ...
 
 
-def embed_input_ids(embed_tokens: Embedding, batch: Batch) -> mx.array:
-    """Token embeddings of the batch; on a chunk with image rows, batch.mm_embeds' leading
-    columns replace the rows batch.mm_rows."""
+def embed_input_ids(embed_tokens: Embedding, batch: Batch, scale: float | None = None) -> mx.array:
+    """Token embeddings of the batch, times scale when given; on a chunk with image rows,
+    batch.mm_embeds' leading columns replace the rows batch.mm_rows, unscaled."""
     if batch.mm_embeds is None:
-        return embed_tokens.forward(batch.input_ids)
+        x = embed_tokens.forward(batch.input_ids)
+        return x if scale is None else x * scale
     else:
         assert batch.mm_rows is not None
         # Image rows carry content pad ids above the vocab: clamped for the lookup, the scatter
         # overwrites those rows.
         x = embed_tokens.forward(mx.minimum(batch.input_ids, embed_tokens.num_embeddings - 1))
+        x = x if scale is None else x * scale
         x[batch.mm_rows] = batch.mm_embeds[:, : x.shape[1]].astype(x.dtype)
         return x
 

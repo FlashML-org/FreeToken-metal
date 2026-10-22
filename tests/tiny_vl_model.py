@@ -33,7 +33,7 @@ from ftmetal.mm.processor import MMResult
 from ftmetal.mm.processors.qwen_vl import QwenVLMMProcessor
 from ftmetal.models.loader import read_model_config
 from ftmetal.models.qwen3_5_moe.vision import Qwen3VLVisionModel
-from ftmetal.models.register import MODEL_REGISTRY, EncoderSpec
+from ftmetal.models.register import MODEL_REGISTRY
 from tiny_model import TINY_TEXT_CONFIG, build_reference, save_checkpoint
 
 # The image processor configs the Qwen3.6-35B-A3B and Gemma-4-26B-A4B checkpoints ship.
@@ -141,6 +141,71 @@ def write_gemma4_model(model_dir: Path) -> None:
     (model_dir / "config.json").write_text(json.dumps(config))
     processor_config = {"image_processor": GEMMA4_IMAGE_PROCESSOR_CONFIG}
     (model_dir / "processor_config.json").write_text(json.dumps(processor_config))
+
+
+# Gemma4's vision_config keys at toy sizes: head_dim 32, a 16-row position table per axis.
+TINY_GEMMA4_VISION_CONFIG: dict[str, object] = {
+    "model_type": "gemma4_vision",
+    "hidden_size": 64,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 2,
+    "num_key_value_heads": 2,
+    "head_dim": 32,
+    "intermediate_size": 96,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "patch_size": 16,
+    "pooling_kernel_size": 3,
+    "position_embedding_size": 16,
+    "rope_parameters": {"rope_theta": 100.0, "rope_type": "default"},
+    "rms_norm_eps": 1e-6,
+    "standardize": True,
+    "use_clipped_linears": False,
+}
+
+
+def gemma4_tower_weights(
+    vision_config: dict[str, object], text_hidden_size: int, seed: int
+) -> dict[str, mx.array]:
+    """fp32 random weights of a Gemma4 vision tower and its projection under the checkpoint's
+    names: norms near one, fan-in scaled projections."""
+    rng = np.random.default_rng(seed)
+    sizes = {key: value for key, value in vision_config.items() if isinstance(value, int)}
+    hidden, heads, head_dim = sizes["hidden_size"], sizes["num_attention_heads"], sizes["head_dim"]
+    kv_heads, intermediate = sizes["num_key_value_heads"], sizes["intermediate_size"]
+    patch, table = sizes["patch_size"], sizes["position_embedding_size"]
+
+    def projection(rows: int, columns: int) -> np.ndarray:
+        return rng.standard_normal((rows, columns)) / np.sqrt(columns)
+
+    def norm(size: int) -> np.ndarray:
+        return 1 + 0.1 * rng.standard_normal(size)
+
+    tower = "vision_tower"
+    weights = {
+        f"{tower}.patch_embedder.input_proj.weight": projection(hidden, 3 * patch**2),
+        f"{tower}.patch_embedder.position_embedding_table": rng.standard_normal((2, table, hidden)),
+        f"{tower}.std_bias": 0.1 * rng.standard_normal(hidden),
+        f"{tower}.std_scale": norm(hidden),
+        "embed_vision.embedding_projection.weight": projection(text_hidden_size, hidden),
+    }
+    shapes = {
+        "self_attn.q_proj": (heads * head_dim, hidden),
+        "self_attn.k_proj": (kv_heads * head_dim, hidden),
+        "self_attn.v_proj": (kv_heads * head_dim, hidden),
+        "self_attn.o_proj": (hidden, heads * head_dim),
+        "mlp.gate_proj": (intermediate, hidden),
+        "mlp.up_proj": (intermediate, hidden),
+        "mlp.down_proj": (hidden, intermediate),
+    }
+    for layer_id in range(sizes["num_hidden_layers"]):
+        layer = f"{tower}.encoder.layers.{layer_id}"
+        for name, (rows, columns) in shapes.items():
+            weights[f"{layer}.{name}.linear.weight"] = projection(rows, columns)
+        for name in ("q_norm", "k_norm"):
+            weights[f"{layer}.self_attn.{name}.weight"] = norm(head_dim)
+        for name in ("input", "post_attention", "pre_feedforward", "post_feedforward"):
+            weights[f"{layer}.{name}_layernorm.weight"] = norm(hidden)
+    return {name: mx.array(value.astype(np.float32)) for name, value in weights.items()}
 
 
 # TINY_TEXT_CONFIG's rope (theta 10000, a quarter of the 64-wide heads) with Qwen3.6's
@@ -289,22 +354,14 @@ def reference_vl_greedy(
     return tokens
 
 
-def register_vision_encoder(monkeypatch: pytest.MonkeyPatch, architecture: str) -> None:
-    """Give architecture the vision encoder its registry entry does not have yet, so its
-    checkpoints serve images."""
-    encoder = EncoderSpec("vision", "vision_config", ("image",), "model.vision_tower.")
-    spec = dataclasses.replace(MODEL_REGISTRY[architecture], encoders=(encoder,))
+def drop_vision_encoder(monkeypatch: pytest.MonkeyPatch, architecture: str) -> None:
+    """Take architecture's encoders out of its registry entry, as for a family that registers
+    its image processor before its tower: its checkpoints serve no images."""
+    spec = dataclasses.replace(MODEL_REGISTRY[architecture], encoders=())
     monkeypatch.setitem(MODEL_REGISTRY, architecture, spec)
 
 
 __all__ = [
-    "TINY_IMAGE_BUDGET",
-    "TINY_IMAGE_TOKEN_ID",
-    "TINY_MROPE_SECTION",
-    "TINY_ROPE_THETA",
-    "TINY_ROTARY_DIM",
-    "TINY_VISION_CONFIG",
-    "TINY_VL_TEXT_CONFIG",
     "GEMMA4_BOI_TOKEN_ID",
     "GEMMA4_EOI_TOKEN_ID",
     "GEMMA4_IMAGE_PROCESSOR_CONFIG",
@@ -312,12 +369,21 @@ __all__ = [
     "QWEN_PREPROCESSOR_CONFIG",
     "QWEN_VL_CHAT_TEMPLATE",
     "ReferenceMRope",
+    "TINY_GEMMA4_VISION_CONFIG",
+    "TINY_IMAGE_BUDGET",
+    "TINY_IMAGE_TOKEN_ID",
+    "TINY_MROPE_SECTION",
+    "TINY_ROPE_THETA",
+    "TINY_ROTARY_DIM",
+    "TINY_VISION_CONFIG",
+    "TINY_VL_TEXT_CONFIG",
     "build_tower",
     "build_vl_checkpoint",
+    "drop_vision_encoder",
+    "gemma4_tower_weights",
     "image_prompt",
     "noise_png",
     "reference_vl_greedy",
-    "register_vision_encoder",
     "save_vl_checkpoint",
     "write_gemma4_model",
     "write_qwen_vl_model",

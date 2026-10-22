@@ -22,7 +22,7 @@ from tiny_vl_model import (
     GEMMA4_BOI_TOKEN_ID,
     GEMMA4_EOI_TOKEN_ID,
     GEMMA4_IMAGE_TOKEN_ID,
-    register_vision_encoder,
+    drop_vision_encoder,
     write_gemma4_model,
     write_qwen_vl_model,
 )
@@ -240,10 +240,11 @@ def test_processor_lookup_needs_a_served_encoder(
     assert get_mm_processor(str(tiny_model_dir), vision_disabled) is None
     audio_disabled = MultimodalConfig(disabled_encoders=frozenset({"audio"}))
     assert isinstance(get_mm_processor(str(tiny_model_dir), audio_disabled), QwenVLMMProcessor)
-    # Gemma4 registers no vision encoder yet.
-    assert get_mm_processor(str(gemma_dir), MultimodalConfig()) is None
-    register_vision_encoder(monkeypatch, "Gemma4ForConditionalGeneration")
     assert isinstance(get_mm_processor(str(gemma_dir), MultimodalConfig()), Gemma4MMProcessor)
+    # A family that registers no vision encoder serves no images.
+    with monkeypatch.context() as patch:
+        drop_vision_encoder(patch, "Gemma4ForConditionalGeneration")
+        assert get_mm_processor(str(gemma_dir), MultimodalConfig()) is None
     # A checkpoint without config.json, or without its vision section, serves no images.
     assert get_mm_processor(str(tmp_path), MultimodalConfig()) is None
     # Nor one whose weights hold no tower under the prefix the loader reads.
