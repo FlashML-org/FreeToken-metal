@@ -1,8 +1,10 @@
-"""Token embedding, bf16 or affine quantized, with the tied LM head projection.
+"""Token embedding whose table, lookup and tied LM head product are its scheme's embedding
+method's.
 
 Port of FreeToken layers/embedding.py. Divergences: no vocab parallelism, so
 VocabParallelEmbedding is Embedding; an untied head is a plain Linear and the tied
-head is as_linear here (ParallelLMHead is gone).
+head is as_linear here (ParallelLMHead is gone); the layer takes its scheme rather than the
+quant config and prefix it would be looked up by.
 """
 
 from __future__ import annotations
@@ -10,7 +12,8 @@ from __future__ import annotations
 import mlx.core as mx
 
 from ftmetal.layers.base import BaseOP
-from ftmetal.layers.quantization.config import AffineScheme
+from ftmetal.layers.quantization.config import QuantScheme
+from ftmetal.layers.quantization.embedding import EmbeddingConfig, embedding_method
 
 
 class Embedding(BaseOP):
@@ -19,48 +22,24 @@ class Embedding(BaseOP):
         num_embeddings: int,
         embedding_dim: int,
         *,
-        scheme: AffineScheme | None = None,
+        scheme: QuantScheme | None = None,
         dtype: mx.Dtype = mx.bfloat16,
     ) -> None:
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
-        self.scheme = scheme
-        if scheme is None:
-            self.weight = mx.zeros((num_embeddings, embedding_dim), dtype=dtype)
-        else:
-            packed = embedding_dim * scheme.bits // 32
-            groups = embedding_dim // scheme.group_size
-            self.weight = mx.zeros((num_embeddings, packed), dtype=mx.uint32)
-            self.scales = mx.zeros((num_embeddings, groups), dtype=dtype)
-            self.biases = mx.zeros((num_embeddings, groups), dtype=dtype)
+        cfg = EmbeddingConfig(
+            num_embeddings=num_embeddings, embedding_dim=embedding_dim, scheme=scheme, dtype=dtype
+        )
+        self.quant_method = embedding_method(cfg)
+        self.quant_method.create_weights(self)
 
     def forward(self, input_ids: mx.array) -> mx.array:
-        if self.scheme is None:
-            return self.weight[input_ids]
-        return mx.dequantize(
-            self.weight[input_ids],
-            self.scales[input_ids],
-            self.biases[input_ids],
-            group_size=self.scheme.group_size,
-            bits=self.scheme.bits,
-            mode="affine",
-        )
+        return self.quant_method.embed(self, input_ids)
 
     def as_linear(self, x: mx.array) -> mx.array:
         """x @ weight.T: the tied LM head."""
-        if self.scheme is None:
-            return x @ self.weight.T
-        return mx.quantized_matmul(
-            x,
-            self.weight,
-            self.scales,
-            self.biases,
-            transpose=True,
-            group_size=self.scheme.group_size,
-            bits=self.scheme.bits,
-            mode="affine",
-        )
+        return self.quant_method.logits(self, x)
 
 
 __all__ = ["Embedding"]

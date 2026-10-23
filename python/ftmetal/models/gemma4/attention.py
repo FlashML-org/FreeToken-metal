@@ -18,7 +18,7 @@ from ftmetal.core import Batch
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
 from ftmetal.layers.norm import RMSNorm
-from ftmetal.layers.quantization.config import AffineScheme
+from ftmetal.layers.quantization.config import QuantScheme
 from ftmetal.layers.rotary import RotaryEmbedding
 from ftmetal.models.config import FullAttentionGroupConfig, ModelConfig, SWAAttentionGroupConfig
 from ftmetal.models.gemma4.weight import K_EQ_V_PARTS, QKV_PARTS
@@ -30,8 +30,8 @@ class Gemma4Attention(BaseOP):
         config: ModelConfig,
         layer_id: int,
         *,
-        qkv_schemes: list[AffineScheme | None],
-        o_scheme: AffineScheme | None,
+        qkv_schemes: list[QuantScheme | None],
+        o_scheme: QuantScheme | None,
         dtype: mx.Dtype,
     ) -> None:
         super().__init__()

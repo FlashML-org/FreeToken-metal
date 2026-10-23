@@ -23,8 +23,8 @@ from typing import Literal
 import mlx.core as mx
 import numpy as np
 
-from ftmetal.layers.moe import ExpertSchemes, moe_layout
 from ftmetal.layers.quantization.config import AffineScheme, BankSpec
+from ftmetal.layers.quantization.moe import ExpertSchemes, MoEConfig, moe_method
 from ftmetal.models.loader import FuseRule, WeightRules
 from ftmetal.moe.offload_cache import STALL_TIMEOUT_S, OffloadMoeCache
 from ftmetal.moe.slot_pools import MoePoolGrouping, PrefillBufferPlacement, plan_slot_layout
@@ -78,6 +78,24 @@ def weight_rules(naming: Naming) -> WeightRules:
         )
 
 
+def moe_layout(
+    hidden_size: int, intermediate_size: int, schemes: ExpertSchemes
+) -> dict[str, BankSpec]:
+    """A resident MoE layer's bf16-scaled bank arrays per expert (its method's layout, which the
+    expert count and top-k do not change)."""
+    cfg = MoEConfig(
+        num_experts=1,
+        top_k=1,
+        hidden=hidden_size,
+        intermediate=intermediate_size,
+        schemes=schemes,
+        activation="silu",
+        dtype=mx.bfloat16,
+        strategy="resident",
+    )
+    return moe_method(cfg).layout()
+
+
 def layer_layouts(spec: CheckpointSpec) -> list[dict[str, BankSpec]]:
     """Each layer's bank arrays per expert as the offload cache holds them: gate and up apart
     in every layer when up_bits sets them apart."""
@@ -91,7 +109,7 @@ def layer_layouts(spec: CheckpointSpec) -> list[dict[str, BankSpec]]:
                 AffineScheme(spec.last_layer_bits, spec.scheme.group_size)
             )
         schemes = replace(schemes, is_gate_up_apart=is_apart)
-        layouts.append(moe_layout(spec.hidden_size, spec.intermediate_size, schemes, mx.bfloat16))
+        layouts.append(moe_layout(spec.hidden_size, spec.intermediate_size, schemes))
     return layouts
 
 

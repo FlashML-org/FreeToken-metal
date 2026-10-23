@@ -20,7 +20,7 @@ import mlx.core as mx
 from mlx.utils import tree_flatten, tree_unflatten
 
 from ftmetal.layers.base import BaseOP
-from ftmetal.layers.quantization.config import AffineScheme, QuantConfig
+from ftmetal.layers.quantization.config import QuantConfig, QuantScheme
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +98,7 @@ def mixed_fuses(rules: WeightRules, quant: QuantConfig | None) -> frozenset[str]
     bf16 parts among quantized ones included: rules.unfused for that checkpoint."""
     if quant is None:
         return frozenset()
-    parts: dict[str, tuple[FuseRule, dict[int, AffineScheme | None]]] = {}
+    parts: dict[str, tuple[FuseRule, dict[int, QuantScheme | None]]] = {}
     for module in quant.quantized_modules.union(quant.overrides):
         key = rules.rename(f"{module}.weight")
         if key is None:

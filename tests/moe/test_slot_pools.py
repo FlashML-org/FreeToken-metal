@@ -18,12 +18,11 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-import mlx.core as mx
 import numpy as np
 import pytest
 
-from ftmetal.layers.moe import ExpertSchemes, moe_layout
 from ftmetal.layers.quantization.config import AffineScheme, BankSpec
+from ftmetal.layers.quantization.moe import ExpertSchemes
 from ftmetal.moe.slot_pools import (
     HOT_EXPERTS_FILE,
     MoePoolGrouping,
@@ -35,6 +34,7 @@ from ftmetal.moe.slot_pools import (
     plan_slot_layout,
     read_expert_counts,
 )
+from offload_harness import moe_layout
 
 COUNTS = np.array([[10, 1, 5, 0], [3, 3, 9, 2]], dtype=np.int64)
 
@@ -42,7 +42,7 @@ COUNTS = np.array([[10, 1, 5, 0], [3, 3, 9, 2]], dtype=np.int64)
 def tiny_layout(bits: int) -> dict[str, BankSpec]:
     """Experts of hidden and intermediate 64, group 64: a slot of 6912 bytes at 4 bits (gate_up
     weight rows of 4096), 13056 at 8 (8192)."""
-    return moe_layout(64, 64, ExpertSchemes.uniform(AffineScheme(bits, 64)), mx.bfloat16)
+    return moe_layout(64, 64, ExpertSchemes.uniform(AffineScheme(bits, 64)))
 
 
 def uniform(num_layers: int) -> list[dict[str, BankSpec]]:

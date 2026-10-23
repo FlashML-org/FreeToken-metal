@@ -16,9 +16,9 @@ from ftmetal.core import Batch
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.embedding import Embedding
 from ftmetal.layers.linear import Linear
-from ftmetal.layers.moe import ExpertSchemes
 from ftmetal.layers.norm import RMSNorm
-from ftmetal.layers.quantization.config import AffineScheme
+from ftmetal.layers.quantization.config import QuantScheme
+from ftmetal.layers.quantization.moe import ExpertSchemes
 from ftmetal.mm.item import MMItem
 from ftmetal.models.blocks import BaseLLMModel, embed_input_ids, select_last_rows
 from ftmetal.models.config import ModelConfig
@@ -35,7 +35,7 @@ from ftmetal.models.qwen3_5_moe.weight import (
 )
 
 
-def scheme_of(config: ModelConfig, model_key: str) -> AffineScheme | None:
+def scheme_of(config: ModelConfig, model_key: str) -> QuantScheme | None:
     if config.quant is None:
         return None
     return config.quant.scheme_for(checkpoint_module(model_key))
@@ -43,7 +43,7 @@ def scheme_of(config: ModelConfig, model_key: str) -> AffineScheme | None:
 
 def schemes_of(
     config: ModelConfig, model_prefix: str, parts: tuple[str, ...]
-) -> list[AffineScheme | None]:
+) -> list[QuantScheme | None]:
     """The scheme of each part of a fused module; they fuse only when all agree."""
     if config.quant is None:
         return [None] * len(parts)

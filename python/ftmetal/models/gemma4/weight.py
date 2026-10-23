@@ -11,7 +11,7 @@ built.
 
 from __future__ import annotations
 
-from ftmetal.layers.quantization.config import AffineScheme
+from ftmetal.layers.quantization.config import QuantScheme
 from ftmetal.models.config import FullAttentionGroupConfig, ModelConfig
 from ftmetal.models.loader import FuseRule, WeightRules
 
@@ -39,7 +39,7 @@ def checkpoint_prefix(model_config: ModelConfig) -> str:
     return ""
 
 
-def scheme_of(config: ModelConfig, checkpoint_module: str) -> AffineScheme | None:
+def scheme_of(config: ModelConfig, checkpoint_module: str) -> QuantScheme | None:
     if config.quant is None:
         return None
     return config.quant.scheme_for(checkpoint_module)
@@ -47,7 +47,7 @@ def scheme_of(config: ModelConfig, checkpoint_module: str) -> AffineScheme | Non
 
 def schemes_of(
     config: ModelConfig, parent_module: str, parts: tuple[str, ...]
-) -> list[AffineScheme | None]:
+) -> list[QuantScheme | None]:
     """The scheme of each part (a checkpoint module name under parent_module) of a fused
     module; they fuse only when all agree."""
     if config.quant is None:

@@ -14,11 +14,11 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
+from mlx.utils import tree_flatten
 from pydantic import JsonValue
 
 from ftmetal.core import SamplingParams
 from ftmetal.engine.config import CacheTypeChoice, EngineConfig
-from ftmetal.layers.moe import ExpertBank, ExpertBankParts
 from ftmetal.message.backend import UserMsg
 from ftmetal.message.tokenizer import TokenizeMsg
 from ftmetal.models.qwen3_5_moe.model import Qwen3_5MoeForCausalLM
@@ -276,8 +276,8 @@ def test_mixed_bit_greedy_decode_matches_mlx_lm(tmp_path: Path, attention_backen
         "shared gate_up_proj": layers[2].mlp.shared_expert.gate_up_proj.part_names,
     }
     assert all(split.values()), split
-    assert isinstance(layers[1].mlp.experts.gate_up_proj, ExpertBankParts)
-    assert isinstance(layers[3].mlp.experts.gate_up_proj, ExpertBank)
+    assert "gate_up_proj.gate_proj.weight" in dict(tree_flatten(layers[1].mlp.experts.parameters()))
+    assert "gate_up_proj.weight" in dict(tree_flatten(layers[3].mlp.experts.parameters()))
     params = SamplingParams(temperature=0.0, max_tokens=steps, ignore_eos=True)
     tokens = scheduler.generate(np.array(prompt, dtype=np.int32), params)
     assert tokens == expected

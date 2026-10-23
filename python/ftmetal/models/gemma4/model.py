@@ -20,8 +20,9 @@ from ftmetal.core import Batch
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.embedding import Embedding
 from ftmetal.layers.linear import Linear
-from ftmetal.layers.moe import ExpertSchemes, MoELayer
+from ftmetal.layers.moe import MoELayer
 from ftmetal.layers.norm import RMSNorm
+from ftmetal.layers.quantization.moe import ExpertSchemes
 from ftmetal.mm.item import MMItem
 from ftmetal.models.blocks import BaseLLMModel, embed_input_ids, select_last_rows
 from ftmetal.models.config import ModelConfig

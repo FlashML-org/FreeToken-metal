@@ -16,7 +16,7 @@ from ftmetal.kernel.router import router_topk
 from ftmetal.layers.activation import gelu_tanh_and_mul
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
-from ftmetal.layers.quantization.config import AffineScheme
+from ftmetal.layers.quantization.config import QuantScheme
 from ftmetal.models.config import ModelConfig
 from ftmetal.models.gemma4.weight import GATE_UP_PARTS
 
@@ -27,8 +27,8 @@ class Gemma4GatedMLP(BaseOP):
         hidden_size: int,
         intermediate_size: int,
         *,
-        gate_up_schemes: list[AffineScheme | None],
-        down_scheme: AffineScheme | None,
+        gate_up_schemes: list[QuantScheme | None],
+        down_scheme: QuantScheme | None,
         dtype: mx.Dtype,
     ) -> None:
         super().__init__()
@@ -50,7 +50,7 @@ class Gemma4Router(BaseOP):
     chosen experts' scales."""
 
     def __init__(
-        self, config: ModelConfig, *, proj_scheme: AffineScheme | None, dtype: mx.Dtype
+        self, config: ModelConfig, *, proj_scheme: QuantScheme | None, dtype: mx.Dtype
     ) -> None:
         super().__init__()
         self.eps = config.rms_norm_eps

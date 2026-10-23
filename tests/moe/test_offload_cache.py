@@ -15,6 +15,7 @@ FTMETAL_TEST_MODEL_PATH.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -24,8 +25,9 @@ import pytest
 from mlx.utils import tree_flatten
 
 from ftmetal.engine.config import EngineConfig
-from ftmetal.layers.moe import ExpertSchemes, MoELayer, moe_layout
+from ftmetal.layers.moe import MoELayer, OffloadMoELayer
 from ftmetal.layers.quantization.config import AffineScheme
+from ftmetal.layers.quantization.moe import ExpertSchemes
 from ftmetal.models.loader import apply_rules, load_checkpoint
 from ftmetal.models.qwen3_5_moe.model import schemes_of
 from ftmetal.models.qwen3_5_moe.weight import GATE_UP_PARTS
@@ -38,6 +40,7 @@ from offload_harness import (
     Naming,
     build_cache,
     checkpoint_rules,
+    moe_layout,
     weight_rules,
     write_checkpoint,
 )
@@ -349,7 +352,7 @@ def test_source_rejects_a_layer_in_another_format(tmp_path: Path) -> None:
     write_checkpoint(tmp_path / "checkpoint", case.spec)
     source = ExpertSource(str(tmp_path / "checkpoint"), weight_rules(case.naming))
     layout = moe_layout(
-        case.hidden_size, case.intermediate_size, ExpertSchemes.uniform(case.scheme), mx.bfloat16
+        case.hidden_size, case.intermediate_size, ExpertSchemes.uniform(case.scheme)
     )
     with pytest.raises(ValueError, match="model.layers.2.mlp.experts.gate_up_proj.weight"):
         source.segment_table([layout] * case.num_layers)
@@ -436,9 +439,21 @@ def test_expert_bank_matches_moe_layout() -> None:
             for key, value in dict(tree_flatten(layer.parameters())).items()
         }
         assert parameters == expected
-        layout = moe_layout(128, 64, schemes, mx.bfloat16)
+        layout = moe_layout(128, 64, schemes)
         assert list(layout) == list(expected)
         assert {role: ((8, *spec.shape), spec.dtype) for role, spec in layout.items()} == expected
+
+
+def test_offload_refuses_bf16_experts() -> None:
+    four = AffineScheme(4, 64)
+    for schemes, refused in [
+        (ExpertSchemes.uniform(None), "gate_up_proj, down_proj"),
+        (ExpertSchemes(None, four, four), "gate_up_proj.gate_proj"),
+        (ExpertSchemes(four, four, None), "down_proj"),
+    ]:
+        message = f"affine-quantized experts only, not {refused}"
+        with pytest.raises(ValueError, match=re.escape(message) + "$"):
+            OffloadMoELayer(0, 8, 2, 128, 64, schemes=schemes)
 
 
 @pytest.mark.skipif(MODEL_PATH is None, reason="FTMETAL_TEST_MODEL_PATH is not set")
@@ -462,7 +477,6 @@ def test_real_checkpoint_rows() -> None:
                 ),
                 is_gate_up_apart=is_apart,
             ),
-            mx.bfloat16,
         )
         for layer_id in range(source.num_layers)
     ]

@@ -14,8 +14,9 @@ from ftmetal.kernel.router import router_topk
 from ftmetal.layers.activation import sigmoid_gated_add, silu_and_mul
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
-from ftmetal.layers.moe import ExpertSchemes, MoELayer, OffloadMoELayer
-from ftmetal.layers.quantization.config import AffineScheme
+from ftmetal.layers.moe import MoELayer, OffloadMoELayer
+from ftmetal.layers.quantization.config import QuantScheme
+from ftmetal.layers.quantization.moe import ExpertSchemes
 from ftmetal.models.config import ModelConfig
 from ftmetal.models.qwen3_5_moe.weight import GATE_UP_PARTS
 
@@ -26,8 +27,8 @@ class SharedExpert(BaseOP):
         hidden_size: int,
         intermediate_size: int,
         *,
-        gate_up_schemes: list[AffineScheme | None],
-        down_scheme: AffineScheme | None,
+        gate_up_schemes: list[QuantScheme | None],
+        down_scheme: QuantScheme | None,
         dtype: mx.Dtype,
     ) -> None:
         super().__init__()
@@ -51,10 +52,10 @@ class Qwen3_5MoE(BaseOP):
         layer_id: int,
         *,
         experts_schemes: ExpertSchemes,
-        gate_scheme: AffineScheme | None,
-        shared_gate_up_schemes: list[AffineScheme | None],
-        shared_down_scheme: AffineScheme | None,
-        shared_gate_scheme: AffineScheme | None,
+        gate_scheme: QuantScheme | None,
+        shared_gate_up_schemes: list[QuantScheme | None],
+        shared_down_scheme: QuantScheme | None,
+        shared_gate_scheme: QuantScheme | None,
         dtype: mx.Dtype,
     ) -> None:
         super().__init__()

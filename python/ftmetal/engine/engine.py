@@ -259,7 +259,7 @@ class Engine:
         experts_bytes = 0
         if is_offload:
             moe_layers = offload_layers(self.model)
-            layouts = [layer.layout() for layer in moe_layers]
+            layouts = [layer.quant_method.layout() for layer in moe_layers]
             expert_source = ExpertSource(config.model_path, rules)
             if config.moe_pool_slots == "profile":
                 if config.moe_pool_profile is not None:

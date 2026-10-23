@@ -1,10 +1,10 @@
-"""Linear layers in bf16 or MLX affine quantization.
+"""Linear layers whose weight arrays and product are their scheme's linear method's.
 
 Port of FreeToken layers/linear.py. Divergences: no tensor parallelism, so
 LinearReplicated / LinearRowParallel collapse into Linear and LinearColParallelMerged
-into LinearMerged; the quant method is the scheme itself (bf16 matmul or
-mx.quantized_matmul) instead of a kernel registry; a LinearMerged whose parts the
-checkpoint quantizes differently runs one Linear per part.
+into LinearMerged; the layer takes its scheme rather than the quant config and prefix it
+would be looked up by; a LinearMerged whose parts the checkpoint quantizes differently runs
+one Linear per part.
 """
 
 from __future__ import annotations
@@ -12,7 +12,8 @@ from __future__ import annotations
 import mlx.core as mx
 
 from ftmetal.layers.base import BaseOP
-from ftmetal.layers.quantization.config import AffineScheme
+from ftmetal.layers.quantization.config import QuantScheme
+from ftmetal.layers.quantization.linear import LinearConfig, linear_method
 
 
 class Linear(BaseOP):
@@ -24,37 +25,22 @@ class Linear(BaseOP):
         output_size: int,
         has_bias: bool = False,
         *,
-        scheme: AffineScheme | None = None,
+        scheme: QuantScheme | None = None,
         dtype: mx.Dtype = mx.bfloat16,
     ) -> None:
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
-        self.scheme = scheme
-        if scheme is None:
-            self.weight = mx.zeros((output_size, input_size), dtype=dtype)
-        else:
-            packed = input_size * scheme.bits // 32
-            self.weight = mx.zeros((output_size, packed), dtype=mx.uint32)
-            self.scales = mx.zeros((output_size, input_size // scheme.group_size), dtype=dtype)
-            self.biases = mx.zeros((output_size, input_size // scheme.group_size), dtype=dtype)
+        cfg = LinearConfig(
+            in_features=input_size, out_features=output_size, scheme=scheme, dtype=dtype
+        )
+        self.quant_method = linear_method(cfg)
+        self.quant_method.create_weights(self)
         if has_bias:
             self.bias = mx.zeros((output_size,), dtype=dtype)
 
     def forward(self, x: mx.array) -> mx.array:
-        if self.scheme is None:
-            y = x @ self.weight.T
-        else:
-            y = mx.quantized_matmul(
-                x,
-                self.weight,
-                self.scales,
-                self.biases,
-                transpose=True,
-                group_size=self.scheme.group_size,
-                bits=self.scheme.bits,
-                mode="affine",
-            )
+        y = self.quant_method.apply(self, x)
         if "bias" in self:
             y = y + self.bias
         return y
@@ -71,7 +57,7 @@ class LinearMerged(Linear):
         output_sizes: list[int],
         has_bias: bool = False,
         *,
-        schemes: list[AffineScheme | None],
+        schemes: list[QuantScheme | None],
         part_names: tuple[str, ...],
         dtype: mx.Dtype = mx.bfloat16,
     ) -> None:

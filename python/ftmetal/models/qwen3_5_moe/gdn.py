@@ -24,7 +24,7 @@ from ftmetal.kvcache.linear_state_pool import LinearStatePool
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
 from ftmetal.layers.norm import GatedRMSNorm
-from ftmetal.layers.quantization.config import AffineScheme
+from ftmetal.layers.quantization.config import QuantScheme
 from ftmetal.models.config import LinearGatedDeltaGroupConfig
 from ftmetal.models.qwen3_5_moe.weight import IN_PROJ_BA_PARTS, IN_PROJ_QKVZ_PARTS
 
@@ -41,9 +41,9 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         rms_norm_eps: float,
         layer_id: int,
         *,
-        qkvz_schemes: list[AffineScheme | None],
-        ba_schemes: list[AffineScheme | None],
-        out_scheme: AffineScheme | None,
+        qkvz_schemes: list[QuantScheme | None],
+        ba_schemes: list[QuantScheme | None],
+        out_scheme: QuantScheme | None,
         dtype: mx.Dtype,
     ) -> None:
         super().__init__()

@@ -17,7 +17,7 @@ from ftmetal.layers.activation import sigmoid_gate
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
 from ftmetal.layers.norm import RMSNorm
-from ftmetal.layers.quantization.config import AffineScheme
+from ftmetal.layers.quantization.config import QuantScheme
 from ftmetal.layers.rotary import MRotaryEmbedding, RotaryEmbedding
 from ftmetal.models.config import ModelConfig
 from ftmetal.models.qwen3_5_moe.weight import QKV_PARTS
@@ -29,8 +29,8 @@ class Qwen3_5Attention(BaseOP):
         config: ModelConfig,
         layer_id: int,
         *,
-        qkv_schemes: list[AffineScheme | None],
-        o_scheme: AffineScheme | None,
+        qkv_schemes: list[QuantScheme | None],
+        o_scheme: QuantScheme | None,
         dtype: mx.Dtype,
     ) -> None:
         super().__init__()
