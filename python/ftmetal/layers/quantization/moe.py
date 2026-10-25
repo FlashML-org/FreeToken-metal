@@ -21,7 +21,7 @@ from typing import Literal, Protocol
 import mlx.core as mx
 from mlx.utils import tree_unflatten
 
-from ftmetal.kernel.gather_qmm_sorted import gather_qmm_sorted
+from ftmetal.kernel.gather_sorted import gather_qmm_sorted
 from ftmetal.kernel.moe_align import moe_align, moe_combine
 from ftmetal.layers.activation import gelu_tanh_and_mul, silu_and_mul
 from ftmetal.layers.base import BaseOP

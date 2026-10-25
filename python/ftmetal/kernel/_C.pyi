@@ -141,7 +141,9 @@ def init_library(source: str) -> None: ...
 def init_gdn_step_library(source: str) -> None: ...
 def init_fdecode_library(source: str) -> None: ...
 def init_fprefill_library(source: str) -> None: ...
-def init_gather_qmm_sorted_library(source: str) -> None: ...
+def init_gather_sorted_libraries(
+    affine_source: str, fp_source: str, unquantized_source: str
+) -> None: ...
 def init_sample_library(source: str) -> None: ...
 def init_moe_lookup_library(source: str) -> None: ...
 def scatter_rows(
@@ -216,12 +218,22 @@ def gather_qmm_sorted(
     x: mx.array,
     w: mx.array,
     scales: mx.array,
-    biases: mx.array,
+    biases: mx.array | None,
     expert_offsets: mx.array,
     expert_bytes: mx.array,
     n: int,
     group_size: int,
     bits: int,
+    mode: str,
+    *,
+    stream: Stream = None,
+) -> mx.array: ...
+def gather_mm_sorted(
+    x: mx.array,
+    w: mx.array,
+    expert_offsets: mx.array,
+    expert_bytes: mx.array,
+    n: int,
     *,
     stream: Stream = None,
 ) -> mx.array: ...

@@ -10,7 +10,7 @@
 #include "expert_service.h"
 #include "fdecode.h"
 #include "fprefill.h"
-#include "gather_qmm_sorted.h"
+#include "gather_sorted.h"
 #include "gdn_step.h"
 #include "moe_lookup.h"
 #include "rows.h"
@@ -26,7 +26,12 @@ NB_MODULE(_C, m) {
   m.def("init_gdn_step_library", &ftmetal::init_gdn_step_library, "source"_a);
   m.def("init_fdecode_library", &ftmetal::init_fdecode_library, "source"_a);
   m.def("init_fprefill_library", &ftmetal::init_fprefill_library, "source"_a);
-  m.def("init_gather_qmm_sorted_library", &ftmetal::init_gather_qmm_sorted_library, "source"_a);
+  m.def(
+      "init_gather_sorted_libraries",
+      &ftmetal::init_gather_sorted_libraries,
+      "affine_source"_a,
+      "fp_source"_a,
+      "unquantized_source"_a);
   m.def("init_sample_library", &ftmetal::init_sample_library, "source"_a);
   m.def("init_moe_lookup_library", &ftmetal::init_moe_lookup_library, "source"_a);
 
@@ -138,15 +143,28 @@ NB_MODULE(_C, m) {
       "x"_a,
       "w"_a,
       "scales"_a,
-      "biases"_a,
+      "biases"_a.none(),
       "expert_offsets"_a,
       "expert_bytes"_a,
       "n"_a,
       "group_size"_a,
       "bits"_a,
+      "mode"_a,
       nb::kw_only(),
       "stream"_a = nb::none(),
       "x[b] @ dequantize(expert e's weights at its byte offsets).T for the rows b of each expert e; returns [B, 1, n].");
+
+  m.def(
+      "gather_mm_sorted",
+      &ftmetal::gather_mm_sorted,
+      "x"_a,
+      "w"_a,
+      "expert_offsets"_a,
+      "expert_bytes"_a,
+      "n"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      "x[b] @ (expert e's weight at its byte offset).T for the rows b of each expert e; returns [B, 1, n].");
 
   m.attr("MAILBOX_WORDS") = ftmetal::MAILBOX_WORDS;
   m.attr("EXPERT_STAGING_BYTES") = ftmetal::EXPERT_STAGING_BYTES;

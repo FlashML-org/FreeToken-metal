@@ -34,7 +34,7 @@ from typing import NamedTuple, Protocol
 import mlx.core as mx
 import numpy as np
 
-from ftmetal.kernel.gather_qmm_sorted import gather_qmm_sorted
+from ftmetal.kernel.gather_sorted import gather_qmm_sorted
 from ftmetal.kernel.inplace import copy_rows, scatter_rows
 
 NUM_EXPERTS = 256

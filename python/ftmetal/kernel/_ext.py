@@ -41,8 +41,10 @@ _C.init_library((METAL_DIR / "rows.metal").read_text())
 _C.init_gdn_step_library((METAL_DIR / "gdn_step.metal").read_text())
 _C.init_fdecode_library((METAL_DIR / "fdecode.metal").read_text())
 _C.init_fprefill_library((METAL_DIR / "fprefill.metal").read_text())
-_C.init_gather_qmm_sorted_library(
-    inline_mlx_headers((METAL_DIR / "gather_qmm_sorted.metal").read_text(), set())
+_C.init_gather_sorted_libraries(
+    inline_mlx_headers((METAL_DIR / "gather_qmm_sorted.metal").read_text(), set()),
+    inline_mlx_headers((METAL_DIR / "fp_gather_qmm_sorted.metal").read_text(), set()),
+    inline_mlx_headers((METAL_DIR / "gather_mm_sorted.metal").read_text(), set()),
 )
 _C.init_sample_library((METAL_DIR / "sample.metal").read_text())
 _C.init_moe_lookup_library((METAL_DIR / "moe_lookup.metal").read_text())
