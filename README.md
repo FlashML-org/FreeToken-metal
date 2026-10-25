@@ -49,8 +49,9 @@ thinking, `/reset` clears the conversation, `/exit` or Ctrl-D quits, Ctrl-C canc
 reply. Environment knobs are read as `FTMETAL_<NAME>`, falling back to
 `FREETOKEN_<NAME>`.
 
-A Qwen3.6 MoE checkpoint with affine 4-bit experts whose experts do not fit the memory
-budget serves them from an offload cache that reads them from the checkpoint on demand
+A Qwen3.6 MoE checkpoint whose experts do not fit the memory budget, in any format it loads
+(bf16, MLX affine or float modes, the Hugging Face layout, an NVFP4 or FP8 export), serves
+them from an offload cache that reads them from the checkpoint on demand
 (`--moe-strategy auto|fused|offload`, FreeToken's flags): `--moe-cache-size`,
 `--moe-cache-rate` or `--moe-cache-auto` size it (auto, the default, gives the KV pools
 `--kv-reserve-tokens` first and the experts the rest), `--disable-moe-prefill-overlap`

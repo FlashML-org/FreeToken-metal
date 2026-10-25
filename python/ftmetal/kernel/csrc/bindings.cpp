@@ -168,6 +168,8 @@ NB_MODULE(_C, m) {
 
   m.attr("MAILBOX_WORDS") = ftmetal::MAILBOX_WORDS;
   m.attr("EXPERT_STAGING_BYTES") = ftmetal::EXPERT_STAGING_BYTES;
+  m.attr("FILL_FILE") = ftmetal::FILL_FILE;
+  m.attr("QMM_TILE_K") = ftmetal::QMM_TILE_K;
   nb::enum_<ftmetal::MailboxWord>(m, "MailboxWord", nb::is_arithmetic())
       .value("STATE", ftmetal::MailboxWord::State)
       .value("SEQUENCE", ftmetal::MailboxWord::Sequence)
@@ -282,6 +284,7 @@ NB_MODULE(_C, m) {
       .def_ro("lookup_hits", &ftmetal::ExpertServiceStats::lookup_hits);
 
   using Int64Table3 = nb::ndarray<const int64_t, nb::ndim<3>, nb::c_contig, nb::device::cpu>;
+  using Int64Table4 = nb::ndarray<const int64_t, nb::ndim<4>, nb::c_contig, nb::device::cpu>;
   nb::class_<ftmetal::ExpertService>(m, "ExpertService")
       .def(
           "__init__",
@@ -299,13 +302,19 @@ NB_MODULE(_C, m) {
              std::vector<mx::array> banks,
              const std::vector<std::string>& files,
              Int64Table3 segments,
+             Int64Table4 locations,
              Int64Table3 destinations,
              const std::vector<int64_t>& buffer_bytes,
              int io_threads,
              double stall_timeout_s,
              bool run_coordinator) {
-            if (segments.shape(0) != static_cast<size_t>(num_layers) || segments.shape(2) != 5) {
-              throw std::invalid_argument("ExpertService: segments must be int64 [num_layers, n, 5]");
+            if (segments.shape(0) != static_cast<size_t>(num_layers) || segments.shape(2) != 3) {
+              throw std::invalid_argument("ExpertService: segments must be int64 [num_layers, n, 3]");
+            }
+            if (locations.shape(0) != segments.shape(0) || locations.shape(1) != segments.shape(1) ||
+                locations.shape(2) != static_cast<size_t>(num_experts) || locations.shape(3) != 2) {
+              throw std::invalid_argument(
+                  "ExpertService: locations must be int64 [num_layers, n, num_experts, 2]");
             }
             if (destinations.shape(0) != static_cast<size_t>(num_layers) ||
                 destinations.shape(1) != banks.size() || destinations.shape(2) != 2) {
@@ -315,8 +324,14 @@ NB_MODULE(_C, m) {
             std::vector<ftmetal::ExpertSegment> table(segments.shape(0) * segments.shape(1));
             const int64_t* row = segments.data();
             for (ftmetal::ExpertSegment& segment : table) {
-              segment = {row[0], row[1], row[2], row[3], row[4]};
-              row += 5;
+              segment = {row[0], row[1], row[2]};
+              row += 3;
+            }
+            std::vector<ftmetal::ExpertLocation> places(table.size() * num_experts);
+            const int64_t* place = locations.data();
+            for (ftmetal::ExpertLocation& location : places) {
+              location = {place[0], place[1]};
+              place += 2;
             }
             new (service) ftmetal::ExpertService(
                 num_layers,
@@ -332,6 +347,7 @@ NB_MODULE(_C, m) {
                 std::move(banks),
                 files,
                 std::move(table),
+                std::move(places),
                 std::vector<int64_t>(destinations.data(), destinations.data() + destinations.size()),
                 buffer_bytes,
                 io_threads,
@@ -351,6 +367,7 @@ NB_MODULE(_C, m) {
           "banks"_a,
           "files"_a,
           "segments"_a,
+          "locations"_a,
           "destinations"_a,
           "buffer_bytes"_a,
           "io_threads"_a,

@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <pthread/qos.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -54,6 +55,7 @@ ExpertService::ExpertService(
     std::vector<mx::array> banks,
     const std::vector<std::string>& files,
     std::vector<ExpertSegment> segments,
+    std::vector<ExpertLocation> locations,
     std::vector<int64_t> destinations,
     std::vector<int64_t> buffer_bytes,
     int io_threads,
@@ -75,6 +77,7 @@ ExpertService::ExpertService(
       buffer_bytes_(std::move(buffer_bytes)),
       files_(files),
       segments_(std::move(segments)),
+      locations_(std::move(locations)),
       segments_per_layer_(static_cast<int>(segments_.size()) / num_layers),
       mailbox_(std::move(mailbox)),
       mailbox_data_(static_cast<uint32_t*>(shared_data(mailbox_, "mailbox"))),
@@ -96,6 +99,9 @@ ExpertService::ExpertService(
   }
   if (segments_.empty() || segments_.size() % num_layers != 0) {
     throw std::invalid_argument("ExpertService: segments must hold the same count per layer");
+  }
+  if (locations_.size() != segments_.size() * num_experts) {
+    throw std::invalid_argument("ExpertService: locations must hold num_experts per segment");
   }
   int64_t num_banks = static_cast<int64_t>(banks_.size());
   if (destinations_.size() != static_cast<size_t>(num_layers * num_banks * 2) ||
@@ -130,13 +136,23 @@ ExpertService::ExpertService(
   for (int layer_id = 0; layer_id < num_layers; ++layer_id) {
     std::vector<std::tuple<int64_t, int64_t, int64_t>> pieces;
     for (int s = 0; s < segments_per_layer_; ++s) {
-      const ExpertSegment& segment = segments_[layer_id * segments_per_layer_ + s];
-      if (segment.file_index < 0 || segment.file_index >= static_cast<int64_t>(files.size()) ||
-          segment.bank_index < 0 || segment.bank_index >= num_banks ||
-          segment.file_offset < 0 || segment.expert_bytes < 1) {
+      int64_t segment_index = layer_id * segments_per_layer_ + s;
+      const ExpertSegment& segment = segments_[segment_index];
+      bool is_valid = segment.bank_index >= 0 && segment.bank_index < num_banks &&
+          segment.expert_bytes >= 1;
+      for (int e = 0; e < num_experts; ++e) {
+        const ExpertLocation& location = locations_[segment_index * num_experts + e];
+        is_valid = is_valid &&
+            (location.file_index == FILL_FILE
+                 ? location.file_offset >= 0 && location.file_offset <= 0xFF
+                 : location.file_index >= 0 &&
+                     location.file_index < static_cast<int64_t>(files.size()) &&
+                     location.file_offset >= 0);
+      }
+      if (!is_valid) {
         throw std::invalid_argument(
             "ExpertService: segment " + std::to_string(s) + " of layer " +
-            std::to_string(layer_id) + " names no file or bank or an empty range");
+            std::to_string(layer_id) + " names no bank, an empty range or an expert in no file");
       }
       pieces.emplace_back(segment.bank_index, segment.row_offset, segment.expert_bytes);
     }
@@ -174,6 +190,26 @@ ExpertService::ExpertService(
       if (fcntl(descriptor, F_NOCACHE, 1) != 0 || fcntl(descriptor, F_RDAHEAD, 0) != 0) {
         throw std::runtime_error(
             "ExpertService: uncached reads of " + file + ": " + error_text(errno));
+      }
+    }
+    // A file cut short under its header fails here, not at the first miss mid-serve.
+    std::vector<int64_t> file_bytes;
+    for (size_t f = 0; f < files_.size(); ++f) {
+      struct stat status;
+      if (fstat(file_descriptors_[f], &status) != 0) {
+        throw std::runtime_error("ExpertService: stat of " + files_[f] + ": " + error_text(errno));
+      }
+      file_bytes.push_back(status.st_size);
+    }
+    for (size_t i = 0; i < locations_.size(); ++i) {
+      const ExpertLocation& location = locations_[i];
+      int64_t expert_bytes = segments_[i / num_experts].expert_bytes;
+      if (location.file_index != FILL_FILE &&
+          location.file_offset + expert_bytes > file_bytes[location.file_index]) {
+        throw std::runtime_error(
+            "ExpertService: " + files_[location.file_index] + " ends before expert " +
+            std::to_string(i % num_experts) + "'s bytes at " +
+            std::to_string(location.file_offset));
       }
     }
     for (int i = 0; i < io_threads; ++i) {
@@ -268,20 +304,34 @@ void ExpertService::submit(
   batch.error.clear();
   std::vector<ReadTask> tasks;
   for (int s = 0; s < segments_per_layer_; ++s) {
-    const ExpertSegment& segment = segments_[layer_id * segments_per_layer_ + s];
+    int64_t segment_index = layer_id * segments_per_layer_ + s;
+    const ExpertSegment& segment = segments_[segment_index];
+    const ExpertLocation* locations = &locations_[segment_index * num_experts_];
     for (int32_t first = 0; first < num_experts_;) {
+      const ExpertLocation& start = locations[first];
       if (batch.index_of_expert[first] < 0) {
+        ++first;
+        continue;
+      } else if (start.file_index == FILL_FILE) {
+        std::memset(
+            expert_row(batch, segment, first),
+            static_cast<int>(start.file_offset),
+            segment.expert_bytes);
         ++first;
         continue;
       }
       int32_t last = first + 1;
-      while (last < num_experts_ && batch.index_of_expert[last] >= 0) {
+      while (last < num_experts_ && batch.index_of_expert[last] >= 0 &&
+             locations[last].file_index == start.file_index &&
+             locations[last].file_offset ==
+                 start.file_offset + (last - first) * segment.expert_bytes) {
         ++last;
       }
-      int64_t run_end = segment.file_offset + last * segment.expert_bytes;
-      for (int64_t begin = segment.file_offset + first * segment.expert_bytes; begin < run_end;
-           begin += MAX_READ_BYTES) {
-        tasks.push_back({&batch, s, begin, std::min(begin + MAX_READ_BYTES, run_end)});
+      int64_t base = start.file_offset - first * segment.expert_bytes;
+      int64_t run_end = base + last * segment.expert_bytes;
+      for (int64_t begin = start.file_offset; begin < run_end; begin += MAX_READ_BYTES) {
+        tasks.push_back(
+            {&batch, s, start.file_index, base, begin, std::min(begin + MAX_READ_BYTES, run_end)});
       }
       first = last;
     }
@@ -322,7 +372,7 @@ void ExpertService::read(const ReadTask& task, uint8_t* staging) {
   const ExpertSegment& segment = segments_[batch.layer_id * segments_per_layer_ + task.segment];
   int64_t aligned_begin = task.begin / READ_ALIGNMENT * READ_ALIGNMENT;
   int64_t aligned_end = (task.end + READ_ALIGNMENT - 1) / READ_ALIGNMENT * READ_ALIGNMENT;
-  int descriptor = file_descriptors_[segment.file_index];
+  int descriptor = file_descriptors_[task.file_index];
   // The widened end may pass the end of the file; only the wanted bytes must arrive.
   int64_t done = 0;
   while (done < task.end - aligned_begin) {
@@ -335,7 +385,7 @@ void ExpertService::read(const ReadTask& task, uint8_t* staging) {
       std::string reason = count < 0 ? error_text(errno) : "unexpected end of file";
       std::lock_guard<std::mutex> lock(batch.error_mutex);
       if (batch.error.empty()) {
-        batch.error = "ExpertService: reading " + files_[segment.file_index] + " at " +
+        batch.error = "ExpertService: reading " + files_[task.file_index] + " at " +
             std::to_string(aligned_begin + done) + ": " + reason;
       }
       return;
@@ -343,22 +393,29 @@ void ExpertService::read(const ReadTask& task, uint8_t* staging) {
     done += count;
   }
   batch.bytes_read.fetch_add(done, std::memory_order_relaxed);
+  int64_t first = (task.begin - task.base) / segment.expert_bytes;
+  int64_t last = (task.end - 1 - task.base) / segment.expert_bytes;
+  for (int64_t expert = first; expert <= last; ++expert) {
+    int64_t expert_begin = task.base + expert * segment.expert_bytes;
+    int64_t piece_begin = std::max(task.begin, expert_begin);
+    int64_t piece_end = std::min(task.end, expert_begin + segment.expert_bytes);
+    std::memcpy(
+        expert_row(batch, segment, expert) + (piece_begin - expert_begin),
+        staging + (piece_begin - aligned_begin),
+        piece_end - piece_begin);
+  }
+}
+
+uint8_t* ExpertService::expert_row(
+    const ReadBatch& batch,
+    const ExpertSegment& segment,
+    int64_t expert) const {
   size_t destination = 2 * (batch.layer_id * banks_.size() + segment.bank_index);
   int64_t row_bytes = destinations_[destination + 1];
   int64_t row_zero = batch.buffer < 0 ? destinations_[destination]
                                       : batch.buffer * buffer_bytes_[segment.bank_index];
-  int64_t first = (task.begin - segment.file_offset) / segment.expert_bytes;
-  int64_t last = (task.end - 1 - segment.file_offset) / segment.expert_bytes;
-  for (int64_t expert = first; expert <= last; ++expert) {
-    int64_t expert_begin = segment.file_offset + expert * segment.expert_bytes;
-    int64_t piece_begin = std::max(task.begin, expert_begin);
-    int64_t piece_end = std::min(task.end, expert_begin + segment.expert_bytes);
-    int64_t row = row_zero + batch.index_of_expert[expert] * row_bytes + segment.row_offset;
-    std::memcpy(
-        bank_data_[segment.bank_index] + row + (piece_begin - expert_begin),
-        staging + (piece_begin - aligned_begin),
-        piece_end - piece_begin);
-  }
+  return bank_data_[segment.bank_index] + row_zero + batch.index_of_expert[expert] * row_bytes +
+      segment.row_offset;
 }
 
 void ExpertService::finish_buffer(PrefillBuffer& buffer, int64_t wait_ns) {

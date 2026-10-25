@@ -54,16 +54,17 @@ from ftmetal.engine.sample import BatchSamplingArgs, Sampler
 from ftmetal.kvcache import create_pools, pool_arrays, pool_costs
 from ftmetal.kvcache.base import PoolCost
 from ftmetal.layers.moe import OffloadMoELayer
-from ftmetal.layers.quantization.moe import can_offload
+from ftmetal.layers.quantization.config import BankSpec
 from ftmetal.mm.config import ENCODER_SECTIONS
 from ftmetal.mm.encoder_cache import EncoderCache
 from ftmetal.mm.processor import MMProcessor, get_mm_processor
 from ftmetal.models.blocks import BaseLLMModel, SupportsMultimodal
 from ftmetal.models.config import MoeStrategy
-from ftmetal.models.loader import WeightRules, checkpoint_bytes, expert_schemes, load_weights
+from ftmetal.models.loader import WeightRules, checkpoint_bytes, load_weights
 from ftmetal.models.register import (
     MODEL_REGISTRY,
     create_model,
+    get_model_spec,
     model_weight_rules,
     read_checkpoint,
 )
@@ -71,6 +72,7 @@ from ftmetal.moe.offload_cache import STAGING_BYTES, OffloadMoeCache
 from ftmetal.moe.slot_pools import (
     HOT_EXPERTS_FILE,
     SlotLayout,
+    bank_layouts,
     find_expert_counts,
     plan_slot_layout,
     read_expert_counts,
@@ -107,7 +109,7 @@ def resolve_moe_strategy(
     """FreeToken's MoE strategy resolution: an explicit strategy stands; auto offloads when a
     cache size flag is given, else keeps the experts resident when the checkpoint's weights
     leave the paged pools kv_reserve_tokens (choose_moe_strategy) or, when they leave them any
-    pages, the offload cache cannot serve their scheme; when they leave none, raises before any
+    pages, the model family has no offload cache; when they leave none, raises before any
     weight is read. state: the lazily mapped checkpoint the model loads from."""
     model_config = config.model_config
     has_cache_flag = (
@@ -142,13 +144,12 @@ def resolve_moe_strategy(
         strategy = choose_moe_strategy(
             resident, kv_reserve_pages(config.kv_reserve_tokens, config.page_size)
         )
-        schemes = expert_schemes(state, rules, model_config.quant)
-        if strategy == "offload" and not all(can_offload(scheme) for scheme in schemes):
+        if strategy == "offload" and not get_model_spec(config.architecture).has_offload:
             # Refused here, before any weight is read, when they leave the paged pools nothing.
             plan_budget(budget, resident.weights, resident.activations, graphs, costs, encoder)
             logger.warning(
-                "MoE offload serves affine-quantized experts only: this checkpoint's stay "
-                "resident, beside less KV than kv_reserve_tokens"
+                f"{config.architecture} has no MoE offload: its experts stay resident, beside "
+                "less KV than kv_reserve_tokens"
             )
             strategy = "fused"
         logger.info(
@@ -266,22 +267,48 @@ class Engine:
         # Delta, not the total: an earlier engine's pools may still be alive in the process.
         resident_before = mx.get_active_memory()
         self.model = create_model(config.architecture, model_config, config.dtype)
+        moe_layers: list[OffloadMoELayer] = []
+        layouts: list[dict[str, BankSpec]] = []
+        expert_source: ExpertSource | None = None
+        if is_offload:
+            moe_layers = offload_layers(self.model)
+            layouts, resident_arrays = bank_layouts(
+                [layer.quant_method.layout() for layer in moe_layers]
+            )
+            for layer_id, layout in enumerate(layouts):
+                if list(layout) != list(layouts[0]):
+                    raise ValueError(
+                        f"MoE offload holds every layer's experts in one set of banks, but MoE "
+                        f"layer {layer_id} stores {sorted(layout)} and layer 0 "
+                        f"{sorted(layouts[0])} (--moe-strategy fused keeps them resident)"
+                    )
+            if is_expert_gate_up_apart:
+                # Every offload layer holds gate and up apart, its resident arrays too.
+                apart = {
+                    f"{name}.gate_up_proj"
+                    for name, module in self.model.named_modules()
+                    if isinstance(module, OffloadMoELayer)
+                }
+                rules = dataclasses.replace(rules, unfused=rules.unfused | apart)
+            # Before the weights load, which empties the state.
+            expert_source = ExpertSource(
+                config.model_path,
+                rules,
+                checkpoint.state,
+                checkpoint.expert_bytes,
+                resident_arrays,
+            )
         load_weights(self.model, checkpoint.state, rules, skip_experts=is_offload)
         logger.info(f"loaded weights from {config.model_path}")
         # Under offload the experts are the cache's, not weights.
         self.weights_bytes = mx.get_active_memory() - resident_before
         logger.info(f"weights resident: {self.weights_bytes / 2**30:.2f} GiB")
 
-        moe_layers: list[OffloadMoELayer] = []
-        expert_source: ExpertSource | None = None
         expert_counts: np.ndarray | None = None
         slot_layout: SlotLayout | None = None
         cache_size = 0
         experts_bytes = 0
         if is_offload:
-            moe_layers = offload_layers(self.model)
-            layouts = [layer.quant_method.layout() for layer in moe_layers]
-            expert_source = ExpertSource(config.model_path, rules)
             if config.moe_pool_slots == "profile":
                 if config.moe_pool_profile is not None:
                     table_path = Path(config.moe_pool_profile)

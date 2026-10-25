@@ -11,8 +11,7 @@ scheme's layout is the arrays it stores an [output, input] weight in, which the 
 layers/quantization/{linear,embedding,moe}.py allocate and read; FreeToken's methods and
 kernels size their arrays themselves, and a method still adds an array whose shape depends
 on the layer kind. BankSpec is FreeToken's (layers/quantization/moe/base.py) with its
-weight's scheme added and no resident (non-bank) arrays, and describes any layout's array,
-not only an expert bank's.
+weight's scheme added, and describes any layout's array, not only an expert bank's.
 """
 
 from __future__ import annotations
@@ -82,11 +81,14 @@ QuantScheme = AffineScheme | FpBlockScheme
 @dataclass(frozen=True)
 class BankSpec:
     """One array of a weight layout; in an expert bank it is per expert and the allocator
-    prepends the expert or slot axis. quant: the scheme of its weight (None: bf16)."""
+    prepends the expert or slot axis. quant: the scheme of its weight (None: bf16); resident:
+    a per-expert array an offload layer keeps itself, indexed by expert, instead of a bank
+    row (an export's output_scale)."""
 
     shape: tuple[int, ...]
     dtype: mx.Dtype
     quant: QuantScheme | None = None
+    resident: bool = False
 
     @property
     def nbytes(self) -> int:

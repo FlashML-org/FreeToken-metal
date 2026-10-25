@@ -36,7 +36,8 @@ CacheTypeChoice = Literal["naive", "radix"]
 MoeStrategyChoice = Literal["auto", "fused", "offload"]
 # From this many prefill tokens on, an offload prefill reads each layer's absent experts ahead
 # of it instead of looking them up: at T * top-8 >= 4 * 256 experts every expert averages
-# four rows, where gather_qmm_sorted's tile kernel beats the per-row matvec.
+# four rows, where the expert-sorted tile kernel beats the per-row matvec in every expert
+# format (1.5-2.8x at Qwen3.6's shapes on the M4 Pro).
 DEFAULT_MOE_PREFILL_OVERLAP_MIN_TOKENS = 128
 
 

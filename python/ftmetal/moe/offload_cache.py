@@ -130,10 +130,13 @@ class OffloadMoeCache:
             dtype=np.int64,
         )
         self.buffer_bytes = np.array(list(slot_layout.buffer_bytes.values()), np.int64)
-        # Each projection's weight, scales and biases banks, by their columns of destinations.
+        # Each projection's banks (weight, then any scales and biases: the layout's
+        # order, the expert-sorted kernels' expert_bytes columns), by their columns of
+        # destinations.
         self.projection_banks: dict[str, list[int]] = {}
         for index, role in enumerate(self.banks):
             self.projection_banks.setdefault(role.rpartition(".")[0], []).append(index)
+        segments, locations = source.segment_table(layouts)
         self.service = _C.ExpertService(
             num_layers,
             num_experts,
@@ -147,7 +150,8 @@ class OffloadMoeCache:
             self.hit_stats,
             list(self.banks.values()),
             source.files,
-            source.segment_table(layouts),
+            segments,
+            locations,
             self.destinations,
             self.buffer_bytes.tolist(),
             IO_THREADS,
@@ -243,8 +247,8 @@ class OffloadMoeCache:
 
     def expert_bytes(self, layer_id: int) -> dict[str, mx.array]:
         """An overlap prefill layer's experts per projection, once its prefill buffer is read:
-        int64 [num_experts, 3], each expert's byte offsets into the projection's weight, scales
-        and biases banks."""
+        int64 [num_experts, banks], each expert's byte offsets into the projection's banks
+        (weight, then any scales and biases)."""
         self.wait_prefill_layer(layer_id)
         return self.prefill_expert_bytes.pop(layer_id)
 

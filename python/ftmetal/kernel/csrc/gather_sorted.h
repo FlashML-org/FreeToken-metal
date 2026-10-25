@@ -66,10 +66,16 @@ mx::array gather_mm_sorted(
 
 // The donor kernel a GatherSorted runs, each from its own Metal source: affine_gather_qmm_rhs,
 // fp_gather_qmm_rhs or gather_mm_rhs.
+// The quantized kernels' K tile (MLX's gather_qmm_rhs BK): a float block mode's K must be
+// whole tiles, as the float tile reads its last partial one past the row.
+constexpr int QMM_TILE_K = 32;
+
 enum class GatherSortedKernel { Affine, Fp, Unquantized };
 
 struct GatherSortedConfig {
   GatherSortedKernel kernel;
+  // The output columns: two calls on the same inputs that differ in n are not equivalent.
+  int n;
   // The quantized kernels' only.
   int group_size;
   int bits;

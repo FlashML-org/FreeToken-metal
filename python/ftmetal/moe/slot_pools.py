@@ -179,6 +179,24 @@ def min_cache_size(
         return floor + 2 * num_experts
 
 
+def bank_layouts(
+    method_layouts: list[dict[str, BankSpec]],
+) -> tuple[list[dict[str, BankSpec]], frozenset[str]]:
+    """The arrays the cache holds of each MoE layer's method layout, and the names of the
+    resident arrays (an export's output_scale) the layers keep instead."""
+    layouts = [
+        {role: spec for role, spec in layout.items() if not spec.resident}
+        for layout in method_layouts
+    ]
+    resident = frozenset(
+        role.rpartition(".")[2]
+        for layout in method_layouts
+        for role, spec in layout.items()
+        if spec.resident
+    )
+    return layouts, resident
+
+
 def plan_slot_layout(
     cache_size: int,
     layouts: list[dict[str, BankSpec]],
@@ -302,6 +320,7 @@ __all__ = [
     "PrefillBufferPlacement",
     "SlotLayout",
     "SlotPool",
+    "bank_layouts",
     "find_expert_counts",
     "initial_experts",
     "min_cache_size",

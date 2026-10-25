@@ -2,7 +2,8 @@
 // pool of IO threads that read expert rows straight from the checkpoint into the bank
 // slots: raw read-around (each read widened to 4 KiB boundaries, F_NOCACHE, no read-ahead)
 // into a per-thread aligned staging buffer, then one memcpy per expert into its row. A run
-// of consecutive experts of one checkpoint segment is one read. Idle threads block; a
+// of consecutive experts whose bytes follow on in one file is one read; a part the
+// checkpoint does not store is filled as the read is submitted instead. Idle threads block; a
 // caller waits for its reads by spinning on a completion counter. A coordinator thread
 // answers the GPU lookups' mailbox requests (see moe_lookup.h) with the same reads, and a
 // watchdog thread fails a request the coordinator leaves unanswered. Public methods other
@@ -29,15 +30,21 @@ namespace ftmetal {
 // Each IO thread's aligned staging buffer, which one read fills.
 constexpr int64_t EXPERT_STAGING_BYTES = 8 << 20;
 
-// One checkpoint part of one bank, per MoE layer: expert e's bytes are
-// [file_offset + e * expert_bytes, file_offset + (e + 1) * expert_bytes) of file
-// file_index, and land at row_offset in a row of bank bank_index.
+// One checkpoint part of one bank, per MoE layer: each expert's expert_bytes bytes land at
+// row_offset in a row of bank bank_index.
 struct ExpertSegment {
-  int64_t file_index;
-  int64_t file_offset;
-  int64_t expert_bytes;
   int64_t bank_index;
   int64_t row_offset;
+  int64_t expert_bytes;
+};
+
+// The file_index of a part the checkpoint does not store: every byte of it is file_offset.
+constexpr int64_t FILL_FILE = -1;
+
+// Where one expert's bytes of one segment start: file_offset of file file_index, or FILL_FILE.
+struct ExpertLocation {
+  int64_t file_index;
+  int64_t file_offset;
 };
 
 // Per MoE layer. hits and misses count the experts of ensure_experts and of the answered
@@ -78,11 +85,13 @@ struct ReadBatch {
   std::string error;
 };
 
-// The bytes [begin, end) of one segment of the batch's layer, all inside one run of the
-// batch's experts.
+// The bytes [begin, end) of file file_index for one segment of the batch's layer, all inside
+// one run of the batch's experts, expert e of the run at base + e * expert_bytes.
 struct ReadTask {
   ReadBatch* batch = nullptr;
   int segment = 0;
+  int64_t file_index = 0;
+  int64_t base = 0;
   int64_t begin = 0;
   int64_t end = 0;
 };
@@ -100,7 +109,8 @@ class ExpertService {
   // buffer_size, layer_pools, pool_bounds and pool_volatile lay out the slots (SlotLru);
   // mailbox uint32 [MAILBOX_WORDS] and hit_stats uint32 [num_layers, 2] are the lookups';
   // banks: one evaluated row-contiguous byte buffer per bank; segments: num_layers *
-  // segments-per-layer entries, layer-major; destinations: per layer and bank, the byte
+  // segments-per-layer entries, layer-major, and locations: each segment's num_experts
+  // entries, in segment order; destinations: per layer and bank, the byte
   // offset of slot 0's row and the row's bytes (slot s at offset + s * row); buffer_bytes:
   // each prefill buffer's bytes in each bank, from byte 0. The watchdog fails a request left
   // unanswered for stall_timeout_s; without run_coordinator nobody answers (a stalled
@@ -119,6 +129,7 @@ class ExpertService {
       std::vector<mx::array> banks,
       const std::vector<std::string>& files,
       std::vector<ExpertSegment> segments,
+      std::vector<ExpertLocation> locations,
       std::vector<int64_t> destinations,
       std::vector<int64_t> buffer_bytes,
       int io_threads,
@@ -180,6 +191,8 @@ class ExpertService {
   void finish_buffer(PrefillBuffer& buffer, int64_t wait_ns);
   void work(int thread_index);
   void read(const ReadTask& task, uint8_t* staging);
+  // Where the segment's bytes of the expert land in the batch's slot or buffer row.
+  uint8_t* expert_row(const ReadBatch& batch, const ExpertSegment& segment, int64_t expert) const;
 
   SlotLru lru_;
   int num_layers_;
@@ -192,6 +205,7 @@ class ExpertService {
   std::vector<std::string> files_;
   std::vector<int> file_descriptors_;
   std::vector<ExpertSegment> segments_;
+  std::vector<ExpertLocation> locations_;
   int segments_per_layer_;
 
   std::mutex call_mutex_;

@@ -6,7 +6,8 @@ at load into MLX's nvfp4 (as stored) and mxfp8 (under unit e8m0 scales) tensors,
 scale becoming an output_scale, instead of read by FP4 / FP8 kernels; each module's format is
 read from the tensors it stores in the MLX layout, not from the config's module lists, which
 name Hugging Face modules, and the config is only checked for formats this serves; activation
-and KV-cache scales are dropped, the engine serving the weights alone.
+and KV-cache scales are dropped, the engine serving the weights alone; the checkpoint bytes of
+each expert tensor carry over to the tensor rewritten from it.
 """
 
 from __future__ import annotations
@@ -14,7 +15,14 @@ from __future__ import annotations
 import mlx.core as mx
 
 from ftmetal.layers.quantization.config import FpBlockScheme, QuantScheme
-from ftmetal.models.loader import config_dict, config_int, config_str
+from ftmetal.models.loader import (
+    ExpertBytes,
+    ExpertFill,
+    config_dict,
+    config_int,
+    config_str,
+    stacked_slices,
+)
 
 # The e8m0 byte of a scale of one.
 E8M0_ONE = 127
@@ -44,11 +52,14 @@ def output_scale(module: str, scale: mx.array, weight: mx.array) -> mx.array:
 
 
 def rewrite_export(
-    state: dict[str, mx.array], quantization_config: dict[str, object]
-) -> tuple[dict[str, mx.array], dict[str, QuantScheme]]:
+    state: dict[str, mx.array],
+    quantization_config: dict[str, object],
+    expert_bytes: dict[str, ExpertBytes],
+) -> tuple[dict[str, mx.array], dict[str, QuantScheme], dict[str, ExpertBytes]]:
     """An export's NVFP4 and per-tensor FP8 modules (an MLX layout state) as MLX nvfp4 / mxfp8
-    weight, scales and output_scale tensors, and the scheme of each module rewritten; raises
-    unless every format the config names is NVFP4 or per-tensor FP8."""
+    weight, scales and output_scale tensors, the scheme of each module rewritten, and
+    expert_bytes (the state's experts' checkpoint bytes) for the result; raises unless every
+    format the config names is NVFP4 or per-tensor FP8."""
     method = config_str(quantization_config, "quant_method", "")
     if method == "modelopt":
         quant_algo = config_str(quantization_config, "quant_algo", "").upper()
@@ -81,8 +92,18 @@ def rewrite_export(
     else:
         raise ValueError(f"quantization method {method!r} is not served")
     out: dict[str, mx.array] = {}
+    out_expert_bytes: dict[str, ExpertBytes] = {}
     schemes: dict[str, QuantScheme] = {}
     consumed: set[str] = set()
+
+    def carry(out_key: str, key: str) -> None:
+        """A rewritten expert tensor's checkpoint bytes: its source's as recorded, or the source
+        stored stacked under its own name."""
+        if key in expert_bytes:
+            out_expert_bytes[out_key] = expert_bytes[key]
+        elif state[key].ndim == 3:
+            out_expert_bytes[out_key] = stacked_slices(key, state[key])
+
     for key in state:
         if key.endswith(".weight_scale_2"):
             # ModelOpt NVFP4 stores the dequantization-side global scale.
@@ -102,6 +123,8 @@ def rewrite_export(
         out[f"{module}.weight"] = weight.view(mx.uint32)
         out[f"{module}.scales"] = scales
         out[f"{module}.output_scale"] = output_scale(module, global_scale, weight)
+        carry(f"{module}.weight", weight_key)
+        carry(f"{module}.scales", f"{module}.weight_scale")
         schemes[module] = NVFP4_SCHEME
         consumed.update((key, weight_key, f"{module}.weight_scale"))
     for key in state:
@@ -115,12 +138,17 @@ def rewrite_export(
             out[f"{module}.weight"] = weight.view(mx.uint32)
             out[f"{module}.scales"] = mx.full((*weight.shape[:-1], groups), E8M0_ONE, mx.uint8)
             out[f"{module}.output_scale"] = output_scale(module, state[key], weight)
+            carry(f"{module}.weight", f"{module}.weight")
+            if weight.ndim == 3:
+                out_expert_bytes[f"{module}.scales"] = ExpertFill(value=E8M0_ONE)
             schemes[module] = FP8_SCHEME
             consumed.update((key, f"{module}.weight"))
     for key, tensor in state.items():
         if key not in consumed and not key.endswith(UNUSED_SCALE_SUFFIXES):
             out[key] = tensor
-    return out, schemes
+            if key in expert_bytes:
+                out_expert_bytes[key] = expert_bytes[key]
+    return out, schemes, out_expert_bytes
 
 
 __all__ = ["rewrite_export"]

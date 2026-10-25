@@ -14,25 +14,42 @@ prompt on both sides of the threshold, a prompt chunked through overlap prefills
 requests decoding together, and three; prefill overlap off, with no buffers; layer 0's up
 in 8 bits (its gate and up apart when resident, every layer's under offload) on a replayed
 decode and an overlap prefill; the last layer's experts in 8 bits, one pool per layout or
-per layer.
+per layer. Every other format the experts load in serves the same overlap, copy-miss and
+decode forwards: unquantized, MLX's float modes, the Hugging Face layout (one tensor per
+expert, or each layer's experts in two banks) and the ModelOpt and compressed-tensors
+exports, NVFP4 or FP8 (whose unit scales the checkpoint does not store) with per-expert
+output scales.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
+from mlx.utils import tree_flatten
+from mlx_lm.models import qwen3_5 as reference
 
 from ftmetal.core import SamplingParams
 from ftmetal.engine.config import EngineConfig
+from ftmetal.layers.quantization.config import FP_BLOCK_SHAPES
 from ftmetal.models.config import MoeStrategy
 from ftmetal.moe.slot_pools import MoePoolGrouping, PrefillBufferPlacement
 from ftmetal.scheduler.scheduler import Scheduler
-from tiny_model import TINY_TEXT_CONFIG, build_reference, save_checkpoint
+from tiny_model import (
+    EXPERTS,
+    LINEAR_ATTENTION,
+    TINY_TEXT_CONFIG,
+    build_reference,
+    hf_layout_weights,
+    save_checkpoint,
+    save_export,
+    save_hf_checkpoint,
+)
 
 NUM_EXPERTS = 16
 OFFLOAD_TEXT_CONFIG = {**TINY_TEXT_CONFIG, "num_experts": NUM_EXPERTS, "num_experts_per_tok": 4}
@@ -45,6 +62,27 @@ PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 # Absolute and relative: the paths differ in summation order only (a weighted sum against
 # moe_combine, the sorted tile kernel against the per-row matvec).
 LOGITS_TOLERANCE = 1e-4
+# Layer 0's up projection, by its MLX layout name.
+FIRST_UP = r"layers\.0\.mlp\.switch_mlp\.up_proj$"
+
+# How the checkpoint stores its experts: MLX affine (in up_bits and last_layer_bits) or a float
+# mode, unquantized in the MLX or the Hugging Face layout (one tensor per expert, or stacked in
+# two banks), or an export's NVFP4 or FP8 (in the Hugging Face layout, or under MLX names), or
+# NVFP4 with layer 0's up in FP8.
+ExpertFormat = Literal[
+    "affine",
+    "mxfp4",
+    "nvfp4",
+    "mxfp8",
+    "unquantized",
+    "hf-unquantized",
+    "hf-unquantized-stacked",
+    "modelopt",
+    "modelopt-mlx-names",
+    "modelopt-up-fp8",
+    "compressed-tensors",
+    "compressed-tensors-fp8",
+]
 
 
 @dataclass(frozen=True)
@@ -65,6 +103,7 @@ class Case:
     # Bits of layer 0's up projection.
     up_bits: int = EXPERT_BITS
     last_layer_bits: int = EXPERT_BITS
+    expert_format: ExpertFormat = "affine"
 
 
 CASES = [
@@ -122,6 +161,60 @@ CASES = [
         up_bits=8,
         last_layer_bits=8,
     ),
+    # The other formats: 64 tokens through the buffers, 36 looked up, both requests decoding.
+    Case("mxfp4", (100, 9), overlap_min_tokens=48, reads_buffers=True, expert_format="mxfp4"),
+    Case("nvfp4", (100, 9), overlap_min_tokens=48, reads_buffers=True, expert_format="nvfp4"),
+    Case("mxfp8", (100, 9), overlap_min_tokens=48, reads_buffers=True, expert_format="mxfp8"),
+    Case(
+        "unquantized",
+        (100, 9),
+        overlap_min_tokens=48,
+        reads_buffers=True,
+        expert_format="unquantized",
+    ),
+    Case(
+        "hf-unquantized",
+        (100, 9),
+        overlap_min_tokens=48,
+        reads_buffers=True,
+        expert_format="hf-unquantized",
+    ),
+    Case(
+        "hf-unquantized-stacked",
+        (100, 9),
+        overlap_min_tokens=48,
+        reads_buffers=True,
+        expert_format="hf-unquantized-stacked",
+    ),
+    Case("modelopt", (100, 9), overlap_min_tokens=48, reads_buffers=True, expert_format="modelopt"),
+    Case(
+        "modelopt-mlx-names",
+        (100, 9),
+        overlap_min_tokens=48,
+        reads_buffers=True,
+        expert_format="modelopt-mlx-names",
+    ),
+    Case(
+        "modelopt-up-fp8",
+        (100, 9),
+        overlap_min_tokens=48,
+        reads_buffers=True,
+        expert_format="modelopt-up-fp8",
+    ),
+    Case(
+        "compressed-tensors",
+        (100, 9),
+        overlap_min_tokens=48,
+        reads_buffers=True,
+        expert_format="compressed-tensors",
+    ),
+    Case(
+        "compressed-tensors-fp8",
+        (100, 9),
+        overlap_min_tokens=48,
+        reads_buffers=True,
+        expert_format="compressed-tensors-fp8",
+    ),
 ]
 
 
@@ -129,10 +222,63 @@ def is_expert_projection(module_path: str, module: nn.Module) -> bool:
     return "switch_mlp" in module_path and hasattr(module, "to_quantized")
 
 
-def write_checkpoint(path: Path, up_bits: int, last_layer_bits: int) -> None:
-    """The reference model with its experts alone affine quantized, layer 0's up in up_bits,
-    the last layer's in last_layer_bits."""
+def write_checkpoint(path: Path, case: Case) -> None:
+    """The reference model with its experts in the case's format: affine quantized alone,
+    layer 0's up in up_bits and the last layer's in last_layer_bits, or another."""
     model = build_reference(seed=11, text_config=OFFLOAD_TEXT_CONFIG)
+    match case.expert_format:
+        case "affine":
+            write_affine_checkpoint(path, model, case.up_bits, case.last_layer_bits)
+        case "mxfp4" | "nvfp4" | "mxfp8" as mode:
+            bits, group_size = FP_BLOCK_SHAPES[mode]
+            nn.quantize(model, group_size, bits, mode=mode, class_predicate=is_expert_projection)
+            mx.eval(model.parameters())
+            quantization = {"group_size": group_size, "bits": bits, "mode": mode}
+            save_checkpoint(model, path, quantization=quantization)
+        case "unquantized":
+            save_checkpoint(model, path, quantization=None)
+        case "hf-unquantized" | "hf-unquantized-stacked" as layout:
+            weights = dict(tree_flatten(model.parameters()))
+            is_stacked = layout == "hf-unquantized-stacked"
+            hf_weights = hf_layout_weights(
+                weights, "model.language_model.", has_stacked_experts=is_stacked
+            )
+            save_hf_checkpoint(hf_weights, model, path, "Qwen3_5MoeForConditionalGeneration")
+        # The export quantizes the same reference model itself.
+        case "modelopt" | "compressed-tensors" as dialect:
+            save_export(dialect, 11, path, mx.float32, text_config=OFFLOAD_TEXT_CONFIG)
+        case "modelopt-mlx-names":
+            save_export(
+                "modelopt",
+                11,
+                path,
+                mx.float32,
+                text_config=OFFLOAD_TEXT_CONFIG,
+                is_hf_layout=False,
+            )
+        case "modelopt-up-fp8":
+            save_export(
+                "modelopt",
+                11,
+                path,
+                mx.float32,
+                text_config=OFFLOAD_TEXT_CONFIG,
+                formats=(FIRST_UP, EXPERTS),
+            )
+        case "compressed-tensors-fp8":
+            save_export(
+                "compressed-tensors",
+                11,
+                path,
+                mx.float32,
+                text_config=OFFLOAD_TEXT_CONFIG,
+                formats=(EXPERTS, LINEAR_ATTENTION),
+            )
+
+
+def write_affine_checkpoint(
+    path: Path, model: reference.Model, up_bits: int, last_layer_bits: int
+) -> None:
     num_layers = OFFLOAD_TEXT_CONFIG["num_hidden_layers"]
     assert isinstance(num_layers, int)
     last_layer = f"language_model.model.layers.{num_layers - 1}.mlp.switch_mlp"
@@ -209,7 +355,7 @@ def test_offload_matches_resident_experts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: Case
 ) -> None:
     monkeypatch.setenv("FTMETAL_MOE_PREFILL_OVERLAP_MIN_TOKENS", str(case.overlap_min_tokens))
-    write_checkpoint(tmp_path, case.up_bits, case.last_layer_bits)
+    write_checkpoint(tmp_path, case)
     rng = np.random.default_rng(len(case.name))
     prompts = [[int(t) for t in rng.integers(1, 120, size=n)] for n in case.prompt_lens]
 
@@ -224,7 +370,7 @@ def test_offload_matches_resident_experts(
     dedicated = 2 * NUM_EXPERTS if case.buffer_placement == "dedicated" else 0
     assert cache.cache_size == case.cache_size - dedicated
     # One layer's gate and up apart puts every layer's apart.
-    is_apart = case.up_bits != EXPERT_BITS
+    is_apart = case.up_bits != EXPERT_BITS or case.expert_format == "modelopt-up-fp8"
     assert all(
         ("gate_up_proj.weight" not in pool.layout) == is_apart for pool in cache.slot_layout.pools
     )
@@ -236,3 +382,23 @@ def test_offload_matches_resident_experts(
     # A prefill buffer read counts as an expert read but not as a miss.
     assert (sum(stats.experts_read) > sum(stats.misses)) == case.reads_buffers
     cache.check_healthy()
+
+
+def test_offload_refuses_layers_in_different_banks(tmp_path: Path) -> None:
+    """The last layer's experts in bf16 beside affine ones elsewhere: one set of banks holds
+    either, not both."""
+    model = build_reference(seed=11, text_config=OFFLOAD_TEXT_CONFIG)
+    num_layers = OFFLOAD_TEXT_CONFIG["num_hidden_layers"]
+    assert isinstance(num_layers, int)
+    last_layer = f"language_model.model.layers.{num_layers - 1}."
+
+    def predicate(module_path: str, module: nn.Module) -> bool:
+        return is_expert_projection(module_path, module) and not module_path.startswith(last_layer)
+
+    nn.quantize(model, EXPERT_GROUP_SIZE, EXPERT_BITS, class_predicate=predicate)
+    mx.eval(model.parameters())
+    quantization = {"group_size": EXPERT_GROUP_SIZE, "bits": EXPERT_BITS, "mode": "affine"}
+    save_checkpoint(model, tmp_path, quantization=quantization)
+    make_scheduler(tmp_path, Case("resident", (9,)), "fused")
+    with pytest.raises(ValueError, match="one set of banks"):
+        make_scheduler(tmp_path, Case("offload", (9,)), "offload")

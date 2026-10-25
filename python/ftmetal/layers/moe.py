@@ -5,13 +5,13 @@ by the model and handed to forward; the experts are one gate_up_proj bank (gate_
 up_proj banks under it when the checkpoint stores them in different schemes) and one down_proj
 bank per layer, gated by silu or gelu_tanh, which the MoE method of
 layers/quantization/moe.py allocates and runs.
-OffloadMoELayer serves affine experts only, from the context's offload cache, whose layers
-share one set of banks: gate and up apart in all layers once one keeps them apart. A decode
-or copy-miss forward gathers the slots its lookup returns from its pool's rows, unsorted
-(below four rows per expert the per-row matvec is the fast path); an overlap prefill sorts
-its pairs and reads each expert at its byte offsets in the banks (gather_qmm_sorted), its
-prefill buffers and the order of its reads and layers kept by the host, where FreeToken
-waits on CUDA events.
+OffloadMoELayer serves its experts from the context's offload cache, whose layers share one
+set of banks (gate and up apart in all layers once one keeps them apart), and holds only its
+method's resident arrays. A decode or copy-miss forward gathers the slots its lookup returns
+from its pool's rows, unsorted (below four rows per expert the per-row matvec is the fast
+path); an overlap prefill sorts its pairs and reads each expert at its byte offsets in the
+banks (the expert-sorted kernels), its prefill buffers and the order of its reads and layers
+kept by the host, where FreeToken waits on CUDA events.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from mlx.utils import tree_flatten
 
 from ftmetal.context import get_global_ctx
 from ftmetal.layers.base import BaseOP
-from ftmetal.layers.quantization.moe import AffineMoEMethod, ExpertSchemes, MoEConfig, moe_method
+from ftmetal.layers.quantization.moe import ExpertSchemes, MoEConfig, moe_method
 from ftmetal.moe.offload_cache import OffloadMoeCache
 
 
@@ -40,7 +40,8 @@ class MoELayer(BaseOP):
         dtype: mx.Dtype = mx.bfloat16,
         strategy: Literal["resident", "offload"] = "resident",
     ) -> None:
-        """An offload layer holds no banks: its offload cache does."""
+        """An offload layer holds its method's resident arrays alone: its offload cache holds
+        the banks."""
         super().__init__()
         cfg = MoEConfig(
             num_experts=num_experts,
@@ -53,8 +54,7 @@ class MoELayer(BaseOP):
             strategy=strategy,
         )
         self.quant_method = moe_method(cfg)
-        if strategy == "resident":
-            self.quant_method.create_weights(self)
+        self.quant_method.create_weights(self)
 
     def forward(
         self, hidden_states: mx.array, topk_weights: mx.array, topk_ids: mx.array
@@ -96,29 +96,34 @@ class OffloadMoELayer(MoELayer):
     ) -> mx.array:
         cache = get_global_ctx().moe_offload_cache
         assert cache is not None, "an offload MoE layer runs on the engine's offload cache"
+        resident = dict(tree_flatten(self.parameters()))
         if cache.mode == "overlap":
-            return self.prefill_forward(cache, hidden_states, topk_weights, topk_ids)
+            return self.prefill_forward(cache, resident, hidden_states, topk_weights, topk_ids)
         else:
             slots = cache.lookup_slots(self.moe_layer_id, topk_ids, hidden_states)
-            banks = cache.layer_banks(self.moe_layer_id)
-            return self.quant_method.apply_unsorted(banks, hidden_states, topk_weights, slots)
+            banks = {**cache.layer_banks(self.moe_layer_id), **resident}
+            return self.quant_method.apply_slots(
+                banks, hidden_states, topk_weights, topk_ids, slots
+            )
 
     def prefill_forward(
         self,
         cache: OffloadMoeCache,
+        resident: dict[str, mx.array],
         hidden_states: mx.array,
         topk_weights: mx.array,
         topk_ids: mx.array,
     ) -> mx.array:
         """An overlap prefill layer: the layer's input runs while its prefill buffer is read,
         its MoE runs as a command buffer of its own once the buffer is in."""
-        method = self.quant_method
-        assert isinstance(method, AffineMoEMethod), "offload experts are affine quantized"
         if self.moe_layer_id == 0:
             cache.begin_prefill_forward()
         mx.async_eval(hidden_states, topk_weights, topk_ids)
         expert_bytes = cache.expert_bytes(self.moe_layer_id)
-        out = method.apply_sorted(cache.banks, hidden_states, topk_weights, topk_ids, expert_bytes)
+        banks = {**cache.banks, **resident}
+        out = self.quant_method.apply_sorted(
+            banks, hidden_states, topk_weights, topk_ids, expert_bytes
+        )
         mx.async_eval(out)
         cache.end_prefill_layer(self.moe_layer_id, out)
         return out

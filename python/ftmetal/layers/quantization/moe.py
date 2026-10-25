@@ -6,9 +6,12 @@ with their kernel's layout and apply). Divergences: moe_method picks the method 
 straight from the checkpoint's MLX tensors; gate, up and down may each have their own scheme,
 so a method gathers each projection by its scheme, and gate and up are two banks when theirs
 differ; the forward is MLX's gather ops around the moe_align / moe_combine kernels instead of
-one fused kernel; one layer's quantized projections are of one kind (affine or float block);
-an offload cache's slot rows arrive as banks keyed like the layout, and the affine method also
-runs the overlap prefill's expert-sorted gather_qmm_sorted.
+one fused kernel; one layer's quantized projections are of one kind (affine or float block).
+A method reads its experts from resident banks (apply), from an offload pool's slot rows, keyed
+like the layout (apply_slots), and from an offload cache's raw byte banks at each expert's byte
+offsets (apply_sorted, on the expert-sorted kernels); a resident array (an export's
+output_scale, FreeToken's resident BankSpec) stays the layer's and is indexed by expert in all
+three.
 """
 
 from __future__ import annotations
@@ -21,8 +24,8 @@ from typing import Literal, Protocol
 import mlx.core as mx
 from mlx.utils import tree_unflatten
 
-from ftmetal.kernel.gather_sorted import gather_qmm_sorted
-from ftmetal.kernel.moe_align import moe_align, moe_combine
+from ftmetal.kernel.gather_sorted import FLOAT_INPUT_TILE, gather_mm_sorted, gather_qmm_sorted
+from ftmetal.kernel.moe_align import ExpertAlignment, moe_align, moe_combine
 from ftmetal.layers.activation import gelu_tanh_and_mul, silu_and_mul
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.quantization.config import AffineScheme, BankSpec, FpBlockScheme, QuantScheme
@@ -76,7 +79,8 @@ class MoEConfig:
     schemes: ExpertSchemes
     activation: Literal["silu", "gelu_tanh"]
     dtype: mx.Dtype
-    # resident: the layer's own banks; offload: an offload cache's slot rows.
+    # resident: the layer's own banks; offload: an offload cache's slot rows, beside the
+    # layer's resident arrays.
     strategy: Literal["resident", "offload"]
 
 
@@ -107,8 +111,35 @@ class MoEMethod(ABC):
         """x through the projection of the experts (or slots) at indices; banks: the layer's
         arrays keyed as layout, the expert or slot axis prepended."""
 
+    @abstractmethod
+    def gather_sorted(
+        self,
+        projection: str,
+        banks: Mapping[str, mx.array],
+        x: mx.array,
+        expert_offsets: mx.array,
+        expert_bytes: mx.array,
+    ) -> mx.array:
+        """x, its rows sorted by expert (moe_align's expert_offsets), through each expert's
+        projection read at its byte offsets expert_bytes [E, arrays] into raw byte banks, one
+        column per bank array of the projection in layout order."""
+
+    def scale_parts(
+        self, projection: str, banks: Mapping[str, mx.array], y: mx.array, expert_ids: mx.array
+    ) -> mx.array:
+        """A projection's output y for the experts at expert_ids, times any per-expert scale of
+        its parts; down's scales the routing weights instead (routing_weights)."""
+        return y
+
+    def routing_weights(
+        self, banks: Mapping[str, mx.array], topk_weights: mx.array, topk_ids: mx.array
+    ) -> mx.array:
+        """topk_weights times any per-expert scale of down's output (down is linear)."""
+        return topk_weights
+
     def layout(self) -> dict[str, BankSpec]:
-        """The layer's expert arrays (an offload cache's bank rows), by key under the layer."""
+        """The layer's expert arrays by key under the layer: the banks (an offload cache's bank
+        rows) and its resident arrays."""
         return {
             f"{projection}.{role}": spec
             for projection in self.projections
@@ -116,13 +147,16 @@ class MoEMethod(ABC):
         }
 
     def create_weights(self, layer: BaseOP) -> None:
-        """Set the layer's resident banks: placeholders the loader replaces."""
+        """Set the layer's banks, or an offload layer's resident arrays alone: placeholders the
+        loader replaces."""
         banks = [
             (key, mx.zeros((self.cfg.num_experts, *spec.shape), dtype=spec.dtype))
             for key, spec in self.layout().items()
+            if self.cfg.strategy == "resident" or spec.resident
         ]
-        for name, value in tree_unflatten(banks).items():
-            setattr(layer, name, value)
+        if banks:
+            for name, value in tree_unflatten(banks).items():
+                setattr(layer, name, value)
 
     def glu(self, x: mx.array, project: ExpertProjection) -> mx.array:
         """down(act(gate x) * up x), each projection through project."""
@@ -140,34 +174,77 @@ class MoEMethod(ABC):
         topk_weights: mx.array,
         topk_ids: mx.array,
     ) -> mx.array:
-        """The experts' output for a routing decision: x [T, H], topk_weights / topk_ids
-        [T, top_k]; from SORT_MIN_PAIRS pairs up the pairs run expert-sorted."""
+        """The experts' output for a routing decision over resident banks: x [T, H],
+        topk_weights / topk_ids [T, top_k]; from SORT_MIN_PAIRS pairs up the pairs run
+        expert-sorted."""
         if topk_ids.size < SORT_MIN_PAIRS:
-            return self.apply_unsorted(banks, x, topk_weights, topk_ids)
+            return self.apply_slots(banks, x, topk_weights, topk_ids, topk_ids)
         else:
             alignment = moe_align(topk_ids, self.cfg.num_experts)
-            sorted_x = mx.expand_dims(x, -2)[alignment.sorted_token_indices]
             expert_ids = alignment.sorted_expert_ids
-            y = self.glu(
-                sorted_x,
-                lambda projection, h: self.gather(projection, banks, h, expert_ids, True),
-            )
-            return moe_combine(y, alignment.pair_positions, topk_weights)
 
-    def apply_unsorted(
+            def project(projection: str, h: mx.array) -> mx.array:
+                y = self.gather(projection, banks, h, expert_ids, True)
+                return self.scale_parts(projection, banks, y, expert_ids)
+
+            return self.sorted_forward(banks, x, topk_weights, topk_ids, alignment, project)
+
+    def apply_slots(
         self,
         banks: Mapping[str, mx.array],
         x: mx.array,
         topk_weights: mx.array,
-        indices: mx.array,
+        topk_ids: mx.array,
+        slots: mx.array,
     ) -> mx.array:
-        """apply with each pair gathered where it is; indices [T, top_k]: the experts, or an
-        offload pool's slots."""
-        y = self.glu(
-            mx.expand_dims(x, (-2, -3)),
-            lambda projection, h: self.gather(projection, banks, h, indices, False),
-        )
-        return (y.squeeze(-2) * topk_weights[..., None]).sum(axis=-2)
+        """apply with each pair gathered where it is, unsorted; slots [T, top_k]: each pair's
+        row of the banks (its expert in resident banks, its slot in an offload pool's)."""
+
+        def project(projection: str, h: mx.array) -> mx.array:
+            y = self.gather(projection, banks, h, slots, False)
+            return self.scale_parts(projection, banks, y, topk_ids)
+
+        y = self.glu(mx.expand_dims(x, (-2, -3)), project)
+        weights = self.routing_weights(banks, topk_weights, topk_ids)
+        return (y.squeeze(-2) * weights[..., None]).sum(axis=-2)
+
+    def apply_sorted(
+        self,
+        banks: Mapping[str, mx.array],
+        x: mx.array,
+        topk_weights: mx.array,
+        topk_ids: mx.array,
+        expert_bytes: Mapping[str, mx.array],
+    ) -> mx.array:
+        """apply over an offload cache's raw byte banks (beside the layer's resident arrays):
+        the pairs sorted by expert, each expert's projection read at its byte offsets
+        expert_bytes[projection] [E, arrays]."""
+        # The kernels read the raw banks' float arrays (scales, biases, bf16 weights) in x's
+        # dtype.
+        assert x.dtype == self.cfg.dtype, f"x is {x.dtype}, the banks {self.cfg.dtype}"
+        alignment = moe_align(topk_ids, self.cfg.num_experts)
+        offsets, expert_ids = alignment.expert_offsets, alignment.sorted_expert_ids
+
+        def project(projection: str, h: mx.array) -> mx.array:
+            y = self.gather_sorted(projection, banks, h, offsets, expert_bytes[projection])
+            return self.scale_parts(projection, banks, y, expert_ids)
+
+        return self.sorted_forward(banks, x, topk_weights, topk_ids, alignment, project)
+
+    def sorted_forward(
+        self,
+        banks: Mapping[str, mx.array],
+        x: mx.array,
+        topk_weights: mx.array,
+        topk_ids: mx.array,
+        alignment: ExpertAlignment,
+        project: ExpertProjection,
+    ) -> mx.array:
+        """The pairs of x sorted by expert through glu(project), combined by their routing
+        weights."""
+        sorted_x = mx.expand_dims(x, -2)[alignment.sorted_token_indices]
+        weights = self.routing_weights(banks, topk_weights, topk_ids)
+        return moe_combine(self.glu(sorted_x, project), alignment.pair_positions, weights)
 
 
 class UnquantizedMoEMethod(MoEMethod):
@@ -189,6 +266,18 @@ class UnquantizedMoEMethod(MoEMethod):
             rhs_indices=indices,
             sorted_indices=sorted_indices,
         )
+
+    def gather_sorted(
+        self,
+        projection: str,
+        banks: Mapping[str, mx.array],
+        x: mx.array,
+        expert_offsets: mx.array,
+        expert_bytes: mx.array,
+    ) -> mx.array:
+        _, output_size, _ = self.projections[projection]
+        weight = banks[f"{projection}.weight"]
+        return gather_mm_sorted(x, weight, expert_offsets, expert_bytes, n=output_size)
 
 
 class AffineMoEMethod(UnquantizedMoEMethod):
@@ -229,37 +318,31 @@ class AffineMoEMethod(UnquantizedMoEMethod):
                 sorted_indices=sorted_indices,
             )
 
-    def apply_sorted(
+    def gather_sorted(
         self,
+        projection: str,
         banks: Mapping[str, mx.array],
         x: mx.array,
-        topk_weights: mx.array,
-        topk_ids: mx.array,
-        expert_bytes: Mapping[str, mx.array],
+        expert_offsets: mx.array,
+        expert_bytes: mx.array,
     ) -> mx.array:
-        """apply over raw byte banks (an offload prefill buffer): the pairs sorted by expert,
-        each expert's projection read at its byte offsets expert_bytes[projection] [E, 3]."""
-        # The kernel reads the raw banks' scales and biases in x's dtype.
-        assert x.dtype == self.cfg.dtype, f"x is {x.dtype}, the banks {self.cfg.dtype}"
-        alignment = moe_align(topk_ids, self.cfg.num_experts)
-        sorted_x = mx.expand_dims(x, -2)[alignment.sorted_token_indices]
-
-        def project(projection: str, h: mx.array) -> mx.array:
-            _, output_size, scheme = self.projections[projection]
-            assert isinstance(scheme, AffineScheme), "offload experts are affine quantized"
+        _, output_size, scheme = self.projections[projection]
+        if scheme is None:
+            return super().gather_sorted(projection, banks, x, expert_offsets, expert_bytes)
+        else:
+            assert isinstance(scheme, AffineScheme), f"{projection} is not affine quantized"
             return gather_qmm_sorted(
-                h,
+                x,
                 banks[f"{projection}.weight"],
                 banks[f"{projection}.scales"],
                 banks[f"{projection}.biases"],
-                alignment.expert_offsets,
-                expert_bytes[projection],
+                expert_offsets,
+                expert_bytes,
                 n=output_size,
                 group_size=scheme.group_size,
                 bits=scheme.bits,
+                mode="affine",
             )
-
-        return moe_combine(self.glu(sorted_x, project), alignment.pair_positions, topk_weights)
 
 
 class FpBlockMoEMethod(UnquantizedMoEMethod):
@@ -276,7 +359,7 @@ class FpBlockMoEMethod(UnquantizedMoEMethod):
             layout = scheme.layout(input_size, output_size, self.cfg.dtype)
             if scheme.has_output_scale:
                 parts = 2 if projection == "gate_up_proj" else 1
-                layout["output_scale"] = BankSpec((parts, 1), mx.float32, scheme)
+                layout["output_scale"] = BankSpec((parts, 1), mx.float32, scheme, resident=True)
             return layout
 
     def gather(
@@ -292,7 +375,7 @@ class FpBlockMoEMethod(UnquantizedMoEMethod):
             return super().gather(projection, banks, x, indices, sorted_indices)
         else:
             assert isinstance(scheme, FpBlockScheme), f"{projection} is not float block quantized"
-            y = mx.gather_qmm(
+            return mx.gather_qmm(
                 x,
                 banks[f"{projection}.weight"],
                 banks[f"{projection}.scales"],
@@ -303,34 +386,58 @@ class FpBlockMoEMethod(UnquantizedMoEMethod):
                 mode=scheme.mode,
                 sorted_indices=sorted_indices,
             )
-            if not scheme.has_output_scale or projection == "down_proj":
-                return y
-            else:
-                # y [..., 1, out] cut into its parts, each times its expert's scale.
-                part_scales = banks[f"{projection}.output_scale"][indices]
-                parts = y.reshape(*y.shape[:-2], part_scales.shape[-2], -1)
-                return scale_output(parts, part_scales).reshape(y.shape)
 
-    def apply(
+    def gather_sorted(
         self,
+        projection: str,
         banks: Mapping[str, mx.array],
         x: mx.array,
-        topk_weights: mx.array,
-        topk_ids: mx.array,
+        expert_offsets: mx.array,
+        expert_bytes: mx.array,
     ) -> mx.array:
-        """apply, with down's output scale on each pair's routing weight (down is linear); only
-        here, as apply_unsorted runs under it."""
+        _, output_size, scheme = self.projections[projection]
+        if scheme is None:
+            return super().gather_sorted(projection, banks, x, expert_offsets, expert_bytes)
+        else:
+            assert isinstance(scheme, FpBlockScheme), f"{projection} is not float block quantized"
+            return gather_qmm_sorted(
+                x,
+                banks[f"{projection}.weight"],
+                banks[f"{projection}.scales"],
+                None,
+                expert_offsets,
+                expert_bytes,
+                n=output_size,
+                group_size=scheme.group_size,
+                bits=scheme.bits,
+                mode=scheme.mode,
+            )
+
+    def scale_parts(
+        self, projection: str, banks: Mapping[str, mx.array], y: mx.array, expert_ids: mx.array
+    ) -> mx.array:
+        scheme = self.projections[projection][2]
+        if (
+            not isinstance(scheme, FpBlockScheme)
+            or not scheme.has_output_scale
+            or projection == "down_proj"
+        ):
+            return y
+        else:
+            # y [..., 1, out] cut into its parts, each times its expert's scale.
+            part_scales = banks[f"{projection}.output_scale"][expert_ids]
+            parts = y.reshape(*y.shape[:-2], part_scales.shape[-2], -1)
+            return scale_output(parts, part_scales).reshape(y.shape)
+
+    def routing_weights(
+        self, banks: Mapping[str, mx.array], topk_weights: mx.array, topk_ids: mx.array
+    ) -> mx.array:
         down = self.projections["down_proj"][2]
         if isinstance(down, FpBlockScheme) and down.has_output_scale:
             down_scales = banks["down_proj.output_scale"][topk_ids][..., 0, 0]
-            topk_weights = (topk_weights * down_scales).astype(topk_weights.dtype)
-        return super().apply(banks, x, topk_weights, topk_ids)
-
-
-def can_offload(scheme: QuantScheme | None) -> bool:
-    """Whether an offload cache serves an expert projection in scheme: only the affine method
-    has an expert-sorted kernel for the overlap prefill."""
-    return isinstance(scheme, AffineScheme)
+            return (topk_weights * down_scales).astype(topk_weights.dtype)
+        else:
+            return topk_weights
 
 
 def moe_method(cfg: MoEConfig) -> MoEMethod:
@@ -340,15 +447,19 @@ def moe_method(cfg: MoEConfig) -> MoEMethod:
         for projection, (_, _, scheme) in projections.items()
         if scheme is not None
     }
-    unsortable = [
-        projection for projection, (_, _, scheme) in projections.items() if not can_offload(scheme)
+    untiled = [
+        f"{projection} ({input_size})"
+        for projection, (input_size, _, scheme) in projections.items()
+        if isinstance(scheme, FpBlockScheme) and input_size % FLOAT_INPUT_TILE != 0
     ]
     if len(set(kinds.values())) > 1:
         mixed = ", ".join(f"{projection} {kind.__name__}" for projection, kind in kinds.items())
         raise ValueError(f"a MoE layer's quantized experts are of one kind, not {mixed}")
-    elif cfg.strategy == "offload" and unsortable:
-        refused = ", ".join(unsortable)
-        raise ValueError(f"MoE offload serves affine-quantized experts only, not {refused}")
+    elif cfg.strategy == "offload" and untiled:
+        raise ValueError(
+            f"MoE offload reads float block experts {FLOAT_INPUT_TILE} inputs at a time, not "
+            f"{', '.join(untiled)} (--moe-strategy fused keeps them resident)"
+        )
     elif not kinds:
         return UnquantizedMoEMethod(cfg)
     elif AffineScheme in kinds.values():
@@ -366,6 +477,5 @@ __all__ = [
     "MoEConfig",
     "MoEMethod",
     "UnquantizedMoEMethod",
-    "can_offload",
     "moe_method",
 ]

@@ -4,7 +4,9 @@ Port of FreeToken models/loader.py and models/weight.py. Divergences: the source
 checkpoint in the MLX layout (safetensors read lazily by mx.load, a family's mlx_layout
 rewriting another layout first), experts arrive pre-stacked, the fused state is applied with
 nn.Module.update after a strict key and shape check, and a fused module whose parts the
-checkpoint quantizes differently loads its parts apart.
+checkpoint quantizes differently loads its parts apart. A rewrite that stacks, splits or
+renames an expert tensor records where each expert's bytes lie in the checkpoint
+(ExpertBytes), which an offload cache reads them from.
 """
 
 from __future__ import annotations
@@ -33,6 +35,43 @@ class FuseRule:
 
     fused: str
     parts: tuple[str, ...]
+
+
+@dataclass(frozen=True, kw_only=True)
+class ExpertSlices:
+    """Where each expert of a stacked expert tensor of the MLX layout lies in the checkpoint:
+    expert e is the nbytes bytes at byte offsets[e] of checkpoint tensor names[e]."""
+
+    names: tuple[str, ...]
+    offsets: tuple[int, ...]
+    nbytes: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class ExpertFill:
+    """A stacked expert tensor the checkpoint does not store, every byte of it value."""
+
+    value: int
+
+
+ExpertBytes = ExpertSlices | ExpertFill
+
+
+def stacked_slices(name: str, tensor: mx.array, part: int = 0, num_parts: int = 1) -> ExpertSlices:
+    """Each expert of checkpoint tensor name, [experts, out, ...] as stored, or of its part-th
+    of num_parts equal parts on the output axis."""
+    num_experts = tensor.shape[0]
+    expert_bytes = tensor.nbytes // num_experts
+    if num_parts > 1 and (tensor.ndim != 3 or tensor.shape[1] % num_parts != 0):
+        raise ValueError(
+            f"{name}: {tensor.shape} does not split into {num_parts} parts on its output axis"
+        )
+    nbytes = expert_bytes // num_parts
+    return ExpertSlices(
+        names=(name,) * num_experts,
+        offsets=tuple(e * expert_bytes + part * nbytes for e in range(num_experts)),
+        nbytes=nbytes,
+    )
 
 
 @dataclass(frozen=True)
@@ -240,23 +279,6 @@ def checkpoint_bytes(state: dict[str, mx.array], rules: WeightRules) -> Checkpoi
     return CheckpointBytes(non_expert, experts)
 
 
-def expert_schemes(
-    state: dict[str, mx.array], rules: WeightRules, quant: QuantConfig | None
-) -> set[QuantScheme | None]:
-    """The schemes the checkpoint stores its routed experts in."""
-    schemes: set[QuantScheme | None] = set()
-    for name in state:
-        key = rules.rename(name)
-        if (
-            key is None
-            or not key.endswith(".weight")
-            or not rules.is_expert(rules.fused_key(key)[0])
-        ):
-            continue
-        schemes.add(None if quant is None else quant.scheme_for(name.removesuffix(".weight")))
-    return schemes
-
-
 def load_checkpoint(model_path: str) -> dict[str, mx.array]:
     """Every tensor of the checkpoint under its checkpoint name, lazily mapped."""
     state: dict[str, mx.array] = {}
@@ -315,7 +337,7 @@ def load_weights(
     model: BaseOP, state: dict[str, mx.array], rules: WeightRules, *, skip_experts: bool = False
 ) -> None:
     """Fill model from a lazily mapped checkpoint state in the MLX layout; skip_experts leaves
-    the routed-expert banks unread (an offload cache reads them).
+    the routed-expert banks the model does not hold unread (an offload cache reads them).
 
     Empties state: a source tensor the rules stack or fuse is then freed once its result is
     built, not kept beside it.
@@ -323,13 +345,21 @@ def load_weights(
     renamed = apply_rules(state, rules)
     state.clear()
     if skip_experts:
-        renamed = {key: tensor for key, tensor in renamed.items() if not rules.is_expert(key)}
+        held = dict(tree_flatten(model.parameters()))
+        renamed = {
+            key: tensor
+            for key, tensor in renamed.items()
+            if not rules.is_expert(key) or key in held
+        }
     load_state(model, renamed)
     mx.eval(model.parameters())
 
 
 __all__ = [
     "CheckpointBytes",
+    "ExpertBytes",
+    "ExpertFill",
+    "ExpertSlices",
     "FuseRule",
     "WeightRules",
     "apply_rules",
@@ -345,11 +375,11 @@ __all__ = [
     "config_optional_str",
     "config_str",
     "config_str_list",
-    "expert_schemes",
     "load_checkpoint",
     "load_state",
     "load_weights",
     "mixed_fuses",
     "read_model_config",
+    "stacked_slices",
     "weight_files",
 ]

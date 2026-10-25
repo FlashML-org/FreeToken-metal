@@ -32,7 +32,7 @@ struct Tiles {
   int wm;
   int wn;
 };
-const Tiles QMM_TILES = {16, 32, 32, 1, 2};
+const Tiles QMM_TILES = {16, 32, QMM_TILE_K, 1, 2};
 const Tiles MM_TILES = {16, 64, 16, 1, 2};
 
 // The (bits, group size) of each float block mode: the only ones MLX instantiates.
@@ -162,7 +162,7 @@ mx::array gather_qmm_sorted(
         "holds arbitrary bytes there");
   }
   return gather_sorted(
-      x, buffers, expert_offsets, expert_bytes, n, {kernel, group_size, bits}, s);
+      x, buffers, expert_offsets, expert_bytes, n, {kernel, n, group_size, bits}, s);
 }
 
 mx::array gather_mm_sorted(
@@ -174,7 +174,7 @@ mx::array gather_mm_sorted(
     mx::StreamOrDevice s) {
   check_sorted_inputs("gather_mm_sorted", x, n, expert_offsets, expert_bytes, 1);
   return gather_sorted(
-      x, {w}, expert_offsets, expert_bytes, n, {GatherSortedKernel::Unquantized, 0, 0}, s);
+      x, {w}, expert_offsets, expert_bytes, n, {GatherSortedKernel::Unquantized, n, 0, 0}, s);
 }
 
 bool GatherSorted::is_equivalent(const mx::Primitive& other) const {

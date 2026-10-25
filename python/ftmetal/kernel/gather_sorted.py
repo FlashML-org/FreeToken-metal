@@ -29,6 +29,8 @@ from ftmetal.kernel._ext import _C
 # MLX's quantization modes; the float block ones take one (bits, group size) each: mxfp4
 # (4, 32), nvfp4 (4, 16), mxfp8 (8, 32).
 QuantMode = Literal["affine", "mxfp4", "nvfp4", "mxfp8"]
+# A float block mode's K is whole tiles of this many inputs.
+FLOAT_INPUT_TILE = _C.QMM_TILE_K
 
 
 def gather_qmm_sorted(
@@ -76,4 +78,4 @@ def gather_mm_sorted(
     return _C.gather_mm_sorted(x, w, expert_offsets, expert_bytes, n)
 
 
-__all__ = ["QuantMode", "gather_mm_sorted", "gather_qmm_sorted"]
+__all__ = ["FLOAT_INPUT_TILE", "QuantMode", "gather_mm_sorted", "gather_qmm_sorted"]

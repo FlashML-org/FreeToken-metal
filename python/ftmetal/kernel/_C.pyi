@@ -10,6 +10,8 @@ Stream = mx.Stream | mx.Device | None
 
 MAILBOX_WORDS: int
 EXPERT_STAGING_BYTES: int
+FILL_FILE: int
+QMM_TILE_K: int
 
 class MailboxWord(enum.IntEnum):
     STATE = 0
@@ -121,6 +123,7 @@ class ExpertService:
         banks: list[mx.array],
         files: list[str],
         segments: npt.NDArray[np.int64],
+        locations: npt.NDArray[np.int64],
         destinations: npt.NDArray[np.int64],
         buffer_bytes: list[int],
         io_threads: int,

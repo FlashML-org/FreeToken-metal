@@ -4,9 +4,11 @@ offload tests.
 A synthetic checkpoint stacks each expert projection as MLX does, [experts, rows, ...]
 (affine quantized by mx.quantize, or bf16), in Qwen3.6 or Gemma4 names, over two files
 behind odd-sized filler tensors so that experts start off 4 KiB boundaries, with one
-layer's projections split across the files. An identifying checkpoint (affine only) fills
-every packed weight word of an expert's projection with expert_code(layer, projection,
-expert) instead, so a bank row read anywhere names the expert it holds.
+layer's projections split across the files; a per-expert checkpoint (Qwen3.6 names only)
+stores one tensor per expert in the Hugging Face layout instead, which the model family's
+mlx_layout stacks. An identifying checkpoint (affine only) fills every packed weight word of
+an expert's projection with expert_code(layer, projection, expert) instead, so a bank row
+read anywhere names the expert it holds.
 
 ReferenceLru is the offload simulation's token-granular LRU per pool: per slot, the expert
 it holds and the step it was last used. A call first marks its hits used at this step, then
@@ -25,7 +27,8 @@ import numpy as np
 
 from ftmetal.layers.quantization.config import AffineScheme, BankSpec
 from ftmetal.layers.quantization.moe import ExpertSchemes, MoEConfig, moe_method
-from ftmetal.models.loader import FuseRule, WeightRules
+from ftmetal.models.loader import ExpertBytes, FuseRule, WeightRules, load_checkpoint
+from ftmetal.models.qwen3_5_moe.weight import mlx_layout
 from ftmetal.moe.offload_cache import STALL_TIMEOUT_S, OffloadMoeCache
 from ftmetal.moe.slot_pools import MoePoolGrouping, PrefillBufferPlacement, plan_slot_layout
 from ftmetal.moe.source import ExpertSource
@@ -51,6 +54,7 @@ class CheckpointSpec:
     # Bits of every layer's up projection, if not the scheme's: gate and up load apart.
     up_bits: int | None = None
     is_identifying: bool = False
+    is_per_expert: bool = False
 
     @property
     def expert_schemes(self) -> ExpertSchemes:
@@ -133,13 +137,32 @@ def expert_code(layer_id: int, projection: int, expert: int) -> int:
     return (layer_id + 1) << 16 | projection << 12 | expert
 
 
+def read_state(
+    directory: Path, spec: CheckpointSpec
+) -> tuple[dict[str, mx.array], dict[str, ExpertBytes]]:
+    """The checkpoint's lazily mapped state in the MLX layout, and its experts' bytes."""
+    state = load_checkpoint(str(directory))
+    return mlx_layout(state) if spec.is_per_expert else (state, {})
+
+
 def write_checkpoint(directory: Path, spec: CheckpointSpec) -> None:
+    assert not spec.is_per_expert or spec.naming == "qwen", "Hugging Face names are Qwen3.6's"
     rng = np.random.default_rng(spec.num_layers * 101 + spec.hidden_size)
     files: list[dict[str, mx.array]] = [
         {"filler.a": mx.zeros((1001,), dtype=mx.uint8)},
         {"filler.b": mx.zeros((333,), dtype=mx.uint8), "filler.c": mx.zeros((77,), mx.uint16)},
     ]
     split_layer = spec.num_layers // 2
+
+    def put(file: dict[str, mx.array], module: str, array: str, tensor: mx.array) -> None:
+        if spec.is_per_expert:
+            hf_module = module.replace("language_model.model.", "model.language_model.")
+            parent, _, projection = hf_module.rpartition(".switch_mlp.")
+            for expert in range(tensor.shape[0]):
+                file[f"{parent}.experts.{expert}.{projection}.{array}"] = tensor[expert]
+        else:
+            file[f"{module}.{array}"] = tensor
+
     for layer_id in range(spec.num_layers):
         if spec.naming == "qwen":
             module = f"language_model.model.layers.{layer_id}.mlp.switch_mlp"
@@ -162,13 +185,15 @@ def write_checkpoint(directory: Path, spec: CheckpointSpec) -> None:
                 packed_shape = (*shape[:2], shape[2] * spec.scheme.bits // 32)
                 packed = np.broadcast_to(np.array(codes, np.uint32)[:, None, None], packed_shape)
                 group_shape = (*shape[:2], shape[2] // spec.scheme.group_size)
-                file[f"{module}.{projection}.weight"] = mx.array(np.ascontiguousarray(packed))
-                file[f"{module}.{projection}.scales"] = mx.zeros(group_shape, dtype=mx.bfloat16)
-                file[f"{module}.{projection}.biases"] = mx.zeros(group_shape, dtype=mx.bfloat16)
+                put(
+                    file, f"{module}.{projection}", "weight", mx.array(np.ascontiguousarray(packed))
+                )
+                put(file, f"{module}.{projection}", "scales", mx.zeros(group_shape, mx.bfloat16))
+                put(file, f"{module}.{projection}", "biases", mx.zeros(group_shape, mx.bfloat16))
                 continue
             weight = mx.array(0.02 * rng.standard_normal(shape, dtype=np.float32), mx.bfloat16)
             if spec.scheme is None:
-                file[f"{module}.{projection}.weight"] = weight
+                put(file, f"{module}.{projection}", "weight", weight)
             else:
                 bits = spec.scheme.bits
                 if layer_id == spec.num_layers - 1 and spec.last_layer_bits is not None:
@@ -176,9 +201,9 @@ def write_checkpoint(directory: Path, spec: CheckpointSpec) -> None:
                 elif projection == "up_proj" and spec.up_bits is not None:
                     bits = spec.up_bits
                 packed, scales, biases = mx.quantize(weight, spec.scheme.group_size, bits)
-                file[f"{module}.{projection}.weight"] = packed
-                file[f"{module}.{projection}.scales"] = scales
-                file[f"{module}.{projection}.biases"] = biases
+                put(file, f"{module}.{projection}", "weight", packed)
+                put(file, f"{module}.{projection}", "scales", scales)
+                put(file, f"{module}.{projection}", "biases", biases)
     directory.mkdir()
     for i, file in enumerate(files):
         mx.save_safetensors(str(directory / f"model-{i:05d}.safetensors"), file)
@@ -197,7 +222,8 @@ def build_cache(
 ) -> tuple[OffloadMoeCache, ExpertSource]:
     """The cache over a new checkpoint of spec written to directory, and its source."""
     write_checkpoint(directory, spec)
-    source = ExpertSource(str(directory), checkpoint_rules(spec))
+    state, expert_bytes = read_state(directory, spec)
+    source = ExpertSource(str(directory), checkpoint_rules(spec), state, expert_bytes)
     slot_layout = plan_slot_layout(
         cache_size,
         layer_layouts(spec),

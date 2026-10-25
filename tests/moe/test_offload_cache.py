@@ -31,9 +31,14 @@ from ftmetal.layers.quantization.moe import ExpertSchemes
 from ftmetal.models.loader import apply_rules, load_checkpoint
 from ftmetal.models.qwen3_5_moe.model import schemes_of
 from ftmetal.models.qwen3_5_moe.weight import GATE_UP_PARTS
-from ftmetal.models.register import model_weight_rules
+from ftmetal.models.register import model_weight_rules, read_checkpoint
 from ftmetal.moe.offload_cache import OffloadMoeCache
-from ftmetal.moe.slot_pools import MoePoolGrouping, PrefillBufferPlacement, plan_slot_layout
+from ftmetal.moe.slot_pools import (
+    MoePoolGrouping,
+    PrefillBufferPlacement,
+    bank_layouts,
+    plan_slot_layout,
+)
 from ftmetal.moe.source import ExpertSource
 from offload_harness import (
     CheckpointSpec,
@@ -41,6 +46,7 @@ from offload_harness import (
     build_cache,
     checkpoint_rules,
     moe_layout,
+    read_state,
     weight_rules,
     write_checkpoint,
 )
@@ -74,6 +80,8 @@ class Case:
     up_bits: int | None = None
     grouping: MoePoolGrouping = "per-layer"
     buffer_placement: PrefillBufferPlacement = "overlay"
+    # One tensor per expert, in the Hugging Face layout.
+    is_per_expert: bool = False
 
     @property
     def spec(self) -> CheckpointSpec:
@@ -86,6 +94,7 @@ class Case:
             scheme=self.scheme,
             last_layer_bits=self.last_layer_bits,
             up_bits=self.up_bits,
+            is_per_expert=self.is_per_expert,
         )
 
     def __str__(self) -> str:
@@ -93,9 +102,11 @@ class Case:
         if self.up_bits is not None:
             scheme += f"-up{self.up_bits}"
         overlap = f"-{self.buffer_placement}" if self.prefill_overlap else ""
+        per_expert = "-per-expert" if self.is_per_expert else ""
         return (
             f"{self.naming}-L{self.num_layers}-E{self.num_experts}-H{self.hidden_size}"
             f"-I{self.intermediate_size}-S{self.cache_size}-{self.grouping}{overlap}-{scheme}"
+            f"{per_expert}"
         )
 
 
@@ -218,6 +229,34 @@ CASES = [
         grouping="per-layer",
         buffer_placement="overlay",
     ),
+    # One tensor per expert: each expert's part is a read of its own (or a run, where the
+    # file happens to store the experts back to back), in slots and in the prefill buffers.
+    Case(
+        3,
+        8,
+        192,
+        64,
+        18,
+        True,
+        script=(
+            ((0, (0, 5, 6)), (1, (7,)), (2, (1, 2, 6, 7))),
+            Prefill((0, 1, 2)),
+            ((0, (5, 7, 3)), (2, (6, 0))),
+        ),
+        is_per_expert=True,
+    ),
+    Case(
+        2,
+        4,
+        192,
+        64,
+        8,
+        True,
+        script=(Prefill((0, 1)), ((1, (2, 3)),)),
+        scheme=None,
+        is_per_expert=True,
+    ),
+    Case(1, 4, 2048, 2048, 4, False, script=(((0, (0, 1, 2, 3)),),), is_per_expert=True),
 ]
 
 
@@ -231,7 +270,7 @@ def build(directory: Path, case: Case) -> tuple[OffloadMoeCache, dict[str, mx.ar
         grouping=case.grouping,
         buffer_placement=case.buffer_placement,
     )
-    reference = apply_rules(load_checkpoint(str(directory)), checkpoint_rules(case.spec))
+    reference = apply_rules(read_state(directory, case.spec)[0], checkpoint_rules(case.spec))
     return cache, reference, source
 
 
@@ -290,7 +329,8 @@ def test_rows_match_checkpoint(tmp_path: Path, case: Case) -> None:
     cache, reference, source = build(tmp_path / "checkpoint", case)
     expected = expected_rows(cache, reference, source.layer_prefixes)
     layouts = [cache.slot_layout.pools[pool].layout for pool in cache.layer_pools]
-    assert (source.segment_table(layouts)[..., 1] % 4096 != 0).any(), "all aligned"
+    locations = source.segment_table(layouts)[1]
+    assert (locations[..., 1] % 4096 != 0).any(), "all aligned"
     cache.fill_initial()
     rows = resident_rows(cache)
     assert len(rows) == sum(pool.num_slots for pool in cache.slot_layout.pools)
@@ -349,8 +389,10 @@ def test_rows_match_checkpoint(tmp_path: Path, case: Case) -> None:
 
 def test_source_rejects_a_layer_in_another_format(tmp_path: Path) -> None:
     case = Case(3, 4, 128, 64, 4, False, last_layer_bits=8)
-    write_checkpoint(tmp_path / "checkpoint", case.spec)
-    source = ExpertSource(str(tmp_path / "checkpoint"), weight_rules(case.naming))
+    directory = tmp_path / "checkpoint"
+    write_checkpoint(directory, case.spec)
+    state = load_checkpoint(str(directory))
+    source = ExpertSource(str(directory), weight_rules(case.naming), state, {})
     layout = moe_layout(
         case.hidden_size, case.intermediate_size, ExpertSchemes.uniform(case.scheme)
     )
@@ -444,17 +486,43 @@ def test_expert_bank_matches_moe_layout() -> None:
         assert {role: ((8, *spec.shape), spec.dtype) for role, spec in layout.items()} == expected
 
 
-def test_offload_refuses_experts_not_affine() -> None:
-    four = AffineScheme(4, 64)
-    for schemes, refused in [
-        (ExpertSchemes.uniform(None), "gate_up_proj, down_proj"),
-        (ExpertSchemes(None, four, four), "gate_up_proj.gate_proj"),
-        (ExpertSchemes(four, four, None), "down_proj"),
-        (ExpertSchemes.uniform(FpBlockScheme("nvfp4")), "gate_up_proj, down_proj"),
+def test_offload_layer_holds_its_resident_arrays_alone() -> None:
+    four, nvfp4 = AffineScheme(4, 64), FpBlockScheme("nvfp4")
+    exported = FpBlockScheme("nvfp4", has_output_scale=True)
+    for schemes, expected in [
+        (ExpertSchemes.uniform(None), {}),
+        (ExpertSchemes(None, four, four), {}),
+        (ExpertSchemes.uniform(nvfp4), {}),
+        (
+            ExpertSchemes.uniform(exported),
+            {
+                "gate_up_proj.output_scale": ((8, 2, 1), mx.float32),
+                "down_proj.output_scale": ((8, 1, 1), mx.float32),
+            },
+        ),
+        (
+            ExpertSchemes(exported, exported, exported, is_gate_up_apart=True),
+            {
+                "gate_up_proj.gate_proj.output_scale": ((8, 1, 1), mx.float32),
+                "gate_up_proj.up_proj.output_scale": ((8, 1, 1), mx.float32),
+                "down_proj.output_scale": ((8, 1, 1), mx.float32),
+            },
+        ),
     ]:
-        message = f"affine-quantized experts only, not {refused}"
-        with pytest.raises(ValueError, match=re.escape(message) + "$"):
-            OffloadMoELayer(0, 8, 2, 128, 64, schemes=schemes)
+        layer = OffloadMoELayer(0, 8, 2, 128, 64, schemes=schemes)
+        parameters = {
+            key: (value.shape, value.dtype)
+            for key, value in dict(tree_flatten(layer.parameters())).items()
+        }
+        assert parameters == expected
+
+
+def test_offload_refuses_float_inputs_off_its_tile() -> None:
+    # nvfp4 takes 80 inputs (five groups of 16), the offload kernel whole tiles of 32.
+    schemes = ExpertSchemes.uniform(FpBlockScheme("nvfp4"))
+    MoELayer(8, 2, 80, 64, schemes=schemes)
+    with pytest.raises(ValueError, match=re.escape("not gate_up_proj (80) (--moe-strategy")):
+        OffloadMoELayer(0, 8, 2, 80, 64, schemes=schemes)
 
 
 def test_moe_layer_refuses_mixed_quant_kinds() -> None:
@@ -477,10 +545,10 @@ def test_real_checkpoint_rows() -> None:
     config = EngineConfig(model_path=MODEL_PATH)
     model_config = config.model_config
     rules = model_weight_rules(config.architecture, model_config)
-    source = ExpertSource(MODEL_PATH, rules)
+    checkpoint = read_checkpoint(config.architecture, MODEL_PATH)
     # The engine's offload layout: gate and up apart in every layer once one keeps them apart.
     is_apart = any(rules.is_expert(module) for module in rules.unfused)
-    layouts = [
+    method_layouts = [
         moe_layout(
             model_config.hidden_size,
             model_config.moe_intermediate_size,
@@ -493,8 +561,10 @@ def test_real_checkpoint_rows() -> None:
                 is_gate_up_apart=is_apart,
             ),
         )
-        for layer_id in range(source.num_layers)
+        for layer_id in range(model_config.num_moe_layers)
     ]
+    layouts, resident = bank_layouts(method_layouts)
+    source = ExpertSource(MODEL_PATH, rules, checkpoint.state, checkpoint.expert_bytes, resident)
     top_k = model_config.num_experts_per_tok
     cache = OffloadMoeCache(
         slot_layout=plan_slot_layout(
@@ -514,7 +584,7 @@ def test_real_checkpoint_rows() -> None:
     if is_apart:
         apart = {f"{prefix}.experts.gate_up_proj" for prefix in source.layer_prefixes}
         rules = replace(rules, unfused=rules.unfused | apart)
-    reference = apply_rules(load_checkpoint(MODEL_PATH), rules)
+    reference = apply_rules(checkpoint.state, rules)
     checked = [(0, [0, 1, 2, source.num_experts - 1])]
     checked += [(layer_id, [17, 18, 100]) for layer_id in range(1, source.num_layers)]
     for layer_id, expert_ids in checked:

@@ -15,7 +15,13 @@ import re
 import mlx.core as mx
 
 from ftmetal.models.config import ModelConfig
-from ftmetal.models.loader import FuseRule, WeightRules
+from ftmetal.models.loader import (
+    ExpertBytes,
+    ExpertSlices,
+    FuseRule,
+    WeightRules,
+    stacked_slices,
+)
 
 # Checkpoint module paths of the quantization map, per fused model leaf.
 QKV_PARTS = ("q_proj", "k_proj", "v_proj")
@@ -41,15 +47,18 @@ SHIFTED_NORMS = (
 )
 
 
-def mlx_layout(state: dict[str, mx.array]) -> dict[str, mx.array]:
+def mlx_layout(
+    state: dict[str, mx.array],
+) -> tuple[dict[str, mx.array], dict[str, ExpertBytes]]:
     """A Hugging Face layout checkpoint in the MLX layout: language_model.* names, each layer's
     experts as switch_mlp banks (one tensor per expert stacked, or a gate_up bank split),
-    [conv_dim, kernel, 1] convs and shifted norms. An MLX checkpoint, the one with
-    language_model.* names, passes unchanged."""
+    [conv_dim, kernel, 1] convs and shifted norms; and where each expert of every bank lies in
+    the checkpoint. An MLX checkpoint, the one with language_model.* names, passes unchanged."""
     if any(key.startswith("language_model.") for key in state):
-        return state
+        return state, {}
     out: dict[str, mx.array] = {}
-    experts: dict[str, dict[int, mx.array]] = {}
+    expert_bytes: dict[str, ExpertBytes] = {}
+    experts: dict[str, dict[int, tuple[str, mx.array]]] = {}
     for hf_key, tensor in state.items():
         if hf_key.startswith("model.language_model."):
             key = "language_model.model." + hf_key.removeprefix("model.language_model.")
@@ -60,14 +69,17 @@ def mlx_layout(state: dict[str, mx.array]) -> dict[str, mx.array]:
         expert = HF_EXPERT.search(key)
         if expert is not None:
             bank = f"{key[: expert.start()]}.mlp.switch_mlp.{key[expert.end() :]}"
-            experts.setdefault(bank, {})[int(expert.group(1))] = tensor
+            experts.setdefault(bank, {})[int(expert.group(1))] = (hf_key, tensor)
         elif key.endswith(HF_GATE_UP_BANK):
             switch_mlp = key.removesuffix(HF_GATE_UP_BANK) + ".mlp.switch_mlp"
-            out[f"{switch_mlp}.gate_proj.weight"], out[f"{switch_mlp}.up_proj.weight"] = mx.split(
-                tensor, 2, axis=-2
-            )
+            gate, up = f"{switch_mlp}.gate_proj.weight", f"{switch_mlp}.up_proj.weight"
+            out[gate], out[up] = mx.split(tensor, 2, axis=-2)
+            expert_bytes[gate] = stacked_slices(hf_key, tensor, 0, 2)
+            expert_bytes[up] = stacked_slices(hf_key, tensor, 1, 2)
         elif key.endswith(HF_DOWN_BANK):
-            out[key.removesuffix(HF_DOWN_BANK) + ".mlp.switch_mlp.down_proj.weight"] = tensor
+            down = key.removesuffix(HF_DOWN_BANK) + ".mlp.switch_mlp.down_proj.weight"
+            out[down] = tensor
+            expert_bytes[down] = stacked_slices(hf_key, tensor)
         elif key.endswith(".conv1d.weight"):
             out[key] = tensor.moveaxis(2, 1)
         elif key.endswith(SHIFTED_NORMS):
@@ -75,8 +87,12 @@ def mlx_layout(state: dict[str, mx.array]) -> dict[str, mx.array]:
         else:
             out[key] = tensor
     for bank, by_expert in experts.items():
-        out[bank] = mx.stack([by_expert[expert_id] for expert_id in range(len(by_expert))])
-    return out
+        names, tensors = zip(*(by_expert[expert_id] for expert_id in range(len(by_expert))))
+        out[bank] = mx.stack(tensors)
+        expert_bytes[bank] = ExpertSlices(
+            names=names, offsets=(0,) * len(names), nbytes=tensors[0].nbytes
+        )
+    return out, expert_bytes
 
 
 def weight_rules(model_config: ModelConfig) -> WeightRules:

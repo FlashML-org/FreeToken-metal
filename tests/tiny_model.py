@@ -1,17 +1,23 @@
 """A tiny random Qwen3.5 MoE model shared by the parity and scheduler tests.
 
 The mlx-lm model is the reference; save_checkpoint writes it in the MLX checkpoint
-layout, save_hf_checkpoint in the Hugging Face layout (hf_layout_weights), and
-reference_greedy is the contiguous-cache greedy decode.
+layout, save_hf_checkpoint in the Hugging Face layout (hf_layout_weights), save_export as a
+ModelOpt or compressed-tensors export, quantized the way each stores it (NVFP4: e2m1 codes
+packed low nibble first, e4m3 scales per 16 and a per-tensor global scale; FP8: e4m3 bytes
+and a per-tensor scale) from the format definitions rather than MLX's kernels, with the
+activation and KV-cache scales the exports carry; reference_greedy is the contiguous-cache
+greedy decode.
 TINY_FULL_ATTENTION_CONFIG drops the linear layers, so the engine has no GDN state pool.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import mlx.core as mx
+import numpy as np
 from mlx.utils import tree_flatten
 from mlx_lm.models import qwen3_5 as reference
 
@@ -150,6 +156,141 @@ def save_hf_checkpoint(
     (path / "config.json").write_text(json.dumps(config))
 
 
+E2M1_VALUES = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float32)
+E2M1_MAX = 6.0
+E4M3_MAX = 448.0
+NVFP4_GROUP_SIZE = 16
+LINEAR_ATTENTION = r"\.linear_attn\.(in_proj_qkv|in_proj_z|out_proj)$"
+FULL_ATTENTION = r"\.self_attn\.[qkvo]_proj$"
+EXPERTS = r"\.mlp\.(switch_mlp|shared_expert)\.(gate|up|down)_proj$"
+# Per dialect, the modules (MLX layout names) stored FP8 and NVFP4 as the real exports store
+# them: ModelOpt's mixed precision, and compressed-tensors with an FP8 group beside NVFP4.
+EXPORT_FORMATS = {
+    "modelopt": (f"{LINEAR_ATTENTION}|{FULL_ATTENTION}", f"{EXPERTS}|lm_head$"),
+    "compressed-tensors": (LINEAR_ATTENTION, f"{EXPERTS}|{FULL_ATTENTION}"),
+}
+NVFP4_WEIGHTS = {"num_bits": 4, "type": "float", "strategy": "tensor_group", "group_size": 16}
+FP8_WEIGHTS = {"num_bits": 8, "type": "float", "strategy": "tensor"}
+EXPORT_CONFIGS: dict[str, dict[str, object]] = {
+    "modelopt": {
+        "quant_method": "modelopt",
+        "quant_algo": "MIXED_PRECISION",
+        "quantized_layers": {"lm_head": {"quant_algo": "W4A16_NVFP4", "group_size": 16}},
+    },
+    "compressed-tensors": {
+        "quant_method": "compressed-tensors",
+        "config_groups": {
+            "group_0": {"weights": NVFP4_WEIGHTS},
+            "group_1": {"weights": FP8_WEIGHTS},
+        },
+    },
+}
+
+
+def e4m3(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Round to e4m3: (the bytes, their values)."""
+    encoded = mx.to_fp8(mx.array(values, dtype=mx.float32))
+    return np.array(encoded), np.array(mx.from_fp8(encoded, dtype=mx.float32))
+
+
+def nvfp4(weight: np.ndarray, headroom: float) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+    """[out, in] -> (packed uint8 [out, in / 2], e4m3 scale bytes [out, in / 16], the
+    dequantization-side global scale, the dequantized weight); the global scale is headroom
+    times the least that reaches the weight's amax."""
+    out_size, in_size = weight.shape
+    global_scale = float(np.abs(weight).max()) * headroom / (E2M1_MAX * E4M3_MAX)
+    blocks = weight.reshape(out_size, in_size // NVFP4_GROUP_SIZE, NVFP4_GROUP_SIZE)
+    scale_bytes, scales = e4m3(np.abs(blocks).max(axis=-1) / E2M1_MAX / global_scale)
+    step = np.maximum(scales * global_scale, np.finfo(np.float32).tiny)[..., None]
+    magnitude = np.argmin(np.abs(np.abs(blocks / step)[..., None] - E2M1_VALUES), axis=-1)
+    codes = (magnitude | np.where(blocks < 0, 8, 0)).astype(np.uint8).reshape(out_size, in_size)
+    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    values = np.where(codes >= 8, -1.0, 1.0) * E2M1_VALUES[codes & 7]
+    dequantized = values.reshape(blocks.shape) * step
+    return packed, scale_bytes, global_scale, dequantized.reshape(out_size, in_size)
+
+
+def fp8(weight: np.ndarray, headroom: float) -> tuple[np.ndarray, float, np.ndarray]:
+    """[out, in] -> (e4m3 bytes, the per-tensor scale, the dequantized weight); the scale is
+    headroom times the least that reaches the weight's amax."""
+    scale = float(np.abs(weight).max()) * headroom / E4M3_MAX
+    encoded, values = e4m3(weight / scale)
+    return encoded, scale, values * scale
+
+
+def save_export(
+    dialect: str,
+    seed: int,
+    path: Path,
+    dtype: mx.Dtype,
+    *,
+    text_config: dict[str, object] | None = None,
+    formats: tuple[str, str] | None = None,
+    is_hf_layout: bool = True,
+) -> dict[str, mx.array]:
+    """Write the tiny model (of text_config) as a ModelOpt or compressed-tensors export, the
+    modules formats (FP8 and NVFP4 module patterns, the dialect's EXPORT_FORMATS by default)
+    names quantized and its other tensors in dtype, in the Hugging Face layout or, without
+    is_hf_layout, under the MLX layout's names; returns the dequantized weights by reference
+    key."""
+    model = build_reference(seed, text_config)
+    fp8_modules, nvfp4_modules = EXPORT_FORMATS[dialect] if formats is None else formats
+    is_modelopt = dialect == "modelopt"
+    dequantized_weights: dict[str, mx.array] = {}
+    stored: dict[str, mx.array] = {}
+    # The tiny model's tensors of a shape share one amax: a headroom drawn per tensor gives each
+    # per-tensor scale its own value, so one read from the wrong expert or fused part shows.
+    rng = np.random.default_rng(seed)
+    for key, value in tree_flatten(model.parameters()):
+        assert isinstance(value, mx.array)
+        module = key.removesuffix(".weight")
+        # A bank is quantized expert by expert; its per-tensor scales stack per expert.
+        tensors = np.array(value, dtype=np.float32).reshape(-1, *value.shape[-2:])
+        ones = mx.ones((len(tensors),), dtype=mx.float32)
+        headrooms = rng.uniform(1.0, 4.0, size=len(tensors))
+        if re.search(fp8_modules, module):
+            encoded, scales, dequantized = zip(*map(fp8, tensors, headrooms), strict=True)
+            stored[f"{module}.weight"] = mx.array(np.stack(encoded).reshape(value.shape))
+            stored[f"{module}.weight_scale"] = mx.array(np.array(scales, np.float32))
+            stored[f"{module}.input_scale"] = ones
+        elif re.search(nvfp4_modules, module):
+            packed, scale_bytes, global_scales, dequantized = zip(
+                *map(nvfp4, tensors, headrooms), strict=True
+            )
+            weight_name = "weight" if is_modelopt else "weight_packed"
+            packed_shape = (*value.shape[:-1], value.shape[-1] // 2)
+            stored[f"{module}.{weight_name}"] = mx.array(np.stack(packed).reshape(packed_shape))
+            stored[f"{module}.weight_scale"] = mx.array(
+                np.stack(scale_bytes).reshape(*value.shape[:-1], -1)
+            )
+            global_array = np.array(global_scales, np.float32)
+            if is_modelopt:
+                stored[f"{module}.weight_scale_2"] = mx.array(global_array)
+                stored[f"{module}.input_scale"] = ones
+            else:
+                stored[f"{module}.weight_global_scale"] = mx.array(1.0 / global_array)
+                stored[f"{module}.input_global_scale"] = ones
+        else:
+            stored[key] = value.astype(dtype)
+            dequantized_weights[key] = value
+            continue
+        dequantized_weights[key] = mx.array(np.stack(dequantized).reshape(value.shape))
+    # The full-attention layers' FP8 KV-cache scales.
+    for key in list(stored):
+        if key.endswith("self_attn.k_proj.weight"):
+            attention = key.removesuffix(".k_proj.weight")
+            kv_scale = f"{attention}.k_proj.k_scale" if is_modelopt else f"{attention}.k_scale"
+            stored[kv_scale] = mx.ones((1,), dtype=mx.float32)
+    # ModelOpt stores one scalar per linear.
+    for key, tensor in stored.items():
+        if is_modelopt and tensor.ndim == 1 and tensor.size == 1 and "switch_mlp" not in key:
+            stored[key] = tensor.reshape(())
+    weights = hf_layout_weights(stored, "model.language_model.") if is_hf_layout else stored
+    architecture = "Qwen3_5MoeForConditionalGeneration"
+    save_hf_checkpoint(weights, model, path, architecture, EXPORT_CONFIGS[dialect])
+    return dequantized_weights
+
+
 def reference_greedy(
     model: reference.Model, prompt: list[int], steps: int
 ) -> tuple[mx.array, list[int]]:
@@ -175,12 +316,19 @@ def uncached_greedy(model: reference.Model, prompt: list[int], steps: int) -> li
 
 
 __all__ = [
+    "EXPERTS",
+    "EXPORT_CONFIGS",
+    "EXPORT_FORMATS",
+    "FP8_WEIGHTS",
+    "FULL_ATTENTION",
+    "LINEAR_ATTENTION",
     "TINY_FULL_ATTENTION_CONFIG",
     "TINY_TEXT_CONFIG",
     "build_reference",
     "hf_layout_weights",
     "reference_greedy",
     "save_checkpoint",
+    "save_export",
     "save_hf_checkpoint",
     "uncached_greedy",
 ]
