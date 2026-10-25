@@ -1,9 +1,11 @@
 """Architecture name -> model package.
 
-Port of FreeToken models/register.py, reduced to the served families, the two hooks a
-package exposes (parse_config and weight_rules) and the multimodal processor and encoder
-towers. Divergences: an EncoderSpec names the checkpoint prefix of its tower's weights and
-the measured activation sizes its memory reserve is computed from.
+Port of FreeToken models/register.py, reduced to the served families, the hooks a package
+exposes (parse_config, weight_rules and, for a family served from Hugging Face layout
+checkpoints too, mlx_layout) and the multimodal processor and encoder towers. Divergences: an
+EncoderSpec names the checkpoint prefix of its tower's weights and the measured activation
+sizes its memory reserve is computed from; read_checkpoint brings every checkpoint into the
+MLX layout and quantization the weight rules and methods read.
 """
 
 from __future__ import annotations
@@ -17,7 +19,15 @@ from ftmetal.layers.quantization.config import QuantConfig
 from ftmetal.mm.config import EncoderKind, Modality
 from ftmetal.models.blocks import BaseLLMModel
 from ftmetal.models.config import ModelConfig
-from ftmetal.models.loader import WeightRules, mixed_fuses
+from ftmetal.models.loader import (
+    WeightRules,
+    config_dict,
+    config_str,
+    load_checkpoint,
+    mixed_fuses,
+    read_model_config,
+)
+from ftmetal.models.quant_export import rewrite_export
 
 
 @dataclass(frozen=True)
@@ -69,6 +79,9 @@ class ModelSpec:
     model_cls: str
     parse_config: str = "parse_config"
     weight_rules: str = "weight_rules"
+    # A function rewriting a lazily mapped checkpoint into the MLX layout the weight rules
+    # read; None: the family loads MLX layout checkpoints only.
+    mlx_layout: str | None = None
     # "module:Class" turning the checkpoint's images into items; None: the family takes no
     # multimodal input.
     mm_processor: str | None = None
@@ -79,10 +92,13 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
     "Qwen3_5MoeForConditionalGeneration": ModelSpec(
         "ftmetal.models.qwen3_5_moe",
         "Qwen3_5MoeForCausalLM",
+        mlx_layout="mlx_layout",
         mm_processor="ftmetal.mm.processors.qwen_vl:QwenVLMMProcessor",
         encoders=(QWEN_VISION,),
     ),
-    "Qwen3_5MoeForCausalLM": ModelSpec("ftmetal.models.qwen3_5_moe", "Qwen3_5MoeForCausalLM"),
+    "Qwen3_5MoeForCausalLM": ModelSpec(
+        "ftmetal.models.qwen3_5_moe", "Qwen3_5MoeForCausalLM", mlx_layout="mlx_layout"
+    ),
     "Gemma4ForConditionalGeneration": ModelSpec(
         "ftmetal.models.gemma4",
         "Gemma4ForCausalLM",
@@ -116,6 +132,33 @@ def model_weight_rules(architecture: str, model_config: ModelConfig) -> WeightRu
     return replace(rules, unfused=mixed_fuses(rules, model_config.quant))
 
 
+@dataclass(frozen=True, kw_only=True)
+class Checkpoint:
+    # Every tensor, lazily mapped, in the MLX layout and quantization.
+    state: dict[str, mx.array]
+    quant: QuantConfig
+
+
+def read_checkpoint(architecture: str, model_path: str) -> Checkpoint:
+    """The checkpoint as an MLX one: a Hugging Face layout rewritten by the family's
+    mlx_layout, then a ModelOpt or compressed-tensors export's tensors by rewrite_export."""
+    spec = get_model_spec(architecture)
+    config = read_model_config(model_path)
+    state = load_checkpoint(model_path)
+    if spec.mlx_layout is not None:
+        state = getattr(importlib.import_module(spec.module), spec.mlx_layout)(state)
+    quantization = config_dict(config, "quantization")
+    export_config = config_dict(config, "quantization_config")
+    if quantization is not None or export_config is None:
+        return Checkpoint(state=state, quant=QuantConfig.from_checkpoint(quantization, list(state)))
+    elif spec.mlx_layout is None:
+        method = config_str(export_config, "quant_method", "")
+        raise ValueError(f"{architecture} serves MLX checkpoints only, not a {method!r} export")
+    else:
+        rewritten, schemes = rewrite_export(state, export_config)
+        return Checkpoint(state=rewritten, quant=QuantConfig.from_export(schemes))
+
+
 def create_model(architecture: str, model_config: ModelConfig, dtype: mx.Dtype) -> BaseLLMModel:
     spec = get_model_spec(architecture)
     module = importlib.import_module(spec.module)
@@ -126,10 +169,12 @@ __all__ = [
     "GEMMA4_VISION",
     "MODEL_REGISTRY",
     "QWEN_VISION",
+    "Checkpoint",
     "EncoderSpec",
     "ModelSpec",
     "create_model",
     "get_model_spec",
     "model_weight_rules",
     "parse_model_config",
+    "read_checkpoint",
 ]

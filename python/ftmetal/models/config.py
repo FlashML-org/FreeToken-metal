@@ -2,7 +2,7 @@
 
 Port of FreeToken models/config.py, reduced to the FULL, SWA and LINEAR group kinds and
 the fields Qwen3.5-style hybrid MoE and Gemma4 models use. Divergences: the quantization
-config is the MLX checkpoint's affine scheme map; no tensor parallelism or MTP; the MoE
+config is the checkpoint's MLX scheme map; no tensor parallelism or MTP; the MoE
 strategy is fused or offload and every layer of a MoE model routes experts; the
 LINEAR group emits a KVCacheGroupSpec too (its per-slot conv and state shapes), so every
 pool is sized from a spec; the rope variant is a rope_type field, not a scaling

@@ -3,9 +3,9 @@ head's product.
 
 Port of FreeToken layers/quantization/embedding/ (EmbeddingConfig, EmbeddingMethod and its
 unquantized method). Divergences: as layers/quantization/linear.py's, embedding_method picks the
-method and a method has no kernel table or finalize step; MLX affine takes the place of
-FreeToken's GGUF kind; no vocab parallelism; the table is its kind's linear method's weight, so
-create_weights and logits are that method's and the tied head has no bias.
+method and a method has no kernel table or finalize step; MLX affine and float block modes
+take the place of FreeToken's GGUF kind; no vocab parallelism; the table is its kind's linear
+method's weight, so create_weights and logits are that method's and the tied head has no bias.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 
 from ftmetal.layers.base import BaseOP
-from ftmetal.layers.quantization.config import AffineScheme, QuantScheme
+from ftmetal.layers.quantization.config import AffineScheme, FpBlockScheme, QuantScheme
 from ftmetal.layers.quantization.linear import LinearConfig, linear_method
 
 
@@ -81,17 +81,40 @@ class AffineEmbeddingMethod(EmbeddingMethod):
         )
 
 
+class FpBlockEmbeddingMethod(EmbeddingMethod):
+    def __init__(self, cfg: EmbeddingConfig, scheme: FpBlockScheme) -> None:
+        """scheme: cfg's, as its kind."""
+        super().__init__(cfg)
+        self.scheme = scheme
+
+    def embed(self, weights: Mapping[str, mx.array], input_ids: mx.array) -> mx.array:
+        # uint8 scales carry no float dtype for the rows to take.
+        return mx.dequantize(
+            weights["weight"][input_ids],
+            weights["scales"][input_ids],
+            group_size=self.scheme.group_size,
+            bits=self.scheme.bits,
+            mode=self.scheme.mode,
+            dtype=self.cfg.dtype,
+        )
+
+
 def embedding_method(cfg: EmbeddingConfig) -> EmbeddingMethod:
     if cfg.scheme is None:
         return UnquantizedEmbeddingMethod(cfg)
-    else:
+    elif isinstance(cfg.scheme, AffineScheme):
         return AffineEmbeddingMethod(cfg, cfg.scheme)
+    elif cfg.scheme.has_output_scale:
+        raise ValueError("an exported embedding table with a per-tensor scale is not served")
+    else:
+        return FpBlockEmbeddingMethod(cfg, cfg.scheme)
 
 
 __all__ = [
     "AffineEmbeddingMethod",
     "EmbeddingConfig",
     "EmbeddingMethod",
+    "FpBlockEmbeddingMethod",
     "UnquantizedEmbeddingMethod",
     "embedding_method",
 ]

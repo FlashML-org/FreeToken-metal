@@ -54,13 +54,19 @@ from ftmetal.engine.sample import BatchSamplingArgs, Sampler
 from ftmetal.kvcache import create_pools, pool_arrays, pool_costs
 from ftmetal.kvcache.base import PoolCost
 from ftmetal.layers.moe import OffloadMoELayer
+from ftmetal.layers.quantization.moe import can_offload
 from ftmetal.mm.config import ENCODER_SECTIONS
 from ftmetal.mm.encoder_cache import EncoderCache
 from ftmetal.mm.processor import MMProcessor, get_mm_processor
 from ftmetal.models.blocks import BaseLLMModel, SupportsMultimodal
 from ftmetal.models.config import MoeStrategy
-from ftmetal.models.loader import WeightRules, checkpoint_bytes, load_weights
-from ftmetal.models.register import MODEL_REGISTRY, create_model, model_weight_rules
+from ftmetal.models.loader import WeightRules, checkpoint_bytes, expert_schemes, load_weights
+from ftmetal.models.register import (
+    MODEL_REGISTRY,
+    create_model,
+    model_weight_rules,
+    read_checkpoint,
+)
 from ftmetal.moe.offload_cache import STAGING_BYTES, OffloadMoeCache
 from ftmetal.moe.slot_pools import (
     HOT_EXPERTS_FILE,
@@ -91,6 +97,7 @@ class ForwardOutput(NamedTuple):
 def resolve_moe_strategy(
     config: EngineConfig,
     rules: WeightRules,
+    state: dict[str, mx.array],
     *,
     budget: int,
     graphs: int,
@@ -99,7 +106,9 @@ def resolve_moe_strategy(
 ) -> MoeStrategy:
     """FreeToken's MoE strategy resolution: an explicit strategy stands; auto offloads when a
     cache size flag is given, else keeps the experts resident when the checkpoint's weights
-    leave the paged pools kv_reserve_tokens (choose_moe_strategy)."""
+    leave the paged pools kv_reserve_tokens (choose_moe_strategy) or, when they leave them any
+    pages, the offload cache cannot serve their scheme; when they leave none, raises before any
+    weight is read. state: the lazily mapped checkpoint the model loads from."""
     model_config = config.model_config
     has_cache_flag = (
         config.moe_cache_size_flag(model_config.num_moe_layers * model_config.num_experts) > 0
@@ -119,10 +128,10 @@ def resolve_moe_strategy(
     elif config.moe_strategy == "offload" or has_cache_flag:
         return "offload"
     else:
-        checkpoint = checkpoint_bytes(config.model_path, rules)
+        weights = checkpoint_bytes(state, rules)
         resident = BudgetReport(
             budget=budget,
-            weights=checkpoint.non_expert + checkpoint.experts,
+            weights=weights.non_expert + weights.experts,
             activations=activation_reserve_bytes(
                 config.max_extend_tokens, model_config.num_qo_heads, IN_FLIGHT_STEPS
             ),
@@ -133,8 +142,17 @@ def resolve_moe_strategy(
         strategy = choose_moe_strategy(
             resident, kv_reserve_pages(config.kv_reserve_tokens, config.page_size)
         )
+        schemes = expert_schemes(state, rules, model_config.quant)
+        if strategy == "offload" and not all(can_offload(scheme) for scheme in schemes):
+            # Refused here, before any weight is read, when they leave the paged pools nothing.
+            plan_budget(budget, resident.weights, resident.activations, graphs, costs, encoder)
+            logger.warning(
+                "MoE offload serves affine-quantized experts only: this checkpoint's stay "
+                "resident, beside less KV than kv_reserve_tokens"
+            )
+            strategy = "fused"
         logger.info(
-            f"Auto-selected MoE strategy: {strategy} ({checkpoint.experts / GIB:.2f} GiB of "
+            f"Auto-selected MoE strategy: {strategy} ({weights.experts / GIB:.2f} GiB of "
             f"experts beside {config.kv_reserve_tokens} tokens of KV; "
             f"{resident.paged_bytes / GIB:.2f} GiB left for the KV pools if resident)"
         )
@@ -215,9 +233,11 @@ class Engine:
         specs = config.model_config.kv_cache_group_specs()
         costs = pool_costs(specs, config)
         rules = model_weight_rules(config.architecture, config.model_config)
+        checkpoint = read_checkpoint(config.architecture, config.model_path)
         moe_strategy = resolve_moe_strategy(
             config,
             rules,
+            checkpoint.state,
             budget=budget,
             graphs=graph_reserve,
             costs=costs,
@@ -246,7 +266,8 @@ class Engine:
         # Delta, not the total: an earlier engine's pools may still be alive in the process.
         resident_before = mx.get_active_memory()
         self.model = create_model(config.architecture, model_config, config.dtype)
-        load_weights(self.model, config.model_path, rules, skip_experts=is_offload)
+        load_weights(self.model, checkpoint.state, rules, skip_experts=is_offload)
+        logger.info(f"loaded weights from {config.model_path}")
         # Under offload the experts are the cache's, not weights.
         self.weights_bytes = mx.get_active_memory() - resident_before
         logger.info(f"weights resident: {self.weights_bytes / 2**30:.2f} GiB")

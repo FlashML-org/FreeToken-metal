@@ -1,7 +1,8 @@
 """A tiny random Qwen3.5 MoE model shared by the parity and scheduler tests.
 
 The mlx-lm model is the reference; save_checkpoint writes it in the MLX checkpoint
-layout ftmetal loads, and reference_greedy is the contiguous-cache greedy decode.
+layout, save_hf_checkpoint in the Hugging Face layout (hf_layout_weights), and
+reference_greedy is the contiguous-cache greedy decode.
 TINY_FULL_ATTENTION_CONFIG drops the linear layers, so the engine has no GDN state pool.
 """
 
@@ -75,7 +76,77 @@ def save_checkpoint(model: reference.Model, path: Path, quantization: dict | Non
         "eos_token_id": [127],
     }
     if quantization is not None:
+        # mlx-lm writes the section twice, the second time as quantization_config.
         config["quantization"] = quantization
+        config["quantization_config"] = quantization
+    (path / "config.json").write_text(json.dumps(config))
+
+
+# The norms the MLX layout stores shifted by one (mlx-lm's qwen3_5 sanitize).
+SHIFTED_NORMS = (
+    ".input_layernorm.weight",
+    ".post_attention_layernorm.weight",
+    "model.norm.weight",
+    ".q_norm.weight",
+    ".k_norm.weight",
+)
+
+
+def hf_layout_weights(
+    weights: dict[str, mx.array], text_prefix: str, *, has_stacked_experts: bool = False
+) -> dict[str, mx.array]:
+    """MLX layout weights (the reference's, or quantized tensors under its module names) as a
+    Hugging Face checkpoint stores them: text_prefix names, one tensor per expert (or, as the
+    bf16 release stores them, each layer's gate and up stacked in one bank and down in
+    another), a [conv_dim, 1, kernel] conv, unshifted norms, and an MTP head the engine does
+    not build, its experts stacked as every export stores them."""
+    out: dict[str, mx.array] = {
+        "mtp.fc.weight": mx.zeros((4, 4)),
+        "mtp.layers.0.mlp.experts.gate_up_proj": mx.zeros((4, 8, 4)),
+        "mtp.layers.0.mlp.experts.down_proj": mx.zeros((4, 4, 4)),
+    }
+    for mlx_key, value in weights.items():
+        if mlx_key.startswith("language_model.model."):
+            key = text_prefix + mlx_key.removeprefix("language_model.model.")
+        else:
+            key = mlx_key.removeprefix("language_model.")
+        parent, _, leaf = key.partition(".switch_mlp.")
+        if leaf and has_stacked_experts:
+            if leaf == "gate_proj.weight":
+                up = weights[mlx_key.replace(".gate_proj.", ".up_proj.")]
+                out[f"{parent}.experts.gate_up_proj"] = mx.concatenate([value, up], axis=-2)
+            elif leaf == "down_proj.weight":
+                out[f"{parent}.experts.down_proj"] = value
+            else:
+                assert leaf == "up_proj.weight", f"{mlx_key}: stacked experts are bf16"
+        elif leaf:
+            for expert_id in range(value.shape[0]):
+                out[f"{parent}.experts.{expert_id}.{leaf}"] = value[expert_id]
+        elif key.endswith(".conv1d.weight"):
+            out[key] = value.moveaxis(1, 2)
+        elif key.endswith(SHIFTED_NORMS):
+            out[key] = value - 1
+        else:
+            out[key] = value
+    return out
+
+
+def save_hf_checkpoint(
+    weights: dict[str, mx.array],
+    model: reference.Model,
+    path: Path,
+    architecture: str,
+    quantization_config: dict[str, object] | None = None,
+) -> None:
+    mx.save_safetensors(str(path / "model.safetensors"), weights)
+    config: dict[str, object] = {
+        "architectures": [architecture],
+        "model_type": "qwen3_5_moe",
+        "text_config": model.args.text_config,
+        "eos_token_id": [127],
+    }
+    if quantization_config is not None:
+        config["quantization_config"] = quantization_config
     (path / "config.json").write_text(json.dumps(config))
 
 
@@ -107,7 +178,9 @@ __all__ = [
     "TINY_FULL_ATTENTION_CONFIG",
     "TINY_TEXT_CONFIG",
     "build_reference",
+    "hf_layout_weights",
     "reference_greedy",
     "save_checkpoint",
+    "save_hf_checkpoint",
     "uncached_greedy",
 ]

@@ -65,6 +65,20 @@ def test_qwen_image_becomes_one_span_of_its_content_pad_id(tiny_model_dir: Path)
     assert result.input_ids.tolist() == [1, 2, *[item.pad_value] * 256, 3]
 
 
+def test_qwen_image_processor_read_from_processor_config(tiny_model_dir: Path) -> None:
+    """A checkpoint without preprocessor_config.json keeps it as processor_config.json's
+    image_processor section."""
+    image_token_id = write_qwen_vl_model(tiny_model_dir)
+    ids = np.array([1, image_token_id, 2], np.int32)
+    expected = qwen_processor(tiny_model_dir).apply(ids, [png(320, 200)])
+    preprocessor = (tiny_model_dir / "preprocessor_config.json").read_text()
+    (tiny_model_dir / "preprocessor_config.json").unlink()
+    (tiny_model_dir / "processor_config.json").write_text(f'{{"image_processor": {preprocessor}}}')
+    result = qwen_processor(tiny_model_dir).apply(ids, [png(320, 200)])
+    assert result.input_ids.tolist() == expected.input_ids.tolist()
+    assert result.mm_items[0].grid_thw == expected.mm_items[0].grid_thw
+
+
 def test_qwen_mrope_positions_spread_the_image_over_its_merged_grid(tiny_model_dir: Path) -> None:
     image_token_id = write_qwen_vl_model(tiny_model_dir)
     ids = np.array([1, 2, image_token_id, 3, 4], np.int32)

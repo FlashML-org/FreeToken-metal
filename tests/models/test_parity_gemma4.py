@@ -82,6 +82,13 @@ POST_NORM_SCALE = 8.0
 # The QAT checkpoint's recipe: 4-bit by default, the dense MLP and the router at 8 bits.
 QUANT_GROUP_SIZE = 32
 EIGHT_BIT_MODULES = ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "router.proj")
+# The recipe in each mode, (group size, bits by default, the 8-bit modules' entry): a float
+# mode keeps the 8-bit modules in mxfp8 through entries that name it.
+QUANT_RECIPES: dict[str, tuple[int, int, dict[str, object]]] = {
+    "affine": (QUANT_GROUP_SIZE, 4, {"group_size": QUANT_GROUP_SIZE, "bits": 8}),
+    "mxfp4": (32, 4, {"group_size": 32, "bits": 8, "mode": "mxfp8"}),
+    "nvfp4": (16, 4, {"group_size": 32, "bits": 8, "mode": "mxfp8"}),
+}
 
 
 def text_config(moe: bool) -> dict[str, object]:
@@ -110,21 +117,23 @@ def build_reference(seed: int, moe: bool) -> reference.Model:
     return model
 
 
-def quantize(model: reference.Model) -> dict[str, object]:
-    """Quantize the reference as the QAT recipe does; returns the config's quantization map."""
+def quantize(model: reference.Model, mode: str = "affine") -> dict[str, object]:
+    """Quantize the reference as the QAT recipe does in mode; returns the config's
+    quantization map."""
+    group_size, bits, eight_bit = QUANT_RECIPES[mode]
     overrides: dict[str, object] = {}
 
-    def predicate(path: str, module: nn.Module) -> bool | dict[str, int]:
+    def predicate(path: str, module: nn.Module) -> bool | dict[str, object]:
         if not hasattr(module, "to_quantized"):
             return False
         if path.endswith(EIGHT_BIT_MODULES):
-            overrides[path] = {"group_size": QUANT_GROUP_SIZE, "bits": 8}
-            return {"group_size": QUANT_GROUP_SIZE, "bits": 8}
+            overrides[path] = eight_bit
+            return dict(eight_bit)
         return True
 
-    nn.quantize(model, group_size=QUANT_GROUP_SIZE, bits=4, class_predicate=predicate)
+    nn.quantize(model, group_size, bits, mode=mode, class_predicate=predicate)
     mx.eval(model.parameters())
-    return {"group_size": QUANT_GROUP_SIZE, "bits": 4, "mode": "affine", **overrides}
+    return {"group_size": group_size, "bits": bits, "mode": mode, **overrides}
 
 
 def save_checkpoint(
@@ -139,7 +148,9 @@ def save_checkpoint(
         "eos_token_id": [EOS],
     }
     if quantization is not None:
+        # mlx-lm writes the section twice, the second time as quantization_config.
         config["quantization"] = quantization
+        config["quantization_config"] = quantization
     (path / "config.json").write_text(json.dumps(config))
 
 
@@ -257,9 +268,12 @@ def test_prefill_logits_match_mlx_lm(tmp_path: Path, attention_backend: str, moe
 
 
 @pytest.mark.parametrize("attention_backend", ["mlx", "metal"])
-def test_quantized_greedy_decode_matches_mlx_lm(tmp_path: Path, attention_backend: str) -> None:
+@pytest.mark.parametrize("mode", list(QUANT_RECIPES))
+def test_quantized_greedy_decode_matches_mlx_lm(
+    tmp_path: Path, attention_backend: str, mode: str
+) -> None:
     model = build_reference(seed=15, moe=True)
-    quantization = quantize(model)
+    quantization = quantize(model, mode)
     save_checkpoint(model, tmp_path, moe=True, quantization=quantization)
     prompt = random_prompt(7, 19)
     steps = 16

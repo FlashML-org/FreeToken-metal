@@ -2,8 +2,8 @@
 
 Port of FreeToken models/qwen3_5_moe/model.py, with the encode of its
 Qwen3_5MoeForConditionalGeneration. Divergences: the batch flows through forward
-explicitly; norms are plain RMSNorm because MLX checkpoints store the (1 + w) shift; each
-Linear takes its affine scheme from the checkpoint's quantization map at construction; one
+explicitly; norms are plain RMSNorm because the MLX layout stores the (1 + w) shift; each
+Linear takes its scheme from the checkpoint's quantization map at construction; one
 class serves both architectures and builds the vision tower when the config has one, in
 the engine dtype.
 """

@@ -19,9 +19,10 @@ import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
-from typing import Literal, NamedTuple
+from typing import Literal, NamedTuple, get_args
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 
 from ftmetal.attention.metadata import AttnType
@@ -50,7 +51,13 @@ from ftmetal.models.gemma4.config import parse_config as parse_gemma4_config
 from ftmetal.models.gemma4.model import Gemma4ForCausalLM
 from ftmetal.models.qwen3_5_moe import vision as qwen_vision
 from ftmetal.models.qwen3_5_moe.config import parse_config
-from ftmetal.models.register import GEMMA4_VISION, QWEN_VISION, EncoderSpec, model_weight_rules
+from ftmetal.models.register import (
+    GEMMA4_VISION,
+    QWEN_VISION,
+    EncoderSpec,
+    model_weight_rules,
+    read_checkpoint,
+)
 from ftmetal.moe.offload_cache import STAGING_BYTES
 from tiny_model import TINY_TEXT_CONFIG, build_reference, save_checkpoint
 
@@ -615,16 +622,39 @@ def test_refused_offload_budgets(fields: dict[str, float | int | bool | None], e
         offload_budget(EngineConfig(model_path="unused", **fields))
 
 
-# (--moe-strategy, cache size flags, budget, the strategy resolved) on a tiny checkpoint: its
-# weights take a few MiB beside an activation reserve of two 0.75 GiB steps.
-STRATEGY_CASES: list[tuple[MoeStrategyChoice, dict[str, float | bool], int, MoeStrategy]] = [
-    ("auto", {}, 2 * GIB, "fused"),
-    ("auto", {}, 1 * GIB, "offload"),
-    ("auto", {"moe_cache_rate": 0.5}, 2 * GIB, "offload"),
-    ("auto", {"moe_cache_auto": True}, 2 * GIB, "offload"),
-    ("fused", {"moe_cache_rate": 0.5}, 1 * GIB, "fused"),
-    ("offload", {}, 2 * GIB, "offload"),
+# (--moe-strategy, EngineConfig flags, budget, the checkpoint's quantization mode or None for
+# bf16, the strategy resolved or the refusal) on a tiny checkpoint: its weights take a few MiB
+# beside an activation reserve of two 0.75 GiB steps, and 8192 tokens of KV take 8 MiB. auto
+# keeps experts the offload cache cannot serve resident when they fit; a cache size flag asks
+# for offload, which the MoE layer then refuses.
+STRATEGY_CASES: list[
+    tuple[MoeStrategyChoice, dict[str, float | bool], int, str | None, MoeStrategy | str]
+] = [
+    ("auto", {}, 2 * GIB, "affine", "fused"),
+    ("auto", {}, 1 * GIB, "affine", "offload"),
+    ("auto", {"kv_reserve_tokens": 1 << 20}, 2 * GIB, None, "fused"),
+    ("auto", {"kv_reserve_tokens": 1 << 20}, 2 * GIB, "mxfp4", "fused"),
+    ("auto", {}, 1 * GIB, None, "model does not fit the memory budget"),
+    ("auto", {"moe_cache_rate": 0.5}, 2 * GIB, None, "offload"),
+    ("auto", {"moe_cache_auto": True}, 2 * GIB, None, "offload"),
+    ("fused", {"moe_cache_rate": 0.5}, 1 * GIB, "affine", "fused"),
+    ("offload", {}, 2 * GIB, None, "offload"),
 ]
+# Group size and bits of each mode the cases quantize in.
+QUANT_SHAPES = {"affine": (32, 4), "mxfp4": (32, 4)}
+
+
+def save_tiny_checkpoint(path: Path, mode: str | None) -> None:
+    """The tiny checkpoint in bf16, or with every linear and the embedding in mode."""
+    model = build_reference(seed=0)
+    if mode is None:
+        save_checkpoint(model, path, quantization=None)
+    else:
+        group_size, bits = QUANT_SHAPES[mode]
+        nn.quantize(model, group_size, bits, mode=mode)
+        mx.eval(model.parameters())
+        quantization = {"group_size": group_size, "bits": bits, "mode": mode}
+        save_checkpoint(model, path, quantization=quantization)
 
 
 def resolve_tiny_strategy(
@@ -637,6 +667,7 @@ def resolve_tiny_strategy(
     return resolve_moe_strategy(
         config,
         model_weight_rules(config.architecture, model_config),
+        read_checkpoint(config.architecture, config.model_path).state,
         budget=budget,
         graphs=0,
         costs=pool_costs(model_config.kv_cache_group_specs(), config),
@@ -644,16 +675,21 @@ def resolve_tiny_strategy(
     )
 
 
-@pytest.mark.parametrize(("strategy", "flags", "budget", "expected"), STRATEGY_CASES)
+@pytest.mark.parametrize(("strategy", "flags", "budget", "mode", "expected"), STRATEGY_CASES)
 def test_moe_strategy_resolution(
     tmp_path: Path,
     strategy: MoeStrategyChoice,
     flags: dict[str, float | bool],
     budget: int,
-    expected: MoeStrategy,
+    mode: str | None,
+    expected: MoeStrategy | str,
 ) -> None:
-    save_checkpoint(build_reference(seed=0), tmp_path, quantization=None)
-    assert resolve_tiny_strategy(tmp_path, strategy, flags, budget) == expected
+    save_tiny_checkpoint(tmp_path, mode)
+    if expected in get_args(MoeStrategy):
+        assert resolve_tiny_strategy(tmp_path, strategy, flags, budget) == expected
+    else:
+        with pytest.raises(RuntimeError, match=expected):
+            resolve_tiny_strategy(tmp_path, strategy, flags, budget)
 
 
 def test_dense_model_refuses_moe_offload(tmp_path: Path) -> None:

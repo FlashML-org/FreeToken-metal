@@ -1,7 +1,7 @@
 """Gemma4 config parsing from an MLX checkpoint's config.json.
 
 Port of FreeToken models/gemma4/config.py. Divergences: reads the MLX checkpoint
-dictionary (text_config or top level) and its affine quantization map; vision_config stays
+dictionary (text_config or top level) and its MLX scheme map; vision_config stays
 the raw section, which the tower parses; the global layers' kv heads follow the parity
 reference (the global count only with attention_k_eq_v); KV sharing and per-layer inputs
 (Gemma4-E2B/E4B) and bidirectional attention on every token are refused.

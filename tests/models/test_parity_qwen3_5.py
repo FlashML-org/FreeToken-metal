@@ -24,7 +24,14 @@ from ftmetal.message.tokenizer import TokenizeMsg
 from ftmetal.models.qwen3_5_moe.model import Qwen3_5MoeForCausalLM
 from ftmetal.scheduler.scheduler import Scheduler
 from ftmetal.tokenizer import TokenizeManager
-from tiny_model import TINY_TEXT_CONFIG, build_reference, reference_greedy, save_checkpoint
+from tiny_model import (
+    TINY_TEXT_CONFIG,
+    build_reference,
+    hf_layout_weights,
+    reference_greedy,
+    save_checkpoint,
+    save_hf_checkpoint,
+)
 
 
 def make_scheduler(
@@ -206,18 +213,72 @@ def test_naive_cache_matches_mlx_lm(tmp_path: Path) -> None:
     assert mx.allclose(logits[0], expected_logits[-1], atol=1e-4, rtol=1e-4)
 
 
+# (the text weights' prefix, the architecture, whether each layer's experts are stacked): a
+# multimodal checkpoint, a text-only one, and the bf16 release's stacked experts.
+HF_LAYOUTS = {
+    "multimodal": ("model.language_model.", "Qwen3_5MoeForConditionalGeneration", False),
+    "text-only": ("model.", "Qwen3_5MoeForCausalLM", False),
+    "stacked-experts": ("model.language_model.", "Qwen3_5MoeForConditionalGeneration", True),
+}
+
+
+@pytest.mark.parametrize("layout", list(HF_LAYOUTS))
+def test_hugging_face_layout_matches_mlx_lm(tmp_path: Path, layout: str) -> None:
+    text_prefix, architecture, has_stacked_experts = HF_LAYOUTS[layout]
+    model = build_reference(seed=6)
+    weights = hf_layout_weights(
+        dict(tree_flatten(model.parameters())),
+        text_prefix,
+        has_stacked_experts=has_stacked_experts,
+    )
+    save_hf_checkpoint(weights, model, tmp_path, architecture)
+    prompt = [int(t) for t in np.random.default_rng(6).integers(1, 120, size=37)]
+    steps = 12
+    expected_logits, expected = reference_greedy(model, prompt, steps)
+
+    logits = last_chunk_logits(make_scheduler(tmp_path, page_size=4), prompt)
+    assert mx.allclose(logits[0], expected_logits[-1], atol=1e-4, rtol=1e-4)
+    scheduler = make_scheduler(tmp_path, page_size=4)
+    params = SamplingParams(temperature=0.0, max_tokens=steps, ignore_eos=True)
+    assert scheduler.generate(np.array(prompt, dtype=np.int32), params) == expected
+
+
+# The mlx-community recipes, (mode, group size, bits, the routers' entry): every other linear
+# and the embedding in the mode, the routers at affine 8-bit through per-module entries that
+# name no mode (mlx-lm reads them as affine); and routers whose entry names a float mode.
+AFFINE_ROUTERS: dict[str, JsonValue] = {"group_size": 64, "bits": 8}
+QUANT_RECIPES: dict[str, tuple[str, int, int, dict[str, JsonValue] | None]] = {
+    "affine": ("affine", 32, 4, None),
+    "mxfp4": ("mxfp4", 32, 4, AFFINE_ROUTERS),
+    "nvfp4": ("nvfp4", 16, 4, AFFINE_ROUTERS),
+    "mxfp8": ("mxfp8", 32, 8, AFFINE_ROUTERS),
+    "nvfp4-mxfp8-routers": ("nvfp4", 16, 4, {"group_size": 32, "bits": 8, "mode": "mxfp8"}),
+}
+
+
 @pytest.mark.parametrize("attention_backend", ["mlx", "metal"])
-def test_quantized_greedy_decode_matches_mlx_lm(tmp_path: Path, attention_backend: str) -> None:
+@pytest.mark.parametrize("recipe", list(QUANT_RECIPES))
+def test_quantized_greedy_decode_matches_mlx_lm(
+    tmp_path: Path, attention_backend: str, recipe: str
+) -> None:
     model = build_reference(seed=4)
+    mode, group_size, bits, router_entry = QUANT_RECIPES[recipe]
+    quantization: dict[str, JsonValue] = {"group_size": group_size, "bits": bits, "mode": mode}
 
-    def predicate(path: str, module: nn.Module) -> bool:
-        return hasattr(module, "to_quantized") and not path.endswith(
-            ("mlp.gate", "shared_expert_gate")
-        )
+    def predicate(path: str, module: nn.Module) -> bool | dict[str, JsonValue]:
+        if not hasattr(module, "to_quantized"):
+            return False
+        elif path.endswith(("mlp.gate", "shared_expert_gate")):
+            if router_entry is None:
+                return False
+            quantization[path] = router_entry
+            return dict(router_entry)
+        else:
+            return True
 
-    nn.quantize(model, group_size=32, bits=4, class_predicate=predicate)
+    nn.quantize(model, group_size, bits, mode=mode, class_predicate=predicate)
     mx.eval(model.parameters())
-    save_checkpoint(model, tmp_path, quantization={"group_size": 32, "bits": 4, "mode": "affine"})
+    save_checkpoint(model, tmp_path, quantization=quantization)
     prompt = [int(t) for t in np.random.default_rng(4).integers(1, 120, size=31)]
     steps = 16
     _, expected = reference_greedy(model, prompt, steps)

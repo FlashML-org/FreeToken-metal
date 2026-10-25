@@ -3,11 +3,10 @@
 Port of FreeToken models/gemma4/model.py (and Gemma4MLP / Gemma4DenseMLP of its moe.py),
 with the encode of its Gemma4ForConditionalGeneration. Divergences: the batch flows through
 forward explicitly; the feed-forward sandwich runs unfused in the decoder layer, which holds
-its norms, router and experts as the checkpoint lays them out; each Linear takes its affine
-scheme from the checkpoint's quantization map at construction; the final logit softcap runs
-in the logits' dtype; the experts are always resident (no offload strategy yet); one class
-serves both architectures and builds the vision tower when the config has one, in the engine
-dtype.
+its norms, router and experts as the checkpoint lays them out; each Linear takes its scheme
+from the checkpoint's quantization map at construction; the final logit softcap runs in the
+logits' dtype; the experts are always resident (no offload strategy yet); one class serves
+both architectures and builds the vision tower when the config has one, in the engine dtype.
 """
 
 from __future__ import annotations

@@ -3,11 +3,12 @@
 Port of FreeToken layers/quantization/moe/ (MoEConfig, MoEMethod and its unquantized method,
 with their kernel's layout and apply). Divergences: moe_method picks the method instead of the
 (kind, layer kind) registry, with no kernel table, pack or finalize step, since the banks load
-straight from MLX checkpoints; gate, up and down may each have their own scheme, so a method
-gathers each projection by its scheme, and gate and up are two banks when theirs differ; the
-forward is MLX's gather ops around the moe_align / moe_combine kernels instead of one fused
-kernel; an offload cache's slot rows arrive as banks keyed like the layout, and the affine
-method also runs the overlap prefill's expert-sorted gather_qmm_sorted.
+straight from the checkpoint's MLX tensors; gate, up and down may each have their own scheme,
+so a method gathers each projection by its scheme, and gate and up are two banks when theirs
+differ; the forward is MLX's gather ops around the moe_align / moe_combine kernels instead of
+one fused kernel; one layer's quantized projections are of one kind (affine or float block);
+an offload cache's slot rows arrive as banks keyed like the layout, and the affine method also
+runs the overlap prefill's expert-sorted gather_qmm_sorted.
 """
 
 from __future__ import annotations
@@ -24,7 +25,8 @@ from ftmetal.kernel.gather_qmm_sorted import gather_qmm_sorted
 from ftmetal.kernel.moe_align import moe_align, moe_combine
 from ftmetal.layers.activation import gelu_tanh_and_mul, silu_and_mul
 from ftmetal.layers.base import BaseOP
-from ftmetal.layers.quantization.config import AffineScheme, BankSpec, QuantScheme
+from ftmetal.layers.quantization.config import AffineScheme, BankSpec, FpBlockScheme, QuantScheme
+from ftmetal.layers.quantization.linear import scale_output
 
 # From this many (token, expert) pairs the expert-sorted path is at least as fast as the
 # unsorted one; measured on the M4 Pro at Qwen3.6-35B-A3B shapes (256 experts, top-8, 4-bit).
@@ -198,6 +200,7 @@ class AffineMoEMethod(UnquantizedMoEMethod):
         if scheme is None:
             return super().projection_layout(projection)
         else:
+            assert isinstance(scheme, AffineScheme), f"{projection} is not affine quantized"
             return scheme.layout(input_size, output_size, self.cfg.dtype)
 
     def gather(
@@ -212,6 +215,7 @@ class AffineMoEMethod(UnquantizedMoEMethod):
         if scheme is None:
             return super().gather(projection, banks, x, indices, sorted_indices)
         else:
+            assert isinstance(scheme, AffineScheme), f"{projection} is not affine quantized"
             return mx.gather_qmm(
                 x,
                 banks[f"{projection}.weight"],
@@ -242,7 +246,7 @@ class AffineMoEMethod(UnquantizedMoEMethod):
 
         def project(projection: str, h: mx.array) -> mx.array:
             _, output_size, scheme = self.projections[projection]
-            assert scheme is not None, "offload experts are affine quantized"
+            assert isinstance(scheme, AffineScheme), "offload experts are affine quantized"
             return gather_qmm_sorted(
                 h,
                 banks[f"{projection}.weight"],
@@ -258,21 +262,99 @@ class AffineMoEMethod(UnquantizedMoEMethod):
         return moe_combine(self.glu(sorted_x, project), alignment.pair_positions, topk_weights)
 
 
+class FpBlockMoEMethod(UnquantizedMoEMethod):
+    """Experts in an MLX float block mode; a projection the checkpoint keeps in bf16 gathers as
+    the unquantized method's. An output_scale is one float32 per expert and fused part,
+    [parts, 1]: gate's and up's apply to their outputs, down's to each pair's routing weight."""
+
+    def projection_layout(self, projection: str) -> dict[str, BankSpec]:
+        input_size, output_size, scheme = self.projections[projection]
+        if scheme is None:
+            return super().projection_layout(projection)
+        else:
+            assert isinstance(scheme, FpBlockScheme), f"{projection} is not float block quantized"
+            layout = scheme.layout(input_size, output_size, self.cfg.dtype)
+            if scheme.has_output_scale:
+                parts = 2 if projection == "gate_up_proj" else 1
+                layout["output_scale"] = BankSpec((parts, 1), mx.float32, scheme)
+            return layout
+
+    def gather(
+        self,
+        projection: str,
+        banks: Mapping[str, mx.array],
+        x: mx.array,
+        indices: mx.array,
+        sorted_indices: bool,
+    ) -> mx.array:
+        scheme = self.projections[projection][2]
+        if scheme is None:
+            return super().gather(projection, banks, x, indices, sorted_indices)
+        else:
+            assert isinstance(scheme, FpBlockScheme), f"{projection} is not float block quantized"
+            y = mx.gather_qmm(
+                x,
+                banks[f"{projection}.weight"],
+                banks[f"{projection}.scales"],
+                rhs_indices=indices,
+                transpose=True,
+                group_size=scheme.group_size,
+                bits=scheme.bits,
+                mode=scheme.mode,
+                sorted_indices=sorted_indices,
+            )
+            if not scheme.has_output_scale or projection == "down_proj":
+                return y
+            else:
+                # y [..., 1, out] cut into its parts, each times its expert's scale.
+                part_scales = banks[f"{projection}.output_scale"][indices]
+                parts = y.reshape(*y.shape[:-2], part_scales.shape[-2], -1)
+                return scale_output(parts, part_scales).reshape(y.shape)
+
+    def apply(
+        self,
+        banks: Mapping[str, mx.array],
+        x: mx.array,
+        topk_weights: mx.array,
+        topk_ids: mx.array,
+    ) -> mx.array:
+        """apply, with down's output scale on each pair's routing weight (down is linear); only
+        here, as apply_unsorted runs under it."""
+        down = self.projections["down_proj"][2]
+        if isinstance(down, FpBlockScheme) and down.has_output_scale:
+            down_scales = banks["down_proj.output_scale"][topk_ids][..., 0, 0]
+            topk_weights = (topk_weights * down_scales).astype(topk_weights.dtype)
+        return super().apply(banks, x, topk_weights, topk_ids)
+
+
+def can_offload(scheme: QuantScheme | None) -> bool:
+    """Whether an offload cache serves an expert projection in scheme: only the affine method
+    has an expert-sorted kernel for the overlap prefill."""
+    return isinstance(scheme, AffineScheme)
+
+
 def moe_method(cfg: MoEConfig) -> MoEMethod:
     projections = cfg.schemes.projections(cfg.hidden, cfg.intermediate)
-    # Only the affine method has an expert-sorted kernel for the overlap prefill.
-    unsortable = [
-        projection
+    kinds = {
+        projection: type(scheme)
         for projection, (_, _, scheme) in projections.items()
-        if not isinstance(scheme, AffineScheme)
+        if scheme is not None
+    }
+    unsortable = [
+        projection for projection, (_, _, scheme) in projections.items() if not can_offload(scheme)
     ]
-    if cfg.strategy == "offload" and unsortable:
+    if len(set(kinds.values())) > 1:
+        mixed = ", ".join(f"{projection} {kind.__name__}" for projection, kind in kinds.items())
+        raise ValueError(f"a MoE layer's quantized experts are of one kind, not {mixed}")
+    elif cfg.strategy == "offload" and unsortable:
         refused = ", ".join(unsortable)
         raise ValueError(f"MoE offload serves affine-quantized experts only, not {refused}")
-    elif all(scheme is None for _, _, scheme in projections.values()):
+    elif not kinds:
         return UnquantizedMoEMethod(cfg)
-    else:
+    elif AffineScheme in kinds.values():
         return AffineMoEMethod(cfg)
+    else:
+        return FpBlockMoEMethod(cfg)
 
 
 __all__ = [
@@ -280,8 +362,10 @@ __all__ = [
     "AffineMoEMethod",
     "ExpertProjection",
     "ExpertSchemes",
+    "FpBlockMoEMethod",
     "MoEConfig",
     "MoEMethod",
     "UnquantizedMoEMethod",
+    "can_offload",
     "moe_method",
 ]

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 import struct
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
@@ -33,6 +34,8 @@ from ftmetal.mm.processor import (
 from ftmetal.models.loader import config_bool, config_dict, config_float, config_int
 
 PREPROCESSOR_CONFIG_FILE = "preprocessor_config.json"
+# A checkpoint without the preprocessor config keeps the image processor's as a section here.
+PROCESSOR_CONFIG_FILE = "processor_config.json"
 # Qwen2VLImageProcessorPil's values for the keys the checkpoint's preprocessor config omits.
 DEFAULT_RESAMPLE = Image.Resampling.BICUBIC
 DEFAULT_RESCALE_FACTOR = 1 / 255
@@ -80,9 +83,16 @@ class QwenVLMMProcessor(MMProcessor):
         self.placeholder = [self.image_token_id]
         self.is_mrope = "mrope_section" in (config_dict(text_config, "rope_parameters") or {})
 
-        preprocessor = read_processor_config(model_path, PREPROCESSOR_CONFIG_FILE)
+        if (Path(model_path) / PREPROCESSOR_CONFIG_FILE).is_file():
+            preprocessor = read_processor_config(model_path, PREPROCESSOR_CONFIG_FILE)
+        else:
+            processor_config = read_processor_config(model_path, PROCESSOR_CONFIG_FILE)
+            image_processor = config_dict(processor_config, "image_processor")
+            if image_processor is None:
+                raise ValueError(f"{PROCESSOR_CONFIG_FILE} of {model_path} has no image_processor")
+            preprocessor = image_processor
         size = config_dict(preprocessor, "size")
-        assert size is not None, f"{PREPROCESSOR_CONFIG_FILE} has no size"
+        assert size is not None, "the image processor config has no size"
         self.patch_size = config_int(preprocessor, "patch_size")
         self.temporal_patch_size = config_int(preprocessor, "temporal_patch_size")
         self.merge_size = config_int(preprocessor, "merge_size")

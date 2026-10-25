@@ -1,13 +1,13 @@
 """Engine configuration and the model config it derives from the checkpoint.
 
 Port of FreeToken engine/config.py (EngineConfig), reduced to the knobs this engine
-has: one process, one GPU, MLX checkpoints. Divergence: served_modalities reads the
-encoders from mm.processor.active_encoders (no active_encoders property) and is empty for
-a checkpoint without config.json; model_config drops the unbuilt encoder sections from the
-raw config dictionary; the MoE strategies are auto, fused and offload (no host-bank kinds),
-and no deprecated moe_backend field (only the flag); memory_ratio defaults to None, the
-working set less a headroom; the three cache size fields are checked exclusive here, not
-only as flags.
+has: one process, one GPU, checkpoints in the MLX layout or rewritten into it. Divergence:
+served_modalities reads the encoders from mm.processor.active_encoders (no active_encoders
+property) and is empty for a checkpoint without config.json; model_config drops the unbuilt
+encoder sections from the raw config dictionary; the MoE strategies are auto, fused and
+offload (no host-bank kinds), and no deprecated moe_backend field (only the flag);
+memory_ratio defaults to None, the working set less a headroom; the three cache size fields
+are checked exclusive here, not only as flags.
 """
 
 from __future__ import annotations
@@ -22,17 +22,11 @@ from typing import Literal
 import mlx.core as mx
 
 from ftmetal.env import read_env
-from ftmetal.layers.quantization.config import QuantConfig
 from ftmetal.mm.config import ENCODER_SECTIONS, Modality, MultimodalConfig
 from ftmetal.mm.processor import active_encoders
 from ftmetal.models.config import ModelConfig
-from ftmetal.models.loader import (
-    checkpoint_tensor_names,
-    config_dict,
-    config_str_list,
-    read_model_config,
-)
-from ftmetal.models.register import parse_model_config
+from ftmetal.models.loader import config_str_list, read_model_config
+from ftmetal.models.register import parse_model_config, read_checkpoint
 from ftmetal.moe.slot_pools import MoePoolGrouping, MoePoolSlots, PrefillBufferPlacement
 
 # Prefix reuse: radix (the hybrid radix on a model with linear attention) or naive (none).
@@ -184,9 +178,7 @@ class EngineConfig:
 
     @cached_property
     def model_config(self) -> ModelConfig:
-        quant = QuantConfig.from_checkpoint(
-            config_dict(self.raw_config, "quantization"), checkpoint_tensor_names(self.model_path)
-        )
+        quant = read_checkpoint(self.architecture, self.model_path).quant
         # The parser sees no section of a tower this process does not build (for the vision
         # tower that also means 1-D rope).
         encoders = active_encoders(self.model_path, self.raw_config, self.mm)

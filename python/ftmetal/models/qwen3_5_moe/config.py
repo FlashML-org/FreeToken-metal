@@ -1,8 +1,8 @@
-"""Qwen3.5 / 3.6 config parsing from an MLX checkpoint's config.json.
+"""Qwen3.5 / 3.6 config parsing from a checkpoint's config.json.
 
-Port of FreeToken models/qwen3_5_moe/config.py. Divergences: reads the MLX
-checkpoint dictionary (text_config or top level) and its affine quantization map; the
-vision section is kept raw for the tower to parse.
+Port of FreeToken models/qwen3_5_moe/config.py. Divergences: reads the checkpoint
+dictionary (text_config or top level) and its MLX scheme map; the vision section is kept raw
+for the tower to parse.
 """
 
 from __future__ import annotations

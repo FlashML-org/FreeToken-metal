@@ -26,7 +26,7 @@ from mlx.utils import tree_flatten
 
 from ftmetal.engine.config import EngineConfig
 from ftmetal.layers.moe import MoELayer, OffloadMoELayer
-from ftmetal.layers.quantization.config import AffineScheme
+from ftmetal.layers.quantization.config import AffineScheme, FpBlockScheme
 from ftmetal.layers.quantization.moe import ExpertSchemes
 from ftmetal.models.loader import apply_rules, load_checkpoint
 from ftmetal.models.qwen3_5_moe.model import schemes_of
@@ -444,16 +444,31 @@ def test_expert_bank_matches_moe_layout() -> None:
         assert {role: ((8, *spec.shape), spec.dtype) for role, spec in layout.items()} == expected
 
 
-def test_offload_refuses_bf16_experts() -> None:
+def test_offload_refuses_experts_not_affine() -> None:
     four = AffineScheme(4, 64)
     for schemes, refused in [
         (ExpertSchemes.uniform(None), "gate_up_proj, down_proj"),
         (ExpertSchemes(None, four, four), "gate_up_proj.gate_proj"),
         (ExpertSchemes(four, four, None), "down_proj"),
+        (ExpertSchemes.uniform(FpBlockScheme("nvfp4")), "gate_up_proj, down_proj"),
     ]:
         message = f"affine-quantized experts only, not {refused}"
         with pytest.raises(ValueError, match=re.escape(message) + "$"):
             OffloadMoELayer(0, 8, 2, 128, 64, schemes=schemes)
+
+
+def test_moe_layer_refuses_mixed_quant_kinds() -> None:
+    four, nvfp4 = AffineScheme(4, 64), FpBlockScheme("nvfp4")
+    for schemes, mixed in [
+        (ExpertSchemes(four, four, nvfp4), "gate_up_proj AffineScheme, down_proj FpBlockScheme"),
+        (
+            ExpertSchemes(nvfp4, four, None),
+            "gate_up_proj.gate_proj FpBlockScheme, gate_up_proj.up_proj AffineScheme",
+        ),
+    ]:
+        message = f"quantized experts are of one kind, not {mixed}"
+        with pytest.raises(ValueError, match=re.escape(message) + "$"):
+            MoELayer(8, 2, 128, 64, schemes=schemes)
 
 
 @pytest.mark.skipif(MODEL_PATH is None, reason="FTMETAL_TEST_MODEL_PATH is not set")

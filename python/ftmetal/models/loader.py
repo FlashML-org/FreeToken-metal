@@ -1,16 +1,16 @@
 """Checkpoint reading and the rename / fuse rules that map it onto a model.
 
-Port of FreeToken models/loader.py and models/weight.py. Divergences: the source is
-an MLX checkpoint (safetensors read lazily by mx.load), experts arrive pre-stacked, the
-fused state is applied with nn.Module.update after a strict key and shape check, and a
-fused module whose parts the checkpoint quantizes differently loads its parts apart.
+Port of FreeToken models/loader.py and models/weight.py. Divergences: the source is a
+checkpoint in the MLX layout (safetensors read lazily by mx.load, a family's mlx_layout
+rewriting another layout first), experts arrive pre-stacked, the fused state is applied with
+nn.Module.update after a strict key and shape check, and a fused module whose parts the
+checkpoint quantizes differently loads its parts apart.
 """
 
 from __future__ import annotations
 
 import glob
 import json
-import logging
 import os
 import struct
 from dataclasses import dataclass, field
@@ -21,8 +21,6 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.quantization.config import QuantConfig, QuantScheme
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -222,30 +220,41 @@ def checkpoint_tensor_names(model_path: str) -> list[str]:
 
 
 class CheckpointBytes(NamedTuple):
-    """What the checkpoint's weights a model loads under rules take, from the headers alone."""
+    """What the checkpoint's weights a model loads under rules take, from the lazily mapped
+    state alone."""
 
     non_expert: int
     experts: int
 
 
-def checkpoint_bytes(model_path: str, rules: WeightRules) -> CheckpointBytes:
+def checkpoint_bytes(state: dict[str, mx.array], rules: WeightRules) -> CheckpointBytes:
     non_expert = experts = 0
-    for name, entry in checkpoint_headers(model_path).items():
+    for name, tensor in state.items():
         key = rules.rename(name)
         if key is None:
             continue
-        offsets = entry.get("data_offsets") if isinstance(entry, dict) else None
-        if not (
-            isinstance(offsets, list)
-            and len(offsets) == 2
-            and all(isinstance(offset, int) for offset in offsets)
-        ):
-            raise ValueError(f"{model_path}: {name} has no data offsets: {entry}")
         if rules.is_expert(rules.fused_key(key)[0]):
-            experts += offsets[1] - offsets[0]
+            experts += tensor.nbytes
         else:
-            non_expert += offsets[1] - offsets[0]
+            non_expert += tensor.nbytes
     return CheckpointBytes(non_expert, experts)
+
+
+def expert_schemes(
+    state: dict[str, mx.array], rules: WeightRules, quant: QuantConfig | None
+) -> set[QuantScheme | None]:
+    """The schemes the checkpoint stores its routed experts in."""
+    schemes: set[QuantScheme | None] = set()
+    for name in state:
+        key = rules.rename(name)
+        if (
+            key is None
+            or not key.endswith(".weight")
+            or not rules.is_expert(rules.fused_key(key)[0])
+        ):
+            continue
+        schemes.add(None if quant is None else quant.scheme_for(name.removesuffix(".weight")))
+    return schemes
 
 
 def load_checkpoint(model_path: str) -> dict[str, mx.array]:
@@ -303,15 +312,20 @@ def load_state(model: BaseOP, state: dict[str, mx.array]) -> None:
 
 
 def load_weights(
-    model: BaseOP, model_path: str, rules: WeightRules, *, skip_experts: bool = False
+    model: BaseOP, state: dict[str, mx.array], rules: WeightRules, *, skip_experts: bool = False
 ) -> None:
-    """skip_experts leaves the routed-expert banks unread: an offload cache reads them."""
-    state = apply_rules(load_checkpoint(model_path), rules)
+    """Fill model from a lazily mapped checkpoint state in the MLX layout; skip_experts leaves
+    the routed-expert banks unread (an offload cache reads them).
+
+    Empties state: a source tensor the rules stack or fuse is then freed once its result is
+    built, not kept beside it.
+    """
+    renamed = apply_rules(state, rules)
+    state.clear()
     if skip_experts:
-        state = {key: tensor for key, tensor in state.items() if not rules.is_expert(key)}
-    load_state(model, state)
+        renamed = {key: tensor for key, tensor in renamed.items() if not rules.is_expert(key)}
+    load_state(model, renamed)
     mx.eval(model.parameters())
-    logger.info(f"loaded weights from {model_path}")
 
 
 __all__ = [
@@ -331,6 +345,7 @@ __all__ = [
     "config_optional_str",
     "config_str",
     "config_str_list",
+    "expert_schemes",
     "load_checkpoint",
     "load_state",
     "load_weights",
