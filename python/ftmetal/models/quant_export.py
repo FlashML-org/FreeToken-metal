@@ -5,9 +5,9 @@ compressed_tensors.py. Divergences: the export's NVFP4 and per-tensor FP8 module
 at load into MLX's nvfp4 (as stored) and mxfp8 (under unit e8m0 scales) tensors, each per-tensor
 scale becoming an output_scale, instead of read by FP4 / FP8 kernels; each module's format is
 read from the tensors it stores in the MLX layout, not from the config's module lists, which
-name Hugging Face modules, and the config is only checked for formats this serves; activation
-and KV-cache scales are dropped, the engine serving the weights alone; the checkpoint bytes of
-each expert tensor carry over to the tensor rewritten from it.
+name Hugging Face modules, and the config is only checked for the formats, transforms and
+sparsity this serves; activation and KV-cache scales are dropped, the engine serving the weights
+alone; the checkpoint bytes of each expert tensor carry over to the tensor rewritten from it.
 """
 
 from __future__ import annotations
@@ -35,6 +35,11 @@ COMPRESSED_TENSORS_WEIGHTS = (
     (4, "float", "tensor_group", NVFP4_SCHEME.group_size),
     (8, "float", "tensor", None),
 )
+# The compressed-tensors fields refused when set, with the weights each marks.
+COMPRESSED_TENSORS_UNSERVED_FIELDS = {
+    "transform_config": "rotated weights",
+    "sparsity_config": "sparse weights",
+}
 UNUSED_SCALE_SUFFIXES = (".input_scale", ".input_global_scale", ".k_scale", ".v_scale")
 
 
@@ -59,7 +64,8 @@ def rewrite_export(
     """An export's NVFP4 and per-tensor FP8 modules (an MLX layout state) as MLX nvfp4 / mxfp8
     weight, scales and output_scale tensors, the scheme of each module rewritten, and
     expert_bytes (the state's experts' checkpoint bytes) for the result; raises unless every
-    format the config names is NVFP4 or per-tensor FP8."""
+    format the config names is NVFP4 or per-tensor FP8 with no transform_config or
+    sparsity_config."""
     method = config_str(quantization_config, "quant_method", "")
     if method == "modelopt":
         quant_algo = config_str(quantization_config, "quant_algo", "").upper()
@@ -74,6 +80,9 @@ def rewrite_export(
         if unserved:
             raise ValueError(f"ModelOpt quant_algo {unserved} is not served, only {MODELOPT_ALGOS}")
     elif method == "compressed-tensors":
+        for field, holds in COMPRESSED_TENSORS_UNSERVED_FIELDS.items():
+            if quantization_config.get(field):
+                raise ValueError(f"compressed-tensors {field} ({holds}) is not served")
         for name, group in (config_dict(quantization_config, "config_groups") or {}).items():
             if not isinstance(group, dict):
                 raise ValueError(f"compressed-tensors config_groups[{name!r}] is not an object")

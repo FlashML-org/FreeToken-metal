@@ -160,6 +160,29 @@ UNSERVED_EXPORTS: list[tuple[dict[str, object], str]] = [
         },
         "stores (8, 'float', 'channel', None)",
     ),
+    (
+        {
+            "quant_method": "compressed-tensors",
+            "config_groups": {"group_0": {"weights": FP8_WEIGHTS}},
+            "transform_config": {
+                "config_groups": {
+                    "u": {
+                        "type": "hadamard",
+                        "apply": [{"targets": ["Linear"], "location": "input"}],
+                    }
+                }
+            },
+        },
+        "compressed-tensors transform_config",
+    ),
+    (
+        {
+            "quant_method": "compressed-tensors",
+            "config_groups": {"group_0": {"weights": FP8_WEIGHTS}},
+            "sparsity_config": {"format": "sparse-24-bitmask", "sparsity_structure": "2:4"},
+        },
+        "compressed-tensors sparsity_config",
+    ),
     ({"quant_method": "gptq"}, "quantization method 'gptq' is not served"),
 ]
 

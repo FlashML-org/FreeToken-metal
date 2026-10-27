@@ -183,6 +183,9 @@ EXPORT_CONFIGS: dict[str, dict[str, object]] = {
             "group_0": {"weights": NVFP4_WEIGHTS},
             "group_1": {"weights": FP8_WEIGHTS},
         },
+        # Empty, as in a real export: no transforms, no sparsity.
+        "sparsity_config": {},
+        "transform_config": {},
     },
 }
 
