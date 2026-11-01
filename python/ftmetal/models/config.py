@@ -48,6 +48,24 @@ def mrope_layout_from_rope_params(rope_params: dict[str, object]) -> MRopeLayout
         return "contiguous"
 
 
+def mrope_section_from_rope_params(
+    rope_params: dict[str, object], vision_config: dict[str, object] | None
+) -> tuple[int, int, int] | None:
+    """rope_parameters' [t, h, w] mrope_section; None without one, and without vision: a
+    text-only model keeps the 1-D partial rope and its decode-graph layout."""
+    raw_section = rope_params.get("mrope_section") if vision_config is not None else None
+    if raw_section is None:
+        return None
+    elif not isinstance(raw_section, list):
+        raise ValueError(f"mrope_section must be three ints, got {raw_section!r}")
+    else:
+        sections = [value for value in raw_section if isinstance(value, int)]
+        if len(sections) != 3 or len(raw_section) != 3:
+            raise ValueError(f"mrope_section must be three ints, got {raw_section!r}")
+        else:
+            return (sections[0], sections[1], sections[2])
+
+
 @dataclass(frozen=True, kw_only=True)
 class SlotStateSpec:
     """A model's own per-request state kept in the GDN state pool's slots, beside the GDN
@@ -81,6 +99,9 @@ class KVCacheGroupSpec:
     index_head_dim: int = 0
     index_block_size: int = 0
     index_topk_blocks: int = 0
+    # Every token's 3-axis rope position at its slot, once for the group's layers: a block's
+    # key ropes at its first token's, which an earlier forward may have written (QSA, mrope).
+    has_rope_positions: bool = False
     # Per-slot state per layer (LINEAR); () when the type has none.
     conv_shape: tuple[int, ...] = ()
     state_shape: tuple[int, ...] = ()
@@ -94,9 +115,11 @@ class KVCacheGroupSpec:
         return len(self.layer_ids)
 
     def token_bytes(self, dtype: mx.Dtype) -> int:
-        """K, V and index key bytes per token over the group's layers; 0 for per-slot state."""
+        """K, V and index key bytes per token over the group's layers, and its rope position;
+        0 for per-slot state."""
         per_layer = (2 * self.num_kv_heads * self.head_dim + self.index_head_dim) * dtype.size
-        return per_layer * self.num_layers
+        rope_bytes = 3 * mx.int32.size if self.has_rope_positions else 0
+        return per_layer * self.num_layers + rope_bytes
 
     def slot_bytes(self, dtype: mx.Dtype) -> int:
         """Conv, recurrent and model state bytes per slot over the group's layers; 0 for paged
@@ -331,6 +354,7 @@ class ModelConfig:
                     index_head_dim=group.index_head_dim,
                     index_block_size=group.index_block_size,
                     index_topk_blocks=group.index_topk_blocks,
+                    has_rope_positions=group.rotary_config.mrope_section is not None,
                 )
             else:
                 # A conv ring over q, k and v; the state is [Hv, Dv, Dk] as the GDN kernels read it.
@@ -363,4 +387,5 @@ __all__ = [
     "SWAAttentionGroupConfig",
     "SlotStateSpec",
     "mrope_layout_from_rope_params",
+    "mrope_section_from_rope_params",
 ]

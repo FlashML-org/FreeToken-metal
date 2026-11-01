@@ -246,7 +246,7 @@ TINY_IMAGE_BUDGET = MultimodalConfig(image_min_tokens=4)
 
 def build_tower(seed: int) -> Qwen3VLVisionModel:
     mx.random.seed(seed)
-    tower = Qwen3VLVisionModel(TINY_VISION_CONFIG)
+    tower = Qwen3VLVisionModel(TINY_VISION_CONFIG, channels_last=False)
     tower.set_dtype(mx.float32)
     mx.eval(tower.parameters())
     return tower

@@ -5,7 +5,9 @@ out over a whole sequence in fp32, without caches: hashed n-gram rows through th
 branch, gated delta rule layers (mlx-lm's ops recurrence), QSA layers attending the keys
 the block indexer selects (the top blocks by summed relu scores, ties to the lower block,
 plus the query's incomplete block; every key while its complete blocks fit), softmax top-k
-experts with a gated shared expert, all over hyper-connected residual streams.
+experts with a gated shared expert, all over hyper-connected residual streams. With
+ReferenceVision, an image prompt's: the tower's rows in the input embeddings, and the 3-axis
+rope at the query positions and at each block's first token.
 save_checkpoint writes the weights in the MLX layout, the PLE table as affine 4-bit shards.
 """
 
@@ -13,6 +15,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
 
 import mlx.core as mx
@@ -282,6 +285,26 @@ def rope(x: mx.array, positions: mx.array, rotary_dim: int, base: float) -> mx.a
     return mx.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin, x[..., rotary_dim:]], axis=-1)
 
 
+def interleaved_rope(
+    x: mx.array, positions: mx.array, rotary_dim: int, base: float, section: list[int]
+) -> mx.array:
+    """Qwen VL's 3-axis NeoX rotation of the first rotary_dim dims of x [L, heads, D] at
+    positions [3, L], written as the reference's apply_interleaved_mrope: frequency i turns by
+    the h position at i = 1, 4, .. below 3 * section[1], the w position at i = 2, 5, .. below
+    3 * section[2], else the t position."""
+    half = rotary_dim // 2
+    inv_freq = base ** (-mx.arange(0, rotary_dim, 2, dtype=mx.float32) / rotary_dim)
+    freqs = positions.astype(mx.float32)[:, :, None] * inv_freq[None, None]
+    columns = [freqs[0, :, i] for i in range(half)]
+    for axis in (1, 2):
+        for i in range(axis, 3 * section[axis], 3):
+            columns[i] = freqs[axis, :, i]
+    angles = mx.stack(columns, axis=1)
+    cos, sin = mx.cos(angles)[:, None], mx.sin(angles)[:, None]
+    x1, x2 = x[..., :half], x[..., half:rotary_dim]
+    return mx.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin, x[..., rotary_dim:]], axis=-1)
+
+
 def dilated_conv(x: mx.array, weight: mx.array, dilation: int) -> mx.array:
     """Causal depthwise conv of x [L, C] by weight [C, K, 1]: sum over taps k of
     weight[:, k] * x[t - (K - 1 - k) * dilation], zero before the sequence."""
@@ -301,10 +324,24 @@ def topk_lowest_ties(scores: np.ndarray, topk: int) -> np.ndarray:
     return np.array([i for i in order[:topk] if np.isfinite(scores[i])], dtype=np.int64)
 
 
+@dataclass(frozen=True)
+class ReferenceVision:
+    """An image prompt's part of a whole-sequence forward: the 3-axis rope positions [3, L],
+    the image rows and the tower's soft tokens for them [len(rows), hidden]."""
+
+    positions: np.ndarray
+    rows: list[int]
+    embeds: mx.array
+
+
 def reference_logits(
-    weights: dict[str, mx.array], tokens: list[int], config: dict[str, object] | None = None
+    weights: dict[str, mx.array],
+    tokens: list[int],
+    config: dict[str, object] | None = None,
+    vision: ReferenceVision | None = None,
 ) -> mx.array:
-    """fp32 logits [L, vocab] of the whole sequence tokens."""
+    """fp32 logits [L, vocab] of the whole sequence tokens; an image row's token is the
+    placeholder."""
     text = TINY_QWEN4_CONFIG if config is None else config
     eps = config_float(text, "rms_norm_eps")
     hidden = config_int(text, "hidden_size")
@@ -333,8 +370,24 @@ def reference_logits(
     types = config_str_list(text, "layer_types")
     assert types is not None
     length = len(tokens)
-    positions = mx.arange(length)
+    num_blocks = length // block
+    if vision is None:
+        section: list[int] = []
+        positions = mx.arange(length)
+        block_starts = mx.arange(num_blocks) * block
+    else:
+        raw_section = rope_params.get("mrope_section")
+        assert isinstance(raw_section, list) and rope_params.get("mrope_interleaved")
+        section = [value for value in raw_section if isinstance(value, int)]
+        positions = mx.array(vision.positions)
+        block_starts = positions[:, : num_blocks * block : block]
     w = weights
+
+    def rope_at(x: mx.array, at: mx.array) -> mx.array:
+        if vision is None:
+            return rope(x, at, rotary_dim, base)
+        else:
+            return interleaved_rope(x, at, rotary_dim, base, section)
 
     def proj(x: mx.array, key: str) -> mx.array:
         return x @ w[key].T
@@ -421,30 +474,21 @@ def reference_logits(
         q, gate = qg[..., :head_dim], qg[..., head_dim:]
         k = proj(x, f"{p}.k_proj.weight").reshape(length, num_kv, head_dim)
         v = proj(x, f"{p}.v_proj.weight").reshape(length, num_kv, head_dim)
-        q = rope(
-            centred_norm(q, w[f"{p}.q_norm.weight"], eps, head_dim), positions, rotary_dim, base
-        )
-        k = rope(
-            centred_norm(k, w[f"{p}.k_norm.weight"], eps, head_dim), positions, rotary_dim, base
-        )
+        q = rope_at(centred_norm(q, w[f"{p}.q_norm.weight"], eps, head_dim), positions)
+        k = rope_at(centred_norm(k, w[f"{p}.k_norm.weight"], eps, head_dim), positions)
         qk = proj(x, f"{p}.indexer.index_qk_proj.weight").reshape(
             length, index_heads + 1, index_dim
         )
-        index_queries = rope(
+        index_queries = rope_at(
             centred_norm(qk[:, :index_heads], w[f"{p}.indexer.q_layernorm.weight"], eps, index_dim),
             positions,
-            rotary_dim,
-            base,
         )
-        num_blocks = length // block
         pooled = mx.mean(
             qk[: num_blocks * block, index_heads].reshape(num_blocks, block, index_dim), axis=1
         )
-        block_keys = rope(
+        block_keys = rope_at(
             centred_norm(pooled[:, None], w[f"{p}.indexer.k_layernorm.weight"], eps, index_dim),
-            mx.arange(num_blocks) * block,
-            rotary_dim,
-            base,
+            block_starts,
         )[:, 0]
         scores = mx.maximum(mx.einsum("thd,nd->thn", index_queries, block_keys), 0).sum(axis=1)
         scores = np.array(scores / math.sqrt(index_dim))
@@ -486,7 +530,10 @@ def reference_logits(
         )
         return mx.stack(routed) + mx.sigmoid(proj(x, f"{p}.shared_expert_gate.weight")) * shared
 
-    streams = mx.tile(w["language_model.model.embed_tokens.weight"][mx.array(tokens)], (1, hc))
+    embedded = w["language_model.model.embed_tokens.weight"][mx.array(tokens)]
+    if vision is not None:
+        embedded[mx.array(vision.rows)] = vision.embeds
+    streams = mx.tile(embedded, (1, hc))
     for layer_id, layer_type in enumerate(types):
         p = f"language_model.model.layers.{layer_id}"
         if layer_id in ple_layers:

@@ -37,6 +37,7 @@ from ftmetal.layers.base import BaseOP
 from ftmetal.layers.gdn import DepthwiseConv1d
 from ftmetal.layers.linear import Linear
 from ftmetal.layers.quantization.config import QuantScheme
+from ftmetal.mm import restore_placeholder
 from ftmetal.models.loader import weight_files
 from ftmetal.models.qwen4_exp.config import Qwen4ExpConfig, ple_context_state, ple_conv_state
 from ftmetal.models.qwen4_exp.norm import CenteredRMSNorm
@@ -189,6 +190,8 @@ class Qwen4ExpPLE(BaseOP):
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
         self.eos_token_id = config.ngram_eos_token_id
+        # Content pad ids reach the hash only when the tower is built.
+        self.image_token_id = None if config.vision_config is None else config.image_token_id
         self.heads_per_ngram = config.heads_per_ngram
         self.context_len = config.ngram_size - 1
         self.dilation = config.ngram_size
@@ -260,7 +263,12 @@ class Qwen4ExpPLE(BaseOP):
                 before = req.input_ids[max(0, req.cached_len - context_len) : req.cached_len]
                 pad = np.full(context_len - before.size, self.eos_token_id)
                 chunk = req.input_ids[req.cached_len : req.device_len]
-                histories.append(np.concatenate([pad, before, chunk]).astype(np.int64))
+                history = np.concatenate([pad, before, chunk]).astype(np.int64)
+                # Image rows hash as the placeholder token, never as their content pad ids.
+                if self.image_token_id is None:
+                    histories.append(history)
+                else:
+                    histories.append(restore_placeholder(history, self.image_token_id))
         # (token, previous, before previous) per token, the service's own hash.
         triples = np.concatenate(
             [np.stack([history[2:], history[1:-1], history[:-2]], axis=1) for history in histories]

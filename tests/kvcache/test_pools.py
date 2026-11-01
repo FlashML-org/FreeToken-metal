@@ -14,6 +14,7 @@ from ftmetal.engine.config import EngineConfig
 from ftmetal.kvcache import create_pools, pool_costs
 from ftmetal.kvcache.linear_state_pool import LinearStatePool
 from ftmetal.kvcache.mha_pool import MHAKVCache
+from ftmetal.kvcache.qsa_pool import QSAKVCache
 from ftmetal.models.config import KVCacheGroupSpec
 from ftmetal.models.qwen3_5_moe.config import parse_config
 from tiny_model import TINY_TEXT_CONFIG
@@ -39,6 +40,44 @@ def test_store_kv_writes_only_the_addressed_rows() -> None:
     assert pool.k_cache(1).sum().item() == 0
     with pytest.raises(KeyError):
         pool.k_cache(0)
+
+
+def test_qsa_pool_rope_positions() -> None:
+    """Under the 3-axis rope the QSA pool keeps each token's position at its slot, priced in
+    its token bytes, and a replay's arrays rebind all of it."""
+    spec = KVCacheGroupSpec(
+        name="qsa",
+        attn_type=AttnType.QSA,
+        layer_ids=(3, 7),
+        num_kv_heads=2,
+        head_dim=8,
+        index_head_dim=8,
+        index_block_size=4,
+        index_topk_blocks=2,
+        has_rope_positions=True,
+    )
+    pool = QSAKVCache(
+        num_kv_heads=2,
+        num_layers=2,
+        head_dim=8,
+        index_head_dim=8,
+        num_pages=5,
+        page_size=4,
+        dtype=mx.float16,
+        layer_ids=(3, 7),
+        has_rope_positions=True,
+    )
+    positions = mx.array([[5, 6], [1, 2], [3, 4]], dtype=mx.int32)
+    out_loc = mx.array([9, 2], dtype=mx.int32)
+    pool.store_rope_positions(positions, out_loc)
+    assert pool.rope_positions is not None
+    assert mx.array_equal(pool.rope_positions[out_loc], positions.T)
+    assert sum(array.nbytes for array in pool.arrays()) == pool.num_tokens * spec.token_bytes(
+        mx.float16
+    )
+    replayed = [array + 1 for array in pool.arrays()]
+    pool.set_arrays(replayed)
+    assert all(mx.array_equal(a, b) for a, b in zip(pool.arrays(), replayed, strict=True))
 
 
 def test_linear_state_pool_alloc_clear_copy_free() -> None:

@@ -136,7 +136,7 @@ class Qwen3_5MoeForCausalLM(BaseLLMModel):
                 dtype=dtype,
             )
         if config.vision_config is not None:
-            self.visual = Qwen3VLVisionModel(config.vision_config)
+            self.visual = Qwen3VLVisionModel(config.vision_config, channels_last=False)
             self.visual.set_dtype(dtype)
 
     def forward(self, batch: Batch) -> mx.array:
@@ -147,8 +147,7 @@ class Qwen3_5MoeForCausalLM(BaseLLMModel):
 
     def encode(self, item: MMItem) -> mx.array:
         """[item.num_tokens, out_hidden_size] soft tokens of one image."""
-        assert item.feature is not None and item.grid_thw is not None
-        return self.visual(mx.array(item.feature).view(mx.bfloat16), [item.grid_thw])
+        return self.visual.encode(item)
 
 
 __all__ = ["Qwen3_5DecoderLayer", "Qwen3_5Model", "Qwen3_5MoeForCausalLM"]

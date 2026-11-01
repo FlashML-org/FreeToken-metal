@@ -3,8 +3,8 @@
 Port of FreeToken models/qwen4_exp/config.py. Divergences: reads the MLX checkpoint's
 text_config and scheme map; the full-attention layers are a QSA group (their indexer's
 geometry on the group, not on every full group); each PLE layer's n-gram context and
-short-conv window are slot states of the GDN group; served text only (the 1-D partial
-rope; no vision tower, no MTP head).
+short-conv window are slot states of the GDN group; the 3-axis rope only when the vision
+tower is built; no MTP head.
 """
 
 from __future__ import annotations
@@ -20,6 +20,8 @@ from ftmetal.models.config import (
     QSAAttentionGroupConfig,
     RotaryConfig,
     SlotStateSpec,
+    mrope_layout_from_rope_params,
+    mrope_section_from_rope_params,
 )
 from ftmetal.models.loader import (
     config_bool,
@@ -82,12 +84,15 @@ def parse_config(config: dict[str, object], quant: QuantConfig | None = None) ->
     head_dim = config_optional_int(text, "head_dim") or hidden_size // num_heads
     num_kv_heads = config_int(text, "num_key_value_heads", num_heads)
     rope_params = config_dict(text, "rope_parameters") or {}
+    vision_config = config_dict(config, "vision_config")
     rotary = RotaryConfig(
         head_dim=head_dim,
         # FreeToken parity: int(), not round().
         rotary_dim=int(head_dim * config_float(rope_params, "partial_rotary_factor", 1.0)),
         max_position=config_int(text, "max_position_embeddings"),
         base=config_float(rope_params, "rope_theta", 10000.0),
+        mrope_section=mrope_section_from_rope_params(rope_params, vision_config),
+        mrope_layout=mrope_layout_from_rope_params(rope_params),
     )
     num_layers = config_int(text, "num_hidden_layers")
     types = config_str_list(text, "layer_types")
@@ -198,6 +203,8 @@ def parse_config(config: dict[str, object], quant: QuantConfig | None = None) ->
             PREFILL_ACTIVATION_BYTES_PER_TOKEN,
         ),
         max_extend_tokens=MAX_EXTEND_TOKENS,
+        vision_config=vision_config,
+        image_token_id=config_optional_int(config, "image_token_id"),
         hc_count=hc_count,
         hc_lowrank=config_int(text, "hc_lowrank"),
         ple_layer_ids=ple_layer_ids,

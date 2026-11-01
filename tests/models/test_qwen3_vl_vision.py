@@ -194,7 +194,7 @@ def reference_tower(
 
 
 def check_against_reference(case: Case) -> None:
-    model = Qwen3VLVisionModel(case.vision_config)
+    model = Qwen3VLVisionModel(case.vision_config, channels_last=False)
     weights = random_weights(model, seed=0)
     model.update(tree_unflatten([(name, mx.array(value)) for name, value in weights.items()]))
     model.set_dtype(case.dtype)
@@ -225,7 +225,7 @@ def test_mlp_row_chunks_match_the_numpy_reference(monkeypatch: pytest.MonkeyPatc
 
 def test_parameters_follow_the_checkpoint_names() -> None:
     """The loader maps model.visual.<name> to <name>: names, shapes and the bf16 dtype."""
-    model = Qwen3VLVisionModel(TINY_VISION_CONFIG)
+    model = Qwen3VLVisionModel(TINY_VISION_CONFIG, channels_last=False)
     top = {
         "patch_embed.proj.weight": (64, 3, 2, 16, 16),
         "patch_embed.proj.bias": (64,),
@@ -260,4 +260,6 @@ def test_parameters_follow_the_checkpoint_names() -> None:
 
 def test_refuses_a_deepstack_tower() -> None:
     with pytest.raises(ValueError, match="DeepStack"):
-        Qwen3VLVisionModel({**TINY_VISION_CONFIG, "deepstack_visual_indexes": [0]})
+        Qwen3VLVisionModel(
+            {**TINY_VISION_CONFIG, "deepstack_visual_indexes": [0]}, channels_last=False
+        )

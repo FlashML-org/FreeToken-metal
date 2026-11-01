@@ -1,5 +1,5 @@
-"""Qwen VL family image processor (Qwen3.6): patch-grid ViT with a spatial merger, 3-axis rope
-positions.
+"""Qwen VL family image processor (Qwen3.6, Qwen3.8-Flash-Next): patch-grid ViT with a
+spatial merger, 3-axis rope positions.
 
 Port of FreeToken mm/processors/qwen_vl.py, with the pixel path of transformers'
 Qwen2VLImageProcessorPil (smart_resize, patchify) ported to numpy and Pillow. Divergences:

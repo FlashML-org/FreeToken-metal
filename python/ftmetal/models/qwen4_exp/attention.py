@@ -1,10 +1,10 @@
 """Qwen3.8-Flash-Next's QSA layer: Qwen3.5's gated attention plus a block indexer.
 
 Port of FreeToken models/qwen4_exp/attention.py (Qwen4ExpAttention, QSAIndexer).
-Divergences: positions come from the batch (text only, the 1-D partial rope); the backend
-from the global Context by attention type, which stores the keys and the index keys and
-selects; the indexer hands it normed and roped index queries, raw index keys and its block
-key norm (the k_layernorm, then the rope at the block's first position).
+Divergences: positions come from the batch (its mrope rows when the model serves vision);
+the backend from the global Context by attention type, which stores the keys and the index
+keys and selects; the indexer hands it normed and roped index queries, raw index keys and
+its block key norm (the k_layernorm, then the rope at the block's first position).
 """
 
 from __future__ import annotations
@@ -20,8 +20,8 @@ from ftmetal.layers.activation import sigmoid_gate
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
 from ftmetal.layers.quantization.config import QuantScheme
-from ftmetal.layers.rotary import RotaryEmbedding
-from ftmetal.models.config import QSAAttentionGroupConfig
+from ftmetal.layers.rotary import MRotaryEmbedding, RotaryEmbedding
+from ftmetal.models.config import QSAAttentionGroupConfig, RotaryConfig
 from ftmetal.models.qwen4_exp.config import Qwen4ExpConfig
 from ftmetal.models.qwen4_exp.norm import CenteredRMSNorm
 from ftmetal.models.qwen4_exp.projection import project, project_split
@@ -32,15 +32,34 @@ from ftmetal.models.qwen4_exp.weight import QKV_PARTS
 NORM_ROPE_MAX_TOKENS = 4
 
 
+def rotary_embedding(head_dim: int, rotary: RotaryConfig) -> RotaryEmbedding | MRotaryEmbedding:
+    """The partial rope, 3-axis when the model serves vision."""
+    if rotary.mrope_section is None:
+        return RotaryEmbedding(head_dim, rotary.rotary_dim, rotary.base)
+    else:
+        return MRotaryEmbedding(
+            head_dim, rotary.rotary_dim, rotary.base, rotary.mrope_section, rotary.mrope_layout
+        )
+
+
 def norm_rope(
-    norm: CenteredRMSNorm, rotary: RotaryEmbedding, positions: mx.array, x: mx.array
+    norm: CenteredRMSNorm,
+    rotary: RotaryEmbedding | MRotaryEmbedding,
+    positions: mx.array,
+    x: mx.array,
 ) -> mx.array:
-    """rotary(positions, norm(x)) for heads x [T, heads, D]."""
-    if x.shape[0] <= NORM_ROPE_MAX_TOKENS and supports_offset_rms_norm_rope(x, rotary.rotary_dim):
+    """rotary(positions, norm(x)) for heads x [T, heads, D]: one launch for a few tokens under
+    the 1-D rope."""
+    if (
+        isinstance(rotary, RotaryEmbedding)
+        and x.shape[0] <= NORM_ROPE_MAX_TOKENS
+        and supports_offset_rms_norm_rope(x, rotary.rotary_dim)
+    ):
         return offset_rms_norm_rope(
             x, norm.weight, norm.eps, positions, rotary.rotary_dim, rotary.base
         )
-    return rotary.forward(positions, norm.forward(x))
+    else:
+        return rotary.forward(positions, norm.forward(x))
 
 
 class QSAIndexer(BaseOP):
@@ -62,11 +81,11 @@ class QSAIndexer(BaseOP):
         self.q_layernorm = CenteredRMSNorm(self.head_dim, config.rms_norm_eps, dtype=dtype)
         self.k_layernorm = CenteredRMSNorm(self.head_dim, config.rms_norm_eps, dtype=dtype)
         # The attention's partial rope (its rotary dims and frequencies) on index vectors.
-        rotary = group.rotary_config
-        self.rotary = RotaryEmbedding(self.head_dim, rotary.rotary_dim, rotary.base)
+        self.rotary = rotary_embedding(self.head_dim, group.rotary_config)
 
     def block_key_norm(self, pooled: mx.array, positions: mx.array) -> mx.array:
-        """Block keys [N, D] of the pooled raw keys [N, D] of blocks starting at positions [N]."""
+        """Block keys [N, D] of the pooled raw keys [N, D] of blocks starting at positions [N]
+        ([3, N] under the 3-axis rope: a block may start on image tokens)."""
         return norm_rope(self.k_layernorm, self.rotary, positions, pooled[:, None, :])[:, 0]
 
     def forward(self, x: mx.array, positions: mx.array) -> QSAIndexInputs:
@@ -113,8 +132,7 @@ class Qwen4ExpAttention(BaseOP):
         )
         self.q_norm = CenteredRMSNorm(head_dim, config.rms_norm_eps, dtype=dtype)
         self.k_norm = CenteredRMSNorm(head_dim, config.rms_norm_eps, dtype=dtype)
-        rotary = group.rotary_config
-        self.rotary = RotaryEmbedding(head_dim, rotary.rotary_dim, rotary.base)
+        self.rotary = rotary_embedding(head_dim, group.rotary_config)
         self.o_proj = Linear(self.qo_attn_dim, config.hidden_size, scheme=o_scheme, dtype=dtype)
         self.indexer = QSAIndexer(config, group, scheme=index_scheme, dtype=dtype)
 
@@ -124,7 +142,7 @@ class Qwen4ExpAttention(BaseOP):
         qg = qg.reshape(num_tokens, self.num_q, 2 * self.head_dim)
         q, gate = mx.split(qg, 2, axis=-1)
         gate = gate.reshape(num_tokens, self.qo_attn_dim)
-        positions = batch.positions
+        positions = batch.get_attn_positions()
         q = norm_rope(self.q_norm, self.rotary, positions, q)
         k = norm_rope(
             self.k_norm, self.rotary, positions, k.reshape(num_tokens, self.num_kv, self.head_dim)

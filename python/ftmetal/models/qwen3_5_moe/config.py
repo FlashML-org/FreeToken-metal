@@ -14,6 +14,7 @@ from ftmetal.models.config import (
     ModelConfig,
     RotaryConfig,
     mrope_layout_from_rope_params,
+    mrope_section_from_rope_params,
 )
 from ftmetal.models.loader import (
     config_bool,
@@ -56,23 +57,13 @@ def parse_config(config: dict[str, object], quant: QuantConfig | None = None) ->
     )
     if rope_type not in (None, "default"):
         raise ValueError(f"unsupported rope type {rope_type!r}")
-    # 3-axis rope only with vision: text-only serving keeps the 1-D partial rope and the
-    # decode-graph layout.
     vision_config = config_dict(config, "vision_config")
-    raw_section = rope_params.get("mrope_section") if vision_config is not None else None
-    if raw_section is None:
-        mrope_section = None
-    else:
-        assert isinstance(raw_section, list), "mrope_section must be a list"
-        sections = [value for value in raw_section if isinstance(value, int)]
-        assert len(sections) == len(raw_section) == 3, "mrope_section must be three ints"
-        mrope_section = (sections[0], sections[1], sections[2])
     rotary = RotaryConfig(
         head_dim=head_dim,
         rotary_dim=int(head_dim * partial),
         max_position=config_int(text, "max_position_embeddings"),
         base=rope_theta,
-        mrope_section=mrope_section,
+        mrope_section=mrope_section_from_rope_params(rope_params, vision_config),
         mrope_layout=mrope_layout_from_rope_params(rope_params),
     )
     types = layer_types(text)

@@ -1,7 +1,8 @@
 """Qwen VL vision tower: ViT blocks with bidirectional attention per image and a 2x2 patch merger.
 
 Port of FreeToken models/qwen3_vl/vision.py. Divergences: the patch conv runs as one matmul
-(kernel == stride); no DeepStack, weight streaming, tensor parallelism or position-table row
+(kernel == stride), its kernel stored channels last when the checkpoint is an MLX
+conversion; no DeepStack, weight streaming, tensor parallelism or position-table row
 chunking; the tower is evaluated stage by stage (the embedding, each block, each MLP row
 chunk) and there is no environment override of the chunk size; the position-table taps and
 the rope positions are built in numpy on the host.
@@ -21,6 +22,7 @@ import numpy as np
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.embedding import Embedding
 from ftmetal.layers.linear import Linear
+from ftmetal.mm.item import MMItem
 from ftmetal.models.loader import config_int, config_optional_str
 
 LAYER_NORM_EPS = 1e-6
@@ -194,7 +196,7 @@ class VisionBlock(BaseOP):
 
 
 class Conv3dParams(nn.Module):
-    """The patch conv's weight [hidden, channels, temporal, patch, patch] and bias."""
+    """The patch conv's weight [hidden, *kernel_shape] and bias."""
 
     def __init__(self, hidden_size: int, kernel_shape: tuple[int, int, int, int]) -> None:
         super().__init__()
@@ -203,20 +205,26 @@ class Conv3dParams(nn.Module):
 
 
 class VisionPatchEmbed(BaseOP):
-    """The patch conv (kernel == stride) as one matmul over each flattened patch."""
+    """The patch conv (kernel == stride) as one matmul over each flattened patch; a
+    channels_last checkpoint stores its kernel [hidden, temporal, patch, patch, channels]."""
 
-    def __init__(self, config: VisionConfig) -> None:
+    def __init__(self, config: VisionConfig, channels_last: bool) -> None:
         super().__init__()
-        kernel_shape = (
-            config.in_channels,
-            config.temporal_patch_size,
-            config.patch_size,
-            config.patch_size,
-        )
+        temporal, patch = config.temporal_patch_size, config.patch_size
+        channels = config.in_channels
+        self.channels_last = channels_last
+        if channels_last:
+            kernel_shape = (temporal, patch, patch, channels)
+        else:
+            kernel_shape = (channels, temporal, patch, patch)
         self.proj = Conv3dParams(config.hidden_size, kernel_shape)
 
     def forward(self, pixel_values: mx.array) -> mx.array:
-        weight = self.proj.weight
+        # The processor flattens each patch channels first.
+        if self.channels_last:
+            weight = self.proj.weight.transpose(0, 4, 1, 2, 3)
+        else:
+            weight = self.proj.weight
         x = pixel_values.astype(weight.dtype)
         return x @ weight.reshape(weight.shape[0], -1).T + self.proj.bias
 
@@ -241,9 +249,10 @@ class Qwen3VLVisionModel(nn.Module):
 
     pixel_values are the processor's patches [sum(h * w), channels * temporal * patch**2] in
     merge-block order, grid_thw one (1, h, w) per image; the output is in the weights' dtype.
+    channels_last: the checkpoint's patch conv kernel is channels last (an MLX conversion's).
     """
 
-    def __init__(self, vision_config: dict[str, object]) -> None:
+    def __init__(self, vision_config: dict[str, object], channels_last: bool) -> None:
         super().__init__()
         config = parse_vision_config(vision_config)
         self.config = config
@@ -251,7 +260,7 @@ class Qwen3VLVisionModel(nn.Module):
         assert self.head_dim % 4 == 0, "rows and columns each take half of every rope half"
         self.grid_side = math.isqrt(config.num_position_embeddings)
         assert self.grid_side**2 == config.num_position_embeddings, "the position table is square"
-        self.patch_embed = VisionPatchEmbed(config)
+        self.patch_embed = VisionPatchEmbed(config, channels_last)
         self.pos_embed = Embedding(config.num_position_embeddings, config.hidden_size)
         self.blocks = [VisionBlock(config) for _ in range(config.depth)]
         self.merger = VisionPatchMerger(config)
@@ -306,6 +315,11 @@ class Qwen3VLVisionModel(nn.Module):
             x = block.forward(x, rope_cos, rope_sin, image_offsets)
             mx.eval(x)
         return self.merger.forward(x)
+
+    def encode(self, item: MMItem) -> mx.array:
+        """[item.num_tokens, out_hidden_size] soft tokens of one image."""
+        assert item.feature is not None and item.grid_thw is not None
+        return self(mx.array(item.feature).view(mx.bfloat16), [item.grid_thw])
 
 
 __all__ = ["MLP_ROWS", "Qwen3VLVisionModel", "VisionConfig", "parse_vision_config"]

@@ -35,7 +35,8 @@ from ftmetal.models.config import KVCacheGroupSpec, ModelConfig
 
 class BlockKeyNorm(Protocol):
     def __call__(self, pooled: mx.array, positions: mx.array) -> mx.array:
-        """Block keys [N, D] of the pooled raw keys [N, D] of blocks starting at positions [N]."""
+        """Block keys [N, D] of the pooled raw keys [N, D] of blocks starting at positions [N]
+        (int32 [3, N] under the 3-axis rope)."""
         ...
 
 
@@ -149,7 +150,18 @@ class QSAAttnBackend(FullAttnBackend):
         pool.store_index_keys(index.keys, batch.out_loc, layer_id)
         pooled = self.window_mean(pool.index_cache(layer_id), metadata.window_slots)
         positions = batch.positions
-        starts = mx.maximum(positions - (self.block_size - 1), 0)
+        rope_positions = batch.get_attn_positions()
+        if rope_positions.ndim == 1:
+            starts = mx.maximum(positions - (self.block_size - 1), 0)
+        elif metadata.block_starts is None:
+            # A block's first token is its window's first slot, and an earlier forward may
+            # have written it: the forward's tokens keep their 3-axis positions at their slots.
+            pool.store_rope_positions(rope_positions, batch.out_loc)
+            assert pool.rope_positions is not None
+            starts = pool.rope_positions[metadata.window_slots[:, 0]].T
+            metadata.block_starts = starts
+        else:
+            starts = metadata.block_starts
         closing = (positions % self.block_size == self.block_size - 1)[:, None]
         stored = mx.where(closing, index.block_key_norm(pooled, starts), index.keys)
         pool.store_index_keys(stored, batch.out_loc, layer_id)

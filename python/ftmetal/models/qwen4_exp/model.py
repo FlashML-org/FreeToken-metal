@@ -1,15 +1,17 @@
 """Qwen3.8-Flash-Next (qwen4_exp): a hybrid GDN + QSA MoE decoder over hyper-connected
 residual streams, with a PLE n-gram branch.
 
-Port of FreeToken models/qwen4_exp/model.py. Divergences: the batch flows through forward
-explicitly; text only, no MTP head; each Linear takes its scheme from the checkpoint's
-quantization map at construction; a sublayer's output is injected into the streams by the
-next hyper-connection as it norms them (a pending branch), the last layer's by the final
-mixer, after the last rows are selected; once the weights load (FinishesLoading) the PLE
-tables are opened from the checkpoint files and each hyper-connection's down and inject
-projections fused; a decode token's projections run on kernel/qmv_rows; the PLE layers'
-row service is armed before each decode step and checked once its tokens land
-(ServesStepLookups).
+Port of FreeToken models/qwen4_exp/model.py, with the encode of its
+Qwen4ExpForConditionalGeneration. Divergences: the batch flows through forward explicitly;
+one class serves both architectures and builds the vision tower (channels-last patch conv,
+the MLX conversion's) when the config has one; no MTP head; each Linear takes its scheme
+from the checkpoint's quantization map at construction; a sublayer's output is injected into
+the streams by the next hyper-connection as it norms them (a pending branch), the last
+layer's by the final mixer, after the last rows are selected; once the weights load
+(FinishesLoading) the PLE tables are opened from the checkpoint files and each
+hyper-connection's down and inject projections fused; a decode token's projections run on
+kernel/qmv_rows; the PLE layers' row service is armed before each decode step and checked
+once its tokens land (ServesStepLookups).
 """
 
 from __future__ import annotations
@@ -27,8 +29,10 @@ from ftmetal.layers.linear import Linear
 from ftmetal.layers.quantization.config import QuantScheme
 from ftmetal.layers.quantization.moe import ExpertSchemes
 from ftmetal.layers.shared_expert_moe import GATE_UP_PARTS, SharedExpertMoE
+from ftmetal.mm.item import MMItem
 from ftmetal.models.blocks import BaseLLMModel, embed_input_ids, select_last_rows
 from ftmetal.models.config import ModelConfig
+from ftmetal.models.qwen3_vl.vision import Qwen3VLVisionModel
 from ftmetal.models.qwen4_exp.attention import Qwen4ExpAttention
 from ftmetal.models.qwen4_exp.config import Qwen4ExpConfig
 from ftmetal.models.qwen4_exp.norm import HyperConnection, PendingBranch, inject
@@ -219,6 +223,9 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 scheme=scheme_of(config, "lm_head"),
                 dtype=dtype,
             )
+        if config.vision_config is not None:
+            self.visual = Qwen3VLVisionModel(config.vision_config, channels_last=True)
+            self.visual.set_dtype(dtype)
 
     def finish_loading(self, model_path: str) -> int:
         """Open each PLE layer's n-gram table in the checkpoint files and fuse each
@@ -263,6 +270,10 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             return self.model.embed_tokens.as_linear(hidden)
         else:
             return project(self.lm_head, hidden)
+
+    def encode(self, item: MMItem) -> mx.array:
+        """[item.num_tokens, out_hidden_size] soft tokens of one image."""
+        return self.visual.encode(item)
 
 
 __all__ = ["Qwen4ExpDecoderLayer", "Qwen4ExpForCausalLM", "Qwen4ExpModel"]

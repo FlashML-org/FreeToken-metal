@@ -61,6 +61,9 @@ QWEN_VISION = EncoderSpec(
     mlp_rows=4096,
     mlp_widths=2,
 )
+# Qwen3.8-Flash-Next's tower: Qwen3.6's geometry (its merger 2560 wide, not 2048), so its
+# measured widths, loaded from the MLX conversion's vision_tower. prefix.
+QWEN4_EXP_VISION = replace(QWEN_VISION, weight_prefix="vision_tower.")
 # Gemma4's tower (its projection loads from embed_vision.), measured on the 26B-A4B in bf16.
 GEMMA4_VISION = EncoderSpec(
     "vision",
@@ -114,9 +117,12 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         encoders=(GEMMA4_VISION,),
     ),
     "Gemma4ForCausalLM": ModelSpec("ftmetal.models.gemma4", "Gemma4ForCausalLM"),
-    # Served text only: the checkpoint's vision tower is not built.
     "Qwen4ExpForConditionalGeneration": ModelSpec(
-        "ftmetal.models.qwen4_exp", "Qwen4ExpForCausalLM", has_offload=True
+        "ftmetal.models.qwen4_exp",
+        "Qwen4ExpForCausalLM",
+        mm_processor="ftmetal.mm.processors.qwen_vl:QwenVLMMProcessor",
+        encoders=(QWEN4_EXP_VISION,),
+        has_offload=True,
     ),
     "Qwen4ExpForCausalLM": ModelSpec(
         "ftmetal.models.qwen4_exp", "Qwen4ExpForCausalLM", has_offload=True
@@ -190,6 +196,7 @@ def create_model(architecture: str, model_config: ModelConfig, dtype: mx.Dtype) 
 __all__ = [
     "GEMMA4_VISION",
     "MODEL_REGISTRY",
+    "QWEN4_EXP_VISION",
     "QWEN_VISION",
     "Checkpoint",
     "EncoderSpec",
