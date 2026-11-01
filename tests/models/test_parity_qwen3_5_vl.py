@@ -4,7 +4,7 @@ reference forward of the same text model and tower (tiny_vl_model.reference_vl_g
 Greedy decode must agree token for token whether the prefill is one chunk or cut inside an
 image span, whether the image prefix comes from the radix cache or is encoded again, and
 whether decode replays CommandGraphs; a text-only prompt on a vision-serving model decodes as
-the same model without vision. The tower is whatever models/qwen3_5_moe/vision.py builds, so
+the same model without vision. The tower is whatever models/qwen3_vl/vision.py builds, so
 nothing here depends on its numerics.
 """
 

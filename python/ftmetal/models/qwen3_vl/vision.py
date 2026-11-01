@@ -1,4 +1,4 @@
-"""Qwen3.6 vision tower: ViT blocks with bidirectional attention per image and a 2x2 patch merger.
+"""Qwen VL vision tower: ViT blocks with bidirectional attention per image and a 2x2 patch merger.
 
 Port of FreeToken models/qwen3_vl/vision.py. Divergences: the patch conv runs as one matmul
 (kernel == stride); no DeepStack, weight streaming, tensor parallelism or position-table row

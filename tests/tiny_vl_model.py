@@ -32,7 +32,7 @@ from ftmetal.mm.config import MultimodalConfig
 from ftmetal.mm.processor import MMResult
 from ftmetal.mm.processors.qwen_vl import QwenVLMMProcessor
 from ftmetal.models.loader import read_model_config
-from ftmetal.models.qwen3_5_moe.vision import Qwen3VLVisionModel
+from ftmetal.models.qwen3_vl.vision import Qwen3VLVisionModel
 from ftmetal.models.register import MODEL_REGISTRY
 from tiny_model import TINY_TEXT_CONFIG, build_reference, save_checkpoint
 

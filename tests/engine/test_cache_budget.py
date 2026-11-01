@@ -50,8 +50,8 @@ from ftmetal.models.config import MoeStrategy
 from ftmetal.models.gemma4 import vision as gemma4_vision
 from ftmetal.models.gemma4.config import parse_config as parse_gemma4_config
 from ftmetal.models.gemma4.model import Gemma4ForCausalLM
-from ftmetal.models.qwen3_5_moe import vision as qwen_vision
 from ftmetal.models.qwen3_5_moe.config import parse_config
+from ftmetal.models.qwen3_vl import vision as qwen_vision
 from ftmetal.models.register import (
     GEMMA4_VISION,
     QWEN_VISION,

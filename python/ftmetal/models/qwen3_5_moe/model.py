@@ -25,8 +25,8 @@ from ftmetal.mm.item import MMItem
 from ftmetal.models.blocks import BaseLLMModel, embed_input_ids, select_last_rows
 from ftmetal.models.config import ModelConfig
 from ftmetal.models.qwen3_5_moe.attention import Qwen3_5Attention
-from ftmetal.models.qwen3_5_moe.vision import Qwen3VLVisionModel
 from ftmetal.models.qwen3_5_moe.weight import QKV_PARTS, checkpoint_module
+from ftmetal.models.qwen3_vl.vision import Qwen3VLVisionModel
 
 
 def scheme_of(config: ModelConfig, model_key: str) -> QuantScheme | None:

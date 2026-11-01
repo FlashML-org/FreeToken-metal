@@ -45,7 +45,9 @@ Only commit when the user asks.
 ## Model code and shared components
 
 - Packages under `models/` never import from each other. A model's layers, weight
-  mapping and attention specifics live in its own package.
+  mapping and attention specifics live in its own package. The one exception is an encoder
+  tower that several families load, which gets its own package (`models/qwen3_vl/`, as in
+  FreeToken) and serves no model by itself; models may import it.
 - When a piece is genuinely shared, extract it into `layers/` (or `attention/`,
   `kvcache/`, `kernel/`) and have every model import the shared version; do not
   reuse across model packages by import.

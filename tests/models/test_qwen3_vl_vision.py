@@ -18,8 +18,8 @@ import numpy as np
 import pytest
 from mlx.utils import tree_flatten, tree_unflatten
 
-from ftmetal.models.qwen3_5_moe import vision
-from ftmetal.models.qwen3_5_moe.vision import Qwen3VLVisionModel
+from ftmetal.models.qwen3_vl import vision
+from ftmetal.models.qwen3_vl.vision import Qwen3VLVisionModel
 
 # The real vision_config keys at toy sizes: head_dim 32, a 4 x 4 position table.
 TINY_VISION_CONFIG: dict[str, object] = {

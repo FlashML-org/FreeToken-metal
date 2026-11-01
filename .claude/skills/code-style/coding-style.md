@@ -246,7 +246,10 @@ speculative generality.
   `__all__`; no wildcard imports. For third-party libraries, prefer their
   documented public import paths (e.g. `from pydantic import BaseModel`).
 - Do not import from a sibling model package (`models/<family>/`). Shared
-  runtime belongs in `layers/`, `attention/`, `kvcache/` or `kernel/`.
+  runtime belongs in `layers/`, `attention/`, `kvcache/` or `kernel/`. The one
+  exception is an encoder tower that several families load, kept in its own
+  package that serves no model by itself (`models/qwen3_vl/`); models may
+  import it.
 
 ## TOOLING
 
