@@ -12,6 +12,8 @@ MAILBOX_WORDS: int
 EXPERT_STAGING_BYTES: int
 FILL_FILE: int
 QMM_TILE_K: int
+PLE_MAILBOX_WORDS: int
+MAX_PLE_ROWS: int
 
 class MailboxWord(enum.IntEnum):
     STATE = 0
@@ -25,11 +27,11 @@ class MailboxWord(enum.IntEnum):
     NUM_IDS = 36
     NUM_MISSES = 37
     IDS = 64
-    NUM_LOADED = 192
-    NUM_EVICTED = 193
-    ERROR = 194
-    CLAIM_TIME = 196
-    DONE_TIME = 198
+    NUM_LOADED = 320
+    NUM_EVICTED = 321
+    ERROR = 322
+    CLAIM_TIME = 324
+    DONE_TIME = 326
 
 class MailboxState(enum.IntEnum):
     IDLE = 0
@@ -51,6 +53,15 @@ class MoeLookupKind(enum.IntEnum):
     DECODE = 1
     PREFILL_COPY_MISS = 2
     PROBE = 3
+
+class PleMailboxWord(enum.IntEnum):
+    STATE = 0
+    SEQUENCE = 1
+    ACKNOWLEDGED = 2
+    SHUTDOWN = 3
+    NUM_ROWS = 32
+    ERROR = 33
+    ROWS = 64
 
 def moe_lookup(
     topk_ids: mx.array,
@@ -140,6 +151,54 @@ class ExpertService:
     def check_healthy(self) -> None: ...
     def shutdown(self) -> None: ...
 
+class PleRowStore:
+    def __init__(
+        self,
+        files: list[str],
+        parts: npt.NDArray[np.int64],
+        shard_starts: list[int],
+        row_bytes: list[int],
+        cache_rows: int,
+        io_threads: int,
+    ) -> None: ...
+    def gather(
+        self,
+        ids: npt.NDArray[np.int64],
+        weight: npt.NDArray[np.uint8],
+        scales: npt.NDArray[np.uint8],
+        biases: npt.NDArray[np.uint8],
+    ) -> None: ...
+    @property
+    def num_rows(self) -> int: ...
+    @property
+    def row_bytes(self) -> list[int]: ...
+    @property
+    def hits(self) -> int: ...
+    @property
+    def misses(self) -> int: ...
+    @property
+    def bytes_read(self) -> int: ...
+
+class PleService:
+    def __init__(
+        self,
+        mailbox: mx.array,
+        staging: list[mx.array],
+        store: PleRowStore,
+        multipliers: list[int],
+        head_sizes: list[int],
+        head_offsets: list[int],
+        eos_token_id: int,
+        stall_timeout_s: float,
+        run_coordinator: bool,
+    ) -> None: ...
+    @property
+    def num_heads(self) -> int: ...
+    def ngram_ids(self, triples: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]: ...
+    def arm(self) -> None: ...
+    def check_healthy(self) -> None: ...
+    def shutdown(self) -> None: ...
+
 def init_library(source: str) -> None: ...
 def init_gdn_step_library(source: str) -> None: ...
 def init_fdecode_library(source: str) -> None: ...
@@ -149,6 +208,24 @@ def init_gather_sorted_libraries(
 ) -> None: ...
 def init_sample_library(source: str) -> None: ...
 def init_moe_lookup_library(source: str) -> None: ...
+def init_ple_lookup_library(source: str) -> None: ...
+def ple_post(
+    input_ids: mx.array,
+    slots: mx.array,
+    context: mx.array,
+    mailbox: mx.array,
+    *,
+    stream: Stream = None,
+) -> list[mx.array]: ...
+def ple_wait(
+    ticket: mx.array,
+    mailbox: mx.array,
+    staging: list[mx.array],
+    num_rows: int,
+    after: list[mx.array] = ...,
+    *,
+    stream: Stream = None,
+) -> list[mx.array]: ...
 def scatter_rows(
     pool: mx.array, rows: mx.array, dst_ids: mx.array, *, stream: Stream = None
 ) -> mx.array: ...
@@ -214,6 +291,28 @@ def flash_prefill(
     mpp: bool,
     scale: float,
     block_ends: mx.array | None = None,
+    *,
+    stream: Stream = None,
+) -> mx.array: ...
+def flash_prefill_qsa(
+    q: mx.array,
+    k_cache: mx.array,
+    v_cache: mx.array,
+    page_table: mx.array,
+    tiles: mx.array,
+    qsa_blocks: mx.array,
+    qsa_counts: mx.array,
+    qsa_bits: mx.array,
+    qsa_block_size: int,
+    page_size: int,
+    num_row_groups: int,
+    head_split: int,
+    block_k: int,
+    kv_shared: bool,
+    num_passes: int,
+    num_partitions: int,
+    mpp: bool,
+    scale: float,
     *,
     stream: Stream = None,
 ) -> mx.array: ...

@@ -19,8 +19,8 @@ namespace mx = mlx::core;
 namespace ftmetal {
 
 // The mailbox: uint32 words in 128-byte lines; line 0 the handshake and the shutdown word,
-// line 1 the request header, lines 2-5 the request's distinct expert ids (uint16, the absent
-// first), line 6 the reply. Shared with metal/moe_lookup.metal.
+// line 1 the request header, lines 2-9 the request's distinct expert ids (uint16, the absent
+// first), line 10 the reply. Shared with metal/moe_lookup.metal.
 enum class MailboxWord : int {
   State = 0,
   // The last request's sequence number, incremented by the GPU per request.
@@ -37,17 +37,17 @@ enum class MailboxWord : int {
   NumIds = 36,
   NumMisses = 37,
   Ids = 64,
-  NumLoaded = 192,
-  NumEvicted = 193,
-  Error = 194,
+  NumLoaded = 320,
+  NumEvicted = 321,
+  Error = 322,
   // uint64 mach_absolute_time stamps.
-  ClaimTime = 196,
-  DoneTime = 198,
+  ClaimTime = 324,
+  DoneTime = 326,
 };
 
 constexpr int MAILBOX_WORDS = 1024;
 // The id lines hold this many uint16 ids, one threadgroup thread per expert.
-constexpr int MAX_LOOKUP_EXPERTS = 256;
+constexpr int MAX_LOOKUP_EXPERTS = 512;
 
 enum class MailboxState : uint32_t {
   Idle = 0,

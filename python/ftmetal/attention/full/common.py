@@ -5,15 +5,15 @@ Port of the shared part of FreeToken's full-attention backends (attention/fa.py'
 prepare_metadata, capture hooks and forward, and the swa_indices translation of
 attention/triton.py). Divergences: the metadata is built from the host page table into
 fresh mx.arrays each step, out_loc is computed here, and the kernel implementation is the
-subclass's attend(); one backend instance serves one type, FULL over MHAKVCache or SWA
-over SWAKVCache, whose rows hold only the keys a step's windows reach, translated to
-window slots, so the kernels never see out-of-window keys (FreeToken translates the whole
-row and masks); a window layer type that attends within images carries the batch's block
-ends in row positions on its metadata. prepare_for_replay swaps a decode batch's page table
-for its graph's fixed width (FULL: the requests' whole page-table rows; SWA: the window)
-and max_seqlen_k for that width (a window decode row is built that wide), so the
-flash-decode partition count is fixed per graph; entries past a request's keys are stale
-but in bounds and never read.
+subclass's attend(); one backend instance serves one type, FULL over MHAKVCache (QSA's
+paged half too, attention/qsa) or SWA over SWAKVCache, whose rows hold only the keys a
+step's windows reach, translated to window slots, so the kernels never see out-of-window
+keys (FreeToken translates the whole row and masks); a window layer type that attends
+within images carries the batch's block ends in row positions on its metadata.
+prepare_for_replay swaps a decode batch's page table for its graph's fixed width (FULL,
+QSA: the requests' whole page-table rows; SWA: the window) and max_seqlen_k for that width
+(a window decode row is built that wide), so the flash-decode partition count is fixed per
+graph; entries past a request's keys are stale but in bounds and never read.
 """
 
 from __future__ import annotations
@@ -60,13 +60,20 @@ class FullAttnMetadata(BaseAttnMetadata):
     # Prefill on a bidirectional layer type, int32 [num_tokens]: where each query's image span
     # ends in its row's positions (0 for text); None when the step has no image token.
     block_ends: mx.array | None = None
+    # QSA, int32 [num_tokens, block_size]: the token slots of the block window ending at each
+    # query, positions p - block_size + 1 .. p clamped at 0.
+    window_slots: mx.array | None = None
 
     def get_last_indices(self, bs: int) -> mx.array:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
 
     def step_inputs(self) -> list[mx.array]:
         arrays = [self.cu_seqlens_q, self.seq_lens, self.page_table]
-        return arrays if self.out_loc is None else [*arrays, self.out_loc]
+        if self.out_loc is not None:
+            arrays.append(self.out_loc)
+        if self.window_slots is not None:
+            arrays.append(self.window_slots)
+        return arrays
 
 
 class FullAttnBackend(BaseAttnBackend):
@@ -82,7 +89,7 @@ class FullAttnBackend(BaseAttnBackend):
         page_size: int,
     ) -> None:
         assert isinstance(kvcache, MHAKVCache), "full attention reads a paged K/V pool"
-        assert spec.attn_type in (AttnType.FULL, AttnType.SWA)
+        assert spec.attn_type in (AttnType.FULL, AttnType.SWA, AttnType.QSA)
         self.config = config
         self.attn_type = spec.attn_type
         self.sliding_window = spec.sliding_window
@@ -133,7 +140,7 @@ class FullAttnBackend(BaseAttnBackend):
             out_loc[offset : offset + req.extend_len] = row[req.cached_len : req.device_len]
             offset += req.extend_len
         batch.out_loc = mx.array(out_loc)
-        batch.attn_metadata[AttnType.FULL] = self.new_metadata(
+        batch.attn_metadata[self.attn_type] = self.new_metadata(
             page_table, seq_lens, extend_lens, cached_lens, None, None
         )
 

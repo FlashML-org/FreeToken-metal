@@ -85,8 +85,8 @@ class EngineConfig:
     attention_backend: str = "metal"
     max_seq_len_override: int | None = None
     num_page_override: int | None = None
-    # Prefill token budget per batch; longer prompts are chunked.
-    max_extend_tokens: int = 2048
+    # Prefill token budget per batch, longer prompts chunked; None: the model's.
+    max_extend_tokens_override: int | None = None
     # Decode steps between status log lines.
     decode_log_interval: int = 40
     cache_type: CacheTypeChoice = "radix"
@@ -196,6 +196,12 @@ class EngineConfig:
         if self.max_seq_len_override is not None:
             return self.max_seq_len_override
         return self.model_config.rotary_config.max_position
+
+    @property
+    def max_extend_tokens(self) -> int:
+        if self.max_extend_tokens_override is not None:
+            return self.max_extend_tokens_override
+        return self.model_config.max_extend_tokens
 
     @property
     def model_name(self) -> str:

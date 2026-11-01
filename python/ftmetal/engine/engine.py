@@ -58,7 +58,12 @@ from ftmetal.layers.quantization.config import BankSpec
 from ftmetal.mm.config import ENCODER_SECTIONS
 from ftmetal.mm.encoder_cache import EncoderCache
 from ftmetal.mm.processor import MMProcessor, get_mm_processor
-from ftmetal.models.blocks import BaseLLMModel, SupportsMultimodal
+from ftmetal.models.blocks import (
+    BaseLLMModel,
+    FinishesLoading,
+    ServesStepLookups,
+    SupportsMultimodal,
+)
 from ftmetal.models.config import MoeStrategy
 from ftmetal.models.loader import WeightRules, checkpoint_bytes, load_weights
 from ftmetal.models.register import (
@@ -135,7 +140,10 @@ def resolve_moe_strategy(
             budget=budget,
             weights=weights.non_expert + weights.experts,
             activations=activation_reserve_bytes(
-                config.max_extend_tokens, model_config.num_qo_heads, IN_FLIGHT_STEPS
+                config.max_extend_tokens,
+                model_config.num_qo_heads,
+                IN_FLIGHT_STEPS,
+                model_config.prefill_activation_bytes,
             ),
             graphs=graphs,
             costs=costs,
@@ -176,8 +184,14 @@ class Engine:
     def __init__(self, config: EngineConfig) -> None:
         self.config = config
         self.dtype = config.dtype
-        # Fail on a page size the backend's kernels reject before any pool is allocated.
-        check_attention_backend(config.attention_backend, config.page_size)
+        # Fail on an attention type or page size the backend's kernels reject before any pool
+        # is allocated.
+        paged_types = frozenset(
+            spec.attn_type
+            for spec in config.model_config.kv_cache_group_specs()
+            if spec.attn_type is not AttnType.LINEAR
+        )
+        check_attention_backend(config.attention_backend, config.page_size, paged_types)
 
         # The image processor of a served vision tower: the warm-up's dummy image and the
         # largest image the encoder's reserve covers.
@@ -261,12 +275,22 @@ class Engine:
         )
         in_flight_steps = OFFLOAD_IN_FLIGHT_STEPS if prefill_overlap else IN_FLIGHT_STEPS
         activations = activation_reserve_bytes(
-            config.max_extend_tokens, model_config.num_qo_heads, in_flight_steps
+            config.max_extend_tokens,
+            model_config.num_qo_heads,
+            in_flight_steps,
+            model_config.prefill_activation_bytes,
         )
 
         # Delta, not the total: an earlier engine's pools may still be alive in the process.
         resident_before = mx.get_active_memory()
         self.model = create_model(config.architecture, model_config, config.dtype)
+        # A step-lookup model's graphs stop at one step's lookup rows; the strategy above
+        # was resolved with the whole ladder's reserve, an upper bound.
+        self.lookup_model = self.model if isinstance(self.model, ServesStepLookups) else None
+        if self.lookup_model is not None:
+            limit = self.lookup_model.max_lookup_rows
+            graph_bs_list = [bs for bs in graph_bs_list if bs <= limit]
+            graph_reserve = graph_reserve_bytes(max(graph_bs_list)) if graph_bs_list else 0
         moe_layers: list[OffloadMoELayer] = []
         layouts: list[dict[str, BankSpec]] = []
         expert_source: ExpertSource | None = None
@@ -299,9 +323,13 @@ class Engine:
                 resident_arrays,
             )
         load_weights(self.model, checkpoint.state, rules, skip_experts=is_offload)
+        # Host memory is the GPU's too on unified memory: a host row cache counts as weights.
+        host_bytes = 0
+        if isinstance(self.model, FinishesLoading):
+            host_bytes = self.model.finish_loading(config.model_path)
         logger.info(f"loaded weights from {config.model_path}")
         # Under offload the experts are the cache's, not weights.
-        self.weights_bytes = mx.get_active_memory() - resident_before
+        self.weights_bytes = mx.get_active_memory() - resident_before + host_bytes
         logger.info(f"weights resident: {self.weights_bytes / 2**30:.2f} GiB")
 
         expert_counts: np.ndarray | None = None
@@ -512,6 +540,8 @@ class Engine:
         cache = self.moe_offload_cache
         if cache is not None and cache.mode != "overlap":
             cache.arm()
+        if batch.is_decode and self.lookup_model is not None:
+            self.lookup_model.arm_lookups()
         if self.graph_runner.can_replay(batch):
             logits = self.graph_runner.replay(batch)
         else:
@@ -521,10 +551,13 @@ class Engine:
         return ForwardOutput(self.sampler.sample(logits, args))
 
     def check_healthy(self) -> None:
-        """Raise the offload cache's first failure (FreeToken raise_if_unhealthy): a forward
-        whose lookups failed computed with stand-in experts, so its tokens must not be used."""
+        """Raise the offload cache's or the model's lookup service's first failure (FreeToken
+        raise_if_unhealthy): a forward whose lookups failed computed with stand-in experts or
+        rows, so its tokens must not be used."""
         if self.moe_offload_cache is not None:
             self.moe_offload_cache.check_healthy()
+        if self.lookup_model is not None:
+            self.lookup_model.check_lookups()
 
     def pool_arrays(self) -> list[mx.array]:
         """The arrays a step updates in place: the pools and the offload cache's tables."""

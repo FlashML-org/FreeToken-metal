@@ -184,7 +184,7 @@ def make_scheduler(
         page_size=page_size,
         attention_backend=attention_backend,
         num_page_override=num_pages,
-        max_extend_tokens=max_extend_tokens,
+        max_extend_tokens_override=max_extend_tokens,
         cache_type=cache_type,
     )
     return Scheduler(config, eos_token_ids={EOS})
@@ -310,7 +310,7 @@ def test_too_few_windows_fail_at_startup_and_naive_ignores_the_count(
         dtype=mx.float32,
         max_running_req=2,
         num_page_override=64,
-        max_extend_tokens=64,
+        max_extend_tokens_override=64,
         swa_windows=24,
     )
     # Two running requests and two chunks hold 2 x (8 + 16 + 8 + 3) + 2 x 64 = 198 window

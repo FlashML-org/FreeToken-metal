@@ -48,5 +48,6 @@ _C.init_gather_sorted_libraries(
 )
 _C.init_sample_library((METAL_DIR / "sample.metal").read_text())
 _C.init_moe_lookup_library((METAL_DIR / "moe_lookup.metal").read_text())
+_C.init_ple_lookup_library((METAL_DIR / "ple_lookup.metal").read_text())
 
 __all__ = ["_C"]

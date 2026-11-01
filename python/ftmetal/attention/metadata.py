@@ -20,6 +20,8 @@ class AttnType(str, Enum):
     FULL = "full"
     SWA = "swa"
     LINEAR = "linear"
+    # Full attention over the keys a block indexer selects (Qwen Sparse Attention).
+    QSA = "qsa"
 
 
 class BaseAttnMetadata(ABC):

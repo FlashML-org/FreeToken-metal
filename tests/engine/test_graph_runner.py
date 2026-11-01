@@ -68,7 +68,7 @@ def engine_config(
         page_size=page_size,
         attention_backend=attention_backend,
         num_page_override=NUM_TOKENS // page_size,
-        max_extend_tokens=128,
+        max_extend_tokens_override=128,
         command_graph=command_graph,
     )
 

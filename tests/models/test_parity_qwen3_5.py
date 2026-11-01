@@ -51,7 +51,7 @@ def make_scheduler(
         attention_backend=attention_backend,
         max_seq_len_override=max_seq_len,
         num_page_override=num_pages,
-        max_extend_tokens=max_extend_tokens,
+        max_extend_tokens_override=max_extend_tokens,
         cache_type=cache_type,
     )
     return Scheduler(config, eos_token_ids={127})

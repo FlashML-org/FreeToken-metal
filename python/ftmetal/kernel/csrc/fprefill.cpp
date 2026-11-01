@@ -26,7 +26,11 @@ void init_fprefill_library(const std::string& source) {
   fprefill_source = source;
 }
 
-mx::array flash_prefill(
+namespace {
+
+// Checks the arguments both modes share and builds the primitive; qsa_lists holds
+// flash_prefill_qsa's (blocks, counts, bits) when qsa_block_size > 0.
+mx::array make_flash_prefill(
     const mx::array& q,
     const mx::array& k_cache,
     const mx::array& v_cache,
@@ -43,6 +47,8 @@ mx::array flash_prefill(
     bool mpp,
     float scale,
     const std::optional<mx::array>& block_ends,
+    int qsa_block_size,
+    const std::vector<mx::array>& qsa_lists,
     mx::StreamOrDevice s) {
   if (q.ndim() != 3 || k_cache.ndim() != 3 || v_cache.ndim() != 3 || page_table.ndim() != 2 ||
       tiles.ndim() != 2 || tiles.shape(1) != 4) {
@@ -116,13 +122,76 @@ mx::array flash_prefill(
       sliding_window,
       mpp,
       scale,
-      block_ends.has_value()};
+      block_ends.has_value(),
+      qsa_block_size};
   auto inputs = paged_attention_inputs(q, k_cache, v_cache, page_table, tiles, stream);
   if (block_ends) {
     inputs.push_back(mx::contiguous(*block_ends, false, stream));
   }
+  for (const auto& list : qsa_lists) {
+    inputs.push_back(mx::contiguous(list, false, stream));
+  }
   return mx::array(
       q.shape(), q.dtype(), std::make_shared<FlashPrefill>(stream, config), std::move(inputs));
+}
+
+} // namespace
+
+mx::array flash_prefill(
+    const mx::array& q,
+    const mx::array& k_cache,
+    const mx::array& v_cache,
+    const mx::array& page_table,
+    const mx::array& tiles,
+    int page_size,
+    int num_row_groups,
+    int head_split,
+    int block_k,
+    bool kv_shared,
+    int num_passes,
+    int num_partitions,
+    int sliding_window,
+    bool mpp,
+    float scale,
+    const std::optional<mx::array>& block_ends,
+    mx::StreamOrDevice s) {
+  return make_flash_prefill(
+      q, k_cache, v_cache, page_table, tiles, page_size, num_row_groups, head_split, block_k,
+      kv_shared, num_passes, num_partitions, sliding_window, mpp, scale, block_ends, 0, {}, s);
+}
+
+mx::array flash_prefill_qsa(
+    const mx::array& q,
+    const mx::array& k_cache,
+    const mx::array& v_cache,
+    const mx::array& page_table,
+    const mx::array& tiles,
+    const mx::array& qsa_blocks,
+    const mx::array& qsa_counts,
+    const mx::array& qsa_bits,
+    int qsa_block_size,
+    int page_size,
+    int num_row_groups,
+    int head_split,
+    int block_k,
+    bool kv_shared,
+    int num_passes,
+    int num_partitions,
+    bool mpp,
+    float scale,
+    mx::StreamOrDevice s) {
+  if (qsa_block_size < 1 || qsa_blocks.ndim() != 2 || qsa_blocks.shape(0) != tiles.shape(0) ||
+      qsa_counts.ndim() != 1 || qsa_counts.shape(0) != tiles.shape(0) || qsa_bits.ndim() != 2 ||
+      qsa_bits.shape(0) != q.shape(0) || qsa_blocks.dtype() != mx::int32 ||
+      qsa_counts.dtype() != mx::int32 || qsa_bits.dtype() != mx::uint32) {
+    throw std::invalid_argument(
+        "ftmetal fprefill qsa: blocks [num_tiles, W] int32, counts [num_tiles] int32, bits "
+        "[num_tokens, B] uint32, block size >= 1");
+  }
+  return make_flash_prefill(
+      q, k_cache, v_cache, page_table, tiles, page_size, num_row_groups, head_split, block_k,
+      kv_shared, num_passes, num_partitions, 0, mpp, scale, std::nullopt, qsa_block_size,
+      {qsa_blocks, qsa_counts, qsa_bits}, s);
 }
 
 bool FlashPrefill::is_equivalent(const mx::Primitive& other) const {
@@ -156,7 +225,8 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
       std::to_string(c.head_split) + "_" + std::to_string(c.block_k) + "_" +
       std::to_string(c.kv_shared) + "_" + std::to_string(c.num_passes) + "_" +
       std::to_string(c.sliding_window) + (c.mpp ? "_mpp" : "_simdgroup") +
-      (c.has_block_ends ? "_blocks" : "");
+      (c.has_block_ends ? "_blocks" : "") +
+      (c.qsa_block_size > 0 ? "_qsa" + std::to_string(c.qsa_block_size) : "");
 
   auto s = stream();
   auto& d = mx::metal::device(s.device);
@@ -175,6 +245,7 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
     replace_all(source, "{{NPASS}}", std::to_string(c.num_passes));
     replace_all(source, "{{MMA}}", c.mpp ? "MMA_MPP" : "MMA_SIMDGROUP");
     replace_all(source, "{{BLOCKS}}", c.has_block_ends ? "1" : "0");
+    replace_all(source, "{{QSA}}", std::to_string(c.qsa_block_size));
     return source;
   });
 
@@ -183,6 +254,18 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
   float scale_log2e = c.scale * static_cast<float>(M_LOG2E);
   int rows = FRAGMENT_SIZE * c.num_row_groups;
   MTL::Size tile_group(SIMD_WIDTH * c.num_row_groups * c.head_split, 1, 1);
+  // The inputs past the shared five: the block ends, or the QSA lists and their widths.
+  auto set_mask_inputs = [&]() {
+    if (c.has_block_ends) {
+      encoder.set_input_array(inputs[5], 9);
+    } else if (c.qsa_block_size > 0) {
+      encoder.set_input_array(inputs[5], 10);
+      encoder.set_input_array(inputs[6], 11);
+      encoder.set_input_array(inputs[7], 12);
+      encoder.set_bytes(static_cast<int>(inputs[5].shape(1)), 13);
+      encoder.set_bytes(static_cast<int>(inputs[7].shape(1)), 14);
+    }
+  };
   if (c.num_partitions == 1) {
     encoder.set_compute_pipeline_state(d.get_kernel("fprefill", library));
     for (int i = 0; i < 5; ++i) {
@@ -191,9 +274,7 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
     encoder.set_output_array(out, 5);
     encoder.set_bytes(max_pages, 7);
     encoder.set_bytes(scale_log2e, 8);
-    if (c.has_block_ends) {
-      encoder.set_input_array(inputs[5], 9);
-    }
+    set_mask_inputs();
     encoder.dispatch_threadgroups(MTL::Size(num_tiles, c.num_kv_heads, 1), tile_group);
     return;
   }
@@ -209,9 +290,7 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
   encoder.set_output_array(part_ml, 6);
   encoder.set_bytes(max_pages, 7);
   encoder.set_bytes(scale_log2e, 8);
-  if (c.has_block_ends) {
-    encoder.set_input_array(inputs[5], 9);
-  }
+  set_mask_inputs();
   encoder.dispatch_threadgroups(
       MTL::Size(num_tiles, c.num_kv_heads, c.num_partitions), tile_group);
 

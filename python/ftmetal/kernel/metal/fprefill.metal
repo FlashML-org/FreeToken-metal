@@ -18,6 +18,10 @@
 // With BLOCKS, a query also sees the keys before its block end (buffer 9, per query token:
 // where its image span ends in row positions, 0 for text), so a tile streams up to its
 // largest block end; the window still applies. Without it the kernel is the causal one.
+// With QSA = n > 0 (block-sparse attention over n-key QSA blocks; no window, no BLOCKS) a tile
+// streams only the union of its queries' visible QSA blocks, listed ascending (buffer 10,
+// buffer 11 holding each tile's count), and a query sees a listed key when the key's block bit
+// is set in its row of buffer 12 and the key is not past it.
 // MMA picks how the two GEMMs run: on 8x8 simdgroup matrices (P rounded to the input
 // type), or as MetalPerformancePrimitives matmul2d on cooperative tensors (P in fp32),
 // which uses the GPU's matrix units where it has them. Everything else is shared: a
@@ -50,6 +54,7 @@ using namespace metal;
 #define KV_SHARED {{KV_SHARED}}
 #define NPASS {{NPASS}}
 #define BLOCKS {{BLOCKS}}
+#define QSA {{QSA}}
 #define M (8 * NSG / DS)
 #define DH (D / DS)
 // Columns staged per pass.
@@ -73,6 +78,8 @@ constant constexpr int KV_SHARED_SIZE = K_SIZE > V_SIZE ? K_SIZE : V_SIZE;
 // (64 when DP / VEC is not a multiple of 8).
 constant constexpr int VEC = 16 / sizeof(T);
 constant constexpr int KEY_LANES = DP / VEC % 8 == 0 ? 8 : 4;
+// The QSA block size as a divisor (1 when QSA is off and nothing divides by it).
+constant constexpr uint QSA_KEYS = QSA > 0 ? QSA : 1;
 using Vec2 = vec<T, 2>;
 using LoadVec = vec<T, VEC>;
 
@@ -210,6 +217,19 @@ inline size_t key_row_offset(const device int* page_row, uint key, uint kv_head)
   return (((size_t)page_row[key / BS] * BS + key % BS) * HKV + kv_head) * D;
 }
 
+// The position of the tile's k-th streamed key: k itself, or under QSA the k % QSA-th key of
+// its k / QSA-th listed block; kv_end past the tile's num_keys keys. A position from kv_end
+// on is neither staged nor visible.
+inline uint key_position(uint k, uint kv_end, uint num_keys, const device int* qsa_list) {
+  if (QSA == 0) {
+    return k;
+  } else if (k >= num_keys) {
+    return kv_end;
+  } else {
+    return uint(qsa_list[k / QSA_KEYS]) * QSA_KEYS + k % QSA_KEYS;
+  }
+}
+
 // Stage the i-th 16-byte vector of a pass's columns of a block's V rows (32 lanes along a
 // key), zero past kv_end.
 inline void stage_value(
@@ -218,15 +238,18 @@ inline void stage_value(
     uint kv_head,
     uint k0,
     uint kv_end,
+    uint num_keys,
+    const device int* qsa_list,
     uint column_offset,
     uint i,
     threadgroup T* v_tg) {
   const uint v_row = i / (DP / VEC);
   const uint v_column = i % (DP / VEC) * VEC;
   LoadVec v_vec = LoadVec(0);
-  if (k0 + v_row < kv_end) {
+  const uint v_position = key_position(k0 + v_row, kv_end, num_keys, qsa_list);
+  if (v_position < kv_end) {
     v_vec = *(const device LoadVec*)(
-        v_cache + key_row_offset(page_row, k0 + v_row, kv_head) + column_offset + v_column);
+        v_cache + key_row_offset(page_row, v_position, kv_head) + column_offset + v_column);
   }
   *(threadgroup LoadVec*)(v_tg + v_row * LDV + v_column) = v_vec;
 }
@@ -235,13 +258,27 @@ inline void stage_value(
 // 3 page_table [B, max_pages] int32, 4 tiles [num_tiles] int4, 5 out [num_tokens, HKV * G,
 // D] (one pass) or part_acc [num_tiles, HKV, P, M, D] fp32 with 6 part_ml [num_tiles,
 // HKV, P, M, 2] fp32 (split-KV), 7 max_pages, 8 scale * log2(e), 9 block_ends
-// [num_tokens] int32 (BLOCKS only).
+// [num_tokens] int32 (BLOCKS only); QSA only: 10 qsa_blocks [num_tiles, list_width] int32,
+// 11 qsa_counts [num_tiles] int32, 12 qsa_bits [num_tokens, bits_width] uint32 (bit b of a
+// query's row: it sees QSA block b), 13 list_width, 14 bits_width.
 #if BLOCKS
 #define BLOCK_ENDS_ARG , device const int* block_ends [[buffer(9)]]
 #define BLOCK_ENDS block_ends
 #else
 #define BLOCK_ENDS_ARG
 #define BLOCK_ENDS nullptr
+#endif
+#if QSA
+#define QSA_ARGS                                         \
+  , device const int* qsa_blocks [[buffer(10)]],         \
+      device const int* qsa_counts [[buffer(11)]],       \
+      device const uint* qsa_bits [[buffer(12)]],        \
+      constant const int& qsa_list_width [[buffer(13)]], \
+      constant const int& qsa_bits_width [[buffer(14)]]
+#define QSA_LISTS qsa_blocks, qsa_counts, qsa_bits, qsa_list_width, qsa_bits_width
+#else
+#define QSA_ARGS
+#define QSA_LISTS nullptr, nullptr, nullptr, 0, 0
 #endif
 
 template <bool SPLIT>
@@ -252,6 +289,11 @@ inline void fprefill_tile(
     device const int* page_table,
     device const int4* tiles,
     device const int* block_ends,
+    device const int* qsa_blocks,
+    device const int* qsa_counts,
+    device const uint* qsa_bits,
+    int qsa_list_width,
+    int qsa_bits_width,
     device T* out,
     device float* part_acc,
     device float* part_ml,
@@ -275,7 +317,11 @@ inline void fprefill_tile(
   if (BLOCKS) {
     for (uint t = 0; t < q_count; ++t) kv_end = max(kv_end, (uint)block_ends[q_row0 + t]);
   }
-  const uint num_blocks = (kv_end + BK - 1) / BK;
+  // The tile streams key positions 0 .. kv_end - 1, or under QSA its listed blocks' keys.
+  const device int* qsa_list =
+      QSA > 0 ? qsa_blocks + (size_t)tile_index * qsa_list_width : nullptr;
+  const uint num_keys = QSA > 0 ? uint(qsa_counts[tile_index]) * QSA : kv_end;
+  const uint num_blocks = (num_keys + BK - 1) / BK;
   // The first query's window starts the tile's keys.
   const uint first_block = W > 0 && q_pos0 + 1 > W ? (q_pos0 + 1 - W) / BK : 0;
   uint block_begin = first_block;
@@ -298,6 +344,8 @@ inline void fprefill_tile(
   const uint position = q_pos0 + token;
   // Keys before it are visible past the diagonal; 0 hides none of them.
   const uint row_block_end = BLOCKS ? (uint)block_ends[q_row0 + token] : 0;
+  const device uint* query_bits =
+      QSA > 0 ? qsa_bits + (size_t)(q_row0 + token) * qsa_bits_width : nullptr;
   const uint group_first_position = q_pos0 + min(row_group * 8 / G, q_count - 1);
   const uint group_last_position = q_pos0 + min((row_group * 8 + 7) / G, q_count - 1);
   const size_t q_offset = ((size_t)(q_row0 + token) * HKV * G + head) * D + column0;
@@ -326,12 +374,14 @@ inline void fprefill_tile(
         const uint k_row = i / KEY_LANES % BK;
         const uint k_column = i / (KEY_LANES * BK) * (KEY_LANES * VEC) + i % KEY_LANES * VEC;
         LoadVec k_vec = LoadVec(0);
-        if (k0 + k_row < kv_end) {
+        const uint k_position = key_position(k0 + k_row, kv_end, num_keys, qsa_list);
+        if (k_position < kv_end) {
           k_vec = *(const device LoadVec*)(
-              k_cache + key_row_offset(page_row, k0 + k_row, kv_head) + pass * DP + k_column);
+              k_cache + key_row_offset(page_row, k_position, kv_head) + pass * DP + k_column);
         }
         if (!KV_SHARED) {
-          stage_value(v_cache, page_row, kv_head, k0, kv_end, pass * DP, i, v_tg);
+          stage_value(
+              v_cache, page_row, kv_head, k0, kv_end, num_keys, qsa_list, pass * DP, i, v_tg);
         }
         UNROLL for (int j = 0; j < VEC; ++j) k_tg[(k_column + j) * LDK + k_row] = k_vec[j];
       }
@@ -360,15 +410,21 @@ inline void fprefill_tile(
       }
     }
 
-    // Blocks crossing the causal diagonal or a window start are masked.
-    const bool needs_mask =
-        k0 + BK - 1 > group_first_position || (W > 0 && k0 + W <= group_last_position);
+    // Blocks crossing the causal diagonal or a window start are masked; under QSA every
+    // block, each key also by its QSA block's bit.
+    const bool needs_mask = QSA > 0 || k0 + BK - 1 > group_first_position ||
+        (W > 0 && k0 + W <= group_last_position);
     float block_max = -INFINITY;
     UNROLL for (int i = 0; i < S_LANE; ++i) {
       float score = s[i] * scale_log2e;
-      const uint key = k0 + element_coord<STile>(lane, i).x;
+      const uint key =
+          key_position(k0 + element_coord<STile>(lane, i).x, kv_end, num_keys, qsa_list);
       if (needs_mask &&
           ((key > position && key >= row_block_end) || (W > 0 && key + W <= position))) {
+        score = -INFINITY;
+      }
+      if (QSA > 0 && key <= position &&
+          ((query_bits[key / QSA_KEYS / 32] >> (key / QSA_KEYS % 32)) & 1u) == 0) {
         score = -INFINITY;
       }
       s[i] = score;
@@ -394,7 +450,8 @@ inline void fprefill_tile(
           threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         for (uint i = thread_index; i < BK * DP / VEC; i += NSG * 32) {
-          stage_value(v_cache, page_row, kv_head, k0, kv_end, pass * DP, i, v_tg);
+          stage_value(
+              v_cache, page_row, kv_head, k0, kv_end, num_keys, qsa_list, pass * DP, i, v_tg);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
       }
@@ -433,16 +490,16 @@ inline void fprefill_tile(
     device const int4* tiles [[buffer(4)]],
     device T* out [[buffer(5)]],
     constant const int& max_pages [[buffer(7)]],
-    constant const float& scale_log2e [[buffer(8)]] BLOCK_ENDS_ARG,
+    constant const float& scale_log2e [[buffer(8)]] BLOCK_ENDS_ARG QSA_ARGS,
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
   threadgroup T kv_tg[KV_SHARED ? KV_SHARED_SIZE : K_SIZE + V_SIZE];
   threadgroup float2 s_tg[DS > 1 ? NSG * S_LANE / 2 * 32 : 1];
   fprefill_tile<false>(
-      q, k_cache, v_cache, page_table, tiles, BLOCK_ENDS, out, nullptr, nullptr, max_pages,
-      scale_log2e, tgpig.x, tgpig.y, 0, 1, sg, lane, kv_tg, kv_tg + (KV_SHARED ? 0 : K_SIZE),
-      s_tg);
+      q, k_cache, v_cache, page_table, tiles, BLOCK_ENDS, QSA_LISTS, out, nullptr, nullptr,
+      max_pages, scale_log2e, tgpig.x, tgpig.y, 0, 1, sg, lane, kv_tg,
+      kv_tg + (KV_SHARED ? 0 : K_SIZE), s_tg);
 }
 
 [[kernel, max_total_threads_per_threadgroup(NSG * 32)]] void fprefill_partials(
@@ -454,7 +511,7 @@ inline void fprefill_tile(
     device float* part_acc [[buffer(5)]],
     device float* part_ml [[buffer(6)]],
     constant const int& max_pages [[buffer(7)]],
-    constant const float& scale_log2e [[buffer(8)]] BLOCK_ENDS_ARG,
+    constant const float& scale_log2e [[buffer(8)]] BLOCK_ENDS_ARG QSA_ARGS,
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint3 tptg [[threadgroups_per_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
@@ -462,8 +519,8 @@ inline void fprefill_tile(
   threadgroup T kv_tg[KV_SHARED ? KV_SHARED_SIZE : K_SIZE + V_SIZE];
   threadgroup float2 s_tg[DS > 1 ? NSG * S_LANE / 2 * 32 : 1];
   fprefill_tile<true>(
-      q, k_cache, v_cache, page_table, tiles, BLOCK_ENDS, nullptr, part_acc, part_ml, max_pages,
-      scale_log2e, tgpig.x, tgpig.y, tgpig.z, tptg.z, sg, lane, kv_tg,
+      q, k_cache, v_cache, page_table, tiles, BLOCK_ENDS, QSA_LISTS, nullptr, part_acc, part_ml,
+      max_pages, scale_log2e, tgpig.x, tgpig.y, tgpig.z, tptg.z, sg, lane, kv_tg,
       kv_tg + (KV_SHARED ? 0 : K_SIZE), s_tg);
 }
 

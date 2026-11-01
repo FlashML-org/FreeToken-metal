@@ -1,19 +1,20 @@
 """GraphRunner: decode steps replayed from one CommandGraph capture per batch-size bucket.
 
 Port of FreeToken engine/graph.py. Divergences: a graph is a CommandGraph capture
-(ftmetal.command_graph) instead of a CUDA graph, so there is no GraphCaptureBuffer:
-the step inputs (input_ids, positions, out_loc, the [3, bs] mrope positions of a model
-serving vision, which join the sequence positions the GDN decode reads, and the metadata
-arrays a backend's prepare_for_replay leaves at the bucket's fixed shapes) are rebound by
-every replay, and so are the pools, which the replay takes and returns; the bs ladder ends
-at max_running_req, on the ladder or not; the arena is the graphs' shared pool, owned by
+(ftmetal.command_graph) instead of a CUDA graph, so there is no GraphCaptureBuffer: the
+step inputs (input_ids, positions, out_loc, the [3, bs] mrope positions of a model serving
+vision, which join the sequence positions the GDN decode reads, and the metadata arrays a
+backend's prepare_for_replay leaves at the bucket's fixed shapes) are rebound by every
+replay, and so are the pools, which the replay takes and returns; the bs ladder ends at
+max_running_req, on the ladder or not; the arena is the graphs' shared pool, owned by
 GraphArena: every capture's intermediates and temporaries are planned into it, it is
 allocated after the captures, and each capture batch's replay on it must give its clean
-replay's logits; graphs outgrowing the memory budget's graph reserve fail the startup
-like a failed capture. Under MoE offload (FreeToken passes the cache to the runner too)
-the banks and slot_of are externals, the lookups' tables are pools and moe_step is the last
-step input; captures run on dummy rows only, so their lookups post nothing; a decode whose
-experts may not fit the cache in one step runs eagerly.
+replay's logits; graphs outgrowing the memory budget's graph reserve fail the startup like
+a failed capture. Under MoE offload (FreeToken passes the cache to the runner too) the
+banks and slot_of are externals, the lookups' tables are pools and moe_step is the last
+step input (a model's own step lookups bind their buffers as externals too); captures run
+on dummy rows only, so their lookups post nothing; a decode whose experts may not fit the
+cache in one step runs eagerly.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from ftmetal.command_graph.arena import GraphArena
 from ftmetal.core import Batch, Req
 from ftmetal.kvcache import pool_arrays, set_pool_arrays
 from ftmetal.kvcache.base import BasePool
-from ftmetal.models.blocks import BaseLLMModel
+from ftmetal.models.blocks import BaseLLMModel, ServesStepLookups
 from ftmetal.moe.offload_cache import OffloadMoeCache
 
 logger = logging.getLogger(__name__)
@@ -137,6 +138,8 @@ class GraphRunner:
         externals = [value for _, value in parameters if isinstance(value, mx.array)]
         if self.moe_offload_cache is not None:
             externals += self.moe_offload_cache.graph_externals()
+        if isinstance(self.model, ServesStepLookups):
+            externals += self.model.lookup_buffers()
         step_inputs = self.step_inputs(batch)
         mx.eval(*step_inputs)
         pools = self.pool_arrays()

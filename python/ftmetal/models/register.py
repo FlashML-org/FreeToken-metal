@@ -114,6 +114,13 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         encoders=(GEMMA4_VISION,),
     ),
     "Gemma4ForCausalLM": ModelSpec("ftmetal.models.gemma4", "Gemma4ForCausalLM"),
+    # Served text only: the checkpoint's vision tower is not built.
+    "Qwen4ExpForConditionalGeneration": ModelSpec(
+        "ftmetal.models.qwen4_exp", "Qwen4ExpForCausalLM", has_offload=True
+    ),
+    "Qwen4ExpForCausalLM": ModelSpec(
+        "ftmetal.models.qwen4_exp", "Qwen4ExpForCausalLM", has_offload=True
+    ),
 }
 
 

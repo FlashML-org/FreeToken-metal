@@ -14,6 +14,8 @@ import re
 
 import mlx.core as mx
 
+from ftmetal.layers.gdn import IN_PROJ_BA_PARTS, IN_PROJ_QKVZ_PARTS
+from ftmetal.layers.shared_expert_moe import GATE_UP_PARTS
 from ftmetal.models.config import ModelConfig
 from ftmetal.models.loader import (
     ExpertBytes,
@@ -25,9 +27,6 @@ from ftmetal.models.loader import (
 
 # Checkpoint module paths of the quantization map, per fused model leaf.
 QKV_PARTS = ("q_proj", "k_proj", "v_proj")
-GATE_UP_PARTS = ("gate_proj", "up_proj")
-IN_PROJ_QKVZ_PARTS = ("in_proj_qkv", "in_proj_z")
-IN_PROJ_BA_PARTS = ("in_proj_b", "in_proj_a")
 
 
 # One tensor per expert in the Hugging Face layout.
@@ -129,9 +128,6 @@ def checkpoint_module(model_key: str) -> str:
 
 
 __all__ = [
-    "GATE_UP_PARTS",
-    "IN_PROJ_BA_PARTS",
-    "IN_PROJ_QKVZ_PARTS",
     "QKV_PARTS",
     "checkpoint_module",
     "mlx_layout",

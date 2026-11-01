@@ -51,6 +51,7 @@ POOL_LABELS: dict[AttnType, str] = {
     AttnType.FULL: "kv pages",
     AttnType.SWA: "swa window",
     AttnType.LINEAR: "gdn slots",
+    AttnType.QSA: "qsa kv pages",
 }
 
 
@@ -65,8 +66,16 @@ def memory_budget_bytes(recommended_working_set: int, memory_ratio: float | None
 
 
 def activation_reserve_bytes(
-    max_extend_tokens: int, num_qo_heads: int, in_flight_steps: int
+    max_extend_tokens: int,
+    num_qo_heads: int,
+    in_flight_steps: int,
+    measured: tuple[int, int] | None = None,
 ) -> int:
+    """What in_flight_steps prefill steps of max_extend_tokens hold above the pools: the model's
+    measured (fixed bytes, bytes per token) when it has one, else the Qwen3.6 estimate."""
+    if measured is not None:
+        fixed_bytes, bytes_per_token = measured
+        return in_flight_steps * (fixed_bytes + max_extend_tokens * bytes_per_token)
     per_step = ACTIVATION_FIXED_BYTES + max_extend_tokens * ACTIVATION_BYTES_PER_TOKEN
     per_step += num_qo_heads * max_extend_tokens * max_extend_tokens * ATTENTION_SCORE_BYTES
     return in_flight_steps * per_step

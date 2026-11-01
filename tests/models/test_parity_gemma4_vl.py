@@ -152,7 +152,7 @@ def make_scheduler(
         page_size=4,
         attention_backend=attention_backend,
         num_page_override=128,
-        max_extend_tokens=max_extend_tokens,
+        max_extend_tokens_override=max_extend_tokens,
         command_graph=command_graph,
         mm=MultimodalConfig() if mm is None else mm,
     )

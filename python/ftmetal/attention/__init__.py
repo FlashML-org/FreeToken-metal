@@ -4,7 +4,7 @@ Port of FreeToken attention/__init__.py. Divergences: creators take the group's 
 its pool and the page table (no global context at construction); LINEAR always gets
 LinearAttnBackend, which only builds metadata (FreeToken's backend-driven type); there
 is no prefill,decode pair and no auto resolution: two kernel sets on one machine, chosen
-by name, each serving the paged types (FULL, SWA) with one instance per type.
+by name, each serving the paged types (FULL, SWA, QSA) with one instance per type.
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register(
-    "mlx", BackendInfo(supported_types=frozenset({AttnType.FULL, AttnType.SWA}))
+    "mlx", BackendInfo(supported_types=frozenset({AttnType.FULL, AttnType.SWA, AttnType.QSA}))
 )
 def create_mlx_backend(
     config: ModelConfig,
@@ -63,14 +63,18 @@ def create_mlx_backend(
     page_size: int,
 ) -> BaseAttnBackend:
     from ftmetal.attention.full.mlx import FullAttnMLXBackend
+    from ftmetal.attention.qsa.mlx import QSAMLXBackend
 
-    return FullAttnMLXBackend(config, spec, pool, page_table, page_size)
+    if spec.attn_type is AttnType.QSA:
+        return QSAMLXBackend(config, spec, pool, page_table, page_size)
+    else:
+        return FullAttnMLXBackend(config, spec, pool, page_table, page_size)
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register(
     "metal",
     BackendInfo(
-        supported_types=frozenset({AttnType.FULL, AttnType.SWA}),
+        supported_types=frozenset({AttnType.FULL, AttnType.SWA, AttnType.QSA}),
         page_sizes=(1, 2, 4, 8, 16, 32, 64),
         can_capture=True,
     ),
@@ -83,8 +87,12 @@ def create_metal_backend(
     page_size: int,
 ) -> BaseAttnBackend:
     from ftmetal.attention.full.metal import FullAttnMetalBackend
+    from ftmetal.attention.qsa.metal import QSAMetalBackend
 
-    return FullAttnMetalBackend(config, spec, pool, page_table, page_size)
+    if spec.attn_type is AttnType.QSA:
+        return QSAMetalBackend(config, spec, pool, page_table, page_size)
+    else:
+        return FullAttnMetalBackend(config, spec, pool, page_table, page_size)
 
 
 def attention_backend_info(name: str) -> BackendInfo:
@@ -99,7 +107,7 @@ def validate_attn_backend(backend: str) -> str:
 
 
 def check_attention_backend(
-    backend: str, page_size: int, required: frozenset[AttnType] = frozenset({AttnType.FULL})
+    backend: str, page_size: int, required: frozenset[AttnType]
 ) -> BackendInfo:
     """Config-time type x page-size capability check; the page-size rule is the backend's
     (its kernels'), never the engine's or the cache's, so it is declared in BackendInfo."""

@@ -84,7 +84,7 @@ def sizing_config(
         dtype=mx.float16,
         page_size=page_size,
         max_running_req=3,
-        max_extend_tokens=64,
+        max_extend_tokens_override=64,
         cache_type=cache_type,
         swa_windows=swa_windows,
     )

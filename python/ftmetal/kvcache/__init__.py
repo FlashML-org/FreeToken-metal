@@ -17,6 +17,7 @@ from ftmetal.attention.metadata import AttnType
 from ftmetal.kvcache.base import BasePool, PoolConfig, PoolCost
 from ftmetal.kvcache.linear_state_pool import LinearStatePool
 from ftmetal.kvcache.mha_pool import MHAKVCache
+from ftmetal.kvcache.qsa_pool import QSAKVCache
 from ftmetal.kvcache.swa_pool import SWAKVCache
 from ftmetal.models.config import KVCacheGroupSpec
 
@@ -24,6 +25,7 @@ POOL_FAMILIES: dict[AttnType, type[BasePool]] = {
     AttnType.FULL: MHAKVCache,
     AttnType.SWA: SWAKVCache,
     AttnType.LINEAR: LinearStatePool,
+    AttnType.QSA: QSAKVCache,
 }
 
 

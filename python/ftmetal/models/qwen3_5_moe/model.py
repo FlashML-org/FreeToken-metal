@@ -15,24 +15,18 @@ import mlx.core as mx
 from ftmetal.core import Batch
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.embedding import Embedding
+from ftmetal.layers.gdn import IN_PROJ_BA_PARTS, IN_PROJ_QKVZ_PARTS, GatedDeltaNet
 from ftmetal.layers.linear import Linear
 from ftmetal.layers.norm import RMSNorm
 from ftmetal.layers.quantization.config import QuantScheme
 from ftmetal.layers.quantization.moe import ExpertSchemes
+from ftmetal.layers.shared_expert_moe import GATE_UP_PARTS, SharedExpertMoE
 from ftmetal.mm.item import MMItem
 from ftmetal.models.blocks import BaseLLMModel, embed_input_ids, select_last_rows
 from ftmetal.models.config import ModelConfig
 from ftmetal.models.qwen3_5_moe.attention import Qwen3_5Attention
-from ftmetal.models.qwen3_5_moe.gdn import Qwen3_5GatedDeltaNet
-from ftmetal.models.qwen3_5_moe.moe import Qwen3_5MoE
 from ftmetal.models.qwen3_5_moe.vision import Qwen3VLVisionModel
-from ftmetal.models.qwen3_5_moe.weight import (
-    GATE_UP_PARTS,
-    IN_PROJ_BA_PARTS,
-    IN_PROJ_QKVZ_PARTS,
-    QKV_PARTS,
-    checkpoint_module,
-)
+from ftmetal.models.qwen3_5_moe.weight import QKV_PARTS, checkpoint_module
 
 
 def scheme_of(config: ModelConfig, model_key: str) -> QuantScheme | None:
@@ -59,7 +53,7 @@ class Qwen3_5DecoderLayer(BaseOP):
             group = config.linear_attention_group()
             assert group is not None
             gdn_prefix = f"{prefix}.linear_attn"
-            self.linear_attn = Qwen3_5GatedDeltaNet(
+            self.linear_attn = GatedDeltaNet(
                 config.hidden_size,
                 group,
                 config.rms_norm_eps,
@@ -79,7 +73,7 @@ class Qwen3_5DecoderLayer(BaseOP):
                 dtype=dtype,
             )
         mlp_prefix = f"{prefix}.mlp"
-        self.mlp = Qwen3_5MoE(
+        self.mlp = SharedExpertMoE(
             config,
             layer_id,
             experts_schemes=ExpertSchemes(

@@ -52,7 +52,7 @@ def make_scheduler(
         max_running_req=max_running_req,
         page_size=page_size,
         num_page_override=num_pages,
-        max_extend_tokens=max_extend_tokens,
+        max_extend_tokens_override=max_extend_tokens,
         gdn_snapshots=gdn_snapshots,
         cache_type=cache_type,
     )

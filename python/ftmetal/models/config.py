@@ -1,7 +1,7 @@
 """Model configuration: attention groups and the per-model geometry.
 
-Port of FreeToken models/config.py, reduced to the FULL, SWA and LINEAR group kinds and
-the fields Qwen3.5-style hybrid MoE and Gemma4 models use. Divergences: the quantization
+Port of FreeToken models/config.py, reduced to the FULL, SWA, LINEAR and QSA group kinds
+and the fields Qwen3.5-style hybrid MoE and Gemma4 models use. Divergences: the quantization
 config is the checkpoint's MLX scheme map; no tensor parallelism or MTP; the MoE
 strategy is fused or offload and every layer of a MoE model routes experts; the
 LINEAR group emits a KVCacheGroupSpec too (its per-slot conv and state shapes), so every
@@ -49,38 +49,62 @@ def mrope_layout_from_rope_params(rope_params: dict[str, object]) -> MRopeLayout
 
 
 @dataclass(frozen=True, kw_only=True)
+class SlotStateSpec:
+    """A model's own per-request state kept in the GDN state pool's slots, beside the GDN
+    states, so snapshots, restores and clears carry it (FreeToken's slot_states)."""
+
+    name: str
+    shape: tuple[int, ...]
+    # None: the engine dtype.
+    dtype: mx.Dtype | None = None
+
+    def nbytes(self, dtype: mx.Dtype) -> int:
+        return math.prod(self.shape) * (self.dtype or dtype).size
+
+
+@dataclass(frozen=True, kw_only=True)
 class KVCacheGroupSpec:
     """The storage view of one attention group: all its pool needs to size and allocate."""
 
     name: str
     attn_type: AttnType
     layer_ids: tuple[int, ...]
-    # Paged K/V geometry (FULL, SWA).
+    # Paged K/V geometry (FULL, SWA, QSA).
     num_kv_heads: int = 0
     head_dim: int = 0
     # The keys a query attends to, its own included (SWA).
     sliding_window: int | None = None
     # Image tokens also attend to their image's later tokens at prefill (batch.mm_block_ends).
     bidirectional_mm_blocks: bool = False
+    # The block indexer (QSA): one index key per token, blocks of index_block_size keys, and
+    # the complete blocks a query attends beside its own incomplete one.
+    index_head_dim: int = 0
+    index_block_size: int = 0
+    index_topk_blocks: int = 0
     # Per-slot state per layer (LINEAR); () when the type has none.
     conv_shape: tuple[int, ...] = ()
     state_shape: tuple[int, ...] = ()
     # The recurrent state's dtype; the conv state and K/V use the engine dtype.
     state_dtype: mx.Dtype = mx.float32
+    # Per-slot states of the model's own, once per slot (LINEAR).
+    slot_states: tuple[SlotStateSpec, ...] = ()
 
     @property
     def num_layers(self) -> int:
         return len(self.layer_ids)
 
     def token_bytes(self, dtype: mx.Dtype) -> int:
-        """K and V bytes per token over the group's layers; 0 for per-slot state."""
-        return 2 * self.num_kv_heads * self.head_dim * dtype.size * self.num_layers
+        """K, V and index key bytes per token over the group's layers; 0 for per-slot state."""
+        per_layer = (2 * self.num_kv_heads * self.head_dim + self.index_head_dim) * dtype.size
+        return per_layer * self.num_layers
 
     def slot_bytes(self, dtype: mx.Dtype) -> int:
-        """Conv and recurrent state bytes per slot over the group's layers; 0 for paged K/V."""
+        """Conv, recurrent and model state bytes per slot over the group's layers; 0 for paged
+        K/V."""
         conv_bytes = math.prod(self.conv_shape) * dtype.size if self.conv_shape else 0
         state_bytes = math.prod(self.state_shape) * self.state_dtype.size if self.state_shape else 0
-        return (conv_bytes + state_bytes) * self.num_layers
+        extra_bytes = sum(state.nbytes(dtype) for state in self.slot_states)
+        return (conv_bytes + state_bytes) * self.num_layers + extra_bytes
 
 
 @dataclass(frozen=True)
@@ -116,6 +140,26 @@ class SWAAttentionGroupConfig(BaseAttentionGroupConfig):
 
 
 @dataclass(frozen=True)
+class QSAAttentionGroupConfig(BaseAttentionGroupConfig):
+    """Full attention over the keys a block indexer selects: each query attends its
+    index_topk_blocks best-scoring complete blocks of index_block_size keys and its own
+    incomplete block, every key while its complete blocks fit."""
+
+    kind: ClassVar[Literal["qsa"]] = "qsa"
+
+    num_kv_heads: int
+    head_dim: int
+    rotary_config: RotaryConfig
+    index_num_heads: int
+    index_head_dim: int
+    index_block_size: int
+    index_topk_blocks: int
+
+
+GatedDeltaOutputGate = Literal["silu", "sigmoid"]
+
+
+@dataclass(frozen=True)
 class LinearGatedDeltaGroupConfig(BaseAttentionGroupConfig):
     kind: ClassVar[Literal["linear_gated_delta"]] = "linear_gated_delta"
 
@@ -124,11 +168,15 @@ class LinearGatedDeltaGroupConfig(BaseAttentionGroupConfig):
     key_head_dim: int
     value_head_dim: int
     conv_kernel_dim: int
-    output_gate: str = "silu"
+    output_gate: GatedDeltaOutputGate = "silu"
+    slot_states: tuple[SlotStateSpec, ...] = ()
 
 
 AttentionGroupConfig = (
-    FullAttentionGroupConfig | SWAAttentionGroupConfig | LinearGatedDeltaGroupConfig
+    FullAttentionGroupConfig
+    | SWAAttentionGroupConfig
+    | LinearGatedDeltaGroupConfig
+    | QSAAttentionGroupConfig
 )
 # How the routed experts are served: fused keeps every expert resident, offload reads them
 # from the checkpoint into a slot cache (moe/offload_cache.py).
@@ -164,6 +212,11 @@ class ModelConfig:
     attn_sm_scale: float | None = None
     final_logit_softcapping: float | None = None
     embedding_scale: float | None = None
+    # A prefill step's peak above the pools, (fixed bytes, bytes per token), measured on the
+    # model; None: the engine's estimate (engine/cache_budget.py).
+    prefill_activation_bytes: tuple[int, int] | None = None
+    # Prefill tokens per batch when the server is not given a budget.
+    max_extend_tokens: int = 2048
     # The checkpoint's vision_config section, None when this process builds no tower.
     vision_config: dict[str, object] | None = None
     image_token_id: int | None = None
@@ -221,6 +274,12 @@ class ModelConfig:
             raise ValueError("expected at most one sliding-window attention group")
         return groups[0] if groups else None
 
+    def qsa_attention_group(self) -> QSAAttentionGroupConfig | None:
+        groups = [g for g in self.attention_groups if isinstance(g, QSAAttentionGroupConfig)]
+        if len(groups) > 1:
+            raise ValueError("expected at most one QSA attention group")
+        return groups[0] if groups else None
+
     def linear_attention_group(self) -> LinearGatedDeltaGroupConfig | None:
         groups = [g for g in self.attention_groups if isinstance(g, LinearGatedDeltaGroupConfig)]
         if len(groups) > 1:
@@ -236,6 +295,8 @@ class ModelConfig:
             return AttnType.LINEAR
         elif isinstance(group, SWAAttentionGroupConfig):
             return AttnType.SWA
+        elif isinstance(group, QSAAttentionGroupConfig):
+            return AttnType.QSA
         else:
             return AttnType.FULL
 
@@ -260,6 +321,17 @@ class ModelConfig:
                     sliding_window=group.sliding_window,
                     bidirectional_mm_blocks=group.bidirectional_mm_blocks,
                 )
+            elif isinstance(group, QSAAttentionGroupConfig):
+                spec = KVCacheGroupSpec(
+                    name=group.name,
+                    attn_type=AttnType.QSA,
+                    layer_ids=group.layer_ids,
+                    num_kv_heads=group.num_kv_heads,
+                    head_dim=group.head_dim,
+                    index_head_dim=group.index_head_dim,
+                    index_block_size=group.index_block_size,
+                    index_topk_blocks=group.index_topk_blocks,
+                )
             else:
                 # A conv ring over q, k and v; the state is [Hv, Dv, Dk] as the GDN kernels read it.
                 conv_dim = 2 * group.num_key_heads * group.key_head_dim
@@ -270,6 +342,7 @@ class ModelConfig:
                     layer_ids=group.layer_ids,
                     conv_shape=(group.conv_kernel_dim, conv_dim),
                     state_shape=(group.num_value_heads, group.value_head_dim, group.key_head_dim),
+                    slot_states=group.slot_states,
                 )
             specs.append(spec)
         assert len({spec.attn_type for spec in specs}) == len(specs), "one group per attention type"
@@ -280,11 +353,14 @@ __all__ = [
     "AttentionGroupConfig",
     "BaseAttentionGroupConfig",
     "FullAttentionGroupConfig",
+    "GatedDeltaOutputGate",
     "KVCacheGroupSpec",
     "LinearGatedDeltaGroupConfig",
     "ModelConfig",
     "MoeStrategy",
+    "QSAAttentionGroupConfig",
     "RotaryConfig",
     "SWAAttentionGroupConfig",
+    "SlotStateSpec",
     "mrope_layout_from_rope_params",
 ]

@@ -13,6 +13,8 @@
 #include "gather_sorted.h"
 #include "gdn_step.h"
 #include "moe_lookup.h"
+#include "ple_lookup.h"
+#include "ple_service.h"
 #include "rows.h"
 #include "sample.h"
 
@@ -34,6 +36,7 @@ NB_MODULE(_C, m) {
       "unquantized_source"_a);
   m.def("init_sample_library", &ftmetal::init_sample_library, "source"_a);
   m.def("init_moe_lookup_library", &ftmetal::init_moe_lookup_library, "source"_a);
+  m.def("init_ple_lookup_library", &ftmetal::init_ple_lookup_library, "source"_a);
 
   m.def(
       "scatter_rows",
@@ -136,6 +139,31 @@ NB_MODULE(_C, m) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       "Paged causal flash-attention of each tile's queries over its request's keys; returns [T, Hq, D].");
+
+  m.def(
+      "flash_prefill_qsa",
+      &ftmetal::flash_prefill_qsa,
+      "q"_a,
+      "k_cache"_a,
+      "v_cache"_a,
+      "page_table"_a,
+      "tiles"_a,
+      "qsa_blocks"_a,
+      "qsa_counts"_a,
+      "qsa_bits"_a,
+      "qsa_block_size"_a,
+      "page_size"_a,
+      "num_row_groups"_a,
+      "head_split"_a,
+      "block_k"_a,
+      "kv_shared"_a,
+      "num_passes"_a,
+      "num_partitions"_a,
+      "mpp"_a,
+      "scale"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      "flash_prefill over each tile's listed QSA blocks, masked per query by its block bits; returns [T, Hq, D].");
 
   m.def(
       "gather_qmm_sorted",
@@ -423,6 +451,170 @@ NB_MODULE(_C, m) {
           &ftmetal::ExpertService::shutdown,
           nb::call_guard<nb::gil_scoped_release>(),
           "Answer a waiting lookup with SHUTDOWN, refuse later ones and stop the threads.");
+
+  m.attr("PLE_MAILBOX_WORDS") = ftmetal::PLE_MAILBOX_WORDS;
+  m.attr("MAX_PLE_ROWS") = ftmetal::MAX_PLE_ROWS;
+  nb::enum_<ftmetal::PleMailboxWord>(m, "PleMailboxWord", nb::is_arithmetic())
+      .value("STATE", ftmetal::PleMailboxWord::State)
+      .value("SEQUENCE", ftmetal::PleMailboxWord::Sequence)
+      .value("ACKNOWLEDGED", ftmetal::PleMailboxWord::Acknowledged)
+      .value("SHUTDOWN", ftmetal::PleMailboxWord::Shutdown)
+      .value("NUM_ROWS", ftmetal::PleMailboxWord::NumRows)
+      .value("ERROR", ftmetal::PleMailboxWord::Error)
+      .value("ROWS", ftmetal::PleMailboxWord::Rows);
+
+  using Int64Table2 = nb::ndarray<const int64_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
+  using RowIds = nb::ndarray<const int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
+  using RowPart = nb::ndarray<uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
+  nb::class_<ftmetal::PleRowStore>(m, "PleRowStore")
+      .def(
+          "__init__",
+          [](ftmetal::PleRowStore* store,
+             const std::vector<std::string>& files,
+             Int64Table3 parts,
+             std::vector<int64_t> shard_starts,
+             std::vector<int64_t> row_bytes,
+             int64_t cache_rows,
+             int io_threads) {
+            if (parts.shape(1) != 3 || parts.shape(2) != 3) {
+              throw std::invalid_argument("PleRowStore: parts must be int64 [num_shards, 3, 3]");
+            }
+            new (store) ftmetal::PleRowStore(
+                files,
+                std::vector<int64_t>(parts.data(), parts.data() + parts.size()),
+                std::move(shard_starts),
+                std::move(row_bytes),
+                cache_rows,
+                io_threads);
+          },
+          "files"_a,
+          "parts"_a,
+          "shard_starts"_a,
+          "row_bytes"_a,
+          "cache_rows"_a,
+          "io_threads"_a,
+          "The PLE table's rows, read from the checkpoint files into a row cache.")
+      .def(
+          "gather",
+          [](const ftmetal::PleRowStore& store,
+             RowIds ids,
+             RowPart weight,
+             RowPart scales,
+             RowPart biases) {
+            RowPart parts[3] = {weight, scales, biases};
+            uint8_t* data[3];
+            for (int p = 0; p < 3; ++p) {
+              if (parts[p].shape(0) != ids.shape(0) ||
+                  static_cast<int64_t>(parts[p].shape(1)) != store.row_bytes(p)) {
+                throw std::invalid_argument(
+                    "PleRowStore.gather: each part must be uint8 [num_ids, its row bytes]");
+              }
+              data[p] = parts[p].data();
+            }
+            for (size_t i = 0; i < ids.shape(0); ++i) {
+              if (ids(i) < 0 || ids(i) >= store.num_rows()) {
+                throw std::out_of_range(
+                    "PleRowStore.gather: row " + std::to_string(ids(i)) + " is not in [0, " +
+                    std::to_string(store.num_rows()) + ")");
+              }
+            }
+            nb::gil_scoped_release release;
+            store.gather(ids.data(), static_cast<int64_t>(ids.shape(0)), data);
+          },
+          "ids"_a,
+          "weight"_a,
+          "scales"_a,
+          "biases"_a,
+          "Copy the rows ids int64 [n] into the parts uint8 [n, row bytes].")
+      .def_prop_ro("num_rows", &ftmetal::PleRowStore::num_rows)
+      .def_prop_ro(
+          "row_bytes",
+          [](const ftmetal::PleRowStore& store) {
+            return std::vector<int64_t>{store.row_bytes(0), store.row_bytes(1), store.row_bytes(2)};
+          })
+      .def_prop_ro("hits", &ftmetal::PleRowStore::hits)
+      .def_prop_ro("misses", &ftmetal::PleRowStore::misses)
+      .def_prop_ro("bytes_read", &ftmetal::PleRowStore::bytes_read);
+
+  nb::class_<ftmetal::PleService>(m, "PleService")
+      .def(
+          nb::init<
+              mx::array,
+              std::vector<mx::array>,
+              const ftmetal::PleRowStore&,
+              std::vector<int64_t>,
+              std::vector<int64_t>,
+              std::vector<int64_t>,
+              int64_t,
+              double,
+              bool>(),
+          "mailbox"_a,
+          "staging"_a,
+          "store"_a,
+          "multipliers"_a,
+          "head_sizes"_a,
+          "head_offsets"_a,
+          "eos_token_id"_a,
+          "stall_timeout_s"_a,
+          "run_coordinator"_a,
+          nb::keep_alive<1, 4>(),
+          "Answer ple_post's posts with the store's rows; the store lives as long as the service.")
+      .def_prop_ro("num_heads", &ftmetal::PleService::num_heads)
+      .def(
+          "ngram_ids",
+          [](const ftmetal::PleService& service, Int64Table2 triples) {
+            if (triples.shape(1) != 3) {
+              throw std::invalid_argument(
+                  "PleService.ngram_ids: triples must be int64 [n, 3] (token, previous, before "
+                  "previous)");
+            }
+            size_t num_triples = triples.shape(0);
+            size_t heads = static_cast<size_t>(service.num_heads());
+            auto* ids = new int64_t[num_triples * heads];
+            nb::capsule owner(ids, [](void* pointer) noexcept {
+              delete[] static_cast<int64_t*>(pointer);
+            });
+            service.ngram_ids(triples.data(), static_cast<int64_t>(num_triples), ids);
+            return nb::ndarray<nb::numpy, int64_t, nb::ndim<2>>(ids, {num_triples, heads}, owner);
+          },
+          "triples"_a,
+          "The table row of each head of each (token, previous, before previous) triple.")
+      .def(
+          "arm",
+          &ftmetal::PleService::arm,
+          "Keep the coordinator spinning through the step about to be submitted.")
+      .def(
+          "check_healthy",
+          &ftmetal::PleService::check_healthy,
+          "Raise the first failure: a read, a broken or unanswered post, the shutdown.")
+      .def(
+          "shutdown",
+          &ftmetal::PleService::shutdown,
+          nb::call_guard<nb::gil_scoped_release>(),
+          "Answer a waiting ple_wait with SHUTDOWN, refuse later posts and stop the threads.");
+
+  m.def(
+      "ple_post",
+      &ftmetal::ple_post,
+      "input_ids"_a,
+      "slots"_a,
+      "context"_a,
+      "mailbox"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      "Post a decode step's rows and advance their n-gram context; returns (context, input_ids copy, ticket).");
+
+  m.def(
+      "ple_wait",
+      &ftmetal::ple_wait,
+      "ticket"_a,
+      "mailbox"_a,
+      "staging"_a,
+      "num_rows"_a,
+      "after"_a = std::vector<mx::array>{},
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      "The rows of ple_post's ticket once the CPU answered (zeros if it failed); returns (weight, scales, biases).");
 
   m.def(
       "sample_tokens",

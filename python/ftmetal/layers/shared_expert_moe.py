@@ -1,6 +1,8 @@
-"""Qwen3.5 sparse MoE block: softmax top-k router, routed experts, gated shared expert.
+"""Sparse MoE block of the Qwen3.5 families: softmax top-k router, routed experts, a shared
+expert gated by sigmoid(shared_expert_gate(x)).
 
-Port of FreeToken models/qwen3_5_moe/moe.py. Divergences: the router is the fused
+Port of FreeToken models/qwen3_5_moe/moe.py, shared by Qwen3.5 / 3.6 and Qwen3.8's
+qwen4_exp (FreeToken's Qwen4ExpMoE subclasses it unchanged). Divergences: the router is the fused
 kernel/router Metal kernel (fp32 softmax, top-k, renorm in one launch) and the
 experts are the resident MoELayer, or OffloadMoELayer under the offload strategy (FreeToken's
 make_moe_layer choice, made here).
@@ -18,7 +20,9 @@ from ftmetal.layers.moe import MoELayer, OffloadMoELayer
 from ftmetal.layers.quantization.config import QuantScheme
 from ftmetal.layers.quantization.moe import ExpertSchemes
 from ftmetal.models.config import ModelConfig
-from ftmetal.models.qwen3_5_moe.weight import GATE_UP_PARTS
+
+# Checkpoint module paths of the fused gate_up projection's parts.
+GATE_UP_PARTS = ("gate_proj", "up_proj")
 
 
 class SharedExpert(BaseOP):
@@ -45,7 +49,7 @@ class SharedExpert(BaseOP):
         return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
 
 
-class Qwen3_5MoE(BaseOP):
+class SharedExpertMoE(BaseOP):
     def __init__(
         self,
         config: ModelConfig,
@@ -103,4 +107,4 @@ class Qwen3_5MoE(BaseOP):
         return sigmoid_gated_add(routed, shared, self.shared_expert_gate.forward(hidden_states))
 
 
-__all__ = ["Qwen3_5MoE", "SharedExpert"]
+__all__ = ["GATE_UP_PARTS", "SharedExpert", "SharedExpertMoE"]

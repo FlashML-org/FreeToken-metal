@@ -9,7 +9,8 @@ turn over a long cached prefix), the partials merged by a second pass. This modu
 the tiles and picks the partitioning, once per batch (prefill_tiles), and launches the
 primitive per layer (flash_prefill). The kernel's two GEMMs run on simdgroup matrices or
 as MetalPerformancePrimitives matmul2d, which reaches the matrix units of GPUs that have
-them (default_mma).
+them (default_mma). flash_prefill_qsa runs the same kernel block-sparse for one request:
+each tile streams only the QSA blocks its queries attend, masked per query.
 """
 
 from __future__ import annotations
@@ -53,6 +54,11 @@ MPP_BLOCK_K = 16
 NAX_MACOS_VERSION = (26, 2)
 NAX_GENERATION = 17
 NAX_P_GENERATION = 18
+# QSA mode: query rows per threadgroup (tokens x G, a multiple of 8). A tile's tokens share
+# their blocks' K/V reads but each attends the others' blocks masked: at Qwen3.8-Flash-Next's
+# shape (G 12, D 256, QSA block 4) the union is 1.24x a query's blocks at 2 tokens, 1.52x at
+# 4 and 1.84x at 8, and 2 tokens (24 rows) ran fastest (measured on the M4 Pro, 2026-10-19).
+QSA_THREADGROUP_ROWS = 24
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -214,4 +220,94 @@ def flash_prefill(
     )
 
 
-__all__ = ["FprefillMma", "PrefillTiles", "default_mma", "flash_prefill", "prefill_tiles"]
+def qsa_prefill_lists(
+    visible: mx.array, first_position: int, num_heads: int, num_kv_heads: int
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+    """flash_prefill_qsa's kernel inputs for one request's queries at consecutive positions
+    from first_position, visible bool [Q, num_blocks] the QSA blocks each attends.
+
+    Returns tiles int32 [num_tiles, 4] (as prefill_tiles lists them, all of request 0), each
+    tile's union of visible blocks int32 [num_tiles, num_blocks] ascending, the first
+    counts int32 [num_tiles] of them real, and each query's visible blocks as bits uint32
+    [Q, ceil(num_blocks / 32)] (bit b % 32 of word b / 32 for block b).
+    """
+    num_queries, num_blocks = visible.shape
+    tile_queries = QSA_THREADGROUP_ROWS // (num_heads // num_kv_heads)
+    num_tiles = -(-num_queries // tile_queries)
+    words = mx.pad(visible, [(0, 0), (0, -num_blocks % 32)]).reshape(num_queries, -1, 32)
+    bits = (words.astype(mx.uint32) << mx.arange(32, dtype=mx.uint32)).sum(axis=-1)
+    padded = mx.pad(visible, [(0, num_tiles * tile_queries - num_queries), (0, 0)])
+    union = padded.reshape(num_tiles, tile_queries, num_blocks).any(axis=1)
+    block_ids = mx.arange(num_blocks, dtype=mx.int32)
+    blocks = mx.sort(mx.where(union, block_ids, num_blocks), axis=-1)
+    first_query = np.arange(num_tiles) * tile_queries
+    query_count = np.minimum(tile_queries, num_queries - first_query)
+    tiles = np.stack(
+        [np.zeros(num_tiles), first_query, query_count, first_position + first_query], axis=1
+    )
+    return mx.array(tiles.astype(np.int32)), blocks, union.sum(axis=-1), bits
+
+
+def flash_prefill_qsa(
+    q: mx.array,
+    k_cache: mx.array,
+    v_cache: mx.array,
+    page_table: mx.array,
+    page_size: int,
+    visible: mx.array,
+    first_position: int,
+    block_size: int,
+    scale: float,
+    mma: FprefillMma | None = None,
+) -> mx.array:
+    """Block-sparse attention of one request's queries over its paged keys.
+
+    q [Q, Hq, D] holds the queries at consecutive positions from first_position;
+    page_table [1, max_pages] int32 the request's page ids into k_cache / v_cache
+    [num_pages * page_size, Hkv, D] in q's dtype, already holding the queries' own keys.
+    Query i attends the keys of the block_size-key QSA blocks visible[i] marks (bool
+    [Q, num_blocks], num_blocks covering its own block) up to its own position. A tile of
+    QSA_THREADGROUP_ROWS // G queries streams its queries' blocks' union once. mma picks
+    the GEMMs (default_mma when None). Returns [Q, Hq, D].
+    """
+    num_heads, head_dim = q.shape[1:]
+    num_kv_heads = k_cache.shape[1]
+    assert num_heads % num_kv_heads == 0 and num_heads // num_kv_heads <= QSA_THREADGROUP_ROWS
+    assert head_dim <= MAX_HEAD_DIM and page_table.shape[0] == 1
+    assert visible.shape[1] * block_size >= first_position + q.shape[0]
+    mma = default_mma() if mma is None else mma
+    head_split, block_k, kv_shared, num_passes = staging_plan(head_dim, q.dtype.size, mma)
+    tiles, blocks, counts, bits = qsa_prefill_lists(
+        visible, first_position, num_heads, num_kv_heads
+    )
+    return _C.flash_prefill_qsa(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        tiles,
+        blocks,
+        counts,
+        bits,
+        block_size,
+        page_size,
+        QSA_THREADGROUP_ROWS // FRAGMENT_ROWS,
+        head_split,
+        block_k,
+        kv_shared,
+        num_passes,
+        1,
+        mma == "mpp",
+        scale,
+    )
+
+
+__all__ = [
+    "FprefillMma",
+    "PrefillTiles",
+    "default_mma",
+    "flash_prefill",
+    "flash_prefill_qsa",
+    "prefill_tiles",
+    "qsa_prefill_lists",
+]

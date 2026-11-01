@@ -1,6 +1,6 @@
 """Attention taxonomy and the backend base.
 
-Port of FreeToken attention/base.py. Divergences: only the FULL, SWA and LINEAR types
+Port of FreeToken attention/base.py. Divergences: only the FULL, SWA, LINEAR and QSA types
 exist, the base backend defines prepare_metadata and the capture hooks only (each
 attention type fixes its own forward signature), AttnType and the metadata records live
 in attention/metadata.py, and the capture hooks serve CommandGraph: a replay rebinds its

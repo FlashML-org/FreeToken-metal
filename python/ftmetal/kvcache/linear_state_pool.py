@@ -1,21 +1,21 @@
 """Per-request recurrent state (conv + SSM) for GDN layers.
 
-Port of FreeToken kvcache/linear_state_pool.py. Divergences: one array per layer
-for the conv states and the recurrent states [num_slots, num_v_heads,
-value_head_dim, key_head_dim] (the layouts the GDN kernels read directly); clearing
-and copying slots are the in-place row primitives; no extra slot_states and no
-runtime rebuild. The conv state of a slot is a ring [kernel, conv_dim] of the last
-kernel conv inputs stored at position mod kernel, so the fused decode step can
-update it in the same launch that reads it (a shift register would race). A prefill
-snapshot for the hybrid radix cache is a whole slot, written into a request's
-ping-pong slot at the deepest stride boundary inside its chunk and at most its prompt's
-reuse_len. The pool is built from the LINEAR group's spec and prices itself (FreeToken's
-engine adds state_pool_bytes to the KV family's fixed cost instead). The hybrid radix
-cache's snapshot cache is gdn_snapshots slots on top of the running requests' (FreeToken's
-is max(4, linear_state_cache_ratio x max_running_req)). Naive holds only each running
-request's live slot and the padding slot, FreeToken's naive size; the live slot is a
-free-list slot the request takes at admission and returns at its finish or abort
-(SGLang's HybridReqToTokenPool), where FreeToken's naive keys it by table_idx.
+Port of FreeToken kvcache/linear_state_pool.py. Divergences: one array per layer for the
+conv states and the recurrent states [num_slots, num_v_heads, value_head_dim, key_head_dim]
+(the layouts the GDN kernels read directly), and one array per slot state a model declares
+(FreeToken's slot_states) [num_slots, *shape]; clearing and copying slots are the in-place
+row primitives; no runtime rebuild. The conv state of a slot is a ring [kernel, conv_dim] of
+the last kernel conv inputs stored at position mod kernel, so the fused decode step can
+update it in the same launch that reads it (a shift register would race). A prefill snapshot
+for the hybrid radix cache is a whole slot, written into a request's ping-pong slot at the
+deepest stride boundary inside its chunk and at most its prompt's reuse_len. The pool is
+built from the LINEAR group's spec and prices itself (FreeToken's engine adds
+state_pool_bytes to the KV family's fixed cost instead). The hybrid radix cache's snapshot
+cache is gdn_snapshots slots on top of the running requests' (FreeToken's is max(4,
+linear_state_cache_ratio x max_running_req)). Naive holds only each running request's live
+slot and the padding slot, FreeToken's naive size; the live slot is a free-list slot the
+request takes at admission and returns at its finish or abort (SGLang's
+HybridReqToTokenPool), where FreeToken's naive keys it by table_idx.
 """
 
 from __future__ import annotations
@@ -80,7 +80,12 @@ class LinearStatePool(BasePool):
         self.recurrent_states = [
             mx.zeros((num_slots, *spec.state_shape), dtype=spec.state_dtype) for _ in spec.layer_ids
         ]
-        mx.eval(*self.conv_states, *self.recurrent_states)
+        # A model's own per-slot states by name, zeroed with the slot.
+        self.slot_states = {
+            state.name: mx.zeros((num_slots, *state.shape), dtype=state.dtype or dtype)
+            for state in spec.slot_states
+        }
+        mx.eval(*self.conv_states, *self.recurrent_states, *self.slot_states.values())
         self.local_index_map = {layer_id: i for i, layer_id in enumerate(spec.layer_ids)}
         self.padding_slot = PADDING_SLOT
         self.free_slots: list[int] = list(range(1, num_slots))
@@ -112,6 +117,8 @@ class LinearStatePool(BasePool):
         for i in range(len(self.conv_states)):
             self.conv_states[i] = zero_rows(self.conv_states[i], ids)
             self.recurrent_states[i] = zero_rows(self.recurrent_states[i], ids)
+        for name, state in self.slot_states.items():
+            self.slot_states[name] = zero_rows(state, ids)
 
     def copy_from(self, src: int, dst: int) -> None:
         """Copy a whole-sequence snapshot (all layers) from slot src to slot dst."""
@@ -120,6 +127,8 @@ class LinearStatePool(BasePool):
         for i in range(len(self.conv_states)):
             self.conv_states[i] = copy_rows(self.conv_states[i], src_ids, dst_ids)
             self.recurrent_states[i] = copy_rows(self.recurrent_states[i], src_ids, dst_ids)
+        for name, state in self.slot_states.items():
+            self.slot_states[name] = copy_rows(state, src_ids, dst_ids)
 
     def is_linear_layer(self, layer_id: int) -> bool:
         return layer_id in self.local_index_map
@@ -128,12 +137,13 @@ class LinearStatePool(BasePool):
         return self.local_index_map[layer_id]
 
     def arrays(self) -> list[mx.array]:
-        return [*self.conv_states, *self.recurrent_states]
+        return [*self.conv_states, *self.recurrent_states, *self.slot_states.values()]
 
     def set_arrays(self, arrays: list[mx.array]) -> None:
         count = len(self.conv_states)
-        assert len(arrays) == 2 * count
-        self.conv_states, self.recurrent_states = arrays[:count], arrays[count:]
+        assert len(arrays) == 2 * count + len(self.slot_states)
+        self.conv_states, self.recurrent_states = arrays[:count], arrays[count : 2 * count]
+        self.slot_states = dict(zip(self.slot_states, arrays[2 * count :], strict=True))
 
     @property
     def num_linear_layers(self) -> int:
@@ -148,7 +158,8 @@ class LinearStatePool(BasePool):
         rec = self.recurrent_states[0]
         per_layer = conv.size // conv.shape[0] * conv.dtype.size
         per_layer += rec.size // rec.shape[0] * rec.dtype.size
-        return per_layer * len(self.conv_states)
+        extra = sum(state.nbytes // state.shape[0] for state in self.slot_states.values())
+        return per_layer * len(self.conv_states) + extra
 
 
 __all__ = [

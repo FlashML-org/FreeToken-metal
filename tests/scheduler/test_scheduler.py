@@ -25,7 +25,7 @@ def make_scheduler(path: Path, max_running_req: int, num_pages: int) -> Schedule
         max_running_req=max_running_req,
         page_size=4,
         num_page_override=num_pages,
-        max_extend_tokens=32,
+        max_extend_tokens_override=32,
     )
     return Scheduler(config, eos_token_ids={127})
 

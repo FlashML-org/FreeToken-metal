@@ -1,6 +1,7 @@
 """Gated DeltaNet layer over the per-request state pool.
 
-Port of FreeToken models/qwen3_5_moe/gdn.py. Divergences: decode is one fused
+Port of FreeToken models/qwen3_5_moe/gdn.py, shared by the GDN families (Qwen3.5 / 3.6 and
+Qwen3.8's qwen4_exp, which gates the output norm with a sigmoid). Divergences: decode is one fused
 launch per layer (conv, gating, q/k norm, recurrence) that updates the conv ring and
 the recurrent state in place; prefill runs one request at a time (varlen): one fused
 launch for conv over the ring's last taps plus the chunk, gating and q/k norm, the
@@ -26,14 +27,16 @@ from ftmetal.layers.linear import Linear, LinearMerged
 from ftmetal.layers.norm import GatedRMSNorm
 from ftmetal.layers.quantization.config import QuantScheme
 from ftmetal.models.config import LinearGatedDeltaGroupConfig
-from ftmetal.models.qwen3_5_moe.weight import IN_PROJ_BA_PARTS, IN_PROJ_QKVZ_PARTS
 
+# Checkpoint module paths of the fused input projections' parts.
+IN_PROJ_QKVZ_PARTS = ("in_proj_qkv", "in_proj_z")
+IN_PROJ_BA_PARTS = ("in_proj_b", "in_proj_a")
 # Shortest prefill run chunked; the per-token kernel is faster below it (crossover at
 # 52-56 tokens on the M4 Pro at the Qwen3.6 shapes, calls serialized as layers are).
 CHUNKED_MIN_TOKENS = 56
 
 
-class Qwen3_5GatedDeltaNet(BaseOP):
+class GatedDeltaNet(BaseOP):
     def __init__(
         self,
         hidden_size: int,
@@ -73,7 +76,9 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self.conv1d = DepthwiseConv1d(self.conv_dim, self.conv_kernel_size, dtype)
         self.dt_bias = mx.ones((self.num_v_heads,), dtype=dtype)
         self.A_log = mx.zeros((self.num_v_heads,), dtype=dtype)
-        self.norm = GatedRMSNorm(self.head_v_dim, eps=rms_norm_eps, dtype=dtype)
+        self.norm = GatedRMSNorm(
+            self.head_v_dim, eps=rms_norm_eps, activation=group.output_gate, dtype=dtype
+        )
         self.out_proj = Linear(self.value_dim, hidden_size, scheme=out_scheme, dtype=dtype)
 
     @staticmethod
@@ -208,4 +213,10 @@ class DepthwiseConv1d(BaseOP):
         return self.weight
 
 
-__all__ = ["DepthwiseConv1d", "Qwen3_5GatedDeltaNet"]
+__all__ = [
+    "CHUNKED_MIN_TOKENS",
+    "IN_PROJ_BA_PARTS",
+    "IN_PROJ_QKVZ_PARTS",
+    "DepthwiseConv1d",
+    "GatedDeltaNet",
+]

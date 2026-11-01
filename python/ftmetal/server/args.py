@@ -293,11 +293,12 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
     parser.add_argument(
         "--max-prefill-length",
         "--max-extend-length",
-        dest="max_extend_tokens",
+        dest="max_extend_tokens_override",
         type=positive_int,
         metavar="N",
-        default=ServerArgs.max_extend_tokens,
-        help="prefill tokens per batch; longer prompts are chunked",
+        default=ServerArgs.max_extend_tokens_override,
+        help="prefill tokens per batch, longer prompts chunked (default: the model's, 2048 "
+        "for most)",
     )
     parser.add_argument(
         "--num-pages",
@@ -580,7 +581,7 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         max_running_req=namespace.max_running_req,
         max_seq_len_override=namespace.max_seq_len_override,
         max_output_tokens=namespace.max_output_tokens,
-        max_extend_tokens=namespace.max_extend_tokens,
+        max_extend_tokens_override=namespace.max_extend_tokens_override,
         num_page_override=namespace.num_page_override,
         page_size=namespace.page_size,
         cache_type=namespace.cache_type,

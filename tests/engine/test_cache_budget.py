@@ -186,7 +186,7 @@ def test_qwen3_6_budget_reproduces_pages_and_slots(
         page_size=case.page_size,
         max_running_req=case.max_running_req,
         gdn_snapshots=case.gdn_snapshots,
-        max_extend_tokens=case.max_extend_tokens,
+        max_extend_tokens_override=case.max_extend_tokens,
         num_page_override=case.num_page_override,
         cache_type=case.cache_type,
     )
@@ -207,7 +207,7 @@ def test_qwen3_6_budget_reproduces_pages_and_slots(
 
 def test_graph_reserve_comes_off_the_paged_pools() -> None:
     model_config = parse_config(QWEN3_6_TEXT_CONFIG)
-    config = EngineConfig(model_path="unused", max_running_req=8)
+    config = EngineConfig(model_path="unused", max_running_req=8, max_extend_tokens_override=2048)
     costs = pool_costs(model_config.kv_cache_group_specs(), config)
     activations = activation_reserve_bytes(
         config.max_extend_tokens, model_config.num_qo_heads, IN_FLIGHT_STEPS
@@ -260,7 +260,7 @@ def test_encoder_reserve_comes_off_the_paged_pools() -> None:
     gemma4 = encoder_reserve_bytes(GEMMA4_VISION, VISION_CONFIG, mx.bfloat16, 2520, FEATURE_BYTES)
     assert gemma4 == 2520 * (4 * 768 + 2 * 24 * 1152) + 2 * 3 * 2560 * 4304 + (160 << 20)
     model_config = parse_config(QWEN3_6_TEXT_CONFIG)
-    config = EngineConfig(model_path="unused", max_running_req=8)
+    config = EngineConfig(model_path="unused", max_running_req=8, max_extend_tokens_override=2048)
     costs = pool_costs(model_config.kv_cache_group_specs(), config)
     budget = memory_budget_bytes(WORKING_SET_BYTES, None)
     without = plan_budget(budget, WEIGHTS_BYTES, 0, 0, costs)
@@ -369,7 +369,7 @@ def test_gemma4_window_pool_beside_the_global_pages() -> None:
         config = EngineConfig(
             model_path="unused",
             max_running_req=4,
-            max_extend_tokens=2048,
+            max_extend_tokens_override=2048,
             cache_type=case.cache_type,
         )
         costs = pool_costs(model_config.kv_cache_group_specs(), config)
@@ -595,6 +595,7 @@ def offload_budget(
 def test_qwen3_6_offload_budget(case: OffloadBudgetCase) -> None:
     config = EngineConfig(
         model_path="unused",
+        max_extend_tokens_override=2048,
         memory_ratio=case.memory_ratio,
         moe_cache_size=case.moe_cache_size,
         moe_cache_rate=case.moe_cache_rate,
@@ -620,7 +621,7 @@ REFUSED_OFFLOAD_CASES: list[tuple[dict[str, float | int | bool | None], str]] = 
 @pytest.mark.parametrize(("fields", "error"), REFUSED_OFFLOAD_CASES)
 def test_refused_offload_budgets(fields: dict[str, float | int | bool | None], error: str) -> None:
     with pytest.raises((ValueError, RuntimeError), match=error):
-        offload_budget(EngineConfig(model_path="unused", **fields))
+        offload_budget(EngineConfig(model_path="unused", max_extend_tokens_override=2048, **fields))
 
 
 # (--moe-strategy, EngineConfig flags, budget, the checkpoint's quantization mode or None for
@@ -660,7 +661,7 @@ def resolve_tiny_strategy(
     path: Path, strategy: MoeStrategyChoice, flags: dict[str, float | bool], budget: int
 ) -> MoeStrategy:
     config = EngineConfig(
-        model_path=str(path), max_extend_tokens=256, moe_strategy=strategy, **flags
+        model_path=str(path), max_extend_tokens_override=256, moe_strategy=strategy, **flags
     )
     model_config = config.model_config
     return resolve_moe_strategy(

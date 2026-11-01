@@ -36,7 +36,7 @@ constant constexpr uint STATE_DONE = 3;
 constant constexpr uint STATE_FAILED = 4;
 constant constexpr uint STATE_SHUTDOWN = 5;
 constant constexpr uint KIND_PROBE = 3;
-constant constexpr uint MAX_EXPERTS = 256;
+constant constexpr uint MAX_EXPERTS = 512;
 
 constant constexpr uint SIMD_WIDTH = 32;
 constant constexpr uint NUM_SIMDGROUPS = MAX_EXPERTS / SIMD_WIDTH;

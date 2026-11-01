@@ -49,6 +49,32 @@ mx::array flash_prefill(
     const std::optional<mx::array>& block_ends = std::nullopt,
     mx::StreamOrDevice s = {});
 
+// flash_prefill's QSA mode, without window or block ends: each tile streams only the keys of
+// its listed qsa_block_size-key QSA blocks, qsa_blocks [num_tiles, list_width] int32 block
+// ids ascending (the first qsa_counts [num_tiles] int32 of them real), and a query sees a
+// listed key when bit b % 32 of word b / 32 of its row of qsa_bits [num_tokens, bits_width]
+// uint32 is set for the key's block b and the key is not past it.
+mx::array flash_prefill_qsa(
+    const mx::array& q,
+    const mx::array& k_cache,
+    const mx::array& v_cache,
+    const mx::array& page_table,
+    const mx::array& tiles,
+    const mx::array& qsa_blocks,
+    const mx::array& qsa_counts,
+    const mx::array& qsa_bits,
+    int qsa_block_size,
+    int page_size,
+    int num_row_groups,
+    int head_split,
+    int block_k,
+    bool kv_shared,
+    int num_passes,
+    int num_partitions,
+    bool mpp,
+    float scale,
+    mx::StreamOrDevice s = {});
+
 struct FlashPrefillConfig {
   int head_dim;
   int group;
@@ -64,6 +90,8 @@ struct FlashPrefillConfig {
   bool mpp;
   float scale;
   bool has_block_ends;
+  // 0: every key up to the query is a candidate; else flash_prefill_qsa's block size.
+  int qsa_block_size;
 
   bool operator==(const FlashPrefillConfig&) const = default;
 };

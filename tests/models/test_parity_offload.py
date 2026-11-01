@@ -313,7 +313,7 @@ def make_scheduler(path: Path, case: Case, strategy: MoeStrategy) -> Scheduler:
         max_running_req=max(2, len(case.prompt_lens)),
         page_size=4,
         num_page_override=128,
-        max_extend_tokens=case.max_extend_tokens,
+        max_extend_tokens_override=case.max_extend_tokens,
         command_graph=case.command_graph,
         moe_strategy=strategy,
         moe_cache_size=case.cache_size if strategy == "offload" else 0,
