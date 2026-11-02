@@ -18,7 +18,8 @@ per layer. Every other format the experts load in serves the same overlap, copy-
 decode forwards: unquantized, MLX's float modes, the Hugging Face layout (one tensor per
 expert, or each layer's experts in two banks) and the ModelOpt and compressed-tensors
 exports, NVFP4 or FP8 (whose unit scales the checkpoint does not store) with per-expert
-output scales.
+output scales. A victim cache of a few entries, affine and NVFP4, serves the same forwards
+from the experts the slots evict.
 """
 
 from __future__ import annotations
@@ -104,6 +105,8 @@ class Case:
     up_bits: int = EXPERT_BITS
     last_layer_bits: int = EXPERT_BITS
     expert_format: ExpertFormat = "affine"
+    # The offload's victim cache (0: none).
+    victim_cache_gib: float = 0
 
 
 CASES = [
@@ -215,6 +218,22 @@ CASES = [
         reads_buffers=True,
         expert_format="compressed-tensors-fp8",
     ),
+    # Six affine (eight NVFP4) victim cache entries for the 12 experts outside the slots.
+    Case(
+        "victim-cache",
+        (100, 9),
+        overlap_min_tokens=48,
+        reads_buffers=True,
+        victim_cache_gib=8e-5,
+    ),
+    Case(
+        "nvfp4-victim-cache",
+        (100, 9),
+        overlap_min_tokens=48,
+        reads_buffers=True,
+        expert_format="nvfp4",
+        victim_cache_gib=8e-5,
+    ),
 ]
 
 
@@ -320,6 +339,7 @@ def make_scheduler(path: Path, case: Case, strategy: MoeStrategy) -> Scheduler:
         moe_pool=case.grouping,
         moe_prefill_overlap=case.prefill_overlap,
         moe_prefill_buffer=case.buffer_placement,
+        moe_victim_cache_gib=case.victim_cache_gib if strategy == "offload" else 0,
     )
     return Scheduler(config, eos_token_ids={127})
 
@@ -379,8 +399,11 @@ def test_offload_matches_resident_experts(
     assert len(scheduler.table_manager.free_slots) == min(max_running, case.max_decode_rows)
     stats = cache.stats()
     assert sum(stats.misses) > 0
-    # A prefill buffer read counts as an expert read but not as a miss.
-    assert (sum(stats.experts_read) > sum(stats.misses)) == case.reads_buffers
+    # A miss is an expert read or a victim cache hit; so is a prefill buffer's absent expert,
+    # which is no miss.
+    copied = sum(stats.victim_hits) + sum(stats.victim_buffer_hits)
+    assert (sum(stats.experts_read) + copied > sum(stats.misses)) == case.reads_buffers
+    assert (copied > 0) == (case.victim_cache_gib > 0)
     cache.check_healthy()
 
 

@@ -11,7 +11,8 @@ checkpoint (no host banks, so no --expert-load or CPU and hybrid strategies); au
 the experts resident when they fit (resolve_moe_strategy); the strategy and the cache size
 are settled before the model is built, and the size from the measured weights after it;
 the cache's health is checked once per forward by the caller, after the forward's tokens
-land (check_healthy), not right after its launch.
+land (check_healthy), not right after its launch; its victim cache lies outside the memory
+budget, in the host memory beyond Metal's working set.
 """
 
 from __future__ import annotations
@@ -47,6 +48,7 @@ from ftmetal.engine.cache_budget import (
     plan_budget,
     resolve_moe_cache_size,
     solve_num_pages,
+    victim_cache_bytes,
 )
 from ftmetal.engine.config import EngineConfig
 from ftmetal.engine.graph import GraphRunner, determine_graph_bs
@@ -336,6 +338,7 @@ class Engine:
         slot_layout: SlotLayout | None = None
         cache_size = 0
         experts_bytes = 0
+        victim_bytes = 0
         if is_offload:
             if config.moe_pool_slots == "profile":
                 if config.moe_pool_profile is not None:
@@ -403,6 +406,11 @@ class Engine:
                 f"MoE offload: {cache_size} expert slots of {total_experts} "
                 f"({cache_size / total_experts:.2f}), {config.moe_cache_policy}; {overlap_note}"
             )
+            memory_size = mx.device_info()["memory_size"]
+            assert isinstance(memory_size, int)
+            victim_bytes = victim_cache_bytes(config.moe_victim_cache_gib, memory_size, working_set)
+        elif config.moe_victim_cache_gib != 0:
+            logger.info("--moe-victim-cache-gib is ignored: the routed experts are not offloaded")
         report = plan_budget(
             budget,
             self.weights_bytes,
@@ -455,6 +463,7 @@ class Engine:
                 prefill_overlap=prefill_overlap,
                 prefill_overlap_min_tokens=config.moe_prefill_overlap_min_tokens,
                 expert_counts=expert_counts,
+                victim_cache_bytes=victim_bytes,
             )
             pool_slots = [pool.num_slots for pool in slot_layout.pools]
             logger.info(
@@ -464,6 +473,12 @@ class Engine:
                 f"{slot_layout.max_decode_rows}, looked-up prefill tokens <= "
                 f"{slot_layout.max_lookup_tokens}"
             )
+            if victim_bytes > 0:
+                stats = self.moe_offload_cache.stats()
+                logger.info(
+                    f"MoE offload: victim cache {stats.victim_bytes / GIB:.2f} GiB "
+                    f"({stats.victim_entries} entries), outside the budget"
+                )
             self.moe_offload_cache.fill_initial()
             self.moe_offload_cache.probe()
             logger.info(

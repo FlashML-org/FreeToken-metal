@@ -7,7 +7,9 @@
 // buffer_size experts each (0: none) hold an overlap prefill layer's absent experts; a pool's
 // first volatile slots lie under them, and their experts are dropped as each overlap prefill
 // begins. A miss evicts a slot of its own pool, never one used earlier in the same step: the
-// step's command buffer could read the old row from the GPU caches.
+// step's command buffer could read the old row from the GPU caches. Every expert leaving a
+// slot, evicted or dropped, is reported with the slot whose row still holds its bytes, for the
+// victim cache (victim_cache.h) to keep.
 #pragma once
 
 #include <compare>
@@ -29,11 +31,16 @@ void* shared_data(const mx::array& array, const std::string& name);
 // (expert, slot): one expert of a layer to read into one bank slot.
 using ExpertLoad = std::pair<int32_t, int32_t>;
 
+// (flat id, slot): an expert leaving the slot whose row holds it.
+using SlotExpert = std::pair<int32_t, int32_t>;
+
 struct SlotAssignment {
   std::vector<int32_t> slots;
   std::vector<ExpertLoad> loads;
   // Loads into a slot that held another expert.
   int64_t num_evicted = 0;
+  // The experts those loads evict.
+  std::vector<SlotExpert> evicted;
 };
 
 class SlotLru {
@@ -62,8 +69,9 @@ class SlotLru {
   // into the least recently used slots of the layer's pool that this call does not use.
   SlotAssignment resolve(int layer_id, const std::vector<int32_t>& expert_ids, uint32_t step);
 
-  // Drop every expert held in a slot under the prefill buffers.
-  void invalidate_prefill_buffers();
+  // Drop every expert held in a slot under the prefill buffers; returns them, the most
+  // recently used first.
+  std::vector<SlotExpert> invalidate_prefill_buffers();
 
   // Every expert of the layer: its slot when resident, else -1 - its row in prefill buffer
   // layer_id % 2, the absent taking rows 0, 1, ... in expert order, which the loads list as

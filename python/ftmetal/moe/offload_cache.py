@@ -21,7 +21,11 @@ host. No slot a step reads may be rewritten within the step, since the GPU cache
 its old row: a decode's rows are capped so that each pool holds its layers' experts of the
 whole decode at once (FreeToken caps per layer), one step as a graph replay must, and a
 copy-miss prefill whose experts may not all fit the pools at once runs as several steps,
-each its own command buffer.
+each its own command buffer. Below the slots, a victim cache in pageable host memory outside
+the GPU budget (victim_cache_bytes, 0: none; FreeToken has none) keeps the experts that leave
+their slots, purgeable under memory pressure: a later miss, or an overlap prefill's absent
+expert, is copied from it instead of read from the checkpoint. Only where a slot's bytes come
+from changes; the lookups and slot_of never see it.
 """
 
 from __future__ import annotations
@@ -63,15 +67,17 @@ class OffloadMoeCache:
         prefill_overlap: bool,
         prefill_overlap_min_tokens: int,
         expert_counts: np.ndarray | None = None,
+        victim_cache_bytes: int,
         stall_timeout_s: float = STALL_TIMEOUT_S,
         run_coordinator: bool = True,
     ) -> None:
         """slot_layout from plan_slot_layout, with prefill buffers when prefill_overlap is on,
         then a prefill of prefill_overlap_min_tokens or more reads its layers ahead;
         expert_counts int64 [num_layers, num_experts], the hot-expert table it was planned
-        with (None: none), picks the experts the pools start with. Without run_coordinator
-        nobody answers the lookups (a stalled coordinator, for tests); the watchdog fails a
-        request unanswered for stall_timeout_s."""
+        with (None: none), picks the experts the pools start with; victim_cache_bytes is the
+        host victim cache's budget, split over the pools by their slots' bytes (0: none).
+        Without run_coordinator nobody answers the lookups (a stalled coordinator, for
+        tests); the watchdog fails a request unanswered for stall_timeout_s."""
         self.slot_layout = slot_layout
         self.layer_pools = slot_layout.layer_pools
         num_layers, num_experts = len(self.layer_pools), slot_layout.num_experts
@@ -154,6 +160,7 @@ class OffloadMoeCache:
             locations,
             self.destinations,
             self.buffer_bytes.tolist(),
+            victim_cache_bytes,
             IO_THREADS,
             stall_timeout_s,
             run_coordinator,

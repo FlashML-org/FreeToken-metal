@@ -45,7 +45,8 @@ nanobind_add_module(
   ${CMAKE_CURRENT_LIST_DIR}/ple_row_store.cpp
   ${CMAKE_CURRENT_LIST_DIR}/ple_service.cpp
   ${CMAKE_CURRENT_LIST_DIR}/rows.cpp
-  ${CMAKE_CURRENT_LIST_DIR}/sample.cpp)
+  ${CMAKE_CURRENT_LIST_DIR}/sample.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/victim_cache.cpp)
 
 target_include_directories(_C PRIVATE ${MLX_INCLUDE_DIRS})
 target_compile_options(_C PRIVATE ${MLX_CXX_FLAGS})

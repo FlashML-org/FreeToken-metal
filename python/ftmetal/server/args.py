@@ -11,19 +11,22 @@ server, so there is no shell mode; the parser inference reads config.json itself
 transformers) and is module-level. MoE: --moe-strategy takes auto, fused and offload, and
 refuses FreeToken's cpu and hybrid (no host banks on unified memory); --expert-load is
 accepted and ignored; --memory-ratio defaults to unset (the working set less a headroom);
-no --moe-cpu-threads, --moe-cpu-layers, --moe-hybrid-max-fetch or --moe-prefill-hit-d2d.
+no --moe-cpu-threads, --moe-cpu-layers, --moe-hybrid-max-fetch or --moe-prefill-hit-d2d;
+--moe-victim-cache-gib is this engine's own.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import get_args
+from typing import Literal, get_args
 
 from ftmetal.attention import SUPPORTED_ATTENTION_BACKENDS
+from ftmetal.engine.cache_budget import GIB, VICTIM_CACHE_HOST_RESERVE_BYTES
 from ftmetal.engine.config import (
     CacheTypeChoice,
     EngineConfig,
@@ -130,6 +133,16 @@ def unit_fraction(value: str) -> float:
     if not 0 <= number <= 1:
         raise argparse.ArgumentTypeError(f"expected a number in [0, 1], got {value}")
     return number
+
+
+def victim_cache_gib(value: str) -> float | Literal["auto"]:
+    """--moe-victim-cache-gib: auto or a finite non-negative number of GiB."""
+    if value == "auto":
+        return "auto"
+    elif not (math.isfinite(float(value)) and float(value) >= 0):
+        raise argparse.ArgumentTypeError(f"expected auto or a non-negative number, got {value}")
+    else:
+        return float(value)
 
 
 def memory_fraction(value: str) -> float:
@@ -434,6 +447,16 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         "from two layers' experts to one token's per layer",
     )
     parser.add_argument(
+        "--moe-victim-cache-gib",
+        type=victim_cache_gib,
+        metavar="{auto,GIB}",
+        default=ServerArgs.moe_victim_cache_gib,
+        help="keep the experts the offload cache evicts in host memory beyond Metal's working "
+        "set, which the system may reclaim, so a later miss copies them back instead of "
+        f"reading the checkpoint: GiB of it, or auto (that memory less a "
+        f"{VICTIM_CACHE_HOST_RESERVE_BYTES // GIB} GiB reserve); 0 (default) keeps none",
+    )
+    parser.add_argument(
         "--expert-load",
         choices=["auto", "serial", "parallel"],
         default=None,
@@ -600,6 +623,7 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         moe_pool_slots=namespace.moe_pool_slots[0],
         moe_pool_profile=namespace.moe_pool_slots[1],
         moe_prefill_overlap=namespace.moe_prefill_overlap,
+        moe_victim_cache_gib=namespace.moe_victim_cache_gib,
         mm=MultimodalConfig(
             disabled_encoders=frozenset(disabled_encoders),
             image_min_tokens=image_min_tokens,
@@ -626,4 +650,5 @@ __all__ = [
     "parse_args",
     "positive_int",
     "unit_fraction",
+    "victim_cache_gib",
 ]

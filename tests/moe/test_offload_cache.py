@@ -7,9 +7,14 @@ and every slot slot_of maps), and at every slot of a prefetched prefill layer's 
 whose resident experts keep their slots. Large experts make one run of reads longer than
 a staging buffer; gate and up in different bits load as two banks in every layer; one pool
 for every layer and prefill buffers over the pools (which drop the experts under them as a
-prefill begins) take the same checks. Errors: a layer in another format, the prefill
-buffer protocol, a file cut short under the cache. The real-checkpoint case needs
-FTMETAL_TEST_MODEL_PATH.
+prefill begins) take the same checks. With a victim cache the same scripts must also leave
+no expert both in a slot and in the victim cache, and every miss or prefetched absent expert
+must be read or copied from it. The victim cache on its own: an evicted expert asked for again
+is copied back, not read, and its entries drop their oldest when full; purged entries are
+read again; an overlap prefill copies the experts it holds into the buffer and keeps them,
+and stores the experts it drops from the slots under the buffers, the most recently used
+first. Errors: a layer in another format, the prefill buffer protocol, a file cut short under
+the cache. The real-checkpoint case needs FTMETAL_TEST_MODEL_PATH.
 """
 
 from __future__ import annotations
@@ -45,6 +50,7 @@ from offload_harness import (
     Naming,
     build_cache,
     checkpoint_rules,
+    entry_bytes,
     moe_layout,
     read_state,
     weight_rules,
@@ -82,6 +88,8 @@ class Case:
     buffer_placement: PrefillBufferPlacement = "overlay"
     # One tensor per expert, in the Hugging Face layout.
     is_per_expert: bool = False
+    # The victim cache's budget in entries of the widest layer (0: none).
+    victim_cache_entries: int = 0
 
     @property
     def spec(self) -> CheckpointSpec:
@@ -103,10 +111,11 @@ class Case:
             scheme += f"-up{self.up_bits}"
         overlap = f"-{self.buffer_placement}" if self.prefill_overlap else ""
         per_expert = "-per-expert" if self.is_per_expert else ""
+        victims = f"-V{self.victim_cache_entries}" if self.victim_cache_entries else ""
         return (
             f"{self.naming}-L{self.num_layers}-E{self.num_experts}-H{self.hidden_size}"
             f"-I{self.intermediate_size}-S{self.cache_size}-{self.grouping}{overlap}-{scheme}"
-            f"{per_expert}"
+            f"{per_expert}{victims}"
         )
 
 
@@ -257,6 +266,98 @@ CASES = [
         is_per_expert=True,
     ),
     Case(1, 4, 2048, 2048, 4, False, script=(((0, (0, 1, 2, 3)),),), is_per_expert=True),
+    # A victim cache under the scripts above: decode misses, overlap prefills, bf16, gate and
+    # up apart, one pool for every layer, pools of two layouts.
+    Case(
+        3,
+        8,
+        192,
+        64,
+        12,
+        False,
+        script=(
+            ((0, (0, 5, 6)), (1, (7,)), (2, (1, 2))),
+            ((0, (5, 7, 3)), (1, (0, 1, 2, 3)), (2, (6,))),
+            ((1, (4, 5)), (2, (0, 7, 6))),
+            ((0, (1, 2, 4)), (2, (3, 4, 5))),
+        ),
+        victim_cache_entries=6,
+    ),
+    Case(
+        4,
+        4,
+        128,
+        128,
+        14,
+        True,
+        script=(
+            ((0, (1, 2)), (1, (3,)), (3, (0, 3))),
+            Prefill((0, 1, 2, 3)),
+            ((0, (0, 3)), (1, (0, 1, 2)), (2, (2,)), (3, (1,))),
+            Prefill((1, 2)),
+            ((2, (0, 1, 3)),),
+        ),
+        naming="gemma4",
+        victim_cache_entries=8,
+    ),
+    # Every slot under the buffers: the prefill stores each pool's two newest experts.
+    Case(
+        3,
+        8,
+        192,
+        64,
+        16,
+        True,
+        script=(((0, (6, 7)), (2, (5, 6, 7))), Prefill((0, 1, 2)), ((0, (0, 1)), (2, (0, 1)))),
+        scheme=None,
+        victim_cache_entries=8,
+    ),
+    Case(
+        3,
+        8,
+        192,
+        64,
+        12,
+        False,
+        script=(((0, (0, 5, 6)), (1, (7,)), (2, (1, 2))), ((0, (5, 7, 1)), (2, (6, 0)))),
+        up_bits=8,
+        victim_cache_entries=6,
+    ),
+    Case(
+        4,
+        4,
+        128,
+        64,
+        12,
+        True,
+        script=(
+            ((0, (1, 2)), (1, (3,)), (3, (0, 3))),
+            ((0, (0, 3)), (1, (0, 1, 2)), (2, (2,)), (3, (1,))),
+            Prefill((0, 1, 2, 3)),
+            ((1, (3, 1)), (2, (0, 1, 2, 3))),
+            Prefill((1, 2)),
+            ((2, (0, 1)),),
+        ),
+        grouping="unified",
+        buffer_placement="overlay",
+        victim_cache_entries=4,
+    ),
+    Case(
+        3,
+        8,
+        192,
+        64,
+        18,
+        True,
+        script=(
+            ((0, (0, 5, 6)), (1, (7,)), (2, (1, 2, 6, 7))),
+            Prefill((0, 1, 2)),
+            ((0, (5, 7, 3)), (2, (6, 0)), (1, (3, 4))),
+        ),
+        last_layer_bits=8,
+        grouping="unified",
+        victim_cache_entries=6,
+    ),
 ]
 
 
@@ -269,6 +370,7 @@ def build(directory: Path, case: Case) -> tuple[OffloadMoeCache, dict[str, mx.ar
         prefill_overlap=case.prefill_overlap,
         grouping=case.grouping,
         buffer_placement=case.buffer_placement,
+        victim_cache_bytes=case.victim_cache_entries * entry_bytes(case.spec),
     )
     reference = apply_rules(read_state(directory, case.spec)[0], checkpoint_rules(case.spec))
     return cache, reference, source
@@ -306,6 +408,12 @@ def expected_rows(
     return rows
 
 
+def check_exclusive(cache: OffloadMoeCache) -> None:
+    """No expert is both in a slot and in the victim cache."""
+    resident = {layer_id * cache.num_experts + expert for layer_id, expert in resident_rows(cache)}
+    assert resident.isdisjoint(cache.service.victim_cache_ids())
+
+
 def slot_offsets(cache: OffloadMoeCache, layer_id: int, slot: int) -> np.ndarray:
     """The byte offset of the layer's row at slot in every bank."""
     return cache.destinations[layer_id, :, 0] + slot * cache.destinations[layer_id, :, 1]
@@ -341,9 +449,12 @@ def test_rows_match_checkpoint(tmp_path: Path, case: Case) -> None:
     check_rows(cache, expected, located(rows))
     pools = cache.slot_layout.pools
     calls_with_misses = 0
+    # The absent experts of the prefetched layers.
+    buffered = 0
     for step, entry in enumerate(case.script, start=1):
         if isinstance(entry, Prefill):
             cache.begin_prefill()
+            check_exclusive(cache)
             resident = resident_rows(cache)
             for (layer_id, _), slot in resident.items():
                 pool = pools[cache.layer_pools[layer_id]]
@@ -366,6 +477,7 @@ def test_rows_match_checkpoint(tmp_path: Path, case: Case) -> None:
                         )
                         buffer_row += 1
                     assert (offsets[expert] == expected_offsets).all(), (layer_id, expert)
+                buffered += buffer_row
                 check_rows(
                     cache,
                     expected,
@@ -381,10 +493,119 @@ def test_rows_match_checkpoint(tmp_path: Path, case: Case) -> None:
                 rows = resident_rows(cache)
                 assert slots == [rows[(layer_id, expert)] for expert in expert_ids]
                 check_rows(cache, expected, located(rows))
+                check_exclusive(cache)
     stats = cache.stats()
     calls = [call for entry in case.script if not isinstance(entry, Prefill) for call in entry]
     assert sum(stats.hits) + sum(stats.misses) == sum(len(expert_ids) for _, expert_ids in calls)
     assert sum(stats.requests) == calls_with_misses
+    copied = sum(stats.victim_hits) + sum(stats.victim_buffer_hits)
+    assert sum(stats.experts_read) + copied == sum(stats.misses) + buffered
+    assert (copied > 0) == (case.victim_cache_entries > 0)
+
+
+def check_resident_rows(cache: OffloadMoeCache, expected: dict[int, dict[str, np.ndarray]]) -> None:
+    """Every slot slot_of maps holds its expert's row."""
+    rows = resident_rows(cache)
+    check_rows(
+        cache, expected, {key: slot_offsets(cache, key[0], slot) for key, slot in rows.items()}
+    )
+
+
+# One layer of 8 experts, two slots and two victim cache entries: each call's experts, then the
+# flat ids the victim cache holds and the experts read from the checkpoint. The fill put
+# experts 1 and 0 in slots 0 and 1.
+VICTIM_LRU_SCRIPT: list[tuple[tuple[int, ...], tuple[int, ...], int]] = [
+    ((2,), (0,), 1),
+    ((3,), (0, 1), 1),
+    # A third store drops the oldest.
+    ((4,), (1, 2), 1),
+    ((0,), (2, 3), 1),
+    # 2 comes back from the victim cache and leaves it; storing 4 drops 3.
+    ((2,), (4,), 0),
+    ((4, 0), (2,), 0),
+]
+
+
+def test_victim_cache_serves_evicted_experts(tmp_path: Path) -> None:
+    cache, reference, source = build(
+        tmp_path / "checkpoint", Case(1, 8, 128, 64, 2, False, victim_cache_entries=2)
+    )
+    expected = expected_rows(cache, reference, source.layer_prefixes)
+    assert cache.stats().victim_entries == 2
+    cache.fill_initial()
+    for step, (expert_ids, cached, num_read) in enumerate(VICTIM_LRU_SCRIPT, start=1):
+        read_before = sum(cache.stats().experts_read)
+        cache.ensure_experts(0, list(expert_ids), step)
+        check_resident_rows(cache, expected)
+        assert cache.service.victim_cache_ids() == list(cached), step
+        assert sum(cache.stats().experts_read) - read_before == num_read, step
+    stats = cache.stats()
+    assert (sum(stats.misses), sum(stats.victim_hits), sum(stats.victim_stores)) == (6, 2, 6)
+    assert stats.victim_copy_ns > 0
+
+
+def test_purged_victim_entries_are_read_again(tmp_path: Path) -> None:
+    cache, reference, source = build(
+        tmp_path / "checkpoint", Case(1, 8, 128, 64, 2, False, victim_cache_entries=2)
+    )
+    expected = expected_rows(cache, reference, source.layer_prefixes)
+    cache.fill_initial()
+    cache.ensure_experts(0, [2], 1)
+    cache.ensure_experts(0, [3], 2)
+    assert cache.service.victim_cache_ids() == [0, 1]
+    cache.service.purge_victim_cache()
+    # 0 and 1 come back from the checkpoint; 2, stored after the purge, from the victim cache.
+    for step, expert in [(3, 0), (4, 1), (5, 2)]:
+        cache.ensure_experts(0, [expert], step)
+        check_resident_rows(cache, expected)
+    stats = cache.stats()
+    assert (stats.victim_drops, stats.victim_hits, stats.experts_read) == ([2], [1], [4])
+
+
+def test_begin_prefill_stores_the_experts_it_drops(tmp_path: Path) -> None:
+    # Pools of 4 slots, all under the buffers, and two victim cache entries each.
+    cache, reference, source = build(
+        tmp_path / "checkpoint", Case(4, 8, 128, 64, 16, True, victim_cache_entries=8)
+    )
+    expected = expected_rows(cache, reference, source.layer_prefixes)
+    assert all(pool.volatile_slots == pool.num_slots for pool in cache.slot_layout.pools)
+    cache.fill_initial()
+    for layer_id in range(cache.num_layers):
+        cache.ensure_experts(layer_id, [0, 1], 1)
+    cache.begin_prefill()
+    # Each pool keeps its most recently used experts.
+    assert resident_rows(cache) == {}
+    assert cache.service.victim_cache_ids() == [0, 1, 8, 9, 16, 17, 24, 25]
+    cache.ensure_experts(2, [1, 5], 2)
+    check_resident_rows(cache, expected)
+    stats = cache.stats()
+    assert (stats.experts_read[2], stats.victim_hits[2], sum(stats.victim_stores)) == (1, 1, 8)
+    assert cache.service.victim_cache_ids() == [0, 1, 8, 9, 16, 24, 25]
+
+
+def test_overlap_prefill_copies_cached_experts(tmp_path: Path) -> None:
+    cache, reference, source = build(
+        tmp_path / "checkpoint", Case(4, 8, 128, 64, 16, True, victim_cache_entries=16)
+    )
+    expected = expected_rows(cache, reference, source.layer_prefixes)
+    cache.fill_initial()
+    cache.begin_prefill()
+    # Every slot lies under the buffers: each layer's experts 0-3 move to the victim cache.
+    cached = [layer_id * 8 + expert for layer_id in range(4) for expert in range(4)]
+    assert cache.service.victim_cache_ids() == cached
+    expert_bytes = {layer_id: cache.prefetch_prefill_layer(layer_id) for layer_id in (0, 1)}
+    for layer_id in (0, 1):
+        cache.wait_prefill_layer(layer_id)
+        offsets = np.concatenate([np.array(v) for v in expert_bytes[layer_id].values()], axis=1)
+        check_rows(
+            cache,
+            expected,
+            {(layer_id, expert): offsets[expert] for expert in range(cache.num_experts)},
+        )
+    stats = cache.stats()
+    assert (stats.experts_read[:2], stats.victim_buffer_hits[:2]) == ([4, 4], [4, 4])
+    assert sum(stats.victim_hits) == 0
+    assert cache.service.victim_cache_ids() == cached
 
 
 def test_source_rejects_a_layer_in_another_format(tmp_path: Path) -> None:
@@ -580,6 +801,7 @@ def test_real_checkpoint_rows() -> None:
         source=source,
         prefill_overlap=False,
         prefill_overlap_min_tokens=128,
+        victim_cache_bytes=0,
     )
     if is_apart:
         apart = {f"{prefix}.experts.gate_up_proj" for prefix in source.layer_prefixes}

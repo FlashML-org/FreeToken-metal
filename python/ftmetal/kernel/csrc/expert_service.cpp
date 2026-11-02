@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <ranges>
 #include <tuple>
 
 namespace ftmetal {
@@ -58,6 +59,7 @@ ExpertService::ExpertService(
     std::vector<ExpertLocation> locations,
     std::vector<int64_t> destinations,
     std::vector<int64_t> buffer_bytes,
+    int64_t victim_cache_bytes,
     int io_threads,
     double stall_timeout_s,
     bool run_coordinator)
@@ -90,6 +92,9 @@ ExpertService::ExpertService(
   }
   if (!(stall_timeout_s > 0)) {
     throw std::invalid_argument("ExpertService: stall_timeout_s must be positive");
+  }
+  if (victim_cache_bytes < 0) {
+    throw std::invalid_argument("ExpertService: victim_cache_bytes must not be negative");
   }
   if (mailbox_.dtype() != mx::uint32 || mailbox_.size() != MAILBOX_WORDS) {
     throw std::invalid_argument("ExpertService: mailbox must be uint32 [1024]");
@@ -179,6 +184,38 @@ ExpertService::ExpertService(
   stats_.bytes_read.assign(num_layers, 0);
   stats_.read_wait_ns.assign(num_layers, 0);
   stats_.serve_ns.assign(num_layers, 0);
+  stats_.victim_hits.assign(num_layers, 0);
+  stats_.victim_buffer_hits.assign(num_layers, 0);
+  stats_.victim_stores.assign(num_layers, 0);
+  stats_.victim_drops.assign(num_layers, 0);
+  if (victim_cache_bytes > 0) {
+    // An entry holds a row of every bank, whose bytes a pool's layers share.
+    size_t num_pools = pool_bounds.size() - 1;
+    std::vector<int64_t> entry_bytes(num_pools, 0);
+    std::vector<int64_t> pool_slots(num_pools);
+    for (size_t pool = 0; pool < num_pools; ++pool) {
+      pool_slots[pool] = pool_bounds[pool + 1] - pool_bounds[pool];
+    }
+    for (int layer_id = 0; layer_id < num_layers; ++layer_id) {
+      int64_t layer_bytes = 0;
+      for (int64_t b = 0; b < num_banks; ++b) {
+        layer_bytes += destinations_[2 * (layer_id * num_banks + b) + 1];
+      }
+      int64_t& pool_bytes = entry_bytes[layer_pools[layer_id]];
+      if (pool_bytes != 0 && pool_bytes != layer_bytes) {
+        throw std::invalid_argument(
+            "ExpertService: the layers of pool " + std::to_string(layer_pools[layer_id]) +
+            " have rows of different bytes");
+      }
+      pool_bytes = layer_bytes;
+    }
+    victims_ = std::make_unique<VictimCache>(
+        num_experts, layer_pools, entry_bytes, pool_slots, victim_cache_bytes);
+    if (victims_->num_entries() == 0) {
+      // A budget below one entry per pool is no cache: the plain path, without the hold.
+      victims_.reset();
+    }
+  }
   std::fill(mailbox_data_, mailbox_data_ + MAILBOX_WORDS, 0u);
   try {
     for (const std::string& file : files_) {
@@ -292,7 +329,8 @@ void ExpertService::submit(
     ReadBatch& batch,
     int layer_id,
     const std::vector<ExpertLoad>& loads,
-    int buffer) {
+    int buffer,
+    std::vector<ReadTask> copies) {
   batch.layer_id = layer_id;
   batch.buffer = buffer;
   batch.experts_read = static_cast<int64_t>(loads.size());
@@ -302,6 +340,8 @@ void ExpertService::submit(
   }
   batch.bytes_read.store(0, std::memory_order_relaxed);
   batch.error.clear();
+  batch.held_fills.clear();
+  bool is_held = batch.is_held.load(std::memory_order_relaxed);
   std::vector<ReadTask> tasks;
   for (int s = 0; s < segments_per_layer_; ++s) {
     int64_t segment_index = layer_id * segments_per_layer_ + s;
@@ -313,10 +353,11 @@ void ExpertService::submit(
         ++first;
         continue;
       } else if (start.file_index == FILL_FILE) {
-        std::memset(
-            expert_row(batch, segment, first),
-            static_cast<int>(start.file_offset),
-            segment.expert_bytes);
+        if (is_held) {
+          batch.held_fills.emplace_back(segment_index, first);
+        } else {
+          fill(batch, segment_index, first);
+        }
         ++first;
         continue;
       }
@@ -335,6 +376,10 @@ void ExpertService::submit(
       }
       first = last;
     }
+  }
+  for (ReadTask& copy : copies) {
+    copy.batch = &batch;
+    tasks.push_back(copy);
   }
   batch.remaining.store(static_cast<int64_t>(tasks.size()), std::memory_order_release);
   if (tasks.empty()) {
@@ -362,7 +407,11 @@ void ExpertService::work(int thread_index) {
       task = queue_.front();
       queue_.pop_front();
     }
-    read(task, staging);
+    if (task.entry != nullptr) {
+      copy_entry(task.entry, task.batch->layer_id, task.batch->buffer, task.index, task.is_store);
+    } else {
+      read(task, staging);
+    }
     task.batch->remaining.fetch_sub(1, std::memory_order_release);
   }
 }
@@ -393,6 +442,9 @@ void ExpertService::read(const ReadTask& task, uint8_t* staging) {
     done += count;
   }
   batch.bytes_read.fetch_add(done, std::memory_order_relaxed);
+  while (batch.is_held.load(std::memory_order_acquire)) {
+    __builtin_arm_yield();
+  }
   int64_t first = (task.begin - task.base) / segment.expert_bytes;
   int64_t last = (task.end - 1 - task.base) / segment.expert_bytes;
   for (int64_t expert = first; expert <= last; ++expert) {
@@ -406,16 +458,65 @@ void ExpertService::read(const ReadTask& task, uint8_t* staging) {
   }
 }
 
+void ExpertService::fill(const ReadBatch& batch, int64_t segment_index, int32_t expert) {
+  const ExpertSegment& segment = segments_[segment_index];
+  std::memset(
+      expert_row(batch, segment, expert),
+      static_cast<int>(locations_[segment_index * num_experts_ + expert].file_offset),
+      segment.expert_bytes);
+}
+
 uint8_t* ExpertService::expert_row(
     const ReadBatch& batch,
     const ExpertSegment& segment,
     int64_t expert) const {
-  size_t destination = 2 * (batch.layer_id * banks_.size() + segment.bank_index);
-  int64_t row_bytes = destinations_[destination + 1];
-  int64_t row_zero = batch.buffer < 0 ? destinations_[destination]
-                                      : batch.buffer * buffer_bytes_[segment.bank_index];
-  return bank_data_[segment.bank_index] + row_zero + batch.index_of_expert[expert] * row_bytes +
+  return bank_row(
+             batch.layer_id, segment.bank_index, batch.buffer, batch.index_of_expert[expert]) +
       segment.row_offset;
+}
+
+uint8_t* ExpertService::bank_row(int layer_id, int64_t bank, int buffer, int64_t index) const {
+  size_t destination = 2 * (layer_id * banks_.size() + bank);
+  int64_t row_zero = buffer < 0 ? destinations_[destination] : buffer * buffer_bytes_[bank];
+  return bank_data_[bank] + row_zero + index * destinations_[destination + 1];
+}
+
+void ExpertService::copy_entry(
+    uint8_t* entry,
+    int layer_id,
+    int buffer,
+    int32_t index,
+    bool is_store) {
+  auto started = std::chrono::steady_clock::now();
+  for (size_t b = 0; b < banks_.size(); ++b) {
+    int64_t row_bytes = destinations_[2 * (layer_id * banks_.size() + b) + 1];
+    uint8_t* row = bank_row(layer_id, static_cast<int64_t>(b), buffer, index);
+    if (is_store) {
+      std::memcpy(entry, row, row_bytes);
+    } else {
+      std::memcpy(row, entry, row_bytes);
+    }
+    entry += row_bytes;
+  }
+  victim_copy_ns_.fetch_add(nanoseconds_since(started), std::memory_order_relaxed);
+}
+
+std::vector<ExpertLoad> ExpertService::split_victim_hits(
+    int layer_id,
+    const std::vector<ExpertLoad>& loads,
+    std::vector<std::pair<int32_t, int32_t>>& hits) {
+  std::vector<ExpertLoad> reads;
+  for (const auto& [expert, index] : loads) {
+    bool is_purged = false;
+    int32_t entry = victims_->pin(layer_id * num_experts_ + expert, is_purged);
+    stats_.victim_drops[layer_id] += is_purged;
+    if (entry == NO_ENTRY) {
+      reads.emplace_back(expert, index);
+    } else {
+      hits.emplace_back(entry, index);
+    }
+  }
+  return reads;
 }
 
 void ExpertService::finish_buffer(PrefillBuffer& buffer, int64_t wait_ns) {
@@ -424,6 +525,13 @@ void ExpertService::finish_buffer(PrefillBuffer& buffer, int64_t wait_ns) {
   stats_.read_wait_ns[batch.layer_id] += wait_ns;
   stats_.experts_read[batch.layer_id] += batch.experts_read;
   stats_.bytes_read[batch.layer_id] += batch.bytes_read.load(std::memory_order_relaxed);
+  if (victims_) {
+    for (int32_t entry : buffer.entries) {
+      victims_->unpin(entry);
+    }
+    stats_.victim_buffer_hits[batch.layer_id] += static_cast<int64_t>(buffer.entries.size());
+    buffer.entries.clear();
+  }
 }
 
 void ExpertService::fill_initial(const std::vector<int32_t>& flat_ids) {
@@ -436,6 +544,9 @@ void ExpertService::fill_initial(const std::vector<int32_t>& flat_ids) {
       finish_buffer(buffer, nanoseconds_since(started));
     }
     buffer.layer_id = -1;
+  }
+  if (victims_) {
+    victims_->clear();
   }
   std::vector<int32_t> slots = lru_.fill(flat_ids);
   std::vector<std::vector<ExpertLoad>> loads(num_layers_);
@@ -491,10 +602,48 @@ SlotAssignment ExpertService::serve(
   }
   stats_.requests[layer_id] += 1;
   auto started = std::chrono::steady_clock::now();
-  submit(ensure_batch_, layer_id, assignment.loads);
+  if (!victims_) {
+    submit(ensure_batch_, layer_id, assignment.loads);
+  } else {
+    // A read's or a hit's slot may be an evicted one: the reads' row writes wait for the
+    // evicted rows to be stored, and the hits are copied in after.
+    try {
+      std::vector<std::pair<int32_t, int32_t>> hits;
+      std::vector<ExpertLoad> reads = split_victim_hits(layer_id, assignment.loads, hits);
+      ensure_batch_.is_held.store(true, std::memory_order_relaxed);
+      submit(ensure_batch_, layer_id, reads);
+      for (const auto& [flat_id, slot] : assignment.evicted) {
+        int32_t entry = victims_->claim(flat_id);
+        if (entry != NO_ENTRY) {
+          copy_entry(victims_->data(entry), layer_id, -1, slot, true);
+          victims_->unpin(entry);
+          stats_.victim_stores[layer_id] += 1;
+        }
+      }
+      ensure_batch_.is_held.store(false, std::memory_order_release);
+      for (const auto& [segment_index, expert] : ensure_batch_.held_fills) {
+        fill(ensure_batch_, segment_index, expert);
+      }
+      for (const auto& [entry, slot] : hits) {
+        copy_entry(victims_->data(entry), layer_id, -1, slot, false);
+        victims_->release(entry);
+      }
+      stats_.victim_hits[layer_id] += static_cast<int64_t>(hits.size());
+    } catch (const std::exception& error) {
+      // slot_of already maps the loads, whose rows may be incomplete: no IO thread may wait
+      // on the hold, the batch's reads end before the batch is reused, and the cache fails.
+      ensure_batch_.is_held.store(false, std::memory_order_release);
+      wait_for(ensure_batch_);
+      fail(MailboxError::Io, std::string("ExpertService: victim cache: ") + error.what());
+      throw;
+    }
+  }
   wait_for(ensure_batch_);
-  stats_.read_wait_ns[layer_id] += nanoseconds_since(started);
-  stats_.experts_read[layer_id] += num_loads;
+  // The checkpoint's reads alone; a miss the victim cache served is no read.
+  if (ensure_batch_.experts_read > 0) {
+    stats_.read_wait_ns[layer_id] += nanoseconds_since(started);
+  }
+  stats_.experts_read[layer_id] += ensure_batch_.experts_read;
   stats_.bytes_read[layer_id] += ensure_batch_.bytes_read.load(std::memory_order_relaxed);
   if (!ensure_batch_.error.empty()) {
     fail(MailboxError::Io, ensure_batch_.error);
@@ -514,7 +663,54 @@ void ExpertService::begin_prefill() {
     }
     buffer.layer_id = -1;
   }
-  lru_.invalidate_prefill_buffers();
+  std::vector<SlotExpert> dropped = lru_.invalidate_prefill_buffers();
+  if (victims_) {
+    // Their rows hold them until the next prefetch. Each pool keeps its most recently used,
+    // stored least recently used first so they end up its newest entries.
+    std::vector<int64_t> taken(victims_->num_pools(), 0);
+    std::vector<SlotExpert> kept;
+    for (const auto& [flat_id, slot] : dropped) {
+      int32_t pool = victims_->pool_of(flat_id);
+      if (taken[pool] < victims_->capacity(pool)) {
+        ++taken[pool];
+        kept.emplace_back(flat_id, slot);
+      }
+    }
+    std::vector<std::vector<ReadTask>> stores(num_layers_);
+    std::vector<int32_t> entries;
+    std::vector<std::unique_ptr<ReadBatch>> batches;
+    try {
+      for (const auto& [flat_id, slot] : std::views::reverse(kept)) {
+        int32_t entry = victims_->claim(flat_id);
+        if (entry != NO_ENTRY) {
+          int layer_id = flat_id / num_experts_;
+          stores[layer_id].push_back(
+              {.entry = victims_->data(entry), .index = slot, .is_store = true});
+          entries.push_back(entry);
+          stats_.victim_stores[layer_id] += 1;
+        }
+      }
+      for (int layer_id = 0; layer_id < num_layers_; ++layer_id) {
+        if (!stores[layer_id].empty()) {
+          batches.push_back(std::make_unique<ReadBatch>());
+          submit(*batches.back(), layer_id, {}, -1, std::move(stores[layer_id]));
+        }
+      }
+      for (const auto& batch : batches) {
+        wait_for(*batch);
+      }
+      for (int32_t entry : entries) {
+        victims_->unpin(entry);
+      }
+    } catch (const std::exception& error) {
+      // The submitted stores end before their batches go; the cache fails.
+      for (const auto& batch : batches) {
+        wait_for(*batch);
+      }
+      fail(MailboxError::Io, std::string("ExpertService: victim cache: ") + error.what());
+      throw;
+    }
+  }
 }
 
 std::vector<int32_t> ExpertService::prefetch_prefill_layer(int layer_id) {
@@ -534,7 +730,25 @@ std::vector<int32_t> ExpertService::prefetch_prefill_layer(int layer_id) {
   buffer.layer_id = layer_id;
   buffer.slot_map = std::move(assignment.slots);
   buffer.is_waited = false;
-  submit(*buffer.batch, layer_id, assignment.loads, layer_id % 2);
+  if (!victims_) {
+    submit(*buffer.batch, layer_id, assignment.loads, layer_id % 2);
+  } else {
+    // A cached expert is copied in and stays cached, pinned until the buffer is waited.
+    try {
+      std::vector<std::pair<int32_t, int32_t>> hits;
+      std::vector<ExpertLoad> reads = split_victim_hits(layer_id, assignment.loads, hits);
+      std::vector<ReadTask> copies;
+      for (const auto& [entry, row] : hits) {
+        copies.push_back({.entry = victims_->data(entry), .index = row});
+        buffer.entries.push_back(entry);
+      }
+      submit(*buffer.batch, layer_id, reads, layer_id % 2, std::move(copies));
+    } catch (const std::exception& error) {
+      // The pool already maps the layer's experts to buffer rows nothing will fill.
+      fail(MailboxError::Io, std::string("ExpertService: victim cache: ") + error.what());
+      throw;
+    }
+  }
   return buffer.slot_map;
 }
 
@@ -565,7 +779,12 @@ ExpertServiceStats ExpertService::stats() {
   {
     std::lock_guard<std::mutex> lock(call_mutex_);
     stats = stats_;
+    if (victims_) {
+      stats.victim_entries = victims_->num_entries();
+      stats.victim_bytes = victims_->num_bytes();
+    }
   }
+  stats.victim_copy_ns = victim_copy_ns_.load(std::memory_order_relaxed);
   for (int layer_id = 0; layer_id < num_layers_; ++layer_id) {
     // The GPU's counts, read without synchronizing: an older value is fine.
     stats.lookups.push_back(
@@ -574,6 +793,18 @@ ExpertServiceStats ExpertService::stats() {
                                     .load(std::memory_order_relaxed));
   }
   return stats;
+}
+
+void ExpertService::purge_victim_cache() {
+  std::lock_guard<std::mutex> lock(call_mutex_);
+  if (victims_) {
+    victims_->purge();
+  }
+}
+
+std::vector<int32_t> ExpertService::victim_cache_ids() {
+  std::lock_guard<std::mutex> lock(call_mutex_);
+  return victims_ ? victims_->flat_ids() : std::vector<int32_t>();
 }
 
 } // namespace ftmetal

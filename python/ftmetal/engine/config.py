@@ -7,7 +7,8 @@ property) and is empty for a checkpoint without config.json; model_config drops 
 encoder sections from the raw config dictionary; the MoE strategies are auto, fused and
 offload (no host-bank kinds), and no deprecated moe_backend field (only the flag);
 memory_ratio defaults to None, the working set less a headroom; the three cache size fields
-are checked exclusive here, not only as flags.
+are checked exclusive here, not only as flags; moe_victim_cache_gib sizes the offload's host
+victim cache, which FreeToken does not have.
 """
 
 from __future__ import annotations
@@ -123,6 +124,9 @@ class EngineConfig:
     moe_prefill_overlap_min_tokens: int = field(
         default_factory=moe_prefill_overlap_min_tokens_from_env
     )
+    # The offload cache's victim cache in host memory beyond Metal's working set, in GiB, or
+    # auto (that memory less a host reserve); 0: none.
+    moe_victim_cache_gib: float | Literal["auto"] = 0
     # The memory budget as a fraction of Metal's recommended working set; None: the working
     # set less its headroom. A fraction also emulates a smaller Mac.
     memory_ratio: float | None = None
@@ -149,6 +153,13 @@ class EngineConfig:
             )
         if self.memory_ratio is not None and not 0 < self.memory_ratio <= 1:
             raise ValueError(f"memory_ratio must be in (0, 1], got {self.memory_ratio}")
+        if self.moe_victim_cache_gib != "auto" and not (
+            math.isfinite(self.moe_victim_cache_gib) and self.moe_victim_cache_gib >= 0
+        ):
+            raise ValueError(
+                f"moe_victim_cache_gib must be auto or a finite non-negative number, got "
+                f"{self.moe_victim_cache_gib}"
+            )
 
     def moe_cache_size_flag(self, total_experts: int) -> int:
         """The offload cache size the flags give, rate resolved (FreeToken: ceil of the

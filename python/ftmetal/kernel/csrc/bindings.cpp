@@ -290,7 +290,7 @@ NB_MODULE(_C, m) {
       .def(
           "invalidate_prefill_buffers",
           &ftmetal::SlotLru::invalidate_prefill_buffers,
-          "Drop every expert held in a slot under the prefill buffers.")
+          "Drop every expert held in a slot under the prefill buffers; returns them as [(flat id, slot)], the most recently used first.")
       .def(
           "prefill_slot_map",
           [](const ftmetal::SlotLru& lru, int layer_id) {
@@ -309,7 +309,14 @@ NB_MODULE(_C, m) {
       .def_ro("read_wait_ns", &ftmetal::ExpertServiceStats::read_wait_ns)
       .def_ro("serve_ns", &ftmetal::ExpertServiceStats::serve_ns)
       .def_ro("lookups", &ftmetal::ExpertServiceStats::lookups)
-      .def_ro("lookup_hits", &ftmetal::ExpertServiceStats::lookup_hits);
+      .def_ro("lookup_hits", &ftmetal::ExpertServiceStats::lookup_hits)
+      .def_ro("victim_hits", &ftmetal::ExpertServiceStats::victim_hits)
+      .def_ro("victim_buffer_hits", &ftmetal::ExpertServiceStats::victim_buffer_hits)
+      .def_ro("victim_stores", &ftmetal::ExpertServiceStats::victim_stores)
+      .def_ro("victim_drops", &ftmetal::ExpertServiceStats::victim_drops)
+      .def_ro("victim_copy_ns", &ftmetal::ExpertServiceStats::victim_copy_ns)
+      .def_ro("victim_entries", &ftmetal::ExpertServiceStats::victim_entries)
+      .def_ro("victim_bytes", &ftmetal::ExpertServiceStats::victim_bytes);
 
   using Int64Table3 = nb::ndarray<const int64_t, nb::ndim<3>, nb::c_contig, nb::device::cpu>;
   using Int64Table4 = nb::ndarray<const int64_t, nb::ndim<4>, nb::c_contig, nb::device::cpu>;
@@ -333,6 +340,7 @@ NB_MODULE(_C, m) {
              Int64Table4 locations,
              Int64Table3 destinations,
              const std::vector<int64_t>& buffer_bytes,
+             int64_t victim_cache_bytes,
              int io_threads,
              double stall_timeout_s,
              bool run_coordinator) {
@@ -378,6 +386,7 @@ NB_MODULE(_C, m) {
                 std::move(places),
                 std::vector<int64_t>(destinations.data(), destinations.data() + destinations.size()),
                 buffer_bytes,
+                victim_cache_bytes,
                 io_threads,
                 stall_timeout_s,
                 run_coordinator);
@@ -398,10 +407,11 @@ NB_MODULE(_C, m) {
           "locations"_a,
           "destinations"_a,
           "buffer_bytes"_a,
+          "victim_cache_bytes"_a,
           "io_threads"_a,
           "stall_timeout_s"_a,
           "run_coordinator"_a,
-          "The slot cache's LRU, IO threads, lookup coordinator and watchdog.")
+          "The slot cache's LRU, IO threads, victim cache, lookup coordinator and watchdog.")
       .def(
           "fill_initial",
           &ftmetal::ExpertService::fill_initial,
@@ -420,7 +430,8 @@ NB_MODULE(_C, m) {
           "begin_prefill",
           &ftmetal::ExpertService::begin_prefill,
           nb::call_guard<nb::gil_scoped_release>(),
-          "Drain the prefill buffer reads and drop the experts the buffer slots hold.")
+          "Drain the prefill buffer reads and drop the experts the buffer slots hold, storing "
+          "the most recently used in the victim cache when there is one.")
       .def(
           "prefetch_prefill_layer",
           &ftmetal::ExpertService::prefetch_prefill_layer,
@@ -437,7 +448,7 @@ NB_MODULE(_C, m) {
           "stats",
           &ftmetal::ExpertService::stats,
           nb::call_guard<nb::gil_scoped_release>(),
-          "Per-layer hits, misses, experts and bytes read, read wait, GPU lookups and hits.")
+          "Per-layer hits, misses, experts and bytes read, read wait, GPU lookups and hits, and the victim cache's counts.")
       .def(
           "arm",
           &ftmetal::ExpertService::arm,
@@ -450,7 +461,17 @@ NB_MODULE(_C, m) {
           "shutdown",
           &ftmetal::ExpertService::shutdown,
           nb::call_guard<nb::gil_scoped_release>(),
-          "Answer a waiting lookup with SHUTDOWN, refuse later ones and stop the threads.");
+          "Answer a waiting lookup with SHUTDOWN, refuse later ones and stop the threads.")
+      .def(
+          "purge_victim_cache",
+          &ftmetal::ExpertService::purge_victim_cache,
+          nb::call_guard<nb::gil_scoped_release>(),
+          "For tests: discard the victim cache's bytes as memory pressure would.")
+      .def(
+          "victim_cache_ids",
+          &ftmetal::ExpertService::victim_cache_ids,
+          nb::call_guard<nb::gil_scoped_release>(),
+          "For tests: the flat ids the victim cache holds, sorted.");
 
   m.attr("PLE_MAILBOX_WORDS") = ftmetal::PLE_MAILBOX_WORDS;
   m.attr("MAX_PLE_ROWS") = ftmetal::MAX_PLE_ROWS;

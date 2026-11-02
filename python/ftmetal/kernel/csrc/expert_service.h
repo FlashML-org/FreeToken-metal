@@ -6,8 +6,15 @@
 // checkpoint does not store is filled as the read is submitted instead. Idle threads block; a
 // caller waits for its reads by spinning on a completion counter. A coordinator thread
 // answers the GPU lookups' mailbox requests (see moe_lookup.h) with the same reads, and a
-// watchdog thread fails a request the coordinator leaves unanswered. Public methods other
-// than arm, check_healthy and shutdown are called from one thread at a time.
+// watchdog thread fails a request the coordinator leaves unanswered. With a victim cache
+// (victim_cache.h), the experts leaving their slots are copied into its entries and a miss it
+// holds is copied back instead of read: the reads of the other misses start first, their row
+// writes held until the evicted rows are stored, and the hits land after the stores, since a
+// hit may take an evicted slot. An overlap prefill copies the absent experts the cache holds
+// into its prefill buffer on the IO threads, keeping them cached, and the experts dropped from
+// the slots under the buffers as it begins are stored first. Only where a slot's bytes come
+// from changes: the GPU side never sees the cache. Public methods other than arm,
+// check_healthy and shutdown are called from one thread at a time.
 #pragma once
 
 #include <atomic>
@@ -24,6 +31,7 @@
 
 #include "expert_lru.h"
 #include "moe_lookup.h"
+#include "victim_cache.h"
 
 namespace ftmetal {
 
@@ -48,9 +56,10 @@ struct ExpertLocation {
 };
 
 // Per MoE layer. hits and misses count the experts of ensure_experts and of the answered
-// lookup requests; experts_read and bytes_read (read-around included) count their reads and
-// the prefill buffers', not the initial fill; read_wait_ns is the time spent waiting for
-// them. lookups and lookup_hits are the GPU's counts: lookups run, experts found resident.
+// lookup requests; experts_read and bytes_read (read-around included) count their reads from
+// the checkpoint and the prefill buffers', not the initial fill; read_wait_ns is the time
+// spent waiting for them (the victim cache's copies overlap it). lookups and lookup_hits are
+// the GPU's counts: lookups run, experts found resident.
 struct ExpertServiceStats {
   std::vector<int64_t> hits;
   std::vector<int64_t> misses;
@@ -63,6 +72,16 @@ struct ExpertServiceStats {
   std::vector<int64_t> serve_ns;
   std::vector<int64_t> lookups;
   std::vector<int64_t> lookup_hits;
+  // The victim cache's: misses copied from it, absent experts copied from it into a prefill
+  // buffer, experts leaving their slots stored in it, and entries found purged.
+  std::vector<int64_t> victim_hits;
+  std::vector<int64_t> victim_buffer_hits;
+  std::vector<int64_t> victim_stores;
+  std::vector<int64_t> victim_drops;
+  // Time spent copying to and from its entries, over every thread; its entries and bytes.
+  int64_t victim_copy_ns = 0;
+  int64_t victim_entries = 0;
+  int64_t victim_bytes = 0;
 };
 
 // A read from the checkpoint failed; the cache maps slots whose rows are incomplete.
@@ -83,10 +102,16 @@ struct ReadBatch {
   std::atomic<int64_t> bytes_read{0};
   std::mutex error_mutex;
   std::string error;
+  // While set, the reads hold their row writes (the rows' evicted experts are being stored),
+  // and submit leaves its fills, (segment index, expert), to held_fills.
+  std::atomic<bool> is_held{false};
+  std::vector<std::pair<int64_t, int32_t>> held_fills;
 };
 
 // The bytes [begin, end) of file file_index for one segment of the batch's layer, all inside
-// one run of the batch's experts, expert e of the run at base + e * expert_bytes.
+// one run of the batch's experts, expert e of the run at base + e * expert_bytes; or, with
+// entry set, a copy between that victim cache entry and the batch layer's row at index (a
+// slot, or a row of the batch's buffer), into the entry when is_store.
 struct ReadTask {
   ReadBatch* batch = nullptr;
   int segment = 0;
@@ -94,6 +119,9 @@ struct ReadTask {
   int64_t base = 0;
   int64_t begin = 0;
   int64_t end = 0;
+  uint8_t* entry = nullptr;
+  int32_t index = 0;
+  bool is_store = false;
 };
 
 // The prefill buffer of the layers of one parity: the layer it holds or is reading.
@@ -102,6 +130,8 @@ struct PrefillBuffer {
   bool is_waited = true;
   std::vector<int32_t> slot_map;
   std::unique_ptr<ReadBatch> batch = std::make_unique<ReadBatch>();
+  // The victim cache entries being copied into it, pinned until it is waited.
+  std::vector<int32_t> entries;
 };
 
 class ExpertService {
@@ -112,9 +142,10 @@ class ExpertService {
   // segments-per-layer entries, layer-major, and locations: each segment's num_experts
   // entries, in segment order; destinations: per layer and bank, the byte
   // offset of slot 0's row and the row's bytes (slot s at offset + s * row); buffer_bytes:
-  // each prefill buffer's bytes in each bank, from byte 0. The watchdog fails a request left
-  // unanswered for stall_timeout_s; without run_coordinator nobody answers (a stalled
-  // coordinator, for tests).
+  // each prefill buffer's bytes in each bank, from byte 0; victim_cache_bytes: the victim
+  // cache's budget (0: none). The watchdog fails a request left unanswered for
+  // stall_timeout_s; without run_coordinator nobody answers (a stalled coordinator, for
+  // tests).
   ExpertService(
       int num_layers,
       int num_experts,
@@ -132,6 +163,7 @@ class ExpertService {
       std::vector<ExpertLocation> locations,
       std::vector<int64_t> destinations,
       std::vector<int64_t> buffer_bytes,
+      int64_t victim_cache_bytes,
       int io_threads,
       double stall_timeout_s,
       bool run_coordinator);
@@ -150,7 +182,7 @@ class ExpertService {
       uint32_t step);
 
   // Drain the prefill buffers' reads, forget the layers they hold and drop the experts their
-  // slots hold.
+  // slots hold, into the victim cache.
   void begin_prefill();
 
   // Start reading the layer's non-resident experts into prefill buffer layer_id % 2; returns its
@@ -173,6 +205,11 @@ class ExpertService {
   // Answer a waiting lookup with SHUTDOWN and refuse later ones, then stop the threads.
   void shutdown();
 
+  // For tests: discard the victim cache's bytes as memory pressure would, and the flat ids it
+  // holds.
+  void purge_victim_cache();
+  std::vector<int32_t> victim_cache_ids();
+
  private:
   std::atomic_ref<uint32_t> mailbox_word(MailboxWord word) const;
   void check_layer(int layer_id, const char* method) const;
@@ -182,17 +219,32 @@ class ExpertService {
   void coordinate();
   void answer();
   void watch();
-  // Read loads (expert, slot) into slots, or (expert, row) into prefill buffer buffer.
+  // Read loads (expert, slot) into slots, or (expert, row) into prefill buffer buffer, and run
+  // copies (victim cache copy tasks) with them.
   void submit(
       ReadBatch& batch,
       int layer_id,
       const std::vector<ExpertLoad>& loads,
-      int buffer = -1);
+      int buffer = -1,
+      std::vector<ReadTask> copies = {});
   void finish_buffer(PrefillBuffer& buffer, int64_t wait_ns);
   void work(int thread_index);
   void read(const ReadTask& task, uint8_t* staging);
+  // Fill the segment's bytes of the expert, which the checkpoint does not store.
+  void fill(const ReadBatch& batch, int64_t segment_index, int32_t expert);
   // Where the segment's bytes of the expert land in the batch's slot or buffer row.
   uint8_t* expert_row(const ReadBatch& batch, const ExpertSegment& segment, int64_t expert) const;
+  // The layer's row at index in the bank: a slot, or (buffer >= 0) a row of that buffer.
+  uint8_t* bank_row(int layer_id, int64_t bank, int buffer, int64_t index) const;
+  // Copy between the entry and the layer's row at index in every bank, into the entry when
+  // is_store.
+  void copy_entry(uint8_t* entry, int layer_id, int buffer, int32_t index, bool is_store);
+  // The loads of the layer the victim cache does not hold; each one it holds is pinned and
+  // added to hits as (entry, slot or row).
+  std::vector<ExpertLoad> split_victim_hits(
+      int layer_id,
+      const std::vector<ExpertLoad>& loads,
+      std::vector<std::pair<int32_t, int32_t>>& hits);
 
   SlotLru lru_;
   int num_layers_;
@@ -212,6 +264,9 @@ class ExpertService {
   ReadBatch ensure_batch_;
   PrefillBuffer buffers_[2];
   ExpertServiceStats stats_;
+  // Null without a victim cache.
+  std::unique_ptr<VictimCache> victims_;
+  std::atomic<int64_t> victim_copy_ns_{0};
 
   std::mutex queue_mutex_;
   std::condition_variable queue_ready_;

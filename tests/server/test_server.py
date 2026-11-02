@@ -986,7 +986,25 @@ REFUSED_MOE_FLAG_CASES: list[tuple[list[str], str]] = [
     (["--moe-cache-size", "-1"], "expected a non-negative integer"),
     (["--memory-ratio", "0"], "expected a number in (0, 1]"),
     (["--moe-cache-policy", "lfu"], "invalid choice: 'lfu'"),
+    (["--moe-victim-cache-gib", "-1"], "expected auto or a non-negative number"),
+    (["--moe-victim-cache-gib", "inf"], "expected auto or a non-negative number"),
 ]
+
+
+# (flags, --moe-victim-cache-gib as the server args hold it)
+VICTIM_CACHE_FLAG_CASES: list[tuple[list[str], float | str]] = [
+    ([], 0),
+    (["--moe-victim-cache-gib", "auto"], "auto"),
+    (["--moe-victim-cache-gib", "4.5"], 4.5),
+]
+
+
+@pytest.mark.parametrize(("flags", "expected"), VICTIM_CACHE_FLAG_CASES)
+def test_victim_cache_flag_reaches_the_server_args(
+    tiny_model_dir: Path, flags: list[str], expected: float | str
+) -> None:
+    args = parse_args(["--model", str(tiny_model_dir), *flags], prog="ftm serve")
+    assert args.moe_victim_cache_gib == expected
 
 
 @pytest.mark.parametrize(("flags", "error"), REFUSED_MOE_FLAG_CASES)

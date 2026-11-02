@@ -41,6 +41,7 @@ from ftmetal.engine.cache_budget import (
     plan_budget,
     resolve_moe_cache_size,
     solve_num_pages,
+    victim_cache_bytes,
 )
 from ftmetal.engine.config import EngineConfig, MoeStrategyChoice
 from ftmetal.engine.engine import resolve_moe_strategy
@@ -615,6 +616,8 @@ REFUSED_OFFLOAD_CASES: list[tuple[dict[str, float | int | bool | None], str]] = 
     ({"moe_cache_rate": 0.5, "moe_cache_auto": True}, "moe_cache_rate and moe_cache_auto are"),
     ({"moe_cache_rate": 1.5}, r"moe_cache_rate must be in \[0, 1\]"),
     ({"memory_ratio": 0.0}, r"memory_ratio must be in \(0, 1\]"),
+    ({"moe_victim_cache_gib": -1.0}, "moe_victim_cache_gib must be auto or a finite"),
+    ({"moe_victim_cache_gib": float("nan")}, "moe_victim_cache_gib must be auto or a finite"),
 ]
 
 
@@ -622,6 +625,32 @@ REFUSED_OFFLOAD_CASES: list[tuple[dict[str, float | int | bool | None], str]] = 
 def test_refused_offload_budgets(fields: dict[str, float | int | bool | None], error: str) -> None:
     with pytest.raises((ValueError, RuntimeError), match=error):
         offload_budget(EngineConfig(model_path="unused", max_extend_tokens_override=2048, **fields))
+
+
+MEMORY_BYTES = 51_539_607_552  # hw.memsize, M4 Pro 48 GB
+# (--moe-victim-cache-gib, hw.memsize, the victim cache's bytes, the warning logged): the
+# memory beyond the working set is 10.56 GiB on this box.
+VICTIM_CACHE_CASES: list[tuple[float | Literal["auto"], int, int, str]] = [
+    (0, MEMORY_BYTES, 0, ""),
+    # 4.56 GiB: all of it less the 6 GiB host reserve.
+    ("auto", MEMORY_BYTES, 4_896_260_096, ""),
+    ("auto", WORKING_SET_BYTES + 4 * GIB, 0, ""),
+    (2.5, MEMORY_BYTES, 2_684_354_560, ""),
+    (16, MEMORY_BYTES, 11_338_711_040, "--moe-victim-cache-gib 16 is capped at 10.56 GiB"),
+]
+
+
+@pytest.mark.parametrize(("requested", "memory_size", "expected", "warning"), VICTIM_CACHE_CASES)
+def test_victim_cache_bytes(
+    caplog: pytest.LogCaptureFixture,
+    requested: float | Literal["auto"],
+    memory_size: int,
+    expected: int,
+    warning: str,
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        assert victim_cache_bytes(requested, memory_size, WORKING_SET_BYTES) == expected
+    assert warning in caplog.text and (warning != "") == bool(caplog.records)
 
 
 # (--moe-strategy, EngineConfig flags, budget, the checkpoint's quantization mode or None for

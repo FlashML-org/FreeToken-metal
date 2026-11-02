@@ -198,6 +198,7 @@ SlotAssignment SlotLru::resolve(
     if (victim.flat_id >= 0) {
       slot_of_data_[victim.flat_id] = -1;
       ++assignment.num_evicted;
+      assignment.evicted.emplace_back(victim.flat_id, victim.slot);
     }
     id_of_slot_[victim.slot] = flat_id;
     slot_of_data_[flat_id] = victim.slot;
@@ -208,17 +209,28 @@ SlotAssignment SlotLru::resolve(
   return assignment;
 }
 
-void SlotLru::invalidate_prefill_buffers() {
+std::vector<SlotExpert> SlotLru::invalidate_prefill_buffers() {
+  candidates_.clear();
   for (size_t pool = 0; pool < pool_volatile_.size(); ++pool) {
     for (int32_t slot = pool_bounds_[pool]; slot < pool_bounds_[pool] + pool_volatile_[pool];
          ++slot) {
       if (id_of_slot_[slot] >= 0) {
+        candidates_.push_back({last_use_data_[slot], id_of_slot_[slot], slot});
         slot_of_data_[id_of_slot_[slot]] = -1;
         id_of_slot_[slot] = -1;
       }
       last_use_data_[slot] = 0;
     }
   }
+  std::sort(candidates_.begin(), candidates_.end(), [](const Candidate& a, const Candidate& b) {
+    return a.last_use > b.last_use || (a.last_use == b.last_use && a.slot < b.slot);
+  });
+  std::vector<SlotExpert> dropped;
+  dropped.reserve(candidates_.size());
+  for (const Candidate& candidate : candidates_) {
+    dropped.emplace_back(candidate.flat_id, candidate.slot);
+  }
+  return dropped;
 }
 
 SlotAssignment SlotLru::prefill_slot_map(int layer_id) const {

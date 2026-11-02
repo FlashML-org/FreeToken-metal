@@ -9,13 +9,15 @@ offload cache's experts, one per pool, activations, the vision encoder's activat
 decode graphs' arena); --moe-cache-auto (plan_cache_budget) gives the KV pools
 kv_reserve_tokens first and the experts the rest, out of what the other lines leave; the
 auto strategy keeps the experts resident when they fit beside that KV reserve (FreeToken's
-auto always offloads a MoE model off unified memory).
+auto always offloads a MoE model off unified memory); the offload's victim cache lies outside
+the budget, in the host memory beyond the working set (victim_cache_bytes).
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Literal
 
 import mlx.core as mx
 
@@ -46,6 +48,11 @@ OFFLOAD_IN_FLIGHT_STEPS = 1
 # partials (their partition count follows the page-table width).
 GRAPH_FIXED_BYTES = 4 << 20
 GRAPH_BYTES_PER_ROW = 5 << 18
+# Host memory beyond Metal's working set that an auto victim cache leaves the system. On the
+# 48 GB M4 Pro (10.56 GiB beyond it) the 4.56 GiB this leaves the cache ran the 2026-11-02
+# victim cache A/B (single-turn cells, agentic replay) without swap and nearly no purges; PR #3's
+# unpinned victim sweep on that box reached free ~0.1 GiB at 6 GiB and swap at 7.
+VICTIM_CACHE_HOST_RESERVE_BYTES = 6 * GIB
 # Each pool's budget line; the only LINEAR pool so far holds GDN state.
 POOL_LABELS: dict[AttnType, str] = {
     AttnType.FULL: "kv pages",
@@ -247,6 +254,24 @@ def plan_budget(
     return report
 
 
+def victim_cache_bytes(
+    requested_gib: float | Literal["auto"], memory_size: int, recommended_working_set: int
+) -> int:
+    """The MoE offload's victim cache, in the host memory beyond Metal's working set: auto
+    takes it less VICTIM_CACHE_HOST_RESERVE_BYTES, a size is capped at all of it."""
+    beyond = max(0, memory_size - recommended_working_set)
+    if requested_gib == "auto":
+        return max(0, beyond - VICTIM_CACHE_HOST_RESERVE_BYTES)
+    elif int(requested_gib * GIB) > beyond:
+        logger.warning(
+            f"--moe-victim-cache-gib {requested_gib} is capped at {beyond / GIB:.2f} GiB, the "
+            f"memory beyond Metal's working set"
+        )
+        return beyond
+    else:
+        return int(requested_gib * GIB)
+
+
 def solve_num_pages(report: BudgetReport, page_size: int, num_page_override: int | None) -> int:
     """Usable pages the paged pools get: their share of the budget unless overridden."""
     if num_page_override is None:
@@ -271,6 +296,7 @@ __all__ = [
     "IN_FLIGHT_STEPS",
     "OFFLOAD_IN_FLIGHT_STEPS",
     "POOL_LABELS",
+    "VICTIM_CACHE_HOST_RESERVE_BYTES",
     "BudgetReport",
     "activation_reserve_bytes",
     "choose_moe_strategy",
@@ -281,4 +307,5 @@ __all__ = [
     "plan_budget",
     "resolve_moe_cache_size",
     "solve_num_pages",
+    "victim_cache_bytes",
 ]

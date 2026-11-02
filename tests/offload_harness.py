@@ -8,7 +8,8 @@ layer's projections split across the files; a per-expert checkpoint (Qwen3.6 nam
 stores one tensor per expert in the Hugging Face layout instead, which the model family's
 mlx_layout stacks. An identifying checkpoint (affine only) fills every packed weight word of
 an expert's projection with expert_code(layer, projection, expert) instead, so a bank row
-read anywhere names the expert it holds.
+read anywhere names the expert it holds. A cache may have a victim cache, its budget a
+number of entries of entry_bytes.
 
 ReferenceLru is the offload simulation's token-granular LRU per pool: per slot, the expert
 it holds and the step it was last used. A call first marks its hits used at this step, then
@@ -117,6 +118,11 @@ def layer_layouts(spec: CheckpointSpec) -> list[dict[str, BankSpec]]:
     return layouts
 
 
+def entry_bytes(spec: CheckpointSpec) -> int:
+    """The bytes of the widest layer's experts in the offload cache: a victim cache entry."""
+    return max(sum(bank.nbytes for bank in layout.values()) for layout in layer_layouts(spec))
+
+
 def checkpoint_rules(spec: CheckpointSpec) -> WeightRules:
     """The rules of the checkpoint's reference state: every layer's gate and up apart when
     they differ, as the offload cache holds them."""
@@ -217,6 +223,7 @@ def build_cache(
     prefill_overlap: bool,
     grouping: MoePoolGrouping = "per-layer",
     buffer_placement: PrefillBufferPlacement = "overlay",
+    victim_cache_bytes: int = 0,
     stall_timeout_s: float = STALL_TIMEOUT_S,
     run_coordinator: bool = True,
 ) -> tuple[OffloadMoeCache, ExpertSource]:
@@ -239,6 +246,7 @@ def build_cache(
         source=source,
         prefill_overlap=prefill_overlap,
         prefill_overlap_min_tokens=PREFILL_OVERLAP_MIN_TOKENS,
+        victim_cache_bytes=victim_cache_bytes,
         stall_timeout_s=stall_timeout_s,
         run_coordinator=run_coordinator,
     )
