@@ -1,8 +1,9 @@
-#include "sample.h"
+#include "sample/sample_tokens.h"
 
 #include <stdexcept>
 
-#include "metal_primitive.h"
+#include "common/metal_primitive.h"
+#include "sample/sample_tokens_shared.h"
 #include "mlx/allocator.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/utils.h"
@@ -12,18 +13,7 @@ namespace ftmetal {
 
 namespace {
 
-std::string sample_source;
-// Shared with metal/sample.metal.
-const int KIND_NONE = 0;
-const int KIND_COUNT = 1;
-const int KIND_MASS = 2;
-const int NUM_BINS = 256;
-const int ROUND_THREADS = 256;
-const int FIND_THREADS = 1024;
-const int MAX_GROUPS = 256;
-const int STATE_SLOTS = 10;
-const int STATE_WORDS = 8;
-const int BITS_PER_ROUND = 8;
+std::string sample_tokens_source;
 
 // One radix-select round: what it bins (counts for top-k, mass for top-p, nothing for the
 // max-only first dispatch), the key bits below its bins, whether its bracket is open above
@@ -35,12 +25,12 @@ struct RoundSpec {
   bool final;
 };
 
-const RoundSpec NO_ROUND{KIND_NONE, 0, false, false};
+const RoundSpec NO_ROUND{SAMPLE_KIND_NONE, 0, false, false};
 
 void check_rows(const mx::array& x, int rows, mx::Dtype dtype, const char* what) {
   if (x.ndim() != 1 || x.shape(0) != rows || x.dtype() != dtype) {
     throw std::invalid_argument(
-        std::string("ftmetal sample: ") + what + " must be [B] " + mx::type_to_name(dtype));
+        std::string("ftmetal sample_tokens: ") + what + " must be [B] " + mx::type_to_name(dtype));
   }
 }
 
@@ -50,23 +40,23 @@ void check_rows(const mx::array& x, int rows, mx::Dtype dtype, const char* what)
 std::vector<RoundSpec> round_chain(int key_bits, bool has_top_k, bool has_top_p) {
   std::vector<RoundSpec> chain;
   auto add_search = [&](int kind) {
-    for (int shift = key_bits - BITS_PER_ROUND; shift >= 0; shift -= BITS_PER_ROUND) {
-      chain.push_back({kind, shift, shift == key_bits - BITS_PER_ROUND, false});
+    for (int shift = key_bits - SAMPLE_BITS_PER_ROUND; shift >= 0; shift -= SAMPLE_BITS_PER_ROUND) {
+      chain.push_back({kind, shift, shift == key_bits - SAMPLE_BITS_PER_ROUND, false});
     }
   };
   if (has_top_k) {
-    add_search(KIND_COUNT);
+    add_search(SAMPLE_KIND_COUNT);
   } else {
     chain.push_back(NO_ROUND);
   }
   if (has_top_p) {
-    add_search(KIND_MASS);
+    add_search(SAMPLE_KIND_MASS);
   } else if (!has_top_k) {
-    chain.push_back({KIND_MASS, key_bits - BITS_PER_ROUND, true, false});
+    chain.push_back({SAMPLE_KIND_MASS, key_bits - SAMPLE_BITS_PER_ROUND, true, false});
   }
   chain.back().final = true;
-  if (static_cast<int>(chain.size()) >= STATE_SLOTS) {
-    throw std::logic_error("ftmetal sample: round chain exceeds the state slots");
+  if (static_cast<int>(chain.size()) >= SAMPLE_STATE_SLOTS) {
+    throw std::logic_error("ftmetal sample_tokens: round chain exceeds the state slots");
   }
   return chain;
 }
@@ -105,8 +95,8 @@ MTL::ComputePipelineState* round_pipeline(
 
 } // namespace
 
-void init_sample_library(const std::string& source) {
-  sample_source = source;
+void init_sample_tokens_library(const std::string& source) {
+  sample_tokens_source = source;
 }
 
 mx::array sample_tokens(
@@ -118,9 +108,9 @@ mx::array sample_tokens(
     const std::optional<mx::array>& random_bits,
     mx::StreamOrDevice s) {
   if (logits.ndim() != 2 || logits.shape(1) < 1) {
-    throw std::invalid_argument("ftmetal sample: logits must be [B, V] with V >= 1");
+    throw std::invalid_argument("ftmetal sample_tokens: logits must be [B, V] with V >= 1");
   }
-  metal_type(logits.dtype(), "sample");
+  metal_type(logits.dtype(), "sample_tokens");
   int rows = logits.shape(0);
   check_rows(temperatures, rows, mx::float32, "temperatures");
   if (random_bits) {
@@ -132,8 +122,8 @@ mx::array sample_tokens(
   if (top_p) {
     check_rows(*top_p, rows, mx::float32, "top_p");
   }
-  if (num_groups < 1 || num_groups > MAX_GROUPS) {
-    throw std::invalid_argument("ftmetal sample: num_groups must be in [1, 256]");
+  if (num_groups < 1 || num_groups > SAMPLE_MAX_GROUPS) {
+    throw std::invalid_argument("ftmetal sample_tokens: num_groups must be in [1, 256]");
   }
   auto stream = mx::to_stream(s);
   std::vector<mx::array> inputs = {
@@ -160,7 +150,7 @@ bool SampleTokens::is_equivalent(const mx::Primitive& other) const {
 }
 
 void SampleTokens::eval_cpu(const std::vector<mx::array>&, std::vector<mx::array>&) {
-  throw std::runtime_error("ftmetal sample: GPU only");
+  throw std::runtime_error("ftmetal sample_tokens: GPU only");
 }
 
 void SampleTokens::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) {
@@ -182,23 +172,23 @@ void SampleTokens::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
   uint32_t groups = c.num_groups;
   uint32_t chunk = (vocab + groups - 1) / groups;
   int key_bits = logits.dtype() == mx::float32 ? 32 : 16;
-  std::string type = metal_type(logits.dtype(), "sample");
-  std::string library_name = "ftmetal_sample_" + type;
+  std::string type = metal_type(logits.dtype(), "sample_tokens");
+  std::string library_name = "ftmetal_sample_tokens_" + type;
 
   auto s = stream();
   auto& d = mx::metal::device(s.device);
   auto* library = d.get_library(library_name, [&]() {
-    std::string source = sample_source;
+    std::string source = sample_tokens_source;
     replace_all(source, "{{T}}", type);
     replace_all(source, "{{KEY_BITS}}", std::to_string(key_bits));
     return source;
   });
 
   // Per-chunk maxima, per-row state slots, two parities of per-chunk counts and masses, and
-  // two of per-chunk mass above the bracket (layout in metal/sample.metal).
+  // two of per-chunk mass above the bracket (layout in sample_tokens.metal).
   int64_t cells = static_cast<int64_t>(rows) * groups;
-  int64_t words = cells + static_cast<int64_t>(rows) * STATE_SLOTS * STATE_WORDS +
-      4 * cells * NUM_BINS + 2 * cells;
+  int64_t words = cells + static_cast<int64_t>(rows) * SAMPLE_STATE_SLOTS * SAMPLE_STATE_WORDS +
+      4 * cells * SAMPLE_NUM_BINS + 2 * cells;
   mx::array workspace({static_cast<int>(words)}, mx::uint32, nullptr, {});
   workspace.set_data(mx::allocator::malloc(workspace.nbytes()));
   auto& encoder = mx::metal::get_command_encoder(s);
@@ -228,7 +218,8 @@ void SampleTokens::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
         c.has_top_k,
         c.has_top_p));
     bind_common();
-    encoder.dispatch_threadgroups(MTL::Size(groups, rows, 1), MTL::Size(ROUND_THREADS, 1, 1));
+    encoder.dispatch_threadgroups(
+        MTL::Size(groups, rows, 1), MTL::Size(SAMPLE_ROUND_THREADS, 1, 1));
   }
   encoder.set_compute_pipeline_state(round_pipeline(
       d,
@@ -243,7 +234,7 @@ void SampleTokens::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
   bind_common();
   encoder.set_input_array(random_bits, 8);
   encoder.set_output_array(tokens, 9);
-  encoder.dispatch_threadgroups(MTL::Size(1, rows, 1), MTL::Size(FIND_THREADS, 1, 1));
+  encoder.dispatch_threadgroups(MTL::Size(1, rows, 1), MTL::Size(SAMPLE_FIND_THREADS, 1, 1));
 }
 
 } // namespace ftmetal

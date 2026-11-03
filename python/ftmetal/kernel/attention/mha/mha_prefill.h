@@ -1,6 +1,6 @@
 // Paged flash-attention prefill as one primitive: the tile pass, or the split-KV
 // partials pass and the merge pass with the partials in a temporary (see
-// metal/fprefill.metal).
+// mha_prefill.metal).
 #pragma once
 
 #include <optional>
@@ -15,7 +15,7 @@ namespace mx = mlx::core;
 namespace ftmetal {
 
 // Register the Metal source template of the three kernels; compiled per configuration.
-void init_fprefill_library(const std::string& source);
+void init_mha_prefill_library(const std::string& source);
 
 // q [num_tokens, Hq, D]; k_cache / v_cache [num_pages * page_size, Hkv, D] in q's dtype;
 // page_table [B, max_pages] int32; tiles [num_tiles, 4] int32 rows (request, first query

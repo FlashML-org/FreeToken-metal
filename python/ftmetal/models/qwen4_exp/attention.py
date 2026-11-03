@@ -15,7 +15,7 @@ from ftmetal.attention.metadata import AttnType
 from ftmetal.attention.qsa.common import QSAAttnBackend, QSAIndexInputs
 from ftmetal.context import get_global_ctx
 from ftmetal.core import Batch
-from ftmetal.kernel.hyper_connection import offset_rms_norm_rope, supports_offset_rms_norm_rope
+from ftmetal.kernel.norm.offset_rms_norm import offset_rms_norm_rope, supports_offset_rms_norm_rope
 from ftmetal.layers.activation import sigmoid_gate
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged

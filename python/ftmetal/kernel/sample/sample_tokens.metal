@@ -1,6 +1,6 @@
 // Token sampling: softmax(logits / T), top-k and top-p filtering, inverse-CDF draw.
 // {{T}} and {{KEY_BITS}} are substituted per logits dtype; function constants specialize
-// each dispatch of the chain csrc/sample.cpp encodes.
+// each dispatch of the chain sample_tokens.cpp encodes.
 // Thresholds come from a radix select over an order-preserving key of each logit's bit
 // pattern (16 bits for bf16 / fp16, 32 for fp32), eight bits per round: top-k keeps every
 // logit >= the k-th largest (counts per bin), top-p every logit >= the largest value whose
@@ -14,6 +14,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#include "sample/sample_tokens_shared.h"
+
 typedef {{T}} T;
 #define KEY_BITS {{KEY_BITS}}
 
@@ -25,17 +27,17 @@ typedef uint Bits;
 constant constexpr uint SIGN_BIT = 1u << (KEY_BITS - 1);
 constant constexpr uint KEY_MASK = KEY_BITS == 32 ? 0xFFFFFFFFu : 0xFFFFu;
 
-constant constexpr int KIND_NONE = 0;
-constant constexpr int KIND_COUNT = 1;
-constant constexpr int KIND_MASS = 2;
-constant constexpr uint NUM_BINS = 256;
-constant constexpr uint ROUND_THREADS = 256;
-constant constexpr uint FIND_THREADS = 1024;
+constant constexpr int KIND_NONE = SAMPLE_KIND_NONE;
+constant constexpr int KIND_COUNT = SAMPLE_KIND_COUNT;
+constant constexpr int KIND_MASS = SAMPLE_KIND_MASS;
+constant constexpr uint NUM_BINS = SAMPLE_NUM_BINS;
+constant constexpr uint ROUND_THREADS = SAMPLE_ROUND_THREADS;
+constant constexpr uint FIND_THREADS = SAMPLE_FIND_THREADS;
 // Logits each thread loads before binning them, so their memory latencies overlap.
 constant constexpr uint LOADS_PER_THREAD = 8;
-constant constexpr uint MAX_GROUPS = 256;
-constant constexpr uint STATE_SLOTS = 10;
-constant constexpr uint STATE_WORDS = 8;
+constant constexpr uint MAX_GROUPS = SAMPLE_MAX_GROUPS;
+constant constexpr uint STATE_SLOTS = SAMPLE_STATE_SLOTS;
+constant constexpr uint STATE_WORDS = SAMPLE_STATE_WORDS;
 
 // Position in the chain; the round this dispatch selects (prev_*) and the one it bins (cur_*).
 constant int dispatch_index [[function_constant(0)]];
@@ -367,7 +369,7 @@ inline void add_to_bins(
   const bool with_masses = cur_kind == KIND_MASS || cur_final;
   // Without top-p a mass round only feeds the draw: all of its mass counts as above the bracket.
   const bool binless = cur_kind == KIND_MASS && !has_top_p;
-  const uint width_shift = cur_shift + 8;
+  const uint width_shift = cur_shift + SAMPLE_BITS_PER_ROUND;
   const float scale = M_LOG2E_F / temperatures[row];
   const uint start = min(vocab, group * chunk);
   const uint end = min(vocab, start + chunk);

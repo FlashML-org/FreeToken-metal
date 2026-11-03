@@ -5,9 +5,9 @@ tails, spare pages and the dummy page that pads short page-table rows) holds hug
 and values, so reading one shows up in the output. Decode runs flash-decode, whose only
 numeric test this is: the decode cases cover each decode plan (head groups and
 simdgroups per head dim and dtype) and partition regime once. Prefill runs flash-prefill
-(its numeric cases are in kernel/test_fprefill.py) on the backend's metadata, one batch of
-unequal requests or one long prompt chunk by chunk. Replay metadata (a page table as wide
-as the longest context, so flash-decode's grid holds the most partitions) must give the
+(its numeric cases are in kernel/attention/mha/test_mha_prefill.py) on the backend's metadata,
+one batch of unequal requests or one long prompt chunk by chunk. Replay metadata (a page table
+as wide as the longest context, so flash-decode's grid holds the most partitions) must give the
 per-length metadata's results. Sliding-window attention runs on a window pool whose slots
 back only the keys a step's windows reach; every other full slot maps to the sentinel,
 which holds huge keys and values like every unused window slot, and the reference attends

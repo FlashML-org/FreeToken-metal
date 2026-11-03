@@ -1,6 +1,6 @@
 """MoE prefill's sorted expert gather on a large shared expert bank, three ways, per call.
 
-    uv run python tools/bench_gather_qmm_sorted.py [--rows 1024,8192,16384,32768]
+    uv run python tools/bench_gather_sorted.py [--rows 1024,8192,16384,32768]
         [--banks 5120,10240] [--projections gate_up,down] [--repeats 25]
 
 Qwen3.6-35B-A3B's expert projections in affine 4-bit, group 64, bf16: gate_up (2048 -> 1024)
@@ -34,8 +34,8 @@ from typing import NamedTuple, Protocol
 import mlx.core as mx
 import numpy as np
 
-from ftmetal.kernel.gather_sorted import gather_qmm_sorted
-from ftmetal.kernel.inplace import copy_rows, scatter_rows
+from ftmetal.kernel.kvcache.pool_rows import copy_rows, scatter_rows
+from ftmetal.kernel.moe.gather_sorted import gather_qmm_sorted
 
 NUM_EXPERTS = 256
 BITS = 4

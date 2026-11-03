@@ -1,4 +1,4 @@
-// fprefill: paged flash-attention prefill, a varlen batch of query tokens over the paged
+// mha_prefill: paged flash-attention prefill, a varlen batch of query tokens over the paged
 // K/V pool. The {{...}} tokens are substituted per configuration before compilation.
 // A tile is one request's run of up to M / G consecutive query tokens; the host lists the
 // tiles (request, first query row, query count, position of the first query). A
@@ -27,11 +27,11 @@
 // which uses the GPU's matrix units where it has them. Everything else is shared: a
 // lane's Q, S and O elements live in arrays and their (column, row) comes from the GEMM's
 // fragment layout.
-// fprefill, grid (32 * NSG * num_tiles, HKV, 1): one pass, writes the output.
-// fprefill_partials, grid (32 * NSG * num_tiles, HKV, P): split-KV, each partition takes
+// mha_prefill, grid (32 * NSG * num_tiles, HKV, 1): one pass, writes the output.
+// mha_prefill_partials, grid (32 * NSG * num_tiles, HKV, P): split-KV, each partition takes
 // an equal share of the tile's key blocks and writes its unnormalized [M, D] accumulator
 // and per-row (max, sum); a partition with no keys writes max -inf.
-// fprefill_merge, grid (32 * M, HKV, num_tiles): one simdgroup per query row merges the
+// mha_prefill_merge, grid (32 * M, HKV, num_tiles): one simdgroup per query row merges the
 // row's partitions by log-sum-exp.
 #define MMA_SIMDGROUP 0
 #define MMA_MPP 1
@@ -282,7 +282,7 @@ inline void stage_value(
 #endif
 
 template <bool SPLIT>
-inline void fprefill_tile(
+inline void mha_prefill_tile(
     device const T* q,
     device const T* k_cache,
     device const T* v_cache,
@@ -482,7 +482,7 @@ inline void fprefill_tile(
   }
 }
 
-[[kernel, max_total_threads_per_threadgroup(NSG * 32)]] void fprefill(
+[[kernel, max_total_threads_per_threadgroup(NSG * 32)]] void mha_prefill(
     device const T* q [[buffer(0)]],
     device const T* k_cache [[buffer(1)]],
     device const T* v_cache [[buffer(2)]],
@@ -496,13 +496,13 @@ inline void fprefill_tile(
     uint lane [[thread_index_in_simdgroup]]) {
   threadgroup T kv_tg[KV_SHARED ? KV_SHARED_SIZE : K_SIZE + V_SIZE];
   threadgroup float2 s_tg[DS > 1 ? NSG * S_LANE / 2 * 32 : 1];
-  fprefill_tile<false>(
+  mha_prefill_tile<false>(
       q, k_cache, v_cache, page_table, tiles, BLOCK_ENDS, QSA_LISTS, out, nullptr, nullptr,
       max_pages, scale_log2e, tgpig.x, tgpig.y, 0, 1, sg, lane, kv_tg,
       kv_tg + (KV_SHARED ? 0 : K_SIZE), s_tg);
 }
 
-[[kernel, max_total_threads_per_threadgroup(NSG * 32)]] void fprefill_partials(
+[[kernel, max_total_threads_per_threadgroup(NSG * 32)]] void mha_prefill_partials(
     device const T* q [[buffer(0)]],
     device const T* k_cache [[buffer(1)]],
     device const T* v_cache [[buffer(2)]],
@@ -518,7 +518,7 @@ inline void fprefill_tile(
     uint lane [[thread_index_in_simdgroup]]) {
   threadgroup T kv_tg[KV_SHARED ? KV_SHARED_SIZE : K_SIZE + V_SIZE];
   threadgroup float2 s_tg[DS > 1 ? NSG * S_LANE / 2 * 32 : 1];
-  fprefill_tile<true>(
+  mha_prefill_tile<true>(
       q, k_cache, v_cache, page_table, tiles, BLOCK_ENDS, QSA_LISTS, nullptr, part_acc, part_ml,
       max_pages, scale_log2e, tgpig.x, tgpig.y, tgpig.z, tptg.z, sg, lane, kv_tg,
       kv_tg + (KV_SHARED ? 0 : K_SIZE), s_tg);
@@ -526,7 +526,7 @@ inline void fprefill_tile(
 
 // Buffers: 0 part_acc, 1 part_ml (as above), 2 tiles, 3 out [num_tokens, HKV * G, D],
 // 4 the partition count P.
-[[kernel]] void fprefill_merge(
+[[kernel]] void mha_prefill_merge(
     device const float* part_acc [[buffer(0)]],
     device const float* part_ml [[buffer(1)]],
     device const int4* tiles [[buffer(2)]],

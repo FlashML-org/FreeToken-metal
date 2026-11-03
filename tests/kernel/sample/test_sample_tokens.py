@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 
 from ftmetal.kernel._ext import _C
-from ftmetal.kernel.sample import sample_tokens
+from ftmetal.kernel.sample.sample_tokens import sample_tokens
 
 TEMPERATURES = [0.1, 0.7, 1.0, 2.0]
 # 0 is off; so is any k >= V.

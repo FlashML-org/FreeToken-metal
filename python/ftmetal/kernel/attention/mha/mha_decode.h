@@ -1,5 +1,5 @@
-// Paged flash-decode (fdecode v4) as one primitive: the partials pass and the merge
-// pass are encoded together, with the partials in a temporary (see metal/fdecode.metal).
+// Paged flash-decode as one primitive: the partials pass and the merge
+// pass are encoded together, with the partials in a temporary (see mha_decode.metal).
 #pragma once
 
 #include <string>
@@ -13,7 +13,7 @@ namespace mx = mlx::core;
 namespace ftmetal {
 
 // Register the Metal source template of the two kernels; compiled per configuration.
-void init_fdecode_library(const std::string& source);
+void init_mha_decode_library(const std::string& source);
 
 // q [B, Hq, D]; k_cache / v_cache [num_pages * page_size, Hkv, D] in q's dtype;
 // page_table [B, max_pages] int32; seq_lens [B] int32. The caller picks the grid's

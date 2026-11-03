@@ -24,7 +24,7 @@ from typing import Self
 
 import mlx.core as mx
 
-from ftmetal.kernel.inplace import copy_rows, zero_rows
+from ftmetal.kernel.kvcache.pool_rows import copy_rows, zero_rows
 from ftmetal.kvcache.base import BasePool, PoolConfig, PoolCost
 from ftmetal.models.config import KVCacheGroupSpec
 

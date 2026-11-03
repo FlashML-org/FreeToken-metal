@@ -24,8 +24,13 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from ftmetal.kernel.fprefill import FprefillMma, flash_prefill_qsa
-from ftmetal.kernel.qsa import qsa_block_scores, qsa_key_table, qsa_topk, qsa_window_mean
+from ftmetal.kernel.attention.mha.mha_prefill import MhaPrefillMma, flash_prefill_qsa
+from ftmetal.kernel.attention.qsa.qsa_indexer import (
+    qsa_block_scores,
+    qsa_key_table,
+    qsa_topk,
+    qsa_window_mean,
+)
 
 BLOCK_SIZE = 4
 SPARE_PAGES = 2
@@ -342,7 +347,7 @@ PREFILL_CASES = [
 
 @pytest.mark.parametrize("mma", MMAS)
 @pytest.mark.parametrize("case", PREFILL_CASES, ids=str)
-def test_prefill_matches_masked_sdpa(case: PrefillCase, mma: FprefillMma) -> None:
+def test_prefill_matches_masked_sdpa(case: PrefillCase, mma: MhaPrefillMma) -> None:
     rng = np.random.default_rng(case.cached_len + case.num_queries)
     key_len = case.cached_len + case.num_queries
     page_table, num_pages = shuffled_page_table((key_len,), case.page_size, rng)

@@ -6,7 +6,7 @@ LLM serving engine for one Apple Silicon Mac: Python + MLX + Metal.
 
 ```bash
 uv sync                                  # creates .venv, builds the C++ extensions
-uv sync --reinstall-package ftmetal      # after editing python/ftmetal/*/csrc
+uv sync --reinstall-package ftmetal      # after editing a .cpp or .h (not for .metal)
 uv run pytest tests/ -q
 uv run ruff check python tests tools && uv run ruff format --check python tests tools
 uvx pyright python tests tools                                 # 0 errors expected
@@ -15,8 +15,8 @@ uv run python tools/aime0_check.py /path/to/Qwen3.6-35B-A3B-MLX   # AIME25 #0 mu
 ```
 
 The extensions `ftmetal.kernel._C` and `ftmetal.command_graph._C` are built by CMake
-against the pinned `mlx` wheel; Metal kernels under `python/ftmetal/kernel/metal/` are
-compiled at first use.
+against the pinned `mlx` wheel; the Metal kernels under `python/ftmetal/kernel/` (layout in
+`docs/dev/kernel-layout.md`) are compiled at first use.
 
 ## Serve and chat
 

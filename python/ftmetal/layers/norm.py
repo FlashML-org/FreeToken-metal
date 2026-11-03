@@ -3,7 +3,7 @@
 Port of FreeToken layers/norm.py. Divergences: no fused add-residual variant (the
 residual add is a separate elementwise op MLX fuses itself); GatedRMSNorm keeps the
 FreeToken's norm-before-gate semantics, its gate silu or sigmoid (the sigmoid one in fp32 with
-one rounding, as FreeToken's gated layernorm kernel, fused in kernel/gated_norm.py).
+one rounding, as FreeToken's gated layernorm kernel, fused in kernel/norm/gated_norm.py).
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from functools import partial
 import mlx.core as mx
 import mlx.nn as nn
 
-from ftmetal.kernel.gated_norm import gated_rms_norm
+from ftmetal.kernel.norm.gated_norm import gated_rms_norm
 from ftmetal.layers.base import BaseOP
 from ftmetal.models.config import GatedDeltaOutputGate
 

@@ -1,8 +1,9 @@
-#include "rows.h"
+#include "kvcache/pool_rows.h"
 
 #include <algorithm>
 #include <stdexcept>
 
+#include "kvcache/pool_rows_shared.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/utils.h"
 
@@ -10,9 +11,8 @@ namespace ftmetal {
 
 namespace {
 
-std::string rows_source;
-const char* LIBRARY_NAME = "ftmetal_rows";
-const int VECTOR_WIDTH = 4;
+std::string pool_rows_source;
+const char* LIBRARY_NAME = "ftmetal_pool_rows";
 
 std::string metal_type(mx::Dtype dtype) {
   switch (dtype) {
@@ -28,40 +28,40 @@ std::string metal_type(mx::Dtype dtype) {
       return "uint";
     default:
       throw std::invalid_argument(
-          "ftmetal rows: unsupported pool dtype " + mx::type_to_name(dtype));
+          "ftmetal pool_rows: unsupported pool dtype " + mx::type_to_name(dtype));
   }
 }
 
 void check_ids(const mx::array& ids, const char* what) {
   if (ids.dtype() != mx::int32) {
-    throw std::invalid_argument(std::string("ftmetal rows: ") + what + " must be int32");
+    throw std::invalid_argument(std::string("ftmetal pool_rows: ") + what + " must be int32");
   }
   if (ids.ndim() != 1) {
-    throw std::invalid_argument(std::string("ftmetal rows: ") + what + " must be 1-D");
+    throw std::invalid_argument(std::string("ftmetal pool_rows: ") + what + " must be 1-D");
   }
 }
 
 void check_rows(const mx::array& pool, const mx::array& rows, const mx::array& ids) {
   if (pool.ndim() < 2) {
-    throw std::invalid_argument("ftmetal rows: pool must be [num_rows, ...]");
+    throw std::invalid_argument("ftmetal pool_rows: pool must be [num_rows, ...]");
   }
   if (rows.dtype() != pool.dtype()) {
-    throw std::invalid_argument("ftmetal rows: rows and pool dtypes differ");
+    throw std::invalid_argument("ftmetal pool_rows: rows and pool dtypes differ");
   }
   if (rows.ndim() != pool.ndim() || rows.shape(0) != ids.shape(0)) {
-    throw std::invalid_argument("ftmetal rows: rows must be [len(ids), *pool.shape[1:]]");
+    throw std::invalid_argument("ftmetal pool_rows: rows must be [len(ids), *pool.shape[1:]]");
   }
   for (int i = 1; i < pool.ndim(); ++i) {
     if (rows.shape(i) != pool.shape(i)) {
-      throw std::invalid_argument("ftmetal rows: rows must be [len(ids), *pool.shape[1:]]");
+      throw std::invalid_argument("ftmetal pool_rows: rows must be [len(ids), *pool.shape[1:]]");
     }
   }
 }
 
 } // namespace
 
-void init_library(const std::string& source) {
-  rows_source = source;
+void init_pool_rows_library(const std::string& source) {
+  pool_rows_source = source;
 }
 
 mx::array scatter_rows(
@@ -75,7 +75,7 @@ mx::array scatter_rows(
   return mx::array(
       pool.shape(),
       pool.dtype(),
-      std::make_shared<InPlaceRows>(stream, RowsKind::Scatter),
+      std::make_shared<PoolRows>(stream, RowsKind::Scatter),
       {pool,
        mx::contiguous(rows, false, stream),
        mx::contiguous(dst_ids, false, stream)});
@@ -89,16 +89,16 @@ mx::array copy_rows(
   check_ids(src_ids, "src_ids");
   check_ids(dst_ids, "dst_ids");
   if (pool.ndim() < 2) {
-    throw std::invalid_argument("ftmetal rows: pool must be [num_rows, ...]");
+    throw std::invalid_argument("ftmetal pool_rows: pool must be [num_rows, ...]");
   }
   if (src_ids.shape(0) != dst_ids.shape(0)) {
-    throw std::invalid_argument("ftmetal rows: src_ids and dst_ids differ in length");
+    throw std::invalid_argument("ftmetal pool_rows: src_ids and dst_ids differ in length");
   }
   auto stream = mx::to_stream(s);
   return mx::array(
       pool.shape(),
       pool.dtype(),
-      std::make_shared<InPlaceRows>(stream, RowsKind::Copy),
+      std::make_shared<PoolRows>(stream, RowsKind::Copy),
       {pool,
        mx::contiguous(src_ids, false, stream),
        mx::contiguous(dst_ids, false, stream)});
@@ -107,13 +107,13 @@ mx::array copy_rows(
 mx::array zero_rows(const mx::array& pool, const mx::array& ids, mx::StreamOrDevice s) {
   check_ids(ids, "ids");
   if (pool.ndim() < 2) {
-    throw std::invalid_argument("ftmetal rows: pool must be [num_rows, ...]");
+    throw std::invalid_argument("ftmetal pool_rows: pool must be [num_rows, ...]");
   }
   auto stream = mx::to_stream(s);
   return mx::array(
       pool.shape(),
       pool.dtype(),
-      std::make_shared<InPlaceRows>(stream, RowsKind::Zero),
+      std::make_shared<PoolRows>(stream, RowsKind::Zero),
       {pool, mx::contiguous(ids, false, stream)});
 }
 
@@ -131,7 +131,7 @@ std::vector<mx::array> kv_write(
   return mx::array::make_arrays(
       {k_cache.shape(), v_cache.shape()},
       {k_cache.dtype(), v_cache.dtype()},
-      std::make_shared<InPlaceRows>(stream, RowsKind::KVWrite),
+      std::make_shared<PoolRows>(stream, RowsKind::KVWrite),
       {k_cache,
        v_cache,
        mx::contiguous(k, false, stream),
@@ -139,7 +139,7 @@ std::vector<mx::array> kv_write(
        mx::contiguous(out_loc, false, stream)});
 }
 
-const char* InPlaceRows::name() const {
+const char* PoolRows::name() const {
   switch (kind_) {
     case RowsKind::Scatter:
       return "ScatterRows";
@@ -150,21 +150,21 @@ const char* InPlaceRows::name() const {
     case RowsKind::KVWrite:
       return "KVWrite";
   }
-  return "InPlaceRows";
+  return "PoolRows";
 }
 
-bool InPlaceRows::is_equivalent(const mx::Primitive& other) const {
-  auto* rows = dynamic_cast<const InPlaceRows*>(&other);
+bool PoolRows::is_equivalent(const mx::Primitive& other) const {
+  auto* rows = dynamic_cast<const PoolRows*>(&other);
   return rows != nullptr && rows->kind_ == kind_;
 }
 
-void InPlaceRows::eval_cpu(
+void PoolRows::eval_cpu(
     const std::vector<mx::array>&,
     std::vector<mx::array>&) {
-  throw std::runtime_error("ftmetal rows: GPU only");
+  throw std::runtime_error("ftmetal pool_rows: GPU only");
 }
 
-void InPlaceRows::eval_gpu(
+void PoolRows::eval_gpu(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
   switch (kind_) {
@@ -189,7 +189,7 @@ void InPlaceRows::eval_gpu(
   }
 }
 
-void InPlaceRows::encode(
+void PoolRows::encode(
     const mx::array& pool_out,
     const mx::array* rows,
     const mx::array* src_ids,
@@ -199,18 +199,18 @@ void InPlaceRows::encode(
     return;
   }
   if (!pool_out.flags().row_contiguous) {
-    throw std::runtime_error("ftmetal rows: pool must be row contiguous");
+    throw std::runtime_error("ftmetal pool_rows: pool must be row contiguous");
   }
   int row_elems = static_cast<int>(pool_out.size() / pool_out.shape(0));
-  bool vectorized = row_elems % VECTOR_WIDTH == 0;
-  int lanes = vectorized ? row_elems / VECTOR_WIDTH : row_elems;
+  bool vectorized = row_elems % POOL_ROWS_VECTOR_WIDTH == 0;
+  int lanes = vectorized ? row_elems / POOL_ROWS_VECTOR_WIDTH : row_elems;
 
   const char* base = rows != nullptr ? "scatter_rows" : (src_ids != nullptr ? "copy_rows" : "zero_rows");
   std::string kernel_name = std::string(base) + (vectorized ? "_vec_" : "_") + metal_type(pool_out.dtype());
 
   auto s = stream();
   auto& d = mx::metal::device(s.device);
-  auto* library = d.get_library(LIBRARY_NAME, [&]() { return rows_source; });
+  auto* library = d.get_library(LIBRARY_NAME, [&]() { return pool_rows_source; });
   auto* kernel = d.get_kernel(kernel_name, library);
 
   auto& encoder = mx::metal::get_command_encoder(s);

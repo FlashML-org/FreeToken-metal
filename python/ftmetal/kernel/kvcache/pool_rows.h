@@ -18,7 +18,7 @@ namespace mx = mlx::core;
 namespace ftmetal {
 
 // Register the Metal source of the row kernels; compiled on first use.
-void init_library(const std::string& source);
+void init_pool_rows_library(const std::string& source);
 
 // pool[dst_ids[i]] = rows[i]
 mx::array scatter_rows(
@@ -51,9 +51,9 @@ std::vector<mx::array> kv_write(
 
 enum class RowsKind { Scatter, Copy, Zero, KVWrite };
 
-class InPlaceRows : public mx::Primitive {
+class PoolRows : public mx::Primitive {
  public:
-  InPlaceRows(mx::Stream stream, RowsKind kind)
+  PoolRows(mx::Stream stream, RowsKind kind)
       : mx::Primitive(stream), kind_(kind) {}
 
   void eval_cpu(

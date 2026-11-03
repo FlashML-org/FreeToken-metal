@@ -281,9 +281,10 @@ def test_encoder_spec_mlp_rows_are_the_towers(encoder: EncoderSpec, tower: Modul
 MODEL_MODULES = (
     "ftmetal.models.gemma4",
     "ftmetal.models.qwen3_5_moe",
-    "ftmetal.kernel.gdn",
-    "ftmetal.kernel.gdn_chunk",
-    "ftmetal.kernel.router",
+    "ftmetal.kernel.attention.gdn.gdn_chunk",
+    "ftmetal.kernel.attention.gdn.gdn_decode",
+    "ftmetal.kernel.attention.gdn.gdn_prefill",
+    "ftmetal.kernel.moe.moe_topk",
 )
 
 

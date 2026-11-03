@@ -1,9 +1,9 @@
-// fdecode: paged flash-decode, one query token per request over the paged K/V pool.
+// mha_decode: paged flash-decode, one query token per request over the paged K/V pool.
 // The {{...}} tokens are substituted per configuration before compilation.
 // The grid holds P partitions per (request, kv head); a request of seq_len keys uses the
 // first request_partitions(seq_len) of them, so a grid fixed at the longest context (a
 // replayed graph) costs a short request only the partitions it would get on its own.
-// fdecode_partials, grid (32 * NSG * P, HKV * HG, B): a threadgroup streams one kv
+// mha_decode_partials, grid (32 * NSG * P, HKV * HG, B): a threadgroup streams one kv
 // head's keys of one partition once for GH = G / HG of its G = Hq / Hkv query heads
 // (HG > 1 trades re-reading the keys for fewer registers per lane at a wide head);
 // each simdgroup takes a contiguous slice and keeps an online softmax per query head
@@ -11,7 +11,7 @@
 // accumulator cannot overflow); the slices merge through threadgroup memory and
 // simdgroup 0 writes the partition's unnormalized [GH, D] accumulator and its (max,
 // sum) in the log2 domain.
-// fdecode_merge, grid (32 * G, HKV, B): one simdgroup per (request, query head) merges
+// mha_decode_merge, grid (32 * G, HKV, B): one simdgroup per (request, query head) merges
 // the request's partials by log-sum-exp.
 #include <metal_stdlib>
 using namespace metal;
@@ -37,7 +37,7 @@ using InVec = vec<T, VW>;
 using FloatVec = vec<float, VW>;
 using AccVec = vec<AccT, VW>;
 
-// The host's partition count (kernel/fdecode.py) for max_seqlen_k = seq_len, capped at
+// The host's partition count (kernel/attention/mha/mha_decode.py) for max_seqlen_k = seq_len, capped at
 // the grid's.
 inline uint request_partitions(uint seq_len, uint batch_size, uint grid_partitions) {
   uint partitions =
@@ -53,7 +53,7 @@ inline uint request_partitions(uint seq_len, uint batch_size, uint grid_partitio
 // Buffers: 0 q [B, HKV * G, D], 1 k_cache / 2 v_cache [num_pages * BS, HKV, D],
 // 3 page_table [B, max_pages] int32, 4 seq_lens [B] int32, 5 part_acc [B, HKV, P, G, D]
 // fp32, 6 part_ml [B, HKV, P, G, 2] fp32, 7 max_pages, 8 scale * log2(e).
-[[kernel, max_total_threads_per_threadgroup(NSG * 32)]] void fdecode_partials(
+[[kernel, max_total_threads_per_threadgroup(NSG * 32)]] void mha_decode_partials(
     device const T* q [[buffer(0)]],
     device const T* k_cache [[buffer(1)]],
     device const T* v_cache [[buffer(2)]],
@@ -192,7 +192,7 @@ inline uint request_partitions(uint seq_len, uint batch_size, uint grid_partitio
 
 // Buffers: 0 part_acc, 1 part_ml (as above), 2 seq_lens, 3 out [B, HKV * G, D],
 // 4 the grid's partition count P.
-[[kernel]] void fdecode_merge(
+[[kernel]] void mha_decode_merge(
     device const float* part_acc [[buffer(0)]],
     device const float* part_ml [[buffer(1)]],
     device const int* seq_lens [[buffer(2)]],

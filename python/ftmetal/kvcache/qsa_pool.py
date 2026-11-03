@@ -16,7 +16,7 @@ from typing import Self
 
 import mlx.core as mx
 
-from ftmetal.kernel.inplace import scatter_rows
+from ftmetal.kernel.kvcache.pool_rows import scatter_rows
 from ftmetal.kvcache.base import PoolConfig
 from ftmetal.kvcache.mha_pool import MHAKVCache
 from ftmetal.models.config import KVCacheGroupSpec

@@ -3,7 +3,7 @@ then a causal dilated short conv.
 
 Port of FreeToken models/qwen4_exp/ple.py (NGramEmbedding, PLELayer) and ple_disk.py
 (DiskRowTable). Divergences: the table is the MLX checkpoint's affine shards, never loaded:
-a row store reads each forward's rows from the checkpoint files (kernel/csrc/ple_service.h)
+a row store reads each forward's rows from the checkpoint files (kernel/service/ple/ple_service.h)
 and they are dequantized on the GPU; a prefill hashes its n-grams on the host (the service's
 hash) over the request's token ids, its context the ids before them (eos at the start), and
 gathers its rows before the layer; a decode step posts its tokens at the forward's start
@@ -31,8 +31,8 @@ from ftmetal.attention.metadata import AttnType, LinearAttnMetadata
 from ftmetal.context import get_global_ctx
 from ftmetal.core import Batch
 from ftmetal.kernel._ext import _C
-from ftmetal.kernel.inplace import scatter_rows
-from ftmetal.kernel.ple_lookup import PleRowParts, ple_post, ple_wait
+from ftmetal.kernel.embedding.ple_lookup import PleRowParts, ple_post, ple_wait
+from ftmetal.kernel.kvcache.pool_rows import scatter_rows
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.gdn import DepthwiseConv1d
 from ftmetal.layers.linear import Linear

@@ -11,7 +11,7 @@ from __future__ import annotations
 import mlx.core as mx
 import numpy as np
 
-from ftmetal.kernel.inplace import scatter_rows
+from ftmetal.kernel.kvcache.pool_rows import scatter_rows
 
 
 class TableManager:

@@ -10,8 +10,8 @@ import mlx.core as mx
 import pytest
 
 from ftmetal.core import host_floats
-from ftmetal.kernel.ref import router_topk_ref
-from ftmetal.kernel.router import router_topk
+from ftmetal.kernel.moe.moe_topk import moe_topk
+from ftmetal.kernel.ref import moe_topk_ref
 
 
 @pytest.mark.parametrize(
@@ -26,13 +26,13 @@ from ftmetal.kernel.router import router_topk
     ],
     ids=["E256-norm-bf16", "E256-fp32", "E64-norm-bf16", "E64-fp32", "E4-norm-fp32", "E4-bf16"],
 )
-def test_router_matches_ops_path(
+def test_moe_topk_matches_ops_path(
     dtype: mx.Dtype, num_experts: int, top_k: int, num_rows: int, norm: bool
 ) -> None:
     mx.random.seed(num_rows * 7 + top_k)
     gates = (3.0 * mx.random.normal((num_rows, num_experts))).astype(dtype)
-    expected_ids, expected_weights = router_topk_ref(gates, top_k, norm)
-    ids, weights = router_topk(gates, top_k, norm)
+    expected_ids, expected_weights = moe_topk_ref(gates, top_k, norm)
+    ids, weights = moe_topk(gates, top_k, norm)
     mx.eval(ids, weights, expected_ids, expected_weights)
     tolerance = 1e-2 if dtype == mx.bfloat16 else 1e-5
     for row in range(num_rows):

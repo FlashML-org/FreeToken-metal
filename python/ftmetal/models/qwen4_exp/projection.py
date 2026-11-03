@@ -1,4 +1,5 @@
-"""One-token projections on kernel/qmv_rows: a decode step's GEMVs on more simdgroups.
+"""One-token projections on kernel/gemm/affine/affine_qmv_rows: a decode step's GEMVs on more
+simdgroups.
 
 A CommandGraph replays a decode step's dispatches back to back, so a GEMV with few
 threadgroups per output row waits on memory latency; qmv_rows computes mx.quantized_matmul's
@@ -11,7 +12,7 @@ from __future__ import annotations
 import mlx.core as mx
 import numpy as np
 
-from ftmetal.kernel.qmv_rows import qmv_rows, supports_qmv_rows
+from ftmetal.kernel.gemm.affine.affine_qmv_rows import qmv_rows, supports_qmv_rows
 from ftmetal.layers.linear import Linear, LinearMerged
 from ftmetal.layers.quantization.config import AffineScheme
 from ftmetal.layers.quantization.linear import AffineLinearMethod

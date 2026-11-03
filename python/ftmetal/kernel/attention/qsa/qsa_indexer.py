@@ -14,8 +14,11 @@ costs what the requests' lengths do.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import mlx.core as mx
 
+from ftmetal.kernel._ext import metal_source
 from ftmetal.kernel.custom import metal_kernel
 
 SCORE_SIMDGROUPS = 8
@@ -25,65 +28,10 @@ BLOCKS_PER_SIMDGROUP = 4
 # One threadgroup per request, the largest Metal allows.
 TOPK_THREADS = 1024
 
-# One simdgroup per BLOCKS_PER_SIMDGROUP consecutive blocks of one request: the sum over the
-# index heads of relu(q . k) / sqrt(D) in fp32, -inf for a block past the complete ones.
-SCORES_SOURCE = """
-    const uint row = threadgroup_position_in_grid.y;
-    const uint lane = thread_index_in_simdgroup;
-    const uint first_block =
-        (threadgroup_position_in_grid.x * SIMDGROUPS + simdgroup_index_in_threadgroup) *
-        BLOCKS_PER_SIMDGROUP;
-    const uint num_blocks = uint(num_blocks_in);
-    if (first_block >= num_blocks) {
-      return;
-    }
-    const uint complete = uint(seq_lens[row]) / BLOCK_SIZE;
-    if (first_block >= complete) {
-      if (lane < BLOCKS_PER_SIMDGROUP && first_block + lane < num_blocks) {
-        scores[row * num_blocks + first_block + lane] = -INFINITY;
-      }
-      return;
-    }
-    constexpr uint PER_LANE = D / 32;
-    float query[HEADS][PER_LANE];
-    for (uint h = 0; h < HEADS; ++h) {
-      for (uint i = 0; i < PER_LANE; ++i) {
-        query[h][i] = static_cast<float>(queries[(row * HEADS + h) * D + lane + i * 32]);
-      }
-    }
-    const uint width = page_table_shape[1];
-    float key[BLOCKS_PER_SIMDGROUP][PER_LANE];
-    for (uint b = 0; b < BLOCKS_PER_SIMDGROUP; ++b) {
-      // A block past the complete ones reads the last complete one's key (its score is -inf).
-      const uint block = metal::min(first_block + b, complete - 1);
-      const uint position = block * BLOCK_SIZE + BLOCK_SIZE - 1;
-      const uint slot = uint(page_table[row * width + position / page_size]) * page_size +
-                        position % page_size;
-      for (uint i = 0; i < PER_LANE; ++i) {
-        key[b][i] = static_cast<float>(index_keys[size_t(slot) * D + lane + i * 32]);
-      }
-    }
-    for (uint b = 0; b < BLOCKS_PER_SIMDGROUP; ++b) {
-      const uint block = first_block + b;
-      if (block >= num_blocks) {
-        break;
-      }
-      float total = 0.0f;
-      for (uint h = 0; h < HEADS; ++h) {
-        float dot = 0.0f;
-        for (uint i = 0; i < PER_LANE; ++i) {
-          dot += query[h][i] * key[b][i];
-        }
-        total += metal::max(simd_sum(dot), 0.0f);
-      }
-      if (lane == 0) {
-        scores[row * num_blocks + block] = block < complete ? total * inv_sqrt_d : -INFINITY;
-      }
-    }
-"""
+SCORES_SOURCE = metal_source(Path(__file__).with_name("qsa_indexer_scores.metal"))
 
 SCORES_KERNEL = metal_kernel(
-    name="qsa_block_scores",
+    name="qsa_indexer_scores",
     input_names=[
         "queries",
         "index_keys",
@@ -97,196 +45,28 @@ SCORES_KERNEL = metal_kernel(
     source=SCORES_SOURCE,
 )
 
-# One threadgroup per request, thread t holding the order-preserving uint keys of blocks
-# [t * per, t * per + per) in registers. Four 8-bit radix passes find the topk-th largest key:
-# each counts the candidates' digits with one atomic add per (simdgroup, distinct digit), a
-# capped loop retiring the lanes that share the lowest pending lane's digit each round, and
-# simdgroup 0 finds the digit by a prefix sum over the bins, highest first. The blocks above
-# that key, then its ties lowest index first, are written in index order.
-TOPK_SOURCE = """
-    const uint row = threadgroup_position_in_grid.y;
-    const uint tid = thread_position_in_threadgroup.x;
-    const uint lane = thread_index_in_simdgroup;
-    const uint simdgroup = simdgroup_index_in_threadgroup;
-    const uint num_blocks = uint(num_blocks_in);
-    const uint complete = metal::min(uint(seq_lens[row]) / BLOCK_SIZE, num_blocks);
-    device int* out = selected + row * TOPK;
-    if (complete <= uint(TOPK)) {
-      for (uint i = tid; i < uint(TOPK); i += THREADS) {
-        out[i] = i < complete ? int(i) : 0;
-      }
-      return;
-    }
-    auto row_scores = scores + row * num_blocks;
-    const uint per = (complete + THREADS - 1) / THREADS;
-    const uint begin = metal::min(tid * per, complete);
-    const uint count = metal::min(begin + per, complete) - begin;
-    uint keys[PER_THREAD];
-    for (uint j = 0; j < uint(PER_THREAD); ++j) {
-      const uint bits = j < count ? as_type<uint>(row_scores[begin + j]) : 0u;
-      keys[j] = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
-    }
-    threadgroup atomic_uint histogram[256];
-    threadgroup uint shared_state[2];
-    uint prefix = 0;
-    uint mask = 0;
-    uint remaining = TOPK;
-    for (int shift = 24; shift >= 0; shift -= 8) {
-      for (uint b = tid; b < 256; b += THREADS) {
-        atomic_store_explicit(&histogram[b], 0u, memory_order_relaxed);
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      for (uint j = 0; j < uint(PER_THREAD); ++j) {
-        bool pending = j < count && (keys[j] & mask) == prefix;
-        const uint bin = (keys[j] >> shift) & 255u;
-        for (uint round = 0; round < 32; ++round) {
-          const uint votes = uint(ulong(simd_ballot(pending)));
-          if (votes == 0) {
-            break;
-          }
-          const uint leader = ctz(votes);
-          const uint leader_bin = simd_shuffle(bin, ushort(leader));
-          const bool same = pending && bin == leader_bin;
-          const uint same_votes = uint(ulong(simd_ballot(same)));
-          if (lane == leader) {
-            atomic_fetch_add_explicit(
-                &histogram[leader_bin], popcount(same_votes), memory_order_relaxed);
-          }
-          pending = pending && !same;
-        }
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (simdgroup == 0) {
-        // Lane l holds bins 255 - 8 l .. 248 - 8 l, highest first.
-        uint counts[8];
-        uint total = 0;
-        for (uint k = 0; k < 8; ++k) {
-          counts[k] = atomic_load_explicit(&histogram[255u - 8u * lane - k], memory_order_relaxed);
-          total += counts[k];
-        }
-        uint above = simd_prefix_exclusive_sum(total);
-        if (above < remaining && remaining <= above + total) {
-          uint bin = 255u - 8u * lane;
-          for (uint k = 0; k < 8; ++k) {
-            if (above + counts[k] >= remaining) {
-              bin = 255u - 8u * lane - k;
-              break;
-            }
-            above += counts[k];
-          }
-          shared_state[0] = bin;
-          shared_state[1] = remaining - above;
-        }
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      prefix |= shared_state[0] << shift;
-      mask |= 255u << shift;
-      remaining = shared_state[1];
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    // prefix is the topk-th largest key; the first remaining keys equal to it are taken.
-    uint greater = 0;
-    uint equal = 0;
-    for (uint j = 0; j < uint(PER_THREAD); ++j) {
-      greater += j < count && keys[j] > prefix;
-      equal += j < count && keys[j] == prefix;
-    }
-    threadgroup uint sums[THREADS / 32];
-    // Exclusive prefix sums over the threads, in index order.
-    uint equal_before = simd_prefix_exclusive_sum(equal);
-    if (lane == 31) {
-      sums[simdgroup] = equal_before + equal;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint j = 0; j < simdgroup; ++j) {
-      equal_before += sums[j];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint ties =
-        equal_before >= remaining ? 0 : metal::min(equal, remaining - equal_before);
-    const uint mine = greater + ties;
-    uint before = simd_prefix_exclusive_sum(mine);
-    if (lane == 31) {
-      sums[simdgroup] = before + mine;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint j = 0; j < simdgroup; ++j) {
-      before += sums[j];
-    }
-    uint taken_ties = 0;
-    for (uint j = 0; j < uint(PER_THREAD); ++j) {
-      bool take = j < count && keys[j] > prefix;
-      if (j < count && keys[j] == prefix && taken_ties < ties) {
-        take = true;
-        ++taken_ties;
-      }
-      if (take) {
-        out[before++] = int(begin + j);
-      }
-    }
-"""
+TOPK_SOURCE = metal_source(Path(__file__).with_name("qsa_indexer_topk.metal"))
 
 TOPK_KERNEL = metal_kernel(
-    name="qsa_topk",
+    name="qsa_indexer_topk",
     input_names=["scores", "seq_lens", "num_blocks_in"],
     output_names=["selected"],
     source=TOPK_SOURCE,
 )
 
-# One thread per table entry: a request's selected blocks' token slots ascending, then its
-# incomplete tail block's; entries past its count hold its last key's slot (never read).
-TABLE_SOURCE = """
-    const uint entry = thread_position_in_grid.x;
-    const uint row = thread_position_in_grid.y;
-    const uint topk = selected_shape[1];
-    const uint width = (topk + 1) * BLOCK_SIZE;
-    if (entry >= width) {
-      return;
-    }
-    const uint seq_len = uint(seq_lens[row]);
-    const uint complete = seq_len / BLOCK_SIZE;
-    const uint num_selected = metal::min(complete, topk) * BLOCK_SIZE;
-    uint position;
-    if (entry < num_selected) {
-      position = uint(selected[row * topk + entry / BLOCK_SIZE]) * BLOCK_SIZE + entry % BLOCK_SIZE;
-    } else {
-      const uint last = metal::max(seq_len, 1u) - 1;
-      position = metal::min(complete * BLOCK_SIZE + entry - num_selected, last);
-    }
-    const uint pages = page_table_shape[1];
-    key_slots[row * width + entry] =
-        int(uint(page_table[row * pages + position / page_size]) * page_size +
-            position % page_size);
-    if (entry == 0) {
-      counts[row] = int(num_selected + seq_len - complete * BLOCK_SIZE);
-    }
-"""
+TABLE_SOURCE = metal_source(Path(__file__).with_name("qsa_indexer_key_table.metal"))
 
 TABLE_KERNEL = metal_kernel(
-    name="qsa_key_table",
+    name="qsa_indexer_key_table",
     input_names=["selected", "page_table", "seq_lens", "page_size"],
     output_names=["key_slots", "counts"],
     source=TABLE_SOURCE,
 )
 
-# One thread per (token, column): the window's keys summed in order in fp32, times 1 / WINDOW,
-# rounded to the keys' dtype.
-WINDOW_MEAN_SOURCE = """
-    const uint column = thread_position_in_grid.x;
-    const uint token = thread_position_in_grid.y;
-    if (column >= D) {
-      return;
-    }
-    float total = 0.0f;
-    for (uint i = 0; i < WINDOW; ++i) {
-      const size_t slot = size_t(window_slots[token * WINDOW + i]);
-      total += static_cast<float>(index_keys[slot * D + column]);
-    }
-    means[token * D + column] = static_cast<T>(total * (1.0f / float(WINDOW)));
-"""
+WINDOW_MEAN_SOURCE = metal_source(Path(__file__).with_name("qsa_indexer_window_mean.metal"))
 
 WINDOW_MEAN_KERNEL = metal_kernel(
-    name="qsa_window_mean",
+    name="qsa_indexer_window_mean",
     input_names=["index_keys", "window_slots"],
     output_names=["means"],
     source=WINDOW_MEAN_SOURCE,

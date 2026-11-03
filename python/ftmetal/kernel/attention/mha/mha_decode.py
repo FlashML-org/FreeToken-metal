@@ -1,7 +1,7 @@
-"""Paged flash-decode (fdecode v4): one query token per request over the paged K/V pool.
+"""Paged flash-decode: one query token per request over the paged K/V pool.
 
-The kernels live in metal/fdecode.metal and are encoded by the C++ FlashDecode
-primitive (csrc/fdecode.cpp): one primitive per call, the partials pass and the
+The kernels live in mha_decode.metal and are encoded by the C++ FlashDecode
+primitive (mha_decode.cpp): one primitive per call, the partials pass and the
 log-sum-exp merge in one launch pair with the partials in a temporary. Each threadgroup
 streams one kv head's keys once for its query heads (GQA packing: all G = Hq / Hkv of
 them, or a 1 / num_head_groups share at a wide head); split-KV partitions fill the GPU
@@ -24,7 +24,7 @@ from ftmetal.kernel._ext import _C
 SIMD_WIDTH = 32
 # Apple GPUs cap threadgroup memory at 32 KiB; keep a margin for the compiler.
 THREADGROUP_MEMORY_BYTES = 30 * 1024
-# Partitioning tuned for fdecode v4 on the M4 Pro (20 GPU cores): about 1k keys per
+# Partitioning tuned on the M4 Pro (20 GPU cores): about 1k keys per
 # partition, at least 256, and at least two waves of threadgroups (counting each kv
 # head's head groups) at small batch.
 PARTITION_TOKENS = 1024

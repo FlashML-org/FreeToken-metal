@@ -1,6 +1,6 @@
 """Per-call time of paged flash-attention prefill at the Qwen3.6 (default) or a given shape.
 
-    uv run python tools/bench_fprefill.py [--shapes 0:2048,30720:64] [--repeats 5]
+    uv run python tools/bench_mha_prefill.py [--shapes 0:2048,30720:64] [--repeats 5]
         [--num-heads 16 --num-kv-heads 2 --head-dim 256] [--sliding-window 1024]
         [--mma simdgroup|mpp]
 
@@ -28,7 +28,12 @@ from dataclasses import dataclass
 import mlx.core as mx
 import numpy as np
 
-from ftmetal.kernel.fprefill import FprefillMma, default_mma, flash_prefill, prefill_tiles
+from ftmetal.kernel.attention.mha.mha_prefill import (
+    MhaPrefillMma,
+    default_mma,
+    flash_prefill,
+    prefill_tiles,
+)
 
 PAGE_SIZE = 1
 CALLS_PER_RUN = 20
@@ -40,7 +45,7 @@ class AttentionShape:
     num_kv_heads: int
     head_dim: int
     sliding_window: int | None
-    mma: FprefillMma
+    mma: MhaPrefillMma
 
 
 class PrefillCall:

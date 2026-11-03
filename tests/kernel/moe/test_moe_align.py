@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from ftmetal.core import host_ints
-from ftmetal.kernel.moe_align import moe_align, moe_combine
+from ftmetal.kernel.moe.moe_align import moe_align, moe_combine
 from ftmetal.kernel.ref import moe_align_ref, moe_combine_ref
 
 

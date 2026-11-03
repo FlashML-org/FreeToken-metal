@@ -1,8 +1,10 @@
-// Row kernels behind ftmetal.kernel.inplace. One thread per element (or per
-// 4-vector), rows along y. Buffer slots: 0 pool, 1 rows, 2 src_ids, 3 dst_ids,
-// 4 lanes per row. The grid is exact (dispatch_threads), so no bounds checks.
+// Row kernels behind ftmetal.kernel.kvcache.pool_rows. One thread per element (or per vector
+// of POOL_ROWS_VECTOR_WIDTH), rows along y. Buffer slots: 0 pool, 1 rows, 2 src_ids,
+// 3 dst_ids, 4 lanes per row. The grid is exact (dispatch_threads), so no bounds checks.
 #include <metal_stdlib>
 using namespace metal;
+
+#include "kvcache/pool_rows_shared.h"
 
 template <typename T>
 [[kernel]] void scatter_rows(
@@ -33,28 +35,27 @@ template <typename T>
   pool[size_t(ids[tid.y]) * lanes + tid.x] = T(0);
 }
 
-#define FTMETAL_ROWS_INSTANTIATE(T, NAME)                                         \
-  template [[host_name("scatter_rows_" #NAME)]] [[kernel]] void scatter_rows<T>( \
-      device T*, device const T*, device const int*, constant const int&, uint2); \
-  template [[host_name("scatter_rows_vec_" #NAME)]] [[kernel]] void               \
-  scatter_rows<vec<T, 4>>(                                                        \
-      device vec<T, 4>*, device const vec<T, 4>*, device const int*,              \
-      constant const int&, uint2);                                                \
-  template [[host_name("copy_rows_" #NAME)]] [[kernel]] void copy_rows<T>(       \
-      device T*, device const int*, device const int*, constant const int&,       \
-      uint2);                                                                     \
-  template [[host_name("copy_rows_vec_" #NAME)]] [[kernel]] void                 \
-  copy_rows<vec<T, 4>>(                                                           \
-      device vec<T, 4>*, device const int*, device const int*,                    \
-      constant const int&, uint2);                                                \
-  template [[host_name("zero_rows_" #NAME)]] [[kernel]] void zero_rows<T>(       \
-      device T*, device const int*, constant const int&, uint2);                  \
-  template [[host_name("zero_rows_vec_" #NAME)]] [[kernel]] void                 \
-  zero_rows<vec<T, 4>>(                                                           \
-      device vec<T, 4>*, device const int*, constant const int&, uint2);
+#define FTMETAL_POOL_ROWS_INSTANTIATE(T, NAME)                                                \
+  template [[host_name("scatter_rows_" #NAME)]] [[kernel]] void scatter_rows<T>(              \
+      device T*, device const T*, device const int*, constant const int&, uint2);             \
+  template [[host_name("scatter_rows_vec_" #NAME)]] [[kernel]] void                           \
+  scatter_rows<vec<T, POOL_ROWS_VECTOR_WIDTH>>(                                               \
+      device vec<T, POOL_ROWS_VECTOR_WIDTH>*, device const vec<T, POOL_ROWS_VECTOR_WIDTH>*,   \
+      device const int*, constant const int&, uint2);                                         \
+  template [[host_name("copy_rows_" #NAME)]] [[kernel]] void copy_rows<T>(                    \
+      device T*, device const int*, device const int*, constant const int&, uint2);           \
+  template [[host_name("copy_rows_vec_" #NAME)]] [[kernel]] void                              \
+  copy_rows<vec<T, POOL_ROWS_VECTOR_WIDTH>>(                                                  \
+      device vec<T, POOL_ROWS_VECTOR_WIDTH>*, device const int*, device const int*,           \
+      constant const int&, uint2);                                                            \
+  template [[host_name("zero_rows_" #NAME)]] [[kernel]] void zero_rows<T>(                    \
+      device T*, device const int*, constant const int&, uint2);                              \
+  template [[host_name("zero_rows_vec_" #NAME)]] [[kernel]] void                              \
+  zero_rows<vec<T, POOL_ROWS_VECTOR_WIDTH>>(                                                  \
+      device vec<T, POOL_ROWS_VECTOR_WIDTH>*, device const int*, constant const int&, uint2);
 
-FTMETAL_ROWS_INSTANTIATE(half, half)
-FTMETAL_ROWS_INSTANTIATE(bfloat, bfloat)
-FTMETAL_ROWS_INSTANTIATE(float, float)
-FTMETAL_ROWS_INSTANTIATE(int, int)
-FTMETAL_ROWS_INSTANTIATE(uint, uint)
+FTMETAL_POOL_ROWS_INSTANTIATE(half, half)
+FTMETAL_POOL_ROWS_INSTANTIATE(bfloat, bfloat)
+FTMETAL_POOL_ROWS_INSTANTIATE(float, float)
+FTMETAL_POOL_ROWS_INSTANTIATE(int, int)
+FTMETAL_POOL_ROWS_INSTANTIATE(uint, uint)

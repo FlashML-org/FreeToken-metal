@@ -24,8 +24,8 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from ftmetal.kernel.fprefill import has_matrix_units
-from ftmetal.kernel.gather_sorted import QuantMode, gather_mm_sorted, gather_qmm_sorted
+from ftmetal.kernel.attention.mha.mha_prefill import has_matrix_units
+from ftmetal.kernel.moe.gather_sorted import QuantMode, gather_mm_sorted, gather_qmm_sorted
 
 # Worst |error| over a row relative to the row's largest |value|, where MLX runs its per-row
 # matvec instead. The affine rhs kernel stages the dequantized weights in x's dtype and the

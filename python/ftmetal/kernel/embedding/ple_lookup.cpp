@@ -1,4 +1,4 @@
-#include "ple_lookup.h"
+#include "embedding/ple_lookup.h"
 
 #include <stdexcept>
 
@@ -14,16 +14,6 @@ std::string ple_lookup_source;
 const char* LIBRARY_NAME = "ftmetal_ple_lookup";
 // ple_wait's one threadgroup copies the rows out.
 const int WAIT_THREADS = 256;
-
-// Shared with metal/ple_lookup.metal.
-struct PostParams {
-  int num_rows;
-};
-
-struct WaitParams {
-  // Each part's bytes: num_rows * heads * row bytes.
-  int part_bytes[3];
-};
 
 void check_mailbox(const mx::array& mailbox, const char* kernel) {
   if (mailbox.dtype() != mx::uint32 || mailbox.shape() != mx::Shape{PLE_MAILBOX_WORDS}) {
@@ -60,7 +50,7 @@ std::vector<mx::array> ple_post(
   check_mailbox(mailbox, "ple_post");
   auto stream = mx::to_stream(s);
   int num_rows = static_cast<int>(input_ids.size());
-  // The context pool and the mailbox stay as they are (see rows.h); eval_gpu checks they
+  // The context pool and the mailbox stay as they are (see kvcache/pool_rows.h); eval_gpu checks they
   // are row contiguous.
   return mx::array::make_arrays(
       {context.shape(), input_ids.shape(), {1}},

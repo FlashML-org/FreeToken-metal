@@ -18,8 +18,8 @@ from typing import Protocol
 
 import mlx.core as mx
 
-from ftmetal.kernel.gdn import gated_delta_recurrence
-from ftmetal.kernel.gdn_chunk import gated_delta_chunked
+from ftmetal.kernel.attention.gdn.gdn_chunk import gated_delta_chunked
+from ftmetal.kernel.attention.gdn.gdn_prefill import gated_delta_recurrence
 
 NUM_K_HEADS = 16
 NUM_V_HEADS = 32

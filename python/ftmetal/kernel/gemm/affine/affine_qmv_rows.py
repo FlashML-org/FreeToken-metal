@@ -10,9 +10,11 @@ epilogue applies silu(y / hc_count) in fp32 to the down rows as it stores them.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import mlx.core as mx
 
-from ftmetal.kernel._ext import inline_mlx_headers
+from ftmetal.kernel._ext import metal_kernel_header, metal_source
 from ftmetal.kernel.custom import metal_kernel
 
 SIMDGROUPS_PER_THREADGROUP = 2
@@ -22,69 +24,12 @@ QMV_FAST_INPUT_STEP = {4: 512, 8: 256}
 QMV_FAST_OUTPUT_TILE = 8
 
 
-def mlx_quantized_header() -> str:
-    """quantized.h and what it builds on, inlined; metal_kernel's preamble already holds utils.h."""
-    included: set[str] = set()
-    inline_mlx_headers('#include "mlx/backend/metal/kernels/utils.h"\n', included)
-    return inline_mlx_headers(
-        '#include "mlx/backend/metal/kernels/steel/gemm/gemm.h"\n'
-        '#include "mlx/backend/metal/kernels/quantized_utils.h"\n'
-        '#include "mlx/backend/metal/kernels/quantized.h"\n',
-        included,
-    )
+QUANTIZED_HEADER = metal_kernel_header(Path(__file__).with_name("affine_qmv_rows.h"))
 
-
-QUANTIZED_HEADER = mlx_quantized_header()
-
-SOURCE = """
-    constexpr int packs_per_thread = BITS == 2 ? 1 : 2;
-    constexpr int pack_factor = get_pack_factor<BITS, 32>();
-    constexpr int bytes_per_pack = get_bytes_per_pack<BITS, 32>();
-    constexpr int values_per_thread = pack_factor * packs_per_thread;
-    constexpr int block_size = values_per_thread * SIMD_SIZE;
-    constexpr int scale_step_per_thread = GROUP_SIZE / values_per_thread;
-    constexpr int in_vec_size_w = K * bytes_per_pack / pack_factor;
-    constexpr int in_vec_size_g = K / GROUP_SIZE;
-    const uint simd_lid = thread_index_in_simdgroup;
-    const int out_row =
-        threadgroup_position_in_grid.y * SIMDGROUPS + simdgroup_index_in_threadgroup;
-    if (out_row >= N) {
-      return;
-    }
-    typedef float U;
-    thread U x_thread[values_per_thread];
-    U result = 0;
-    const device uint8_t* ws = (const device uint8_t*)weight + out_row * in_vec_size_w +
-        simd_lid * packs_per_thread * bytes_per_pack;
-    const device T* sl = scales + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-    const device T* bl = biases + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-    const device T* xp = x + simd_lid * values_per_thread;
-    for (int k = 0; k < K; k += block_size) {
-      U sum = load_vector<T, U, values_per_thread, BITS>(xp, x_thread);
-      U s = sl[0];
-      U b = bl[0];
-      result += qdot<U, values_per_thread, BITS>(ws, x_thread, s, b, sum);
-      ws += block_size * bytes_per_pack / pack_factor;
-      sl += block_size / GROUP_SIZE;
-      bl += block_size / GROUP_SIZE;
-      xp += block_size;
-    }
-    result = simd_sum(result);
-    if (simd_lid == 0) {
-      const T value = static_cast<T>(result);
-      if (out_row < SILU_ROWS) {
-        // silu of the stored value over hc_count in fp32, with MLX's sigmoid.
-        const float scaled = static_cast<float>(value) / static_cast<float>(HC_COUNT);
-        const float e = 1 / (1 + metal::precise::exp(metal::abs(scaled)));
-        y[out_row] = static_cast<T>(scaled * ((scaled < 0) ? e : 1 - e));
-      } else {
-        y[out_row] = value;
-      }
-    }
-"""
+SOURCE = metal_source(Path(__file__).with_name("affine_qmv_rows.metal"))
 
 KERNEL = metal_kernel(
-    name="qmv_rows",
+    name="affine_qmv_rows",
     input_names=["weight", "scales", "biases", "x"],
     output_names=["y"],
     source=SOURCE,
@@ -148,4 +93,4 @@ def qmv_rows(
     return y
 
 
-__all__ = ["QMV_FAST_INPUT_STEP", "QUANTIZED_HEADER", "qmv_rows", "supports_qmv_rows"]
+__all__ = ["QMV_FAST_INPUT_STEP", "qmv_rows", "supports_qmv_rows"]

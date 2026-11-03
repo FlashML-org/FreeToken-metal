@@ -4,7 +4,7 @@ streams.
 Port of FreeToken models/qwen4_exp/hc.py (GroupedPlusOneRMSNorm, GatedResidual).
 Divergences: the hyper-connection returns its branch input and the branch's raw inject
 logits, and injects the branch before it (the attention's or the MLP's, pending) as it
-norms the streams (kernel/hyper_connection.py), so the decoder layer hands a pending
+norms the streams (kernel/norm/offset_rms_norm.py), so the decoder layer hands a pending
 (branch, logits) on; the down and inject projections are fused once loaded (FreeToken fuses
 them at load too), and a decode token runs its up projection fused with the mix.
 """
@@ -14,8 +14,9 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
-from ftmetal.kernel.hyper_connection import hyper_mix, hyper_norm, offset_rms_norm
-from ftmetal.kernel.hyper_up_mix import hyper_up_mix, supports_hyper_up_mix
+from ftmetal.kernel.hc.hc_mix import hc_mix
+from ftmetal.kernel.hc.hc_up_mix import hc_up_mix, supports_hc_up_mix
+from ftmetal.kernel.norm.offset_rms_norm import hc_norm, offset_rms_norm
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear
 from ftmetal.layers.quantization.config import QuantScheme
@@ -48,7 +49,7 @@ class CenteredRMSNorm(BaseOP):
 
 def inject(hyper: mx.array, branch: mx.array, logits: mx.array) -> mx.array:
     """hyper [T, hc * H] plus branch [T, H] into each stream s, weighted 2 * sigmoid(logits[:, s]
-    / hc), in fp32 (hyper_norm's inject, without the norm)."""
+    / hc), in fp32 (hc_norm's inject, without the norm)."""
     num_tokens, hc_count = logits.shape
     gates = 2.0 * mx.sigmoid(logits.astype(mx.float32) / hc_count)
     streams = hyper.astype(mx.float32).reshape(num_tokens, hc_count, -1)
@@ -149,7 +150,7 @@ class HyperConnection(BaseOP):
         method = up.quant_method
         if isinstance(method, AffineLinearMethod):
             scheme = method.scheme
-            if supports_hyper_up_mix(
+            if supports_hc_up_mix(
                 activated,
                 up["weight"],
                 up["scales"],
@@ -158,7 +159,7 @@ class HyperConnection(BaseOP):
                 scheme.group_size,
                 scheme.bits,
             ):
-                return hyper_up_mix(
+                return hc_up_mix(
                     activated,
                     up["weight"],
                     up["scales"],
@@ -168,13 +169,13 @@ class HyperConnection(BaseOP):
                     group_size=scheme.group_size,
                     bits=scheme.bits,
                 )
-        return hyper_mix(project(up, activated), normed, self.hc_count)
+        return hc_mix(project(up, activated), normed, self.hc_count)
 
     def norm(self, hyper: mx.array, pending: PendingBranch | None) -> tuple[mx.array, mx.array]:
         """(normed streams, streams): hyper with the pending branch injected."""
         branch, logits = pending if pending is not None else (None, None)
         norm = self.hc_norm
-        return hyper_norm(hyper, norm.weight, norm.eps, self.hc_count, branch, logits)
+        return hc_norm(hyper, norm.weight, norm.eps, self.hc_count, branch, logits)
 
     def forward(
         self, hyper: mx.array, pending: PendingBranch | None

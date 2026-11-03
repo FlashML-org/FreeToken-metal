@@ -13,7 +13,7 @@ from typing import Self
 
 import mlx.core as mx
 
-from ftmetal.kernel.inplace import kv_write
+from ftmetal.kernel.kvcache.pool_rows import kv_write
 from ftmetal.kvcache.base import BaseKVCachePool, PoolConfig, PoolCost
 from ftmetal.models.config import KVCacheGroupSpec
 

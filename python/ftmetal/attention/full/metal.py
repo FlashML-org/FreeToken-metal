@@ -17,8 +17,8 @@ import numpy as np
 
 from ftmetal.attention.full.common import FullAttnBackend, FullAttnMetadata
 from ftmetal.core import Batch
-from ftmetal.kernel.fdecode import flash_decode
-from ftmetal.kernel.fprefill import PrefillTiles, flash_prefill, prefill_tiles
+from ftmetal.kernel.attention.mha.mha_decode import flash_decode
+from ftmetal.kernel.attention.mha.mha_prefill import PrefillTiles, flash_prefill, prefill_tiles
 from ftmetal.kvcache.base import BasePool
 from ftmetal.models.config import KVCacheGroupSpec, ModelConfig
 

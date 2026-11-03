@@ -1,7 +1,7 @@
-// ExpertService's mailbox side (see moe_lookup.h): the coordinator thread that answers the
+// ExpertService's mailbox side (see moe/moe_lookup.h): the coordinator thread that answers the
 // GPU lookups' requests with the IO side's reads, the watchdog thread that fails a request
 // left unanswered, and the failure record every call checks.
-#include "expert_service.h"
+#include "service/expert/expert_service.h"
 
 #include <mach/mach_time.h>
 #include <pthread/qos.h>

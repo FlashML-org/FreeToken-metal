@@ -10,8 +10,8 @@ the streams by the next hyper-connection as it norms them (a pending branch), th
 layer's by the final mixer, after the last rows are selected; once the weights load
 (FinishesLoading) the PLE tables are opened from the checkpoint files and each
 hyper-connection's down and inject projections fused; a decode token's projections run on
-kernel/qmv_rows; the PLE layers' row service is armed before each decode step and checked
-once its tokens land (ServesStepLookups).
+kernel/gemm/affine/affine_qmv_rows; the PLE layers' row service is armed before each decode step
+and checked once its tokens land (ServesStepLookups).
 """
 
 from __future__ import annotations

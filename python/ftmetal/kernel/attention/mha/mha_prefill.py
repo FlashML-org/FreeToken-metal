@@ -1,7 +1,7 @@
 """Paged flash-attention prefill: a varlen batch of query tokens over the paged K/V pool.
 
-The kernels live in metal/fprefill.metal and are encoded by the C++ FlashPrefill
-primitive (csrc/fprefill.cpp): the query tokens are cut into per-request tiles, and a
+The kernels live in mha_prefill.metal and are encoded by the C++ FlashPrefill
+primitive (mha_prefill.cpp): the query tokens are cut into per-request tiles, and a
 threadgroup streams one kv head's visible keys once for the tile's G = Hq / Hkv query
 heads (GQA packing), gathering them through the page table; the queries' own keys are
 already in the pool. Split-KV partitions fill the GPU when the tiles are few (a short
@@ -25,9 +25,9 @@ import numpy as np
 
 from ftmetal.env import read_env
 from ftmetal.kernel._ext import _C
-from ftmetal.kernel.fdecode import THREADGROUP_MEMORY_BYTES
+from ftmetal.kernel.attention.mha.mha_decode import THREADGROUP_MEMORY_BYTES
 
-FprefillMma = Literal["simdgroup", "mpp"]
+MhaPrefillMma = Literal["simdgroup", "mpp"]
 
 FRAGMENT_ROWS = 8
 # Tile shape tuned on the M4 Pro at the Qwen3.6 shape (D 256, G 8): 32 query rows (tokens
@@ -123,7 +123,7 @@ def has_matrix_units() -> bool:
 
 
 @functools.cache
-def default_mma() -> FprefillMma:
+def default_mma() -> MhaPrefillMma:
     """FTMETAL_FPREFILL_MMA (simdgroup or mpp), else mpp where the GPU has matrix units."""
     value = read_env("FPREFILL_MMA")
     if value is None:
@@ -137,7 +137,7 @@ def default_mma() -> FprefillMma:
 def threadgroup_memory_bytes(
     head_dim: int, block_k: int, head_split: int, itemsize: int, kv_shared: bool, num_passes: int
 ) -> int:
-    """fprefill.metal's threadgroup arrays: K transposed [D / num_passes, BK] and V
+    """mha_prefill.metal's threadgroup arrays: K transposed [D / num_passes, BK] and V
     [BK, D / num_passes] with rows padded by 16 bytes (one buffer for both when kv_shared),
     and with a head split each simdgroup's [8, BK] fp32 partial scores."""
     columns = head_dim // num_passes
@@ -149,7 +149,7 @@ def threadgroup_memory_bytes(
     return staged_bytes + score_bytes
 
 
-def staging_plan(head_dim: int, itemsize: int, mma: FprefillMma) -> tuple[int, int, bool, int]:
+def staging_plan(head_dim: int, itemsize: int, mma: MhaPrefillMma) -> tuple[int, int, bool, int]:
     """(head_split, block_k, kv_shared, num_passes): the largest key block whose staging
     fits, in separate K and V buffers when both fit; matmul2d keeps 16-key blocks and
     stages them in column passes instead."""
@@ -180,7 +180,7 @@ def flash_prefill(
     page_size: int,
     scale: float,
     sliding_window: int | None = None,
-    mma: FprefillMma | None = None,
+    mma: MhaPrefillMma | None = None,
     block_ends: mx.array | None = None,
 ) -> mx.array:
     """Causal attention of each request's queries over its paged keys.
@@ -258,7 +258,7 @@ def flash_prefill_qsa(
     first_position: int,
     block_size: int,
     scale: float,
-    mma: FprefillMma | None = None,
+    mma: MhaPrefillMma | None = None,
 ) -> mx.array:
     """Block-sparse attention of one request's queries over its paged keys.
 
@@ -303,7 +303,7 @@ def flash_prefill_qsa(
 
 
 __all__ = [
-    "FprefillMma",
+    "MhaPrefillMma",
     "PrefillTiles",
     "default_mma",
     "flash_prefill",

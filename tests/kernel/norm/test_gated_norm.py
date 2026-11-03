@@ -8,7 +8,7 @@ from __future__ import annotations
 import mlx.core as mx
 import pytest
 
-from ftmetal.kernel.gated_norm import gated_rms_norm, supports_gated_rms_norm
+from ftmetal.kernel.norm.gated_norm import gated_rms_norm, supports_gated_rms_norm
 
 EPS = 1e-6
 BF16 = mx.bfloat16

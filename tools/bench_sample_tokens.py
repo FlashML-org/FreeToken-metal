@@ -1,6 +1,6 @@
 """Per-call time of token sampling: the Metal kernels against the MLX-op composition.
 
-    uv run python tools/bench_sample.py [--vocab-sizes 151936,248320] [--batch-sizes 1,4,8]
+    uv run python tools/bench_sample_tokens.py [--vocab-sizes 151936,248320] [--batch-sizes 1,4,8]
 
 Each call samples one token per row of bf16 logits through Sampler.sample with the
 Qwen3.6 recommendation (top_k 20, top_p 0.95; temperature 0.7 here), random draw included.

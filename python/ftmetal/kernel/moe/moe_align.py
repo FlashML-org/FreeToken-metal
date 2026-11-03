@@ -9,10 +9,12 @@ the inverse permutation, which moe_combine uses to un-sort and reduce over top-k
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import NamedTuple
 
 import mlx.core as mx
 
+from ftmetal.kernel._ext import metal_source
 from ftmetal.kernel.custom import metal_kernel
 
 # One threadgroup sorts every pair; each thread owns at most one expert in the scan.
@@ -21,88 +23,19 @@ ALIGN_THREADS = 1024
 COMBINE_VECTOR = 4
 COMBINE_THREADS = 256
 
-# Histogram with threadgroup atomics, exclusive scan of the E counts (simdgroup prefix
-# sums, then a scan of the simdgroup totals), then each pair claims its slot with an
-# atomic cursor per expert.
-ALIGN_SOURCE = """
-    const uint tid = thread_position_in_threadgroup.x;
-    const uint lane = thread_index_in_simdgroup;
-    const uint simdgroup = simdgroup_index_in_threadgroup;
-    const int num_pairs = topk_ids_shape[0] * K;
-    threadgroup atomic_int cursor[E];
-    threadgroup int simdgroup_offsets[TG / 32];
+ALIGN_SOURCE = metal_source(Path(__file__).with_name("moe_align_sort.metal"))
 
-    for (uint e = tid; e < E; e += TG) {
-      atomic_store_explicit(&cursor[e], 0, memory_order_relaxed);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int i = tid; i < num_pairs; i += TG) {
-      atomic_fetch_add_explicit(&cursor[topk_ids[i]], 1, memory_order_relaxed);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const int count = tid < E ? atomic_load_explicit(&cursor[tid], memory_order_relaxed) : 0;
-    const int prefix = simd_prefix_exclusive_sum(count);
-    if (lane == 31) {
-      simdgroup_offsets[simdgroup] = prefix + count;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simdgroup == 0) {
-      const int total = lane < TG / 32 ? simdgroup_offsets[lane] : 0;
-      const int scanned = simd_prefix_exclusive_sum(total);
-      if (lane < TG / 32) {
-        simdgroup_offsets[lane] = scanned;
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const int offset = prefix + simdgroup_offsets[simdgroup];
-    if (tid < E) {
-      expert_offsets[tid] = offset;
-      atomic_store_explicit(&cursor[tid], offset, memory_order_relaxed);
-    }
-    if (tid == E - 1) {
-      expert_offsets[E] = offset + count;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (int i = tid; i < num_pairs; i += TG) {
-      const int expert = topk_ids[i];
-      const int position = atomic_fetch_add_explicit(&cursor[expert], 1, memory_order_relaxed);
-      sorted_token_indices[position] = i / K;
-      sorted_expert_ids[position] = expert;
-      pair_positions[i] = position;
-    }
-"""
-
-# Grid (H / V, T): each thread gathers V columns of a token's K expert rows from their
-# sorted positions and accumulates the routing-weighted sum in fp32.
-COMBINE_SOURCE = """
-    const uint token = thread_position_in_grid.y;
-    const uint column = thread_position_in_grid.x * V;
-    float acc[V] = {};
-    for (int j = 0; j < K; ++j) {
-      const size_t row = pair_positions[token * K + j];
-      const float weight = static_cast<float>(topk_weights[token * K + j]);
-      auto source = expert_out + row * H + column;
-      for (int v = 0; v < V; ++v) {
-        acc[v] += weight * static_cast<float>(source[v]);
-      }
-    }
-    auto target = out + (size_t)token * H + column;
-    for (int v = 0; v < V; ++v) {
-      target[v] = static_cast<T>(acc[v]);
-    }
-"""
+COMBINE_SOURCE = metal_source(Path(__file__).with_name("moe_align_combine.metal"))
 
 ALIGN_KERNEL = metal_kernel(
-    name="moe_align",
+    name="moe_align_sort",
     input_names=["topk_ids"],
     output_names=["expert_offsets", "sorted_token_indices", "sorted_expert_ids", "pair_positions"],
     source=ALIGN_SOURCE,
 )
 
 COMBINE_KERNEL = metal_kernel(
-    name="moe_combine",
+    name="moe_align_combine",
     input_names=["expert_out", "pair_positions", "topk_weights"],
     output_names=["out"],
     source=COMBINE_SOURCE,

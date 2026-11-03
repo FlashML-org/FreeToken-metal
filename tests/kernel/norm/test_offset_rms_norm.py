@@ -1,11 +1,10 @@
-"""The hyper-connection kernels against the fp32 op chains they fuse, bit for bit.
+"""The grouped (1 + w) RMS norm and its fusions against the fp32 op chains they fuse, bit for bit.
 
 Each reference computes in fp32 with separate MLX ops and casts once: the (1 + w) norm as a
-weightless mx.fast.rms_norm times (1 + w), the inject as hyper + branch * 2 *
-sigmoid(logit / hc_count), the mix as the mean over the streams of sigmoid(up) * normed, the up
-mix on the one-token mx.quantized_matmul, the head norm then the model's RotaryEmbedding.
-Qwen3.8-Flash-Next's shapes (hidden 2560, 4 streams, low rank 320; heads of 256 and index heads
-of 128, 64 rotary dims at base 1e7) and small ones, bf16 and fp32.
+weightless mx.fast.rms_norm times (1 + w), the hyper-connection inject as hyper + branch * 2 *
+sigmoid(logit / hc_count), the head norm then the model's RotaryEmbedding. Qwen3.8-Flash-Next's
+shapes (hidden 2560, 4 streams; heads of 256 and index heads of 128, 64 rotary dims at base 1e7)
+and small ones, bf16 and fp32.
 """
 
 from __future__ import annotations
@@ -13,14 +12,12 @@ from __future__ import annotations
 import mlx.core as mx
 import pytest
 
-from ftmetal.kernel.hyper_connection import (
-    hyper_mix,
-    hyper_norm,
+from ftmetal.kernel.norm.offset_rms_norm import (
+    hc_norm,
     offset_rms_norm,
     offset_rms_norm_rope,
     supports_offset_rms_norm_rope,
 )
-from ftmetal.kernel.hyper_up_mix import hyper_up_mix, supports_hyper_up_mix
 from ftmetal.layers.rotary import RotaryEmbedding
 
 EPS = 1e-6
@@ -54,12 +51,6 @@ def inject_reference(
     return streams.reshape(hyper.shape).astype(hyper.dtype)
 
 
-def mix_reference(up: mx.array, normed: mx.array, hc_count: int) -> mx.array:
-    weighted = mx.sigmoid(up.astype(F32)) * normed.astype(F32)
-    total = weighted.reshape(normed.shape[0], hc_count, -1).sum(axis=1)
-    return (total / hc_count).astype(normed.dtype)
-
-
 # (tokens, hc_count, hidden, dtype, inject, scale of the streams)
 NORM_CASES = [
     (1, 4, 2560, BF16, True, 3.0),  # a decode token's streams, the pending branch injected
@@ -72,7 +63,7 @@ NORM_CASES = [
 
 
 @pytest.mark.parametrize(("tokens", "hc_count", "hidden", "dtype", "inject", "scale"), NORM_CASES)
-def test_hyper_norm(
+def test_hc_norm(
     tokens: int, hc_count: int, hidden: int, dtype: mx.Dtype, inject: bool, scale: float
 ) -> None:
     mx.random.seed(tokens * hidden + hc_count)
@@ -81,10 +72,10 @@ def test_hyper_norm(
     if inject:
         branch = random((tokens, hidden), scale, dtype)
         logits = random((tokens, hc_count), 4.0, dtype)
-        normed, streams = hyper_norm(hyper, weight, EPS, hc_count, branch, logits)
+        normed, streams = hc_norm(hyper, weight, EPS, hc_count, branch, logits)
         check_equal(streams, inject_reference(hyper, branch, logits, hc_count))
     else:
-        normed, streams = hyper_norm(hyper, weight, EPS, hc_count)
+        normed, streams = hc_norm(hyper, weight, EPS, hc_count)
         assert streams is hyper
     check_equal(normed, offset_norm_reference(streams, weight, hidden))
 
@@ -142,72 +133,3 @@ def test_offset_rms_norm_rope_refuses_other_shapes() -> None:
     assert not supports_offset_rms_norm_rope(mx.zeros((1, 2, 128), BF16), 63)
     assert not supports_offset_rms_norm_rope(mx.zeros((1, 2, 128), BF16), 256)
     assert not supports_offset_rms_norm_rope(mx.zeros((1, 2, 8192), BF16), 64)
-
-
-# (tokens, hc_count, hidden, dtype)
-MIX_CASES = [
-    (1, 4, 2560, BF16),
-    (6, 4, 2560, F32),
-    (3, 2, 96, BF16),
-    (2, 3, 100, F32),  # a mean over 3: the division rounds
-]
-
-
-@pytest.mark.parametrize(("tokens", "hc_count", "hidden", "dtype"), MIX_CASES)
-def test_hyper_mix(tokens: int, hc_count: int, hidden: int, dtype: mx.Dtype) -> None:
-    mx.random.seed(tokens + hidden)
-    up = random((tokens, hc_count * hidden), 4.0, dtype)
-    normed = random((tokens, hc_count * hidden), 1.0, dtype)
-    check_equal(hyper_mix(up, normed, hc_count), mix_reference(up, normed, hc_count))
-
-
-def quantized_up(
-    hc_count: int, hidden: int, lowrank: int, group_size: int, dtype: mx.Dtype
-) -> tuple[mx.array, mx.array, mx.array]:
-    weight = random((hc_count * hidden, lowrank), 0.05, dtype)
-    quantized, scales, biases = mx.quantize(weight, group_size=group_size, bits=4)
-    return quantized, scales, biases
-
-
-# (hidden, lowrank, hc_count, group_size, dtype)
-UP_MIX_CASES = [
-    # Input 320: one block, then 64 values on lanes 0-7, its 4 rows over 4 lane groups.
-    (2560, 320, 4, 32, BF16),
-    (2560, 320, 4, 32, F32),
-    (256, 96, 4, 32, BF16),  # less than one block, on 12 lanes
-    (128, 384, 4, 64, F32),  # 128 values on lanes 0-15, rows over 2 lane groups
-    (64, 320, 2, 32, BF16),  # 2 rows: no split over 4 lane groups
-]
-
-
-@pytest.mark.parametrize(("hidden", "lowrank", "hc_count", "group_size", "dtype"), UP_MIX_CASES)
-def test_hyper_up_mix(
-    hidden: int, lowrank: int, hc_count: int, group_size: int, dtype: mx.Dtype
-) -> None:
-    mx.random.seed(hidden + lowrank)
-    weight, scales, biases = quantized_up(hc_count, hidden, lowrank, group_size, dtype)
-    x = random((1, lowrank), 1.0, dtype)
-    normed = random((1, hc_count * hidden), 1.0, dtype)
-    assert supports_hyper_up_mix(x, weight, scales, normed, hc_count, group_size, 4)
-    up = mx.quantized_matmul(
-        x, weight, scales, biases, transpose=True, group_size=group_size, bits=4
-    )
-    got = hyper_up_mix(x, weight, scales, biases, normed, hc_count, group_size=group_size, bits=4)
-    check_equal(got, mix_reference(up, normed, hc_count))
-
-
-def test_hyper_up_mix_refuses_other_projections() -> None:
-    """Shapes mx.quantized_matmul runs on another kernel (qmv_quad at inputs 64 and 128,
-    qmv_fast at multiples of 512), other bit widths, more tokens, mixed dtypes."""
-    normed = mx.zeros((1, 4 * 256), BF16)
-    for lowrank in (64, 128, 512):
-        weight, scales, _ = quantized_up(4, 256, lowrank, 32, BF16)
-        x = mx.zeros((1, lowrank), BF16)
-        assert not supports_hyper_up_mix(x, weight, scales, normed, 4, 32, 4)
-    weight, scales, _ = quantized_up(4, 256, 320, 32, BF16)
-    x = mx.zeros((1, 320), BF16)
-    assert supports_hyper_up_mix(x, weight, scales, normed, 4, 32, 4)
-    assert not supports_hyper_up_mix(mx.zeros((2, 320), BF16), weight, scales, normed, 4, 32, 4)
-    assert not supports_hyper_up_mix(mx.zeros((1, 320), F32), weight, scales, normed, 4, 32, 4)
-    eight_bit, eight_bit_scales, _ = mx.quantize(mx.zeros((4 * 256, 320), BF16), 64, 8)
-    assert not supports_hyper_up_mix(x, eight_bit, eight_bit_scales, normed, 4, 64, 8)

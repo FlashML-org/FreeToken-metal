@@ -33,22 +33,23 @@ nanobind_add_module(
   NB_DOMAIN
   mlx
   ${CMAKE_CURRENT_LIST_DIR}/bindings.cpp
-  ${CMAKE_CURRENT_LIST_DIR}/expert_lru.cpp
-  ${CMAKE_CURRENT_LIST_DIR}/expert_mailbox.cpp
-  ${CMAKE_CURRENT_LIST_DIR}/expert_service.cpp
-  ${CMAKE_CURRENT_LIST_DIR}/fdecode.cpp
-  ${CMAKE_CURRENT_LIST_DIR}/fprefill.cpp
-  ${CMAKE_CURRENT_LIST_DIR}/gather_sorted.cpp
-  ${CMAKE_CURRENT_LIST_DIR}/gdn_step.cpp
-  ${CMAKE_CURRENT_LIST_DIR}/moe_lookup.cpp
-  ${CMAKE_CURRENT_LIST_DIR}/ple_lookup.cpp
-  ${CMAKE_CURRENT_LIST_DIR}/ple_row_store.cpp
-  ${CMAKE_CURRENT_LIST_DIR}/ple_service.cpp
-  ${CMAKE_CURRENT_LIST_DIR}/rows.cpp
-  ${CMAKE_CURRENT_LIST_DIR}/sample.cpp
-  ${CMAKE_CURRENT_LIST_DIR}/victim_cache.cpp)
+  ${CMAKE_CURRENT_LIST_DIR}/attention/gdn/gdn_decode.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/attention/mha/mha_decode.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/attention/mha/mha_prefill.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/embedding/ple_lookup.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/kvcache/pool_rows.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/moe/gather_sorted.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/moe/moe_lookup.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/sample/sample_tokens.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/service/expert/expert_lru.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/service/expert/expert_mailbox.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/service/expert/expert_service.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/service/expert/victim_cache.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/service/ple/ple_row_store.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/service/ple/ple_service.cpp)
 
-target_include_directories(_C PRIVATE ${MLX_INCLUDE_DIRS})
+# Includes name their header from kernel/: "moe/moe_lookup.h".
+target_include_directories(_C PRIVATE ${CMAKE_CURRENT_LIST_DIR} ${MLX_INCLUDE_DIRS})
 target_compile_options(_C PRIVATE ${MLX_CXX_FLAGS})
 # libmlx symbols resolve from the mlx.core module already loaded in the
 # process, so the build env's mlx wheel location never leaks into an rpath.

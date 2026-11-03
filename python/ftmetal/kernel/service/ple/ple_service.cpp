@@ -1,14 +1,14 @@
 // PleService (see ple_service.h): the n-gram hash, the coordinator thread that answers
 // ple_post's posts, the watchdog thread that fails a post left unanswered, and the failure
 // record every step checks.
-#include "ple_service.h"
+#include "service/ple/ple_service.h"
 
 #include <pthread/qos.h>
 
 #include <algorithm>
 #include <optional>
 
-#include "expert_lru.h"
+#include "service/expert/expert_lru.h"
 
 namespace ftmetal {
 

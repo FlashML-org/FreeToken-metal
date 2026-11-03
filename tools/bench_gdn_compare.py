@@ -1,7 +1,8 @@
 """GDN prefill recurrence kernels head to head at the Qwen3.6 shapes (Hk 16, Hv 32, D 128).
 
-ours chunked   = ftmetal kernel/gdn_chunk.gated_delta_chunked (WY, C=64)
-ours per-token = ftmetal kernel/gdn.gated_delta_recurrence (mlx-lm's kernel, tg y=4)
+ours chunked   = ftmetal kernel/attention/gdn/gdn_chunk.gated_delta_chunked (WY, C=64)
+ours per-token = ftmetal kernel/attention/gdn/gdn_prefill.gated_delta_recurrence
+                 (mlx-lm's kernel, tg y=4)
 mlx-lm         = mlx_lm.models.gated_delta.gated_delta_kernel
 fork           = FreeToken-shreyvishen kernel/metal/gdn.py gdn_step, ported: tg y=32,
                  state [Hv, Dk, Dv], log-decay input
@@ -18,9 +19,9 @@ import time
 import mlx.core as mx
 from mlx_lm.models.gated_delta import gated_delta_kernel
 
+from ftmetal.kernel.attention.gdn.gdn_chunk import gated_delta_chunked
+from ftmetal.kernel.attention.gdn.gdn_prefill import gated_delta_recurrence
 from ftmetal.kernel.custom import metal_kernel
-from ftmetal.kernel.gdn import gated_delta_recurrence
-from ftmetal.kernel.gdn_chunk import gated_delta_chunked
 
 HK, HV, D = 16, 32, 128
 TOKENS_PER_RUN = 32768

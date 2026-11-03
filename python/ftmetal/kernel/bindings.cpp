@@ -6,17 +6,17 @@
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
-#include "expert_lru.h"
-#include "expert_service.h"
-#include "fdecode.h"
-#include "fprefill.h"
-#include "gather_sorted.h"
-#include "gdn_step.h"
-#include "moe_lookup.h"
-#include "ple_lookup.h"
-#include "ple_service.h"
-#include "rows.h"
-#include "sample.h"
+#include "attention/gdn/gdn_decode.h"
+#include "attention/mha/mha_decode.h"
+#include "attention/mha/mha_prefill.h"
+#include "embedding/ple_lookup.h"
+#include "kvcache/pool_rows.h"
+#include "moe/gather_sorted.h"
+#include "moe/moe_lookup.h"
+#include "sample/sample_tokens.h"
+#include "service/expert/expert_lru.h"
+#include "service/expert/expert_service.h"
+#include "service/ple/ple_service.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -24,17 +24,17 @@ using namespace nb::literals;
 NB_MODULE(_C, m) {
   m.doc() = "ftmetal in-place pool primitives";
 
-  m.def("init_library", &ftmetal::init_library, "source"_a);
-  m.def("init_gdn_step_library", &ftmetal::init_gdn_step_library, "source"_a);
-  m.def("init_fdecode_library", &ftmetal::init_fdecode_library, "source"_a);
-  m.def("init_fprefill_library", &ftmetal::init_fprefill_library, "source"_a);
+  m.def("init_pool_rows_library", &ftmetal::init_pool_rows_library, "source"_a);
+  m.def("init_gdn_decode_library", &ftmetal::init_gdn_decode_library, "source"_a);
+  m.def("init_mha_decode_library", &ftmetal::init_mha_decode_library, "source"_a);
+  m.def("init_mha_prefill_library", &ftmetal::init_mha_prefill_library, "source"_a);
   m.def(
       "init_gather_sorted_libraries",
       &ftmetal::init_gather_sorted_libraries,
       "affine_source"_a,
       "fp_source"_a,
       "unquantized_source"_a);
-  m.def("init_sample_library", &ftmetal::init_sample_library, "source"_a);
+  m.def("init_sample_tokens_library", &ftmetal::init_sample_tokens_library, "source"_a);
   m.def("init_moe_lookup_library", &ftmetal::init_moe_lookup_library, "source"_a);
   m.def("init_ple_lookup_library", &ftmetal::init_ple_lookup_library, "source"_a);
 
@@ -80,8 +80,8 @@ NB_MODULE(_C, m) {
       "k_cache[out_loc[i]] = k[i] and v_cache[out_loc[i]] = v[i], in place; returns (k_cache, v_cache).");
 
   m.def(
-      "gdn_step",
-      &ftmetal::gdn_step,
+      "gdn_decode",
+      &ftmetal::gdn_decode,
       "conv_pool"_a,
       "state_pool"_a,
       "conv_in"_a,

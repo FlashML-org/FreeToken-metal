@@ -31,7 +31,7 @@ import pytest
 
 from ftmetal.command_graph import capture, replay
 from ftmetal.kernel._ext import _C
-from ftmetal.kernel.ple_lookup import PleRowParts, ple_post, ple_wait
+from ftmetal.kernel.embedding.ple_lookup import PleRowParts, ple_post, ple_wait
 
 Word = _C.PleMailboxWord
 State = _C.MailboxState

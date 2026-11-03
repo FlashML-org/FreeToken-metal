@@ -1,5 +1,5 @@
 // What the Metal-backed primitives share: templating a kernel source per configuration,
-// and the paged-attention inputs and split-KV partials of fdecode and fprefill.
+// and the paged-attention inputs and split-KV partials of mha_decode and mha_prefill.
 #pragma once
 
 #include <stdexcept>
@@ -37,7 +37,7 @@ inline void replace_all(std::string& text, const std::string& token, const std::
   }
 }
 
-// {q, k_cache, v_cache, page_table, lengths}: the k/v pools stay as they are (see rows.h),
+// {q, k_cache, v_cache, page_table, lengths}: the k/v pools stay as they are (see kvcache/pool_rows.h),
 // the rest is made contiguous; eval_gpu checks the pools with check_pools_row_contiguous.
 inline std::vector<mx::array> paged_attention_inputs(
     const mx::array& q,

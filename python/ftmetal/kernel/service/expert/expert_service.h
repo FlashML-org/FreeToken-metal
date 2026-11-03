@@ -5,7 +5,7 @@
 // of consecutive experts whose bytes follow on in one file is one read; a part the
 // checkpoint does not store is filled as the read is submitted instead. Idle threads block; a
 // caller waits for its reads by spinning on a completion counter. A coordinator thread
-// answers the GPU lookups' mailbox requests (see moe_lookup.h) with the same reads, and a
+// answers the GPU lookups' mailbox requests (see moe/moe_lookup.h) with the same reads, and a
 // watchdog thread fails a request the coordinator leaves unanswered. With a victim cache
 // (victim_cache.h), the experts leaving their slots are copied into its entries and a miss it
 // holds is copied back instead of read: the reads of the other misses start first, their row
@@ -29,9 +29,12 @@
 #include <thread>
 #include <vector>
 
-#include "expert_lru.h"
-#include "moe_lookup.h"
-#include "victim_cache.h"
+#include "common/mailbox.h"
+#include "mlx/array.h"
+#include "service/expert/expert_lru.h"
+#include "service/expert/victim_cache.h"
+
+namespace mx = mlx::core;
 
 namespace ftmetal {
 

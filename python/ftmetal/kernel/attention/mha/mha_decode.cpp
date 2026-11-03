@@ -1,9 +1,9 @@
-#include "fdecode.h"
+#include "attention/mha/mha_decode.h"
 
 #include <cmath>
 #include <stdexcept>
 
-#include "metal_primitive.h"
+#include "common/metal_primitive.h"
 #include "mlx/allocator.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/utils.h"
@@ -12,7 +12,7 @@ namespace ftmetal {
 
 namespace {
 
-std::string fdecode_source;
+std::string mha_decode_source;
 const int SIMD_WIDTH = 32;
 // From this head dim up 16-bit inputs accumulate in half: fp32 accumulators cost
 // occupancy and ran 2x slower at D=256 on the M4 Pro.
@@ -20,8 +20,8 @@ const int HALF_ACCUMULATOR_HEAD_DIM = 256;
 
 } // namespace
 
-void init_fdecode_library(const std::string& source) {
-  fdecode_source = source;
+void init_mha_decode_library(const std::string& source) {
+  mha_decode_source = source;
 }
 
 mx::array flash_decode(
@@ -43,42 +43,42 @@ mx::array flash_decode(
   if (q.ndim() != 3 || k_cache.ndim() != 3 || v_cache.ndim() != 3 || page_table.ndim() != 2 ||
       seq_lens.ndim() != 1) {
     throw std::invalid_argument(
-        "ftmetal fdecode: q [B, Hq, D], k/v cache [slots, Hkv, D], page_table [B, P], seq_lens [B]");
+        "ftmetal mha_decode: q [B, Hq, D], k/v cache [slots, Hkv, D], page_table [B, P], seq_lens [B]");
   }
   int batch = q.shape(0);
   int num_heads = q.shape(1);
   int head_dim = q.shape(2);
   int num_kv_heads = k_cache.shape(1);
-  metal_type(q.dtype(), "fdecode");
+  metal_type(q.dtype(), "mha_decode");
   if (k_cache.dtype() != q.dtype() || v_cache.dtype() != q.dtype()) {
-    throw std::invalid_argument("ftmetal fdecode: k/v cache must be in q's dtype");
+    throw std::invalid_argument("ftmetal mha_decode: k/v cache must be in q's dtype");
   }
   if (k_cache.shape() != v_cache.shape() || k_cache.shape(2) != head_dim) {
-    throw std::invalid_argument("ftmetal fdecode: k/v cache shape mismatch");
+    throw std::invalid_argument("ftmetal mha_decode: k/v cache shape mismatch");
   }
   if (num_kv_heads <= 0 || num_heads % num_kv_heads != 0) {
-    throw std::invalid_argument("ftmetal fdecode: Hq must be a multiple of Hkv");
+    throw std::invalid_argument("ftmetal mha_decode: Hq must be a multiple of Hkv");
   }
   if (head_dim % (2 * SIMD_WIDTH) != 0) {
-    throw std::invalid_argument("ftmetal fdecode: head_dim must be a multiple of 64");
+    throw std::invalid_argument("ftmetal mha_decode: head_dim must be a multiple of 64");
   }
   if (page_size <= 0 || (page_size & (page_size - 1)) != 0) {
-    throw std::invalid_argument("ftmetal fdecode: page size must be a power of two");
+    throw std::invalid_argument("ftmetal mha_decode: page size must be a power of two");
   }
   if (page_table.dtype() != mx::int32 || seq_lens.dtype() != mx::int32) {
-    throw std::invalid_argument("ftmetal fdecode: page_table and seq_lens must be int32");
+    throw std::invalid_argument("ftmetal mha_decode: page_table and seq_lens must be int32");
   }
   if (page_table.shape(0) != batch || seq_lens.shape(0) != batch) {
-    throw std::invalid_argument("ftmetal fdecode: page_table and seq_lens must have B rows");
+    throw std::invalid_argument("ftmetal mha_decode: page_table and seq_lens must have B rows");
   }
   if (num_partitions < 1 || num_simdgroups < 1) {
-    throw std::invalid_argument("ftmetal fdecode: partitions and simdgroups must be >= 1");
+    throw std::invalid_argument("ftmetal mha_decode: partitions and simdgroups must be >= 1");
   }
   if (num_head_groups < 1 || (num_heads / num_kv_heads) % num_head_groups != 0) {
-    throw std::invalid_argument("ftmetal fdecode: num_head_groups must divide Hq / Hkv");
+    throw std::invalid_argument("ftmetal mha_decode: num_head_groups must divide Hq / Hkv");
   }
   if (partition_tokens < 1 || min_partition_tokens < 1 || max_partitions < 1) {
-    throw std::invalid_argument("ftmetal fdecode: partition rule values must be >= 1");
+    throw std::invalid_argument("ftmetal mha_decode: partition rule values must be >= 1");
   }
   auto stream = mx::to_stream(s);
   FlashDecodeConfig config{
@@ -109,11 +109,11 @@ bool FlashDecode::is_equivalent(const mx::Primitive& other) const {
 }
 
 void FlashDecode::eval_cpu(const std::vector<mx::array>&, std::vector<mx::array>&) {
-  throw std::runtime_error("ftmetal fdecode: GPU only");
+  throw std::runtime_error("ftmetal mha_decode: GPU only");
 }
 
 void FlashDecode::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) {
-  check_pools_row_contiguous(inputs, "fdecode");
+  check_pools_row_contiguous(inputs, "mha_decode");
   auto& out = outputs[0];
   out.set_data(mx::allocator::malloc(out.nbytes()));
   int batch = inputs[0].shape(0);
@@ -123,10 +123,10 @@ void FlashDecode::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx:
   const auto& c = config_;
   auto dtype = out.dtype();
   // 16-bit inputs stage the cross-simdgroup merge in half; fp32 inputs stay fp32.
-  std::string type = metal_type(dtype, "fdecode");
+  std::string type = metal_type(dtype, "mha_decode");
   std::string stage_type = dtype == mx::float32 ? "float" : "half";
   std::string acc_type = c.head_dim >= HALF_ACCUMULATOR_HEAD_DIM ? stage_type : "float";
-  std::string library_name = "ftmetal_fdecode_" + type + "_" + acc_type + "_" +
+  std::string library_name = "ftmetal_mha_decode_" + type + "_" + acc_type + "_" +
       std::to_string(c.head_dim) + "_" + std::to_string(c.group) + "_" +
       std::to_string(c.num_kv_heads) + "_" + std::to_string(c.page_size) + "_" +
       std::to_string(c.num_head_groups) + "_" + std::to_string(c.num_simdgroups) + "_" +
@@ -137,7 +137,7 @@ void FlashDecode::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx:
   auto s = stream();
   auto& d = mx::metal::device(s.device);
   auto* library = d.get_library(library_name, [&]() {
-    std::string source = fdecode_source;
+    std::string source = mha_decode_source;
     replace_all(source, "{{T}}", type);
     replace_all(source, "{{ACC_T}}", acc_type);
     replace_all(source, "{{STAGE_T}}", stage_type);
@@ -160,7 +160,7 @@ void FlashDecode::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx:
 
   int max_pages = inputs[3].shape(1);
   float scale_log2e = c.scale * static_cast<float>(M_LOG2E);
-  encoder.set_compute_pipeline_state(d.get_kernel("fdecode_partials", library));
+  encoder.set_compute_pipeline_state(d.get_kernel("mha_decode_partials", library));
   for (int i = 0; i < 5; ++i) {
     encoder.set_input_array(inputs[i], i);
   }
@@ -172,7 +172,7 @@ void FlashDecode::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx:
       MTL::Size(c.num_partitions, c.num_kv_heads * c.num_head_groups, batch),
       MTL::Size(SIMD_WIDTH * c.num_simdgroups, 1, 1));
 
-  encoder.set_compute_pipeline_state(d.get_kernel("fdecode_merge", library));
+  encoder.set_compute_pipeline_state(d.get_kernel("mha_decode_merge", library));
   encoder.set_input_array(part_acc, 0);
   encoder.set_input_array(part_ml, 1);
   encoder.set_input_array(inputs[4], 2);

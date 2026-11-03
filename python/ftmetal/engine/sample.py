@@ -1,8 +1,8 @@
 """Token sampling on device: greedy, or temperature with top-k / top-p.
 
 Port of FreeToken engine/sample.py. Divergences: sampling runs on the Metal kernels of
-kernel/sample.py (FreeToken's semantics, boundary ties kept) with the draw's uniform from
-MLX's key sequence instead of flashinfer. FTMETAL_SAMPLE_KERNEL=0, or a device without Metal,
+kernel/sample/sample_tokens.py (FreeToken's semantics, boundary ties kept) with the draw's uniform
+from MLX's key sequence instead of flashinfer. FTMETAL_SAMPLE_KERNEL=0, or a device without Metal,
 selects the MLX-op composition (sorted-probability masks and mx.random.categorical), which
 differs from FreeToken only at boundary ties: its top-k keeps exactly k tokens by rank and
 its top-p stops at the first sorted token that crosses p.
@@ -16,7 +16,7 @@ import mlx.core as mx
 
 from ftmetal.core import Batch
 from ftmetal.env import read_env
-from ftmetal.kernel.sample import sample_tokens
+from ftmetal.kernel.sample.sample_tokens import sample_tokens
 
 MIN_TEMPERATURE = 1e-6
 MIN_TOP_P = 1e-6

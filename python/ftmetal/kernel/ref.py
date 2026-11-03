@@ -1,10 +1,11 @@
-"""Pure-MLX references for the kernels; the tests compare every kernel against these."""
+"""Pure-MLX references that more than one test compares a kernel against; a reference only
+one test uses lives in that test."""
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from ftmetal.core import host_ints
-from ftmetal.kernel.moe_align import ExpertAlignment
+from ftmetal.kernel.moe.moe_align import ExpertAlignment
 
 # Queries per SDPA call of flash_prefill_ref, which materializes [Hq, rows, keys] fp32 scores.
 PREFILL_REF_QUERY_ROWS = 512
@@ -13,7 +14,7 @@ PREFILL_REF_QUERY_ROWS = 512
 def mrope_ref(
     x: mx.array, positions: mx.array, inv_freq: mx.array, section: mx.array, rotary_dim: int
 ) -> mx.array:
-    """kernel.mrope in MLX ops: x [tokens, heads, head_dim], int32 [3, tokens] positions."""
+    """kernel.rope.mrope in MLX ops: x [tokens, heads, head_dim], int32 [3, tokens] positions."""
     half = rotary_dim // 2
     angle = positions[section].T.astype(mx.float32) * inv_freq
     cos = mx.cos(angle)[:, None, :]
@@ -133,7 +134,7 @@ def gdn_prefill_inputs_ref(
     return q.astype(dtype), k.astype(dtype), v.astype(dtype), decay[None], beta[None]
 
 
-def router_topk_ref(gates: mx.array, top_k: int, norm_topk_prob: bool) -> tuple[mx.array, mx.array]:
+def moe_topk_ref(gates: mx.array, top_k: int, norm_topk_prob: bool) -> tuple[mx.array, mx.array]:
     """The ops path of the router: fp32 softmax, argpartition, renormalized weights."""
     scores = mx.softmax(gates, axis=-1, precise=True)
     topk_ids = mx.argpartition(scores, kth=-top_k, axis=-1)[..., -top_k:]
@@ -165,6 +166,14 @@ def moe_combine_ref(
     rows = expert_out.reshape(num_tokens * top_k, -1)[pair_positions].astype(mx.float32)
     weighted = rows.reshape(num_tokens, top_k, -1) * topk_weights.astype(mx.float32)[..., None]
     return weighted.sum(axis=1).astype(expert_out.dtype)
+
+
+def hc_mix_ref(up: mx.array, normed: mx.array, hc_count: int) -> mx.array:
+    """kernel.hc.hc_mix in MLX ops: the mean over the streams of sigmoid(up) * normed in fp32,
+    cast once."""
+    weighted = mx.sigmoid(up.astype(mx.float32)) * normed.astype(mx.float32)
+    total = weighted.reshape(normed.shape[0], hc_count, -1).sum(axis=1)
+    return (total / hc_count).astype(normed.dtype)
 
 
 def flash_decode_ref(
@@ -246,9 +255,10 @@ __all__ = [
     "flash_prefill_ref",
     "gdn_decode_step_ref",
     "gdn_prefill_inputs_ref",
+    "hc_mix_ref",
     "moe_align_ref",
     "moe_combine_ref",
-    "router_topk_ref",
+    "moe_topk_ref",
     "scatter_rows_ref",
     "zero_rows_ref",
 ]

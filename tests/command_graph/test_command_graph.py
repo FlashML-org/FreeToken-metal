@@ -14,7 +14,7 @@ from ftmetal.command_graph.arena import (
     plan_graph_arena,
 )
 from ftmetal.kernel.custom import metal_kernel
-from ftmetal.kernel.inplace import scatter_rows
+from ftmetal.kernel.kvcache.pool_rows import scatter_rows
 
 HIDDEN = 256
 NUM_HEADS = 4

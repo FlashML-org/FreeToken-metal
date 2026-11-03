@@ -23,7 +23,12 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from ftmetal.kernel.fprefill import MAX_BLOCK_K, FprefillMma, flash_prefill, prefill_tiles
+from ftmetal.kernel.attention.mha.mha_prefill import (
+    MAX_BLOCK_K,
+    MhaPrefillMma,
+    flash_prefill,
+    prefill_tiles,
+)
 from ftmetal.kernel.ref import flash_prefill_ref
 
 NUM_KV_HEADS = 2
@@ -200,7 +205,7 @@ def filled_pool(
 
 @pytest.mark.parametrize("mma", MMAS)
 @pytest.mark.parametrize("case", CASES, ids=str)
-def test_matches_sdpa(case: Case, mma: FprefillMma) -> None:
+def test_matches_sdpa(case: Case, mma: MhaPrefillMma) -> None:
     cached_lens, extend_lens = list(case.cached_lens), list(case.extend_lens)
     window = case.window
     seq_lens = [c + e for c, e in zip(cached_lens, extend_lens)]
@@ -238,7 +243,7 @@ def test_matches_sdpa(case: Case, mma: FprefillMma) -> None:
 @pytest.mark.parametrize("mma", MMAS)
 @pytest.mark.parametrize("num_partitions", [None, 3])
 def test_donated_query_buffer_keeps_the_output(
-    num_partitions: int | None, mma: FprefillMma
+    num_partitions: int | None, mma: MhaPrefillMma
 ) -> None:
     """The output may take q's buffer when nothing else holds q; it must not change."""
     cached_lens, extend_lens = list(UNEQUAL[0]), list(UNEQUAL[1])
@@ -258,7 +263,7 @@ def test_donated_query_buffer_keeps_the_output(
 
 
 @pytest.mark.parametrize("mma", MMAS)
-def test_text_only_block_ends_change_nothing(mma: FprefillMma) -> None:
+def test_text_only_block_ends_change_nothing(mma: MhaPrefillMma) -> None:
     """All-zero block ends (a batch without image tokens) give the causal kernel's output
     bit for bit."""
     cached_lens, extend_lens = list(ACROSS[0]), list(ACROSS[1])

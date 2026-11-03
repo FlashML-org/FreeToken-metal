@@ -3,7 +3,7 @@ expert gated by sigmoid(shared_expert_gate(x)).
 
 Port of FreeToken models/qwen3_5_moe/moe.py, shared by Qwen3.5 / 3.6 and Qwen3.8's
 qwen4_exp (FreeToken's Qwen4ExpMoE subclasses it unchanged). Divergences: the router is the fused
-kernel/router Metal kernel (fp32 softmax, top-k, renorm in one launch) and the
+kernel/moe/moe_topk Metal kernel (fp32 softmax, top-k, renorm in one launch) and the
 experts are the resident MoELayer, or OffloadMoELayer under the offload strategy (FreeToken's
 make_moe_layer choice, made here).
 """
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-from ftmetal.kernel.router import router_topk
+from ftmetal.kernel.moe.moe_topk import moe_topk
 from ftmetal.layers.activation import sigmoid_gated_add, silu_and_mul
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
@@ -99,7 +99,7 @@ class SharedExpertMoE(BaseOP):
         )
 
     def forward(self, hidden_states: mx.array) -> mx.array:
-        topk_ids, topk_weights = router_topk(
+        topk_ids, topk_weights = moe_topk(
             self.gate.forward(hidden_states), self.top_k, self.norm_topk_prob
         )
         routed = self.experts.forward(hidden_states, topk_weights, topk_ids)

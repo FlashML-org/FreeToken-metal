@@ -1,4 +1,4 @@
-#include "moe_lookup.h"
+#include "moe/moe_lookup.h"
 
 #include <stdexcept>
 
@@ -12,16 +12,6 @@ namespace {
 
 std::string moe_lookup_source;
 const char* LIBRARY_NAME = "ftmetal_moe_lookup";
-
-// Shared with metal/moe_lookup.metal.
-struct LookupParams {
-  int layer_id;
-  int num_experts;
-  int num_rows;
-  int top_k;
-  uint32_t kind;
-  int slot_base;
-};
 
 void check_array(
     const mx::array& array,
@@ -84,7 +74,7 @@ std::vector<mx::array> moe_lookup(
     throw std::invalid_argument("ftmetal moe_lookup: unknown lookup kind");
   }
   auto stream = mx::to_stream(s);
-  // The shared tables stay as they are (see rows.h); eval_gpu checks they are row contiguous.
+  // The shared tables stay as they are (see kvcache/pool_rows.h); eval_gpu checks they are row contiguous.
   return mx::array::make_arrays(
       {topk_ids.shape(), {num_experts}, mailbox.shape(), last_use.shape(), hit_stats.shape()},
       {mx::int32, mx::int32, mx::uint32, mx::uint32, mx::uint32},

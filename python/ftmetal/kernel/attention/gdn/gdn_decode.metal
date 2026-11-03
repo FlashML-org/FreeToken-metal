@@ -1,4 +1,4 @@
-// gdn_step: one Gated DeltaNet decode step for a batch of requests, in place on
+// gdn_decode: one Gated DeltaNet decode step for a batch of requests, in place on
 // the conv ring and the recurrent state pool. The {{...}} tokens are substituted
 // per configuration before compilation. Buffer slots: 0 conv_pool [S, KCONV, CONV_DIM]
 // (ring of the last KCONV inputs by position mod KCONV), 1 state_pool [S, HV, DV, DK]
@@ -49,7 +49,7 @@ inline float conv_at(
   return acc;
 }
 
-[[kernel]] void gdn_step(
+[[kernel]] void gdn_decode(
     device T* conv_pool [[buffer(0)]],
     device float* state_pool [[buffer(1)]],
     device T* y [[buffer(2)]],

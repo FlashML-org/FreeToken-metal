@@ -1,11 +1,12 @@
-"""Loads the C++ extension against the pinned MLX and hands it the Metal sources."""
+"""Loads the C++ extension against the pinned MLX, hands it the Metal libraries, and reads the
+Metal sources of the metal_kernel wrappers."""
 
 import re
 from importlib.metadata import version
 from pathlib import Path
 
 REQUIRED_MLX_VERSION = "0.32.3"
-METAL_DIR = Path(__file__).resolve().parent / "metal"
+KERNEL_DIR = Path(__file__).resolve().parent
 
 if version("mlx") != REQUIRED_MLX_VERSION:
     raise ImportError(
@@ -17,14 +18,14 @@ import mlx.core  # noqa: E402  (import order is the loading contract)
 
 from ftmetal.kernel import _C  # noqa: E402
 
-# The Metal kernel headers the mlx wheel ships; runtime Metal compilation has no include
-# path, so a source that builds on them gets them inlined.
+# Runtime Metal compilation has no include path, so a source gets the headers it includes
+# inlined: mlx/... from the mlx wheel, any other path from this package (relative to kernel/).
 MLX_INCLUDE_DIR = Path(mlx.core.__file__).parent / "include"
-MLX_INCLUDE_PATTERN = re.compile(r'^#include "(mlx/[^"]+)"$|^#pragma once$', re.MULTILINE)
+INCLUDE_PATTERN = re.compile(r'^#include "([^"]+)"$|^#pragma once$', re.MULTILINE)
 
 
-def inline_mlx_headers(source: str, included: set[str]) -> str:
-    """source with each #include "mlx/..." replaced by that header, the first time only."""
+def inline_headers(source: str, included: set[str]) -> str:
+    """source with each #include "..." replaced by that header, the first time only."""
 
     def inline(match: re.Match[str]) -> str:
         header = match.group(1)
@@ -32,22 +33,35 @@ def inline_mlx_headers(source: str, included: set[str]) -> str:
             return ""
         else:
             included.add(header)
-            return inline_mlx_headers((MLX_INCLUDE_DIR / header).read_text(), included)
+            root = MLX_INCLUDE_DIR if header.startswith("mlx/") else KERNEL_DIR
+            return inline_headers((root / header).read_text(), included)
 
-    return MLX_INCLUDE_PATTERN.sub(inline, source)
+    return INCLUDE_PATTERN.sub(inline, source)
 
 
-_C.init_library((METAL_DIR / "rows.metal").read_text())
-_C.init_gdn_step_library((METAL_DIR / "gdn_step.metal").read_text())
-_C.init_fdecode_library((METAL_DIR / "fdecode.metal").read_text())
-_C.init_fprefill_library((METAL_DIR / "fprefill.metal").read_text())
+def metal_source(path: Path) -> str:
+    """A Metal library or a metal_kernel body, its includes inlined."""
+    return inline_headers(path.read_text(), set())
+
+
+def metal_kernel_header(path: Path) -> str:
+    """A metal_kernel header, its includes inlined less utils.h, which the preamble holds."""
+    included: set[str] = set()
+    inline_headers('#include "mlx/backend/metal/kernels/utils.h"\n', included)
+    return inline_headers(path.read_text(), included)
+
+
+_C.init_pool_rows_library(metal_source(KERNEL_DIR / "kvcache" / "pool_rows.metal"))
+_C.init_gdn_decode_library(metal_source(KERNEL_DIR / "attention" / "gdn" / "gdn_decode.metal"))
+_C.init_mha_decode_library(metal_source(KERNEL_DIR / "attention" / "mha" / "mha_decode.metal"))
+_C.init_mha_prefill_library(metal_source(KERNEL_DIR / "attention" / "mha" / "mha_prefill.metal"))
 _C.init_gather_sorted_libraries(
-    inline_mlx_headers((METAL_DIR / "gather_qmm_sorted.metal").read_text(), set()),
-    inline_mlx_headers((METAL_DIR / "fp_gather_qmm_sorted.metal").read_text(), set()),
-    inline_mlx_headers((METAL_DIR / "gather_mm_sorted.metal").read_text(), set()),
+    metal_source(KERNEL_DIR / "moe" / "affine" / "affine_gather_qmm_sorted.metal"),
+    metal_source(KERNEL_DIR / "moe" / "fp" / "fp_gather_qmm_sorted.metal"),
+    metal_source(KERNEL_DIR / "moe" / "unquantized" / "gather_mm_sorted.metal"),
 )
-_C.init_sample_library((METAL_DIR / "sample.metal").read_text())
-_C.init_moe_lookup_library((METAL_DIR / "moe_lookup.metal").read_text())
-_C.init_ple_lookup_library((METAL_DIR / "ple_lookup.metal").read_text())
+_C.init_sample_tokens_library(metal_source(KERNEL_DIR / "sample" / "sample_tokens.metal"))
+_C.init_moe_lookup_library(metal_source(KERNEL_DIR / "moe" / "moe_lookup.metal"))
+_C.init_ple_lookup_library(metal_source(KERNEL_DIR / "embedding" / "ple_lookup.metal"))
 
-__all__ = ["_C"]
+__all__ = ["KERNEL_DIR", "_C", "metal_kernel_header", "metal_source"]

@@ -7,7 +7,7 @@ element; each pool dtype (bf16 K/V and conv, fp32 GDN state, int32 tokens) takes
 import mlx.core as mx
 import pytest
 
-from ftmetal.kernel.inplace import copy_rows, kv_write, scatter_rows, zero_rows
+from ftmetal.kernel.kvcache.pool_rows import copy_rows, kv_write, scatter_rows, zero_rows
 from ftmetal.kernel.ref import copy_rows_ref, scatter_rows_ref, zero_rows_ref
 
 DTYPES = [mx.bfloat16, mx.float32, mx.int32]

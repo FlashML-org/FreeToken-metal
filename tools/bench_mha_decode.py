@@ -1,6 +1,6 @@
 """Per-call time of paged flash-decode at the Qwen3.6 (default) or a given attention shape.
 
-    uv run python tools/bench_fdecode.py [--lengths 1024,2048,8192,32768] [--batch-size 1]
+    uv run python tools/bench_mha_decode.py [--lengths 1024,2048,8192,32768] [--batch-size 1]
         [--num-heads 16 --num-kv-heads 2 --head-dim 256]
 
 One call is one full-attention layer of a decode batch: bf16 q [B, Hq, D] over a
@@ -23,7 +23,7 @@ import time
 import mlx.core as mx
 import numpy as np
 
-from ftmetal.kernel.fdecode import flash_decode
+from ftmetal.kernel.attention.mha.mha_decode import flash_decode
 
 PAGE_SIZE = 1
 CALLS_PER_RUN = 200

@@ -9,8 +9,8 @@
 // kernel takes the quantized kernels' buffer order (M, N, K instead of gather_mm_rhs's
 // GEMMParams), so the three share one dispatch.
 // note (jason-fxz): this is coupled to the internals of mlx==0.32.3 (the kernels in
-// metal/gather_qmm_sorted.metal, metal/fp_gather_qmm_sorted.metal and
-// metal/gather_mm_sorted.metal and this host side). Re-check them against the new
+// moe/affine/affine_gather_qmm_sorted.metal, moe/fp/fp_gather_qmm_sorted.metal and
+// moe/unquantized/gather_mm_sorted.metal and this host side). Re-check them against the new
 // quantized.cpp, matmul.cpp, quantized.h, fp_quantized.h and steel_gemm_gather.h on any MLX
 // upgrade; the bit-exact tests are the guard.
 #pragma once

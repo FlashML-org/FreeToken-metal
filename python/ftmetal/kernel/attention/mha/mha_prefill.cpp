@@ -1,9 +1,9 @@
-#include "fprefill.h"
+#include "attention/mha/mha_prefill.h"
 
 #include <cmath>
 #include <stdexcept>
 
-#include "metal_primitive.h"
+#include "common/metal_primitive.h"
 #include "mlx/allocator.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/utils.h"
@@ -12,7 +12,7 @@ namespace ftmetal {
 
 namespace {
 
-std::string fprefill_source;
+std::string mha_prefill_source;
 const int SIMD_WIDTH = 32;
 const int FRAGMENT_SIZE = 8;
 const int MAX_THREADGROUP_THREADS = 1024;
@@ -22,8 +22,8 @@ const int MPP_GRANULE = 16;
 
 } // namespace
 
-void init_fprefill_library(const std::string& source) {
-  fprefill_source = source;
+void init_mha_prefill_library(const std::string& source) {
+  mha_prefill_source = source;
 }
 
 namespace {
@@ -53,59 +53,59 @@ mx::array make_flash_prefill(
   if (q.ndim() != 3 || k_cache.ndim() != 3 || v_cache.ndim() != 3 || page_table.ndim() != 2 ||
       tiles.ndim() != 2 || tiles.shape(1) != 4) {
     throw std::invalid_argument(
-        "ftmetal fprefill: q [T, Hq, D], k/v cache [slots, Hkv, D], page_table [B, P], "
+        "ftmetal mha_prefill: q [T, Hq, D], k/v cache [slots, Hkv, D], page_table [B, P], "
         "tiles [num_tiles, 4]");
   }
   int num_heads = q.shape(1);
   int head_dim = q.shape(2);
   int num_kv_heads = k_cache.shape(1);
-  metal_type(q.dtype(), "fprefill");
+  metal_type(q.dtype(), "mha_prefill");
   if (k_cache.dtype() != q.dtype() || v_cache.dtype() != q.dtype()) {
-    throw std::invalid_argument("ftmetal fprefill: k/v cache must be in q's dtype");
+    throw std::invalid_argument("ftmetal mha_prefill: k/v cache must be in q's dtype");
   }
   if (k_cache.shape() != v_cache.shape() || k_cache.shape(2) != head_dim) {
-    throw std::invalid_argument("ftmetal fprefill: k/v cache shape mismatch");
+    throw std::invalid_argument("ftmetal mha_prefill: k/v cache shape mismatch");
   }
   if (num_kv_heads <= 0 || num_heads % num_kv_heads != 0) {
-    throw std::invalid_argument("ftmetal fprefill: Hq must be a multiple of Hkv");
+    throw std::invalid_argument("ftmetal mha_prefill: Hq must be a multiple of Hkv");
   }
   if (head_dim % SIMD_WIDTH != 0) {
-    throw std::invalid_argument("ftmetal fprefill: head_dim must be a multiple of 32");
+    throw std::invalid_argument("ftmetal mha_prefill: head_dim must be a multiple of 32");
   }
   if (page_size <= 0 || (page_size & (page_size - 1)) != 0) {
-    throw std::invalid_argument("ftmetal fprefill: page size must be a power of two");
+    throw std::invalid_argument("ftmetal mha_prefill: page size must be a power of two");
   }
   if (page_table.dtype() != mx::int32 || tiles.dtype() != mx::int32) {
-    throw std::invalid_argument("ftmetal fprefill: page_table and tiles must be int32");
+    throw std::invalid_argument("ftmetal mha_prefill: page_table and tiles must be int32");
   }
   int group = num_heads / num_kv_heads;
   if (num_row_groups < 1 || head_split < 1 ||
       num_row_groups * head_split * SIMD_WIDTH > MAX_THREADGROUP_THREADS ||
       FRAGMENT_SIZE * num_row_groups < group) {
     throw std::invalid_argument(
-        "ftmetal fprefill: a threadgroup's 8 * num_row_groups rows must hold one token's heads");
+        "ftmetal mha_prefill: a threadgroup's 8 * num_row_groups rows must hold one token's heads");
   }
   int granule = mpp ? MPP_GRANULE : FRAGMENT_SIZE;
   if (head_dim % (granule * head_split) != 0) {
     throw std::invalid_argument(
-        "ftmetal fprefill: head_split must cut D into 8-column slices (16 with mpp)");
+        "ftmetal mha_prefill: head_split must cut D into 8-column slices (16 with mpp)");
   }
   if (block_k < granule || block_k % granule != 0) {
-    throw std::invalid_argument("ftmetal fprefill: block_k must be a multiple of 8 (16 with mpp)");
+    throw std::invalid_argument("ftmetal mha_prefill: block_k must be a multiple of 8 (16 with mpp)");
   }
   if (num_passes < 1 || head_split % num_passes != 0 || (num_passes > 1 && !kv_shared)) {
     throw std::invalid_argument(
-        "ftmetal fprefill: num_passes must divide head_split, and share the K/V buffer");
+        "ftmetal mha_prefill: num_passes must divide head_split, and share the K/V buffer");
   }
   if (num_partitions < 1) {
-    throw std::invalid_argument("ftmetal fprefill: num_partitions must be >= 1");
+    throw std::invalid_argument("ftmetal mha_prefill: num_partitions must be >= 1");
   }
   if (sliding_window < 0) {
-    throw std::invalid_argument("ftmetal fprefill: sliding_window must be >= 0 (0: none)");
+    throw std::invalid_argument("ftmetal mha_prefill: sliding_window must be >= 0 (0: none)");
   }
   if (block_ends && (block_ends->ndim() != 1 || block_ends->shape(0) != q.shape(0) ||
                      block_ends->dtype() != mx::int32)) {
-    throw std::invalid_argument("ftmetal fprefill: block_ends must be int32 [num_tokens]");
+    throw std::invalid_argument("ftmetal mha_prefill: block_ends must be int32 [num_tokens]");
   }
   auto stream = mx::to_stream(s);
   FlashPrefillConfig config{
@@ -185,7 +185,7 @@ mx::array flash_prefill_qsa(
       qsa_bits.shape(0) != q.shape(0) || qsa_blocks.dtype() != mx::int32 ||
       qsa_counts.dtype() != mx::int32 || qsa_bits.dtype() != mx::uint32) {
     throw std::invalid_argument(
-        "ftmetal fprefill qsa: blocks [num_tiles, W] int32, counts [num_tiles] int32, bits "
+        "ftmetal mha_prefill qsa: blocks [num_tiles, W] int32, counts [num_tiles] int32, bits "
         "[num_tokens, B] uint32, block size >= 1");
   }
   return make_flash_prefill(
@@ -200,11 +200,11 @@ bool FlashPrefill::is_equivalent(const mx::Primitive& other) const {
 }
 
 void FlashPrefill::eval_cpu(const std::vector<mx::array>&, std::vector<mx::array>&) {
-  throw std::runtime_error("ftmetal fprefill: GPU only");
+  throw std::runtime_error("ftmetal mha_prefill: GPU only");
 }
 
 void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) {
-  check_pools_row_contiguous(inputs, "fprefill");
+  check_pools_row_contiguous(inputs, "mha_prefill");
   const auto& q = inputs[0];
   auto& out = outputs[0];
   // A threadgroup reads only its own tile's query rows, all before it writes them.
@@ -218,8 +218,8 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
     return;
   }
   const auto& c = config_;
-  std::string type = metal_type(out.dtype(), "fprefill");
-  std::string library_name = "ftmetal_fprefill_" + type + "_" + std::to_string(c.head_dim) +
+  std::string type = metal_type(out.dtype(), "mha_prefill");
+  std::string library_name = "ftmetal_mha_prefill_" + type + "_" + std::to_string(c.head_dim) +
       "_" + std::to_string(c.group) + "_" + std::to_string(c.num_kv_heads) + "_" +
       std::to_string(c.page_size) + "_" + std::to_string(c.num_row_groups) + "_" +
       std::to_string(c.head_split) + "_" + std::to_string(c.block_k) + "_" +
@@ -231,7 +231,7 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
   auto s = stream();
   auto& d = mx::metal::device(s.device);
   auto* library = d.get_library(library_name, [&]() {
-    std::string source = fprefill_source;
+    std::string source = mha_prefill_source;
     replace_all(source, "{{T}}", type);
     replace_all(source, "{{D}}", std::to_string(c.head_dim));
     replace_all(source, "{{G}}", std::to_string(c.group));
@@ -267,7 +267,7 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
     }
   };
   if (c.num_partitions == 1) {
-    encoder.set_compute_pipeline_state(d.get_kernel("fprefill", library));
+    encoder.set_compute_pipeline_state(d.get_kernel("mha_prefill", library));
     for (int i = 0; i < 5; ++i) {
       encoder.set_input_array(inputs[i], i);
     }
@@ -282,7 +282,7 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
   auto [part_acc, part_ml] =
       split_partials({num_tiles, c.num_kv_heads, c.num_partitions, rows}, c.head_dim, encoder);
 
-  encoder.set_compute_pipeline_state(d.get_kernel("fprefill_partials", library));
+  encoder.set_compute_pipeline_state(d.get_kernel("mha_prefill_partials", library));
   for (int i = 0; i < 5; ++i) {
     encoder.set_input_array(inputs[i], i);
   }
@@ -294,7 +294,7 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
   encoder.dispatch_threadgroups(
       MTL::Size(num_tiles, c.num_kv_heads, c.num_partitions), tile_group);
 
-  encoder.set_compute_pipeline_state(d.get_kernel("fprefill_merge", library));
+  encoder.set_compute_pipeline_state(d.get_kernel("mha_prefill_merge", library));
   encoder.set_input_array(part_acc, 0);
   encoder.set_input_array(part_ml, 1);
   encoder.set_input_array(inputs[4], 2);

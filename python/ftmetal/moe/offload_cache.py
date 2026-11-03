@@ -10,10 +10,10 @@ banks); slot_of and last_use are shared arrays the C++ side writes in place; ens
 takes the forward's step and returns the slots; prefetch_prefill_layer returns where each
 of the layer's experts lies (resident experts in their slots, only the absent read into
 the prefill buffer) instead of copying a whole layer, which the expert-sorted gather reads
-at byte offsets. Decode and short prefills look their experts up on the GPU (kernel/moe_lookup.py):
-misses go to the C++ coordinator through a mailbox instead of FreeToken's per-layer
-ready/done flags, with a watchdog (FreeToken cpu_executor.py) failing an unanswered
-request. Each forward is prepared like an attention backend's metadata: a decode, or a
+at byte offsets. Decode and short prefills look their experts up on the GPU
+(kernel/moe/moe_lookup.py): misses go to the C++ coordinator through a mailbox instead of
+FreeToken's per-layer ready/done flags, with a watchdog (FreeToken cpu_executor.py) failing an
+unanswered request. Each forward is prepared like an attention backend's metadata: a decode, or a
 prefill below prefill_overlap_min_tokens, looks its experts up (a copy-miss prefill: its
 misses join the LRU, where FreeToken's prefill streams whole layers); a longer prefill
 reads each layer's absent experts into a prefill buffer one layer ahead, ordered by the
@@ -37,7 +37,7 @@ import numpy as np
 
 from ftmetal.core import Batch
 from ftmetal.kernel._ext import _C
-from ftmetal.kernel.moe_lookup import moe_lookup
+from ftmetal.kernel.moe.moe_lookup import moe_lookup
 from ftmetal.moe.slot_pools import SlotLayout, initial_experts
 from ftmetal.moe.source import ExpertSource
 

@@ -13,9 +13,9 @@ layouts. Below four rows per logical expert MLX's per-row affine matvec beats ei
 kernel (1.3-1.9x at B 32 to 768) and does not depend on the bank. On a GPU without matrix
 units these equal mx.gather_qmm and mx.gather_mm bit for bit wherever MLX takes its rhs
 kernel; a NAX GPU (M5 class) gets MLX's matrix-unit kernels, which these do not carry.
-Adapted from MLX v0.32.3 (metal/gather_qmm_sorted.metal, metal/fp_gather_qmm_sorted.metal,
-metal/gather_mm_sorted.metal, csrc/gather_sorted.h) and coupled to its internals: re-check
-them on any MLX upgrade; the bit-exact tests are the guard.
+Adapted from MLX v0.32.3 (affine/affine_gather_qmm_sorted.metal, fp/fp_gather_qmm_sorted.metal,
+unquantized/gather_mm_sorted.metal, gather_sorted.h) and coupled to its internals: re-check them
+on any MLX upgrade; the bit-exact tests are the guard.
 """
 
 from __future__ import annotations

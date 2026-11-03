@@ -24,8 +24,8 @@ from typing import Literal, Protocol
 import mlx.core as mx
 from mlx.utils import tree_unflatten
 
-from ftmetal.kernel.gather_sorted import FLOAT_INPUT_TILE, gather_mm_sorted, gather_qmm_sorted
-from ftmetal.kernel.moe_align import ExpertAlignment, moe_align, moe_combine
+from ftmetal.kernel.moe.gather_sorted import FLOAT_INPUT_TILE, gather_mm_sorted, gather_qmm_sorted
+from ftmetal.kernel.moe.moe_align import ExpertAlignment, moe_align, moe_combine
 from ftmetal.layers.activation import gelu_tanh_and_mul, silu_and_mul
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.quantization.config import AffineScheme, BankSpec, FpBlockScheme, QuantScheme

@@ -30,7 +30,7 @@ import numpy as np
 from ftmetal.attention.base import BaseAttnBackend
 from ftmetal.attention.metadata import AttnType, LinearAttnMetadata
 from ftmetal.core import Batch
-from ftmetal.kernel.gdn_chunk import CHUNK_SIZE
+from ftmetal.kernel.attention.gdn.gdn_chunk import CHUNK_SIZE
 from ftmetal.kvcache.base import BasePool
 from ftmetal.kvcache.linear_state_pool import LinearStatePool
 

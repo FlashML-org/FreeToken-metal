@@ -1,5 +1,5 @@
 // Token sampling as one primitive: the radix-select rounds and the draw of
-// metal/sample.metal, encoded as one dispatch chain over a temporary workspace.
+// sample_tokens.metal, encoded as one dispatch chain over a temporary workspace.
 #pragma once
 
 #include <optional>
@@ -14,7 +14,7 @@ namespace mx = mlx::core;
 namespace ftmetal {
 
 // Register the Metal source template of the sampling kernels; compiled per logits dtype.
-void init_sample_library(const std::string& source);
+void init_sample_tokens_library(const std::string& source);
 
 // logits [B, V] (bf16, fp16 or fp32); temperatures [B] fp32 > 0; top_k [B] int32, off at
 // 0 or >= V; top_p [B] fp32, off at >= 1. A missing top_k or top_p turns that filter off

@@ -15,9 +15,14 @@ import mlx.core as mx
 from ftmetal.attention.full.common import FullAttnMetadata
 from ftmetal.attention.full.metal import FullAttnMetalBackend
 from ftmetal.attention.qsa.common import QSAAttnBackend, block_scores, visible_blocks
-from ftmetal.kernel.fdecode import flash_decode
-from ftmetal.kernel.fprefill import flash_prefill_qsa
-from ftmetal.kernel.qsa import qsa_block_scores, qsa_key_table, qsa_topk, qsa_window_mean
+from ftmetal.kernel.attention.mha.mha_decode import flash_decode
+from ftmetal.kernel.attention.mha.mha_prefill import flash_prefill_qsa
+from ftmetal.kernel.attention.qsa.qsa_indexer import (
+    qsa_block_scores,
+    qsa_key_table,
+    qsa_topk,
+    qsa_window_mean,
+)
 
 # Prefill queries selecting at once, at most: bounds their [queries, blocks] scores and masks.
 QUERY_CHUNK = 256

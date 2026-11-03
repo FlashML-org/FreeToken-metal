@@ -1,4 +1,4 @@
-// PleLookup (see csrc/ple_lookup.h). ple_post (one thread) writes each batch row's token and
+// PleLookup (see ple_lookup.h). ple_post (one thread) writes each batch row's token and
 // n-gram context to the mailbox, advances the context pool and posts; ple_wait (one
 // threadgroup) spins until the CPU has answered the ticket's post, then copies the staged
 // rows out with coherent loads. Memory the CPU shares is accessed volatile coherent(system),
@@ -18,26 +18,23 @@ constexpr constant metal::thread_scope thread_scope_system =
 #include <metal_stdlib>
 using namespace metal;
 
-// Shared with csrc/ple_lookup.h and csrc/moe_lookup.h (the states).
-constant constexpr uint WORD_STATE = 0;
-constant constexpr uint WORD_SEQUENCE = 1;
-constant constexpr uint WORD_ACKNOWLEDGED = 2;
-constant constexpr uint WORD_SHUTDOWN = 3;
-constant constexpr uint WORD_NUM_ROWS = 32;
-constant constexpr uint WORD_ROWS = 64;
-constant constexpr uint STATE_IDLE = 0;
-constant constexpr uint STATE_POSTED = 1;
-constant constexpr uint STATE_DONE = 3;
-constant constexpr uint STATE_FAILED = 4;
-constant constexpr uint STATE_SHUTDOWN = 5;
+#include "common/mailbox.h"
+
+constant constexpr uint WORD_STATE = uint(PleMailboxWord::State);
+constant constexpr uint WORD_SEQUENCE = uint(PleMailboxWord::Sequence);
+constant constexpr uint WORD_ACKNOWLEDGED = uint(PleMailboxWord::Acknowledged);
+constant constexpr uint WORD_SHUTDOWN = uint(PleMailboxWord::Shutdown);
+constant constexpr uint WORD_NUM_ROWS = uint(PleMailboxWord::NumRows);
+constant constexpr uint WORD_ROWS = uint(PleMailboxWord::Rows);
+constant constexpr uint STATE_IDLE = uint(MailboxState::Idle);
+constant constexpr uint STATE_POSTED = uint(MailboxState::Posted);
+constant constexpr uint STATE_DONE = uint(MailboxState::Done);
+constant constexpr uint STATE_FAILED = uint(MailboxState::Failed);
+constant constexpr uint STATE_SHUTDOWN = uint(MailboxState::Shutdown);
 
 inline void system_fence() {
   atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_system);
 }
-
-struct PostParams {
-  int num_rows;
-};
 
 [[kernel]] void ple_post(
     device const int* input_ids [[buffer(0)]],
@@ -76,10 +73,6 @@ struct PostParams {
   }
   ticket[0] = sequence;
 }
-
-struct WaitParams {
-  int part_bytes[3];
-};
 
 // The first bytes of staging, or zeros, by word where the part allows it.
 inline void copy_part(

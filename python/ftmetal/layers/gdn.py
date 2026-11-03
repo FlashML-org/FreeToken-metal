@@ -18,9 +18,10 @@ import mlx.core as mx
 from ftmetal.attention.metadata import AttnType, LinearAttnMetadata
 from ftmetal.context import get_global_ctx
 from ftmetal.core import Batch
-from ftmetal.kernel.gdn import gated_delta_recurrence, gdn_decode_step, gdn_prefill_inputs
-from ftmetal.kernel.gdn_chunk import gated_delta_chunked
-from ftmetal.kernel.inplace import scatter_rows
+from ftmetal.kernel.attention.gdn.gdn_chunk import gated_delta_chunked
+from ftmetal.kernel.attention.gdn.gdn_decode import gdn_decode_step
+from ftmetal.kernel.attention.gdn.gdn_prefill import gated_delta_recurrence, gdn_prefill_inputs
+from ftmetal.kernel.kvcache.pool_rows import scatter_rows
 from ftmetal.kvcache.linear_state_pool import LinearStatePool
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged

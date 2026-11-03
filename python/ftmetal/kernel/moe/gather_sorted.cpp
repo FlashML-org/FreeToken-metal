@@ -1,4 +1,4 @@
-#include "gather_sorted.h"
+#include "moe/gather_sorted.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -7,7 +7,7 @@
 #include <string>
 #include <utility>
 
-#include "metal_primitive.h"
+#include "common/metal_primitive.h"
 #include "mlx/allocator.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/utils.h"

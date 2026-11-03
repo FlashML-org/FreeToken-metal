@@ -2,7 +2,7 @@
 
 Port of FreeToken models/gemma4/moe.py (Gemma4Router; the GatedMLP its Gemma4MLP and
 Gemma4DenseMLP share). Divergences: the router's softmax, top-k and renormalization run
-in the fused router_topk kernel (softmax over the top-k logits equals the full softmax
+in the fused moe_topk kernel (softmax over the top-k logits equals the full softmax
 renormalized over the top k) and the per-expert scale is applied after it; the
 feed-forward sandwich, its norms and the layer scalar are the decoder layer's, as in the
 checkpoint's layout.
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-from ftmetal.kernel.router import router_topk
+from ftmetal.kernel.moe.moe_topk import moe_topk
 from ftmetal.layers.activation import gelu_tanh_and_mul
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
@@ -63,7 +63,7 @@ class Gemma4Router(BaseOP):
     def forward(self, x: mx.array) -> tuple[mx.array, mx.array]:
         """x [T, H] -> (expert ids int32 [T, top_k], weights [T, top_k])."""
         normed = mx.fast.rms_norm(x, self.scale * self.root_size, self.eps)
-        topk_ids, topk_weights = router_topk(self.proj.forward(normed), self.top_k, True)
+        topk_ids, topk_weights = moe_topk(self.proj.forward(normed), self.top_k, True)
         return topk_ids, topk_weights * self.per_expert_scale[topk_ids]
 
 

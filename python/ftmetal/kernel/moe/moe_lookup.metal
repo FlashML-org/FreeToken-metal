@@ -1,4 +1,4 @@
-// MoeLookup (see csrc/moe_lookup.h): one threadgroup of MAX_EXPERTS threads, thread e owning
+// MoeLookup (see moe_lookup.h): one threadgroup of MAX_EXPERTS threads, thread e owning
 // expert e. The real rows' experts are marked in a threadgroup bitmap and looked up in
 // slot_of; when some are absent thread 0 posts them, absent first, and spins until the CPU
 // answers, then their slots are looked up again. Memory the CPU shares is accessed
@@ -18,38 +18,29 @@ constexpr constant metal::thread_scope thread_scope_system =
 #include <metal_stdlib>
 using namespace metal;
 
-// Shared with csrc/moe_lookup.h.
-constant constexpr uint WORD_STATE = 0;
-constant constexpr uint WORD_SEQUENCE = 1;
-constant constexpr uint WORD_ACKNOWLEDGED = 2;
-constant constexpr uint WORD_SHUTDOWN = 3;
-constant constexpr uint WORD_KIND = 32;
-constant constexpr uint WORD_LAYER = 33;
-constant constexpr uint WORD_STEP = 34;
-constant constexpr uint WORD_NUM_ROWS = 35;
-constant constexpr uint WORD_NUM_IDS = 36;
-constant constexpr uint WORD_NUM_MISSES = 37;
-constant constexpr uint WORD_IDS = 64;
-constant constexpr uint STATE_IDLE = 0;
-constant constexpr uint STATE_POSTED = 1;
-constant constexpr uint STATE_DONE = 3;
-constant constexpr uint STATE_FAILED = 4;
-constant constexpr uint STATE_SHUTDOWN = 5;
-constant constexpr uint KIND_PROBE = 3;
-constant constexpr uint MAX_EXPERTS = 512;
+#include "common/mailbox.h"
+
+constant constexpr uint WORD_STATE = uint(MailboxWord::State);
+constant constexpr uint WORD_SEQUENCE = uint(MailboxWord::Sequence);
+constant constexpr uint WORD_ACKNOWLEDGED = uint(MailboxWord::Acknowledged);
+constant constexpr uint WORD_SHUTDOWN = uint(MailboxWord::Shutdown);
+constant constexpr uint WORD_KIND = uint(MailboxWord::Kind);
+constant constexpr uint WORD_LAYER = uint(MailboxWord::Layer);
+constant constexpr uint WORD_STEP = uint(MailboxWord::Step);
+constant constexpr uint WORD_NUM_ROWS = uint(MailboxWord::NumRows);
+constant constexpr uint WORD_NUM_IDS = uint(MailboxWord::NumIds);
+constant constexpr uint WORD_NUM_MISSES = uint(MailboxWord::NumMisses);
+constant constexpr uint WORD_IDS = uint(MailboxWord::Ids);
+constant constexpr uint STATE_IDLE = uint(MailboxState::Idle);
+constant constexpr uint STATE_POSTED = uint(MailboxState::Posted);
+constant constexpr uint STATE_DONE = uint(MailboxState::Done);
+constant constexpr uint STATE_FAILED = uint(MailboxState::Failed);
+constant constexpr uint STATE_SHUTDOWN = uint(MailboxState::Shutdown);
+constant constexpr uint KIND_PROBE = uint(MoeLookupKind::Probe);
+constant constexpr uint MAX_EXPERTS = MAX_LOOKUP_EXPERTS;
 
 constant constexpr uint SIMD_WIDTH = 32;
 constant constexpr uint NUM_SIMDGROUPS = MAX_EXPERTS / SIMD_WIDTH;
-
-struct LookupParams {
-  int layer_id;
-  int num_experts;
-  int num_rows;
-  int top_k;
-  uint kind;
-  // The outputs are slots less this: the first slot of the layer's pool.
-  int slot_base;
-};
 
 inline void system_fence() {
   atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_system);

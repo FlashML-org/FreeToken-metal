@@ -26,7 +26,7 @@ def test_compile_bakes_implicitly_captured_arrays_as_constants() -> None:
 
 
 def test_python_scatter_copies_the_pool_under_pipelining() -> None:
-    """Why pool writes go through the C++ primitives (see kernel/test_inplace.py)."""
+    """Why pool writes go through the C++ primitives (see kernel/kvcache/test_pool_rows.py)."""
     rows, cols = 4096, 8192
     pool_bytes = rows * cols * 2
     pool = mx.zeros((rows, cols), dtype=mx.float16)

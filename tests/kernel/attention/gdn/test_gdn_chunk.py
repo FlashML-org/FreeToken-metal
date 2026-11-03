@@ -10,8 +10,8 @@ from __future__ import annotations
 import mlx.core as mx
 import pytest
 
-from ftmetal.kernel.gdn import gated_delta_recurrence
-from ftmetal.kernel.gdn_chunk import gated_delta_chunked
+from ftmetal.kernel.attention.gdn.gdn_chunk import gated_delta_chunked
+from ftmetal.kernel.attention.gdn.gdn_prefill import gated_delta_recurrence
 
 SHAPES = {
     "tiny": dict(batch=2, num_k_heads=2, num_v_heads=4, head_dim=32),

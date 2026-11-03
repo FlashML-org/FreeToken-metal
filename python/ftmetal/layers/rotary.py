@@ -2,7 +2,7 @@
 
 Port of FreeToken layers/rotary.py. Divergences: only the default (NeoX, partial),
 proportional and 3-axis ropes are served; mx.fast.rope does the 1-D rotation with the
-batch's flat positions as per-token offsets, and kernel/mrope.py the 3-axis one from an
+batch's flat positions as per-token offsets, and kernel/rope/mrope.py the 3-axis one from an
 inv_freq table, instead of a cos/sin cache; MRotaryEmbedding is its own op, not a
 RotaryEmbedding subclass; build_section_table returns a numpy array.
 """
@@ -14,7 +14,7 @@ from typing import Literal
 import mlx.core as mx
 import numpy as np
 
-from ftmetal.kernel.mrope import mrope
+from ftmetal.kernel.rope.mrope import mrope
 from ftmetal.layers.base import BaseOP
 
 # How the [t, h, w] mrope sections share the frequency slots (build_section_table).

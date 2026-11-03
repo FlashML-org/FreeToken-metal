@@ -14,7 +14,7 @@ from __future__ import annotations
 import mlx.core as mx
 import pytest
 
-from ftmetal.kernel.qmv_rows import qmv_rows, supports_qmv_rows
+from ftmetal.kernel.gemm.affine.affine_qmv_rows import qmv_rows, supports_qmv_rows
 
 BF16 = mx.bfloat16
 F32 = mx.float32
