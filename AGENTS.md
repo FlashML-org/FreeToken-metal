@@ -22,6 +22,11 @@ Python is managed with [uv](https://docs.astral.sh/uv/), always:
 Before writing, modifying, or reviewing code, read and follow
 [.claude/skills/code-style/coding-style.md](.claude/skills/code-style/coding-style.md).
 
+## Kernel layout
+
+Before adding, moving or renaming anything under `python/ftmetal/kernel/`, read and follow
+[docs/dev/kernel-layout.md](docs/dev/kernel-layout.md).
+
 ## Commit style guidelines
 
 Before writing a commit message, read and follow

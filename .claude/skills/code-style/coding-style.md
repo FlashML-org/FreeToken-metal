@@ -160,6 +160,8 @@ speculative generality.
   only in entry-point modules. Library imports must be side-effect-free.
 - No dead code: unreachable branches, commented-out blocks, stale TODOs,
   "kept for later" stubs.
+- Custom kernels under `python/ftmetal/kernel/` follow the directory, file and naming
+  rules in [docs/dev/kernel-layout.md](../../../docs/dev/kernel-layout.md).
 
 ## ERROR HANDLING & MATURITY
 
