@@ -1,10 +1,9 @@
-// MoeLookup (see moe_lookup.h): one threadgroup of MAX_EXPERTS threads, thread e owning
-// expert e. The real rows' experts are marked in a threadgroup bitmap and looked up in
-// slot_of; when some are absent thread 0 posts them, absent first, and spins until the CPU
-// answers, then their slots are looked up again. Memory the CPU shares is accessed
-// volatile coherent(system), with system-scope fences around the handshake. Buffers: 0
-// topk_ids, 1 moe_step, 2 slot_of, 3 mailbox, 4 last_use, 5 hit_stats, 6 slots, 7 slot_map,
-// 8 params.
+// MoeLookup (see moe_lookup.h): one threadgroup of MAX_EXPERTS threads, thread e owning expert e.
+// The real rows' experts are marked in a threadgroup bitmap and looked up in slot_of; when some are
+// absent thread 0 posts them, absent first, waits for the CPU's answer (common/mailbox_wait.h) and
+// their slots are looked up again. Memory the CPU shares is accessed volatile coherent(system),
+// with system-scope fences around the handshake. Buffers: 0 topk_ids, 1 moe_step, 2 slot_of, 3
+// mailbox, 4 last_use, 5 hit_stats, 6 slots, 7 slot_map, 8 params.
 #pragma METAL internals : enable
 #ifndef __METAL_MEMORY_SCOPE_SYSTEM__
 #define __METAL_MEMORY_SCOPE_SYSTEM__ 3
@@ -18,12 +17,12 @@ constexpr constant metal::thread_scope thread_scope_system =
 #include <metal_stdlib>
 using namespace metal;
 
-#include "common/mailbox.h"
+#include "common/mailbox_wait.h"
 
 constant constexpr uint WORD_STATE = uint(MailboxWord::State);
 constant constexpr uint WORD_SEQUENCE = uint(MailboxWord::Sequence);
-constant constexpr uint WORD_ACKNOWLEDGED = uint(MailboxWord::Acknowledged);
 constant constexpr uint WORD_SHUTDOWN = uint(MailboxWord::Shutdown);
+constant constexpr uint WORD_ABANDONED = uint(MailboxWord::Abandoned);
 constant constexpr uint WORD_KIND = uint(MailboxWord::Kind);
 constant constexpr uint WORD_LAYER = uint(MailboxWord::Layer);
 constant constexpr uint WORD_STEP = uint(MailboxWord::Step);
@@ -33,18 +32,12 @@ constant constexpr uint WORD_NUM_MISSES = uint(MailboxWord::NumMisses);
 constant constexpr uint WORD_IDS = uint(MailboxWord::Ids);
 constant constexpr uint STATE_IDLE = uint(MailboxState::Idle);
 constant constexpr uint STATE_POSTED = uint(MailboxState::Posted);
-constant constexpr uint STATE_DONE = uint(MailboxState::Done);
-constant constexpr uint STATE_FAILED = uint(MailboxState::Failed);
 constant constexpr uint STATE_SHUTDOWN = uint(MailboxState::Shutdown);
 constant constexpr uint KIND_PROBE = uint(MoeLookupKind::Probe);
 constant constexpr uint MAX_EXPERTS = MAX_LOOKUP_EXPERTS;
 
 constant constexpr uint SIMD_WIDTH = 32;
 constant constexpr uint NUM_SIMDGROUPS = MAX_EXPERTS / SIMD_WIDTH;
-
-inline void system_fence() {
-  atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_system);
-}
 
 [[kernel]] void moe_lookup(
     device const int* topk_ids [[buffer(0)]],
@@ -133,9 +126,10 @@ inline void system_fence() {
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     if (expert == 0) {
       bool answered = false;
-      // After a shutdown nobody answers: post nothing. The shutdown word, unlike the state,
-      // is never overwritten here, so a shutdown racing this post still releases the wait.
-      if (mailbox[WORD_SHUTDOWN] == 0) {
+      // After a shutdown, or once a wait gave up, nobody answers: post nothing. The shutdown
+      // word, unlike the state, is never overwritten here, so a shutdown racing this post still
+      // releases the wait.
+      if (is_mailbox_open(mailbox)) {
         mailbox[WORD_KIND] = params.kind;
         mailbox[WORD_LAYER] = uint(params.layer_id);
         mailbox[WORD_STEP] = step;
@@ -147,23 +141,12 @@ inline void system_fence() {
         mailbox[WORD_SEQUENCE] = sequence;
         system_fence();
         mailbox[WORD_STATE] = STATE_POSTED;
-        uint state;
-        while (true) {
+        answered = wait_for_answer(mailbox, sequence);
+        // A wait that gave up leaves the handshake to the CPU, if it is still there.
+        if (mailbox[WORD_ABANDONED] == 0) {
+          mailbox[WORD_STATE] = mailbox[WORD_SHUTDOWN] != 0 ? STATE_SHUTDOWN : STATE_IDLE;
           system_fence();
-          state = mailbox[WORD_STATE];
-          if ((state == STATE_DONE || state == STATE_FAILED) &&
-              mailbox[WORD_ACKNOWLEDGED] == sequence) {
-            break;
-          }
-          if (mailbox[WORD_SHUTDOWN] != 0) {
-            state = STATE_SHUTDOWN;
-            break;
-          }
         }
-        system_fence();
-        answered = state == STATE_DONE;
-        mailbox[WORD_STATE] = mailbox[WORD_SHUTDOWN] != 0 ? STATE_SHUTDOWN : STATE_IDLE;
-        system_fence();
       }
       is_answered = answered;
     }

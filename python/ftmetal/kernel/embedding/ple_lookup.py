@@ -5,10 +5,11 @@ ple_post, at the step's start, posts each batch row's token with its slot's n-gr
 (the two tokens before it) to the mailbox and advances the context; the service's
 coordinator hashes the n-grams, gathers the table rows from its row store into the staging
 buffers and answers; ple_wait, encoded after the arrays it is given (the PLE layer's input),
-spins until the answer and copies the rows out. No host code reads the step's token ids, so
-a decode step with lookups replays as a command graph. A post refused after a shutdown, a
-failed or unanswered post and a wait the shutdown releases return zero rows; the service
-records each of them first, so check_healthy raises before the step's tokens are used.
+waits for the answer and copies the rows out. No host code reads the step's token ids, so a
+decode step with lookups replays as a command graph. A post refused after a shutdown, a
+failed or unanswered post, a wait the shutdown releases and one that gave up past the spin
+limit return zero rows; the service records the first ones and the GPU the last (the abandoned
+word), so check_healthy raises before the step's tokens are used.
 """
 
 from __future__ import annotations

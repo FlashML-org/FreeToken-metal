@@ -267,6 +267,7 @@ ExpertService::ExpertService(
     }
   }
   std::fill(mailbox_data_, mailbox_data_ + MAILBOX_WORDS, 0u);
+  mailbox_word(MailboxWord::SpinLimit).store(MAILBOX_SPIN_LIMIT, std::memory_order_release);
   try {
     for (const std::string& file : files_) {
       int descriptor = open(file.c_str(), O_RDONLY | O_CLOEXEC);

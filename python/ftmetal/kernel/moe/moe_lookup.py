@@ -1,10 +1,10 @@
 """MoE slot lookup: the bank slot of each routed expert of one layer, on the GPU.
 
-The offload cache keeps routed experts in bank slots that slot_of maps. The lookup takes
-the distinct experts of the real rows (moe_step's first entry); when some are absent it
-posts them to the mailbox and spins in the kernel until the CPU has read them into victim
-slots, so a forward with lookups needs no host synchronization and replays as a command
-graph. A probe posts no experts and only checks that the CPU answers.
+The offload cache keeps routed experts in bank slots that slot_of maps. The lookup takes the
+distinct experts of the real rows (moe_step's first entry); when some are absent it posts them to
+the mailbox and waits in the kernel until the CPU has read them into victim slots (or gives up on a
+CPU gone silent past the spin limit), so a forward with lookups needs no host synchronization and
+replays as a command graph. A probe posts no experts and only checks that the CPU answers.
 """
 
 from __future__ import annotations

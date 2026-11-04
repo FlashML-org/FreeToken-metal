@@ -1,10 +1,10 @@
-// PleLookup (see ple_lookup.h). ple_post (one thread) writes each batch row's token and
-// n-gram context to the mailbox, advances the context pool and posts; ple_wait (one
-// threadgroup) spins until the CPU has answered the ticket's post, then copies the staged
-// rows out with coherent loads. Memory the CPU shares is accessed volatile coherent(system),
-// with system-scope fences around the handshake. Buffers: ple_post 0 input_ids, 1 slots,
-// 2 context, 3 mailbox, 4 input_ids copy, 5 ticket, 6 params; ple_wait 0 ticket, 1 mailbox,
-// 2-4 weight, scales and biases staging, 5-7 the parts out, 8 params.
+// PleLookup (see ple_lookup.h). ple_post (one thread) writes each batch row's token and n-gram
+// context to the mailbox, advances the context pool and posts; ple_wait (one threadgroup) waits for
+// the CPU's answer to the ticket's post (common/mailbox_wait.h), then copies the staged rows out
+// with coherent loads. Memory the CPU shares is accessed volatile coherent(system), with
+// system-scope fences around the handshake. Buffers: ple_post 0 input_ids, 1 slots, 2 context, 3
+// mailbox, 4 input_ids copy, 5 ticket, 6 params; ple_wait 0 ticket, 1 mailbox, 2-4 weight, scales
+// and biases staging, 5-7 the parts out, 8 params.
 #pragma METAL internals : enable
 #ifndef __METAL_MEMORY_SCOPE_SYSTEM__
 #define __METAL_MEMORY_SCOPE_SYSTEM__ 3
@@ -18,23 +18,17 @@ constexpr constant metal::thread_scope thread_scope_system =
 #include <metal_stdlib>
 using namespace metal;
 
-#include "common/mailbox.h"
+#include "common/mailbox_wait.h"
 
 constant constexpr uint WORD_STATE = uint(PleMailboxWord::State);
 constant constexpr uint WORD_SEQUENCE = uint(PleMailboxWord::Sequence);
-constant constexpr uint WORD_ACKNOWLEDGED = uint(PleMailboxWord::Acknowledged);
 constant constexpr uint WORD_SHUTDOWN = uint(PleMailboxWord::Shutdown);
+constant constexpr uint WORD_ABANDONED = uint(PleMailboxWord::Abandoned);
 constant constexpr uint WORD_NUM_ROWS = uint(PleMailboxWord::NumRows);
 constant constexpr uint WORD_ROWS = uint(PleMailboxWord::Rows);
 constant constexpr uint STATE_IDLE = uint(MailboxState::Idle);
 constant constexpr uint STATE_POSTED = uint(MailboxState::Posted);
-constant constexpr uint STATE_DONE = uint(MailboxState::Done);
-constant constexpr uint STATE_FAILED = uint(MailboxState::Failed);
 constant constexpr uint STATE_SHUTDOWN = uint(MailboxState::Shutdown);
-
-inline void system_fence() {
-  atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_system);
-}
 
 [[kernel]] void ple_post(
     device const int* input_ids [[buffer(0)]],
@@ -59,8 +53,8 @@ inline void system_fence() {
     context[2 * slot + 1] = input_ids[r];
   }
   uint sequence = 0;
-  // After a shutdown nobody answers: post nothing.
-  if (mailbox[WORD_SHUTDOWN] == 0) {
+  // After a shutdown, or once a wait gave up, nobody answers: post nothing.
+  if (is_mailbox_open(mailbox)) {
     mailbox[WORD_NUM_ROWS] = uint(num_rows);
     system_fence();
     sequence = mailbox[WORD_SEQUENCE] + 1;
@@ -113,23 +107,12 @@ inline void copy_part(
     bool answered = false;
     // A refused post (sequence 0) has nothing to wait for.
     if (sequence != 0) {
-      uint state;
-      while (true) {
+      answered = wait_for_answer(mailbox, sequence);
+      // A wait that gave up leaves the handshake to the CPU, if it is still there.
+      if (mailbox[WORD_ABANDONED] == 0) {
+        mailbox[WORD_STATE] = mailbox[WORD_SHUTDOWN] != 0 ? STATE_SHUTDOWN : STATE_IDLE;
         system_fence();
-        state = mailbox[WORD_STATE];
-        if ((state == STATE_DONE || state == STATE_FAILED) &&
-            mailbox[WORD_ACKNOWLEDGED] == sequence) {
-          break;
-        }
-        if (mailbox[WORD_SHUTDOWN] != 0) {
-          state = STATE_SHUTDOWN;
-          break;
-        }
       }
-      system_fence();
-      answered = state == STATE_DONE;
-      mailbox[WORD_STATE] = mailbox[WORD_SHUTDOWN] != 0 ? STATE_SHUTDOWN : STATE_IDLE;
-      system_fence();
     }
     is_answered = answered;
   }

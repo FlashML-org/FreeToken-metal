@@ -217,11 +217,14 @@ NB_MODULE(_C, m) {
   m.attr("FILL_FILE") = ftmetal::FILL_FILE;
   m.attr("QMM_TILE_K") = ftmetal::QMM_TILE_K;
   m.attr("MAX_PAIR_CODE_BITS") = ftmetal::MAX_PAIR_CODE_BITS;
+  m.attr("MAILBOX_SPIN_LIMIT") = ftmetal::MAILBOX_SPIN_LIMIT;
   nb::enum_<ftmetal::MailboxWord>(m, "MailboxWord", nb::is_arithmetic())
       .value("STATE", ftmetal::MailboxWord::State)
       .value("SEQUENCE", ftmetal::MailboxWord::Sequence)
       .value("ACKNOWLEDGED", ftmetal::MailboxWord::Acknowledged)
       .value("SHUTDOWN", ftmetal::MailboxWord::Shutdown)
+      .value("ABANDONED", ftmetal::MailboxWord::Abandoned)
+      .value("SPIN_LIMIT", ftmetal::MailboxWord::SpinLimit)
       .value("KIND", ftmetal::MailboxWord::Kind)
       .value("LAYER", ftmetal::MailboxWord::Layer)
       .value("STEP", ftmetal::MailboxWord::Step)
@@ -499,6 +502,8 @@ NB_MODULE(_C, m) {
       .value("SEQUENCE", ftmetal::PleMailboxWord::Sequence)
       .value("ACKNOWLEDGED", ftmetal::PleMailboxWord::Acknowledged)
       .value("SHUTDOWN", ftmetal::PleMailboxWord::Shutdown)
+      .value("ABANDONED", ftmetal::PleMailboxWord::Abandoned)
+      .value("SPIN_LIMIT", ftmetal::PleMailboxWord::SpinLimit)
       .value("NUM_ROWS", ftmetal::PleMailboxWord::NumRows)
       .value("ERROR", ftmetal::PleMailboxWord::Error)
       .value("ROWS", ftmetal::PleMailboxWord::Rows);

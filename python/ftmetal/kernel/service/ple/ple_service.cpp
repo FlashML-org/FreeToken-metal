@@ -94,6 +94,7 @@ PleService::PleService(
   }
   mailbox_data_ = static_cast<uint32_t*>(shared_data(mailbox_, "mailbox"));
   std::fill(mailbox_data_, mailbox_data_ + PLE_MAILBOX_WORDS, 0u);
+  mailbox_word(PleMailboxWord::SpinLimit).store(MAILBOX_SPIN_LIMIT, std::memory_order_release);
   try {
     watchdog_ = std::thread(&PleService::watch, this);
     if (run_coordinator) {
@@ -151,6 +152,10 @@ void PleService::check_healthy() const {
   if (has_failed_.load(std::memory_order_acquire)) {
     std::lock_guard<std::mutex> lock(failure_mutex_);
     throw std::runtime_error("PleService failed earlier: " + failure_);
+  }
+  if (mailbox_word(PleMailboxWord::Abandoned).load(std::memory_order_acquire) != 0) {
+    throw std::runtime_error(
+        "PleService: a GPU lookup gave up waiting for the CPU past its spin limit");
   }
 }
 

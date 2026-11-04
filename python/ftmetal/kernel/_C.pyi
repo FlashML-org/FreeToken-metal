@@ -13,6 +13,7 @@ EXPERT_STAGING_BYTES: int
 FILL_FILE: int
 QMM_TILE_K: int
 MAX_PAIR_CODE_BITS: int
+MAILBOX_SPIN_LIMIT: int
 PLE_MAILBOX_WORDS: int
 MAX_PLE_ROWS: int
 
@@ -21,6 +22,8 @@ class MailboxWord(enum.IntEnum):
     SEQUENCE = 1
     ACKNOWLEDGED = 2
     SHUTDOWN = 3
+    ABANDONED = 4
+    SPIN_LIMIT = 5
     KIND = 32
     LAYER = 33
     STEP = 34
@@ -60,6 +63,8 @@ class PleMailboxWord(enum.IntEnum):
     SEQUENCE = 1
     ACKNOWLEDGED = 2
     SHUTDOWN = 3
+    ABANDONED = 4
+    SPIN_LIMIT = 5
     NUM_ROWS = 32
     ERROR = 33
     ROWS = 64

@@ -1,6 +1,16 @@
 // The mailbox protocol between the lookup kernels (moe/moe_lookup, embedding/ple_lookup) and
 // their CPU services (service/expert, service/ple): the word layouts, states, errors and sizes,
 // and the kernels' parameter blocks. One definition, included by C++ and Metal alike.
+//
+// A request: the GPU writes its words, increments Sequence and sets State POSTED; the CPU claims it
+// (CLAIMED), answers DONE or FAILED, writes the reply and last Acknowledged = Sequence. The
+// watchdog answers a stuck request FAILED the same way; a shutdown sets the shutdown word, then
+// Acknowledged = Sequence, then State SHUTDOWN. moe_lookup and ple_wait wait in one threadgroup and
+// return State to IDLE (SHUTDOWN after a shutdown) themselves. A wait never outlives its CPU: after
+// the spin limit unanswered (some 20 s, past the watchdog's timeout, which answers first while the
+// CPU lives) it sets the abandoned word and takes the request as unanswered; from then on no kernel
+// posts or waits, and check_healthy raises (common/mailbox_wait.h). A process stopped that long (a
+// debugger, SIGTSTP) while a wait is pending also fails its services.
 #pragma once
 
 #ifdef __METAL_VERSION__
@@ -25,6 +35,11 @@ enum class MailboxWord : int {
   // Nonzero once the service shut down; written by the CPU only, never cleared. The GPU
   // posts nothing once it is set, and stops waiting when it appears.
   Shutdown = 3,
+  // Nonzero once a GPU wait gave up on the CPU; written by the GPU only, never cleared. Like
+  // the shutdown word, it ends every post and wait.
+  Abandoned = 4,
+  // The spins a GPU wait makes before it gives up, written by the service as it starts.
+  SpinLimit = 5,
   Kind = 32,
   Layer = 33,
   Step = 34,
@@ -85,11 +100,22 @@ enum class PleMailboxWord : int {
   Acknowledged = 2,
   // Nonzero once the service shut down; written by the CPU only, never cleared.
   Shutdown = 3,
+  Abandoned = 4,
+  SpinLimit = 5,
   NumRows = 32,
   Error = 33,
   // Per batch row: token, previous token, the one before it.
   Rows = 64,
 };
+
+// One wait (common/mailbox_wait.h) serves both mailboxes.
+static_assert(
+    int(PleMailboxWord::State) == int(MailboxWord::State) &&
+        int(PleMailboxWord::Acknowledged) == int(MailboxWord::Acknowledged) &&
+        int(PleMailboxWord::Shutdown) == int(MailboxWord::Shutdown) &&
+        int(PleMailboxWord::Abandoned) == int(MailboxWord::Abandoned) &&
+        int(PleMailboxWord::SpinLimit) == int(MailboxWord::SpinLimit),
+    "the two mailboxes share their handshake words");
 
 MAILBOX_CONSTANT int PLE_MAILBOX_WORDS = 256;
 // The batch rows one post holds: the row lines' capacity.
@@ -115,6 +141,10 @@ struct WaitParams {
 };
 
 #ifndef __METAL_VERSION__
+// The SpinLimit word the services write: some 20 s of spinning on an idle GPU, longer on a busy
+// one.
+constexpr uint32_t MAILBOX_SPIN_LIMIT = 60'000'000;
+
 } // namespace ftmetal
 #endif
 #undef MAILBOX_CONSTANT

@@ -2,22 +2,22 @@
 checkpoints: every packed weight word of an expert's projection names (layer, projection,
 expert).
 
-A chain of layers, each a lookup of the step's routed ids followed by gathers of the
-gate_up and down bank rows at its slots and at its slot map, runs one step per eval; each
-layer's ids depend on the previous layer's gathers, as a router's do. The cache holds a
-fraction of the experts, so most layers miss and the coordinator reads victims between the
-layers of one command buffer. Every real pair's and used expert's rows must name it, the
-slots and the cache's slot_of and last_use must equal the reference LRU's for the same
-calls (the GPU's hit marks reach the victim choice, and no slot the request uses is a
-victim), padding rows and unused experts must read a slot the layer uses, and the counts
-must add up; with one pool for every layer, the layers of a step share its slots. The chain
-runs eagerly, and captured once as a command graph (banks and slot_of external, mailbox,
-last_use and hit_stats pools, moe_step and the ids step inputs) and replayed. Then the
-handshake's edges: no real rows post nothing, a probe round trip, a hit in the least
-recently used slot keeps it, a failed read and a layer routing more experts than its pool
-holds fail their requests, a corrupted sequence is a protocol error, a shutdown releases a
-waiting lookup, also one whose post overwrote the shutdown's refusal, and the watchdog
-fails a request nobody answers.
+A chain of layers, each a lookup of the step's routed ids followed by gathers of the gate_up and
+down bank rows at its slots and at its slot map, runs one step per eval; each layer's ids depend
+on the previous layer's gathers, as a router's do. The cache holds a fraction of the experts, so
+most layers miss and the coordinator reads victims between the layers of one command buffer.
+Every real pair's and used expert's rows must name it, the slots and the cache's slot_of and
+last_use must equal the reference LRU's for the same calls (the GPU's hit marks reach the victim
+choice, and no slot the request uses is a victim), padding rows and unused experts must read a
+slot the layer uses, and the counts must add up; with one pool for every layer, the layers of a
+step share its slots. The chain runs eagerly, and captured once as a command graph (banks and
+slot_of external, mailbox, last_use and hit_stats pools, moe_step and the ids step inputs) and
+replayed. Then the handshake's edges: no real rows post nothing, a probe round trip, a hit in
+the least recently used slot keeps it, a failed read and a layer routing more experts than its
+pool holds fail their requests, a corrupted sequence is a protocol error, a shutdown releases a
+waiting lookup, also one whose post overwrote the shutdown's refusal, the watchdog fails a
+request nobody answers, and with no CPU to answer at all the lookup gives up past the mailbox's
+spin limit, after which nothing posts.
 """
 
 from __future__ import annotations
@@ -46,6 +46,8 @@ HIDDEN_SIZE = 64
 INTERMEDIATE_SIZE = 64
 # A summary row: the slot, then the min and max word of the gate, up and down parts.
 SUMMARY_COLUMNS = 7
+# A spin limit the tests' unanswered waits reach in milliseconds.
+TEST_SPIN_LIMIT = 100_000
 
 
 @dataclass(frozen=True)
@@ -427,3 +429,22 @@ def test_watchdog_fails_an_unanswered_request(tmp_path: Path) -> None:
     assert words[Word.ERROR] == _C.MailboxError.TIMEOUT
     with pytest.raises(RuntimeError, match="unanswered"):
         cache.check_healthy()
+
+
+def test_lookup_gives_up_past_its_spin_limit(tmp_path: Path) -> None:
+    """Neither coordinator nor watchdog answers, as when the CPU is gone: the lookup gives up after
+    the mailbox's spin limit, its misses fall back, nothing later posts and check_healthy
+    raises."""
+    cache = small_cache(tmp_path, run_coordinator=False, stall_timeout_s=600.0)
+    words = mailbox_words(cache)
+    assert words[Word.SPIN_LIMIT] == _C.MAILBOX_SPIN_LIMIT
+    words[Word.SPIN_LIMIT] = TEST_SPIN_LIMIT
+    slots = lookup(cache, [[0, 1]], 1, 1)
+    mx.eval(slots, cache.mailbox)
+    assert np.array(slots).tolist() == [[0, 0]]
+    assert words[Word.ABANDONED] == 1
+    assert words[Word.SEQUENCE] == 1 and words[Word.STATE] == State.POSTED
+    with pytest.raises(RuntimeError, match="gave up waiting for the CPU"):
+        cache.check_healthy()
+    mx.eval(lookup(cache, [[2, 3]], 1, 2), cache.mailbox)
+    assert words[Word.SEQUENCE] == 1

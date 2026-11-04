@@ -52,6 +52,10 @@ void ExpertService::check_healthy() const {
     std::lock_guard<std::mutex> lock(failure_mutex_);
     throw std::runtime_error("ExpertService failed earlier: " + failure_);
   }
+  if (mailbox_word(MailboxWord::Abandoned).load(std::memory_order_acquire) != 0) {
+    throw std::runtime_error(
+        "ExpertService: a GPU lookup gave up waiting for the CPU past its spin limit");
+  }
 }
 
 void ExpertService::arm() {

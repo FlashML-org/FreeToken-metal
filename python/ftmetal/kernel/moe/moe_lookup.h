@@ -1,7 +1,7 @@
 // MoeLookup: one MoE layer's routed experts -> bank slots of the offload cache, on the GPU.
 // The distinct experts of the real rows are looked up in slot_of; when some are absent the
-// kernel posts them to the mailbox and spins until the CPU (ExpertService's coordinator)
-// has read them into victim slots, then looks them up again (see moe_lookup.metal).
+// kernel posts them to the mailbox and waits (common/mailbox_wait.h) until the CPU
+// (ExpertService's coordinator) has read them into victim slots, then looks them up again.
 // mailbox, last_use and hit_stats are updated in place: the outputs alias the inputs (see
 // kvcache/pool_rows.h) and callers rebind them. slot_of and the banks are written by the CPU behind
 // MLX's back and read coherently.

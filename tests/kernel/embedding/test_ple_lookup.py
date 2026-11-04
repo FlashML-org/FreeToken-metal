@@ -9,7 +9,8 @@ ids, at shard boundaries and on many threads. The service's hash must equal a nu
 reference. A chain of decode steps, each a post, a stand-in for the layers before the PLE
 layer and a wait, must return each row's hashed table rows and advance its slot's context,
 eagerly and replayed as a command graph. Then the failure paths: a shutdown releases a
-waiting ple_wait and refuses later posts, the watchdog fails a post nobody answers, a
+waiting ple_wait and refuses later posts, the watchdog fails a post nobody answers, with no CPU
+to answer at all the wait gives up past the mailbox's spin limit and later posts are refused, a
 failed read and a corrupted sequence fail theirs, each with zero rows and check_healthy
 raising.
 """
@@ -47,6 +48,8 @@ HEAD_OFFSETS = tuple(int(offset) for offset in np.cumsum((0, *HEAD_SIZES[:-1])))
 # 855 rows; the heads use the first 816.
 SHARD_ROWS = (131, 7, 263, 5, 449)
 STALL_TIMEOUT_S = 10.0
+# A spin limit the tests' unanswered waits reach in milliseconds.
+TEST_SPIN_LIMIT = 100_000
 # The largest token ids the vocabulary holds.
 VOCAB_SIZE = 248320
 
@@ -408,6 +411,23 @@ def test_watchdog_fails_an_unanswered_post(tmp_path: Path) -> None:
     assert words[Word.ERROR] == Error.TIMEOUT
     with pytest.raises(RuntimeError, match="PLE post 1 was left unanswered"):
         lookup.service.check_healthy()
+
+
+def test_wait_gives_up_past_its_spin_limit(tmp_path: Path) -> None:
+    store = open_store(write_table(tmp_path / "table", SHARD_ROWS, num_files=1))
+    lookup = start_lookup(store, run_coordinator=False, stall_timeout_s=600.0)
+    words = lookup.words()
+    assert words[Word.SPIN_LIMIT] == _C.MAILBOX_SPIN_LIMIT
+    words[Word.SPIN_LIMIT] = TEST_SPIN_LIMIT
+    rows, ticket = one_row_step(lookup, 11)
+    mx.eval(rows, ticket)
+    assert ticket.item() == 1 and not np.array(rows).any()
+    assert words[Word.ABANDONED] == 1 and words[Word.STATE] == State.POSTED
+    with pytest.raises(RuntimeError, match="gave up waiting for the CPU"):
+        lookup.service.check_healthy()
+    rows, ticket = one_row_step(lookup, 12)
+    mx.eval(rows, ticket)
+    assert ticket.item() == 0 and words[Word.SEQUENCE] == 1
 
 
 def test_failed_read_fails_the_post(tmp_path: Path) -> None:

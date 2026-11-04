@@ -45,7 +45,8 @@ from ftmetal.moe.source import ExpertSource
 # others copy out of their staging buffers.
 IO_THREADS = 8
 # FreeToken's watchdog threshold. Metal let a lookup spin 60 s on the M4 Pro without failing
-# its command buffer (timeout_probe), so the threshold is a policy choice, not a limit.
+# its command buffer (timeout_probe), so the threshold is a policy choice, not a limit; a GPU wait
+# gives up on its own some time later (MAILBOX_SPIN_LIMIT), when the CPU is gone.
 STALL_TIMEOUT_S = 10.0
 # The IO threads' staging buffers, beside the banks.
 STAGING_BYTES = IO_THREADS * _C.EXPERT_STAGING_BYTES

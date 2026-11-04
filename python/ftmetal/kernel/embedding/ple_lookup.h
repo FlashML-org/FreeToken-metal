@@ -1,12 +1,13 @@
-// PleLookup: a decode step's PLE (per-layer n-gram embedding) table rows, looked up inside
-// the step. ple_post, at the step's start, writes each batch row's token and n-gram context
-// (the two tokens before it) to the mailbox, posts it and advances the context pool;
-// PleService's coordinator (service/ple/ple_service.h) hashes the n-grams, gathers the rows into the
-// staging buffers and answers; ple_wait, encoded just before the PLE layer, spins until the
-// answer and copies the rows out with coherent loads. No host code reads the step's token
-// ids. A post refused after a shutdown, a failed answer and a released wait give zero rows;
-// the service records each of them, so check_healthy raises before the step's tokens are
-// used. The mailbox and the staging buffers are written by the CPU behind MLX's back.
+// PleLookup: a decode step's PLE (per-layer n-gram embedding) table rows, looked up inside the
+// step. ple_post, at the step's start, writes each batch row's token and n-gram context (the two
+// tokens before it) to the mailbox, posts it and advances the context pool; PleService's
+// coordinator (service/ple/ple_service.h) hashes the n-grams, gathers the rows into the staging
+// buffers and answers; ple_wait, encoded just before the PLE layer, waits for the answer
+// (common/mailbox_wait.h) and copies the rows out with coherent loads. No host code reads the
+// step's token ids. A post refused after a shutdown, a failed answer, a released wait and one that
+// gave up give zero rows; the service records the first three and the GPU the last (the abandoned
+// word), so check_healthy raises before the step's tokens are used. The mailbox and the staging
+// buffers are written by the CPU behind MLX's back.
 #pragma once
 
 #include <cstdint>
