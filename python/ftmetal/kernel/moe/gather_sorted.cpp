@@ -17,6 +17,7 @@ namespace ftmetal {
 namespace {
 
 std::string gather_qmm_sorted_source;
+std::string gather_qmm_sorted_pair_codes_source;
 std::string fp_gather_qmm_sorted_source;
 std::string gather_mm_sorted_source;
 const int SIMD_WIDTH = 32;
@@ -42,7 +43,27 @@ const std::map<std::string, std::pair<int, int>> FP_BLOCK_SHAPES = {
     {"mxfp8", {8, 32}},
 };
 
-// What both ops take alike: x [B, 1, K] in a float dtype, a positive n, expert_offsets
+// The affine (group size, bits) MLX instantiates.
+void check_affine_quantization(const std::string& op_name, int group_size, int bits) {
+  bool is_instantiated = (group_size == 32 || group_size == 64 || group_size == 128) &&
+      (bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8);
+  if (!is_instantiated) {
+    throw std::invalid_argument(
+        "ftmetal " + op_name + ": affine group size must be 32, 64 or 128 and bits 2-6 or 8, " +
+        "not (" + std::to_string(group_size) + ", " + std::to_string(bits) + ")");
+  }
+}
+
+// x's K is whole groups and whole packed words.
+void check_whole_groups(const std::string& op_name, const mx::array& x, int group_size, int bits) {
+  int K = x.shape(2);
+  if (K % group_size != 0 || K * bits % 32 != 0) {
+    throw std::invalid_argument(
+        "ftmetal " + op_name + ": x's K must be a whole number of groups and packed words");
+  }
+}
+
+// What all ops take alike: x [B, 1, K] in a float dtype, a positive n, expert_offsets
 // [E + 1] int32 and expert_bytes [E, num_buffers] int64.
 void check_sorted_inputs(
     const std::string& op_name,
@@ -93,9 +114,11 @@ mx::array gather_sorted(
 
 void init_gather_sorted_libraries(
     const std::string& affine_source,
+    const std::string& affine_pair_codes_source,
     const std::string& fp_source,
     const std::string& unquantized_source) {
   gather_qmm_sorted_source = affine_source;
+  gather_qmm_sorted_pair_codes_source = affine_pair_codes_source;
   fp_gather_qmm_sorted_source = fp_source;
   gather_mm_sorted_source = unquantized_source;
 }
@@ -115,14 +138,7 @@ mx::array gather_qmm_sorted(
   auto fp_shape = FP_BLOCK_SHAPES.find(mode);
   GatherSortedKernel kernel;
   if (mode == "affine") {
-    bool is_instantiated = (group_size == 32 || group_size == 64 || group_size == 128) &&
-        (bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8);
-    if (!is_instantiated) {
-      throw std::invalid_argument(
-          "ftmetal gather_qmm_sorted: affine group size must be 32, 64 or 128 and bits 2-6 "
-          "or 8, not (" +
-          std::to_string(group_size) + ", " + std::to_string(bits) + ")");
-    }
+    check_affine_quantization("gather_qmm_sorted", group_size, bits);
     if (!biases) {
       throw std::invalid_argument("ftmetal gather_qmm_sorted: affine needs biases");
     }
@@ -149,12 +165,8 @@ mx::array gather_qmm_sorted(
   }
   check_sorted_inputs(
       "gather_qmm_sorted", x, n, expert_offsets, expert_bytes, static_cast<int>(buffers.size()));
-  int K = x.shape(2);
-  if (K % group_size != 0 || K * bits % 32 != 0) {
-    throw std::invalid_argument(
-        "ftmetal gather_qmm_sorted: x's K must be a whole number of groups and packed words");
-  }
-  if (kernel == GatherSortedKernel::Fp && K % QMM_TILES.bk != 0) {
+  check_whole_groups("gather_qmm_sorted", x, group_size, bits);
+  if (kernel == GatherSortedKernel::Fp && x.shape(2) % QMM_TILES.bk != 0) {
     throw std::invalid_argument(
         "ftmetal gather_qmm_sorted: " + mode + " needs K a multiple of " +
         std::to_string(QMM_TILES.bk) +
@@ -163,6 +175,40 @@ mx::array gather_qmm_sorted(
   }
   return gather_sorted(
       x, buffers, expert_offsets, expert_bytes, n, {kernel, n, group_size, bits}, s);
+}
+
+mx::array gather_qmm_sorted_pair_codes(
+    const mx::array& x,
+    const mx::array& w,
+    const mx::array& codes,
+    const mx::array& pairs,
+    const mx::array& expert_offsets,
+    const mx::array& expert_bytes,
+    int n,
+    int group_size,
+    int bits,
+    int code_bits,
+    mx::StreamOrDevice s) {
+  const std::string op_name = "gather_qmm_sorted_pair_codes";
+  check_affine_quantization(op_name, group_size, bits);
+  if (code_bits < 1 || code_bits > MAX_PAIR_CODE_BITS) {
+    throw std::invalid_argument(
+        "ftmetal " + op_name + ": code_bits must be 1-" + std::to_string(MAX_PAIR_CODE_BITS) +
+        ", not " + std::to_string(code_bits));
+  }
+  check_sorted_inputs(op_name, x, n, expert_offsets, expert_bytes, 2);
+  check_whole_groups(op_name, x, group_size, bits);
+  if (pairs.ndim() != 2 || pairs.shape(1) != 2 || pairs.dtype() != x.dtype()) {
+    throw std::invalid_argument("ftmetal " + op_name + ": pairs must be [P, 2] in x's dtype");
+  }
+  return gather_sorted(
+      x,
+      {w, codes, pairs},
+      expert_offsets,
+      expert_bytes,
+      n,
+      {GatherSortedKernel::AffinePairCodes, n, group_size, bits, code_bits},
+      s);
 }
 
 mx::array gather_mm_sorted(
@@ -189,14 +235,12 @@ void GatherSorted::eval_cpu(const std::vector<mx::array>&, std::vector<mx::array
 void GatherSorted::eval_gpu(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
-  // inputs: x, the weight buffers (weight, then scales and biases when quantized),
-  // expert_offsets, expert_bytes.
+  // inputs: x, the weight buffers (weight, then scales and biases when quantized, or codes and
+  // the pair table over pair-code rows), expert_offsets, expert_bytes.
   int num_buffers = static_cast<int>(inputs.size()) - 3;
   for (int i = 1; i <= num_buffers; ++i) {
     if (!inputs[i].flags().row_contiguous) {
-      throw std::runtime_error(
-          "ftmetal gather_sorted: the weight, scales and biases buffers must be row "
-          "contiguous");
+      throw std::runtime_error("ftmetal gather_sorted: the weight buffers must be row contiguous");
     }
   }
   const auto& x = inputs[0];
@@ -220,6 +264,10 @@ void GatherSorted::eval_gpu(
     source = &gather_qmm_sorted_source;
     kernel_name = "gather_qmm_sorted";
     tiles = QMM_TILES;
+  } else if (c.kernel == GatherSortedKernel::AffinePairCodes) {
+    source = &gather_qmm_sorted_pair_codes_source;
+    kernel_name = "gather_qmm_sorted_pair_codes";
+    tiles = QMM_TILES;
   } else if (c.kernel == GatherSortedKernel::Fp) {
     source = &fp_gather_qmm_sorted_source;
     kernel_name = "fp_gather_qmm_sorted";
@@ -232,6 +280,9 @@ void GatherSorted::eval_gpu(
   std::string library_name = "ftmetal_" + kernel_name + "_" + type;
   if (c.kernel != GatherSortedKernel::Unquantized) {
     library_name += "_gs_" + std::to_string(c.group_size) + "_b_" + std::to_string(c.bits);
+  }
+  if (c.kernel == GatherSortedKernel::AffinePairCodes) {
+    library_name += "_c_" + std::to_string(c.code_bits);
   }
   bool align_N = (N % tiles.bn) == 0;
   bool align_K = (K % tiles.bk) == 0;
@@ -249,6 +300,7 @@ void GatherSorted::eval_gpu(
     replace_all(templated, "{{T}}", type);
     replace_all(templated, "{{GROUP_SIZE}}", std::to_string(c.group_size));
     replace_all(templated, "{{BITS}}", std::to_string(c.bits));
+    replace_all(templated, "{{CODE_BITS}}", std::to_string(c.code_bits));
     replace_all(templated, "{{BM}}", std::to_string(tiles.bm));
     replace_all(templated, "{{BN}}", std::to_string(tiles.bn));
     replace_all(templated, "{{BK}}", std::to_string(tiles.bk));
@@ -260,7 +312,8 @@ void GatherSorted::eval_gpu(
   auto& encoder = mx::metal::get_command_encoder(s);
   encoder.set_compute_pipeline_state(d.get_kernel(kernel_name, library, hash_name, constants));
   // gather_qmm_rhs's buffer order, also for the unquantized kernel; a float block kernel
-  // leaves buffer 3 (MLX's biases or nvfp4 global scale) unbound.
+  // leaves buffer 3 (MLX's biases or nvfp4 global scale) unbound, the pair_codes kernel binds its
+  // pair table there.
   encoder.set_input_array(x, 0);
   for (int i = 1; i <= num_buffers; ++i) {
     encoder.set_input_array(inputs[i], i);

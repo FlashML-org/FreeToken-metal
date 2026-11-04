@@ -13,7 +13,11 @@ layouts. Below four rows per logical expert MLX's per-row affine matvec beats ei
 kernel (1.3-1.9x at B 32 to 768) and does not depend on the bank. On a GPU without matrix
 units these equal mx.gather_qmm and mx.gather_mm bit for bit wherever MLX takes its rhs
 kernel; a NAX GPU (M5 class) gets MLX's matrix-unit kernels, which these do not carry.
-Adapted from MLX v0.32.3 (affine/affine_gather_qmm_sorted.metal, fp/fp_gather_qmm_sorted.metal,
+gather_qmm_sorted_pair_codes is the affine kernel over pair-code rows (affine/affine_pair_codes.h),
+each group's scale and bias looked up by its code, and equals gather_qmm_sorted on the expanded
+scales and biases bit for bit.
+Adapted from MLX v0.32.3 (affine/affine_gather_qmm_sorted.metal,
+affine/affine_gather_qmm_sorted_pair_codes.metal, fp/fp_gather_qmm_sorted.metal,
 unquantized/gather_mm_sorted.metal, gather_sorted.h) and coupled to its internals: re-check them
 on any MLX upgrade; the bit-exact tests are the guard.
 """
@@ -62,6 +66,31 @@ def gather_qmm_sorted(
     )
 
 
+def gather_qmm_sorted_pair_codes(
+    x: mx.array,
+    w: mx.array,
+    codes: mx.array,
+    pairs: mx.array,
+    expert_offsets: mx.array,
+    expert_bytes: mx.array,
+    *,
+    n: int,
+    group_size: int,
+    bits: int,
+    code_bits: int,
+) -> mx.array:
+    """gather_qmm_sorted in affine over pair-code rows; returns [B, 1, n].
+
+    As gather_qmm_sorted, with w and codes row-contiguous buffers of any dtype holding expert e's
+    [n, K * bits / 32] uint32 weight (transposed) and its n * K / group_size code_bits-bit codes
+    (4-byte aligned) at byte offsets expert_bytes[e] int64 [E, 2] (weight, codes), and pairs
+    [P, 2] in x's dtype the (scale, bias) of each code. The codes are not checked.
+    """
+    return _C.gather_qmm_sorted_pair_codes(
+        x, w, codes, pairs, expert_offsets, expert_bytes, n, group_size, bits, code_bits
+    )
+
+
 def gather_mm_sorted(
     x: mx.array,
     w: mx.array,
@@ -78,4 +107,10 @@ def gather_mm_sorted(
     return _C.gather_mm_sorted(x, w, expert_offsets, expert_bytes, n)
 
 
-__all__ = ["FLOAT_INPUT_TILE", "QuantMode", "gather_mm_sorted", "gather_qmm_sorted"]
+__all__ = [
+    "FLOAT_INPUT_TILE",
+    "QuantMode",
+    "gather_mm_sorted",
+    "gather_qmm_sorted",
+    "gather_qmm_sorted_pair_codes",
+]

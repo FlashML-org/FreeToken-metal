@@ -2,6 +2,8 @@
 
     uv run python tools/bench_gather_sorted.py [--rows 1024,8192,16384,32768]
         [--banks 5120,10240] [--projections gate_up,down] [--repeats 25]
+    uv run python tools/bench_gather_sorted.py --pair-codes [--models qwen3.6,qwen3.8]
+        [--tokens 512,2048,4096] [--projections gate_up,down] [--repeats 25]
 
 Qwen3.6-35B-A3B's expert projections in affine 4-bit, group 64, bf16: gate_up (2048 -> 1024)
 and down (512 -> 2048). The B rows are (token, expert) pairs with ascending expert ids drawn
@@ -20,6 +22,13 @@ The large bank tiles the resident one; expert e sits at a random slot past the p
 buffer for B and C, and at an ascending one for E. Each figure is the median ms per call
 (the call and its eval) over the repeats, the calls interleaved, with its ratio to A.
 exact: C, B and E equal A bit for bit.
+
+--pair-codes instead times gather_qmm_sorted_pair_codes on pair-code rows (--code-bits wide)
+against gather_qmm_sorted on the scales and biases they stand for, at a prefill step's tokens
+routed to top_k distinct experts each, uniformly: Qwen3.6-35B-A3B (256 experts, top 8, group 64)
+and Qwen3.8-Flash-Next (512 experts, top 10, group 32), affine 4-bit bf16, the experts at their
+own rows of one bank with random codes into a table of 2^code_bits pairs. Each figure is the
+median ms per call over the repeats, the calls interleaved. exact: equal bit for bit.
 """
 
 from __future__ import annotations
@@ -35,7 +44,8 @@ import mlx.core as mx
 import numpy as np
 
 from ftmetal.kernel.kvcache.pool_rows import copy_rows, scatter_rows
-from ftmetal.kernel.moe.gather_sorted import gather_qmm_sorted
+from ftmetal.kernel.moe.gather_sorted import gather_qmm_sorted, gather_qmm_sorted_pair_codes
+from ftmetal.kernel.ref import pair_code_bank_ref
 
 NUM_EXPERTS = 256
 BITS = 4
@@ -45,6 +55,22 @@ DTYPE = mx.bfloat16
 PROJECTIONS = {"gate_up": (2048, 1024), "down": (512, 2048)}
 WARMUP_CALLS = 3
 QUANTIZATION = {"transpose": True, "group_size": GROUP_SIZE, "bits": BITS}
+# Experts encoded per pair_code_bank_ref call, which unpacks every code bit as one value.
+ENCODE_EXPERTS = 64
+
+
+class ExpertShapes(NamedTuple):
+    num_experts: int
+    top_k: int
+    group_size: int
+    # (input size, output size) of each routed expert projection.
+    projections: dict[str, tuple[int, int]]
+
+
+PAIR_CODE_MODELS = {
+    "qwen3.6": ExpertShapes(256, 8, 64, {"gate_up": (2048, 1024), "down": (512, 2048)}),
+    "qwen3.8": ExpertShapes(512, 10, 32, {"gate_up": (2560, 1280), "down": (640, 2560)}),
+}
 
 
 class Bank(NamedTuple):
@@ -165,7 +191,6 @@ def bench_bank(
     random_bytes = slot_bytes(random_slots)
     buffer_bytes = slot_bytes(buffer_rows)
     mx.eval(random_bytes, buffer_bytes)
-    options = {"n": output_size, "group_size": GROUP_SIZE, "bits": BITS}
     for rows in row_counts:
         experts = np.sort(rng.integers(0, NUM_EXPERTS, rows))
         offsets = np.searchsorted(experts, np.arange(NUM_EXPERTS + 1))
@@ -182,8 +207,24 @@ def bench_bank(
 
         calls: list[ProjectionCall] = [
             lambda: buffer_gather(resident),
-            lambda: gather_qmm_sorted(x, *large, expert_offsets, random_bytes, **options),
-            lambda: gather_qmm_sorted(x, *resident, expert_offsets, buffer_bytes, **options),
+            lambda: gather_qmm_sorted(
+                x,
+                *large,
+                expert_offsets,
+                random_bytes,
+                n=output_size,
+                group_size=GROUP_SIZE,
+                bits=BITS,
+            ),
+            lambda: gather_qmm_sorted(
+                x,
+                *resident,
+                expert_offsets,
+                buffer_bytes,
+                n=output_size,
+                group_size=GROUP_SIZE,
+                bits=BITS,
+            ),
             lambda: mx.gather_qmm(
                 x, *large, rhs_indices=slot_ids, sorted_indices=True, **QUANTIZATION
             ),
@@ -207,13 +248,102 @@ def bench_bank(
         )
 
 
+def bench_pair_codes(
+    model: str,
+    projection: str,
+    token_counts: list[int],
+    code_bits: int,
+    repeats: int,
+    rng: np.random.Generator,
+) -> None:
+    """One table row per token count, over a bank of the model's experts built once."""
+    shapes = PAIR_CODE_MODELS[model]
+    num_experts, top_k, group_size = shapes.num_experts, shapes.top_k, shapes.group_size
+    input_size, output_size = shapes.projections[projection]
+    w_shape = (num_experts, output_size, input_size * BITS // 32)
+    w = mx.random.randint(0, 2**16, w_shape, dtype=mx.uint32) << 16
+    w = w | mx.random.randint(0, 2**16, w_shape, dtype=mx.uint32)
+    num_pairs = 1 << code_bits
+    pairs = mx.array(0.02 * rng.standard_normal((num_pairs, 2), dtype=np.float32)).astype(DTYPE)
+    num_codes = output_size * input_size // group_size
+    parts = []
+    for first in range(0, num_experts, ENCODE_EXPERTS):
+        count = min(ENCODE_EXPERTS, num_experts - first)
+        codes = rng.integers(0, num_pairs, (count, num_codes)).astype(np.uint16)
+        parts.append(pair_code_bank_ref(codes, pairs, output_size, code_bits))
+        mx.eval(parts[-1])
+    rows, scales, biases = (mx.concatenate(list(arrays)) for arrays in zip(*parts))
+    mx.eval(w, rows, scales, biases)
+    experts = np.arange(num_experts, dtype=np.int64)[:, None]
+    affine_bytes = mx.array(experts * np.array([w[0].nbytes, scales[0].nbytes, biases[0].nbytes]))
+    pair_codes_bytes = mx.array(experts * np.array([w[0].nbytes, rows[0].nbytes]))
+    for tokens in token_counts:
+        routed = np.stack([rng.choice(num_experts, top_k, replace=False) for _ in range(tokens)])
+        expert_ids = np.sort(routed.reshape(-1))
+        offsets = np.searchsorted(expert_ids, np.arange(num_experts + 1))
+        expert_offsets = mx.array(offsets.astype(np.int32))
+        x = mx.random.normal((expert_ids.size, 1, input_size)).astype(DTYPE)
+        mx.eval(expert_offsets, x)
+        calls: list[ProjectionCall] = [
+            lambda: gather_qmm_sorted(
+                x,
+                w,
+                scales,
+                biases,
+                expert_offsets,
+                affine_bytes,
+                n=output_size,
+                group_size=group_size,
+                bits=BITS,
+            ),
+            lambda: gather_qmm_sorted_pair_codes(
+                x,
+                w,
+                rows,
+                pairs,
+                expert_offsets,
+                pair_codes_bytes,
+                n=output_size,
+                group_size=group_size,
+                bits=BITS,
+                code_bits=code_bits,
+            ),
+        ]
+        is_exact = bool(mx.array_equal(calls[0](), calls[1]()))
+        affine_ms, pair_codes_ms = median_ms(calls, repeats)
+        print(
+            f"| {model} | {projection} | {tokens} | {expert_ids.size} | {num_experts} "
+            f"| {affine_ms:.2f} | {pair_codes_ms:.2f} | {pair_codes_ms / affine_ms:.3f} "
+            f"| {'y' if is_exact else 'n'} |",
+            flush=True,
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows", default="1024,8192,16384,32768")
     parser.add_argument("--banks", default="5120,10240")
     parser.add_argument("--projections", default="gate_up,down")
     parser.add_argument("--repeats", type=int, default=25)
+    parser.add_argument("--pair-codes", action="store_true")
+    parser.add_argument("--code-bits", type=int, default=13)
+    parser.add_argument("--models", default="qwen3.6,qwen3.8")
+    parser.add_argument("--tokens", default="512,2048,4096")
     args = parser.parse_args()
+    if args.pair_codes:
+        token_counts = [int(tokens) for tokens in args.tokens.split(",")]
+        rng = np.random.default_rng(0)
+        mx.random.seed(0)
+        print(
+            "| model | proj | tokens | B | E | gather_qmm_sorted ms | pair_codes ms "
+            "| pair_codes / affine | exact |"
+        )
+        print("|---|---|---:|---:|---:|---:|---:|---:|---|")
+        for model in args.models.split(","):
+            for projection in args.projections.split(","):
+                bench_pair_codes(model, projection, token_counts, args.code_bits, args.repeats, rng)
+                mx.clear_cache()
+        return 0
     row_counts = [int(rows) for rows in args.rows.split(",")]
     bank_sizes = [int(bank_size) for bank_size in args.banks.split(",")]
     assert all(bank_size % NUM_EXPERTS == 0 for bank_size in bank_sizes)

@@ -12,7 +12,9 @@ large-bank case must also equal the same rows on the resident bank bit for bit. 
 each weight format: row tiles cut by a run boundary or by B, a partial column tile, one expert,
 mostly empty experts (the first and last among them), fewer than 16 rows, no rows; affine bits
 2-6 and 8 with group sizes 32, 64 and 128, mxfp4, nvfp4, mxfp8 and unquantized weights (also
-with a partial K tile), each dtype.
+with a partial K tile), each dtype. gather_qmm_sorted_pair_codes must equal gather_qmm_sorted on
+the scales and biases its codes stand for bit for bit, on every affine case with 13-bit codes and
+three with 16, 9 and 1, at the experts' byte offsets into a bank and behind other bytes.
 """
 
 from __future__ import annotations
@@ -25,7 +27,13 @@ import numpy as np
 import pytest
 
 from ftmetal.kernel.attention.mha.mha_prefill import has_matrix_units
-from ftmetal.kernel.moe.gather_sorted import QuantMode, gather_mm_sorted, gather_qmm_sorted
+from ftmetal.kernel.moe.gather_sorted import (
+    QuantMode,
+    gather_mm_sorted,
+    gather_qmm_sorted,
+    gather_qmm_sorted_pair_codes,
+)
+from ftmetal.kernel.ref import pair_code_bank_ref
 
 # Worst |error| over a row relative to the row's largest |value|, where MLX runs its per-row
 # matvec instead. The affine rhs kernel stages the dequantized weights in x's dtype and the
@@ -40,6 +48,9 @@ FP_BLOCK_SHAPES: dict[QuantMode, tuple[int, int]] = {
     "nvfp4": (4, 16),
     "mxfp8": (8, 32),
 }
+
+# The pair tables of the rejected-argument cases: 13-bit codes.
+MAX_PAIRS = 8192
 
 # uniform: rows on random experts; single: every row on one expert; sparse: rows on three
 # experts, the first and last expert empty.
@@ -281,6 +292,76 @@ def test_matches_mlx(case: Case) -> None:
         assert (error <= TOLERANCE[case.dtype] * row_scale).all()
 
 
+AFFINE_CASES = [case for case in CASES if case.mode == "affine"]
+# Every affine case with 13-bit codes, and three with 16, 9 and 1 bits.
+PAIR_CODE_CASES = [
+    *((case, 13) for case in AFFINE_CASES),
+    (AFFINE_CASES[0], 16),
+    (AFFINE_CASES[len(AFFINE_CASES) // 2], 9),
+    (AFFINE_CASES[-1], 1),
+]
+
+
+@pytest.mark.parametrize(
+    ("case", "code_bits"),
+    PAIR_CODE_CASES,
+    ids=[f"{case}-c{bits}" for case, bits in PAIR_CODE_CASES],
+)
+def test_pair_codes_matches_affine(case: Case, code_bits: int) -> None:
+    rng = np.random.default_rng(case.num_experts * 1013 + case.num_rows)
+    x = mx.array(rng.standard_normal((case.num_rows, 1, case.input_size), dtype=np.float32))
+    x = x.astype(case.dtype)
+    experts = expert_rows(rng, case)
+    offsets = np.searchsorted(experts, np.arange(case.num_experts + 1))
+    expert_offsets = mx.array(offsets.astype(np.int32))
+    bank_size = case.bank_size or case.num_experts
+    slots = rng.permutation(bank_size)[: case.num_experts].astype(np.int64)
+    words = case.input_size * case.bits // 32
+    w = mx.array(rng.integers(0, 2**32, (bank_size, case.output_size, words), dtype=np.uint32))
+    num_pairs = 1 << code_bits
+    pairs = mx.array(0.02 * rng.standard_normal((num_pairs, 2), dtype=np.float32))
+    pairs = pairs.astype(case.dtype)
+    num_codes = case.output_size * case.input_size // case.group_size
+    codes = rng.integers(0, num_pairs, (bank_size, num_codes)).astype(np.uint16)
+    rows, scales, biases = pair_code_bank_ref(codes, pairs, case.output_size, code_bits)
+    expected = gather_qmm_sorted(
+        x,
+        w,
+        scales,
+        biases,
+        expert_offsets,
+        expert_bytes(slots, (w, scales, biases)),
+        n=case.output_size,
+        group_size=case.group_size,
+        bits=case.bits,
+    )
+
+    def pair_codes(
+        weight_buffer: mx.array, code_buffer: mx.array, byte_offsets: mx.array
+    ) -> mx.array:
+        return gather_qmm_sorted_pair_codes(
+            x,
+            weight_buffer,
+            code_buffer,
+            pairs,
+            expert_offsets,
+            byte_offsets,
+            n=case.output_size,
+            group_size=case.group_size,
+            bits=case.bits,
+            code_bits=code_bits,
+        )
+
+    out = pair_codes(w, rows, expert_bytes(slots, (w, rows)))
+    assert out.shape == expected.shape and out.dtype == case.dtype
+    assert mx.array_equal(out, expected)
+    pads = (4096, 768)
+    raw_w, raw_rows = behind(w, pads[0]), behind(rows, pads[1])
+    assert mx.array_equal(
+        pair_codes(raw_w, raw_rows, expert_bytes(slots, (w, rows), pads)), expected
+    )
+
+
 def test_rejects_unsupported_arguments() -> None:
     rng = np.random.default_rng(0)
     case = Case(4, 64)
@@ -313,6 +394,29 @@ def test_rejects_unsupported_arguments() -> None:
             mode=mode,
         )
 
+    pairs = mx.zeros((MAX_PAIRS, 2), dtype=case.dtype)
+
+    def call_pair_codes(
+        x: mx.array = x,
+        pairs: mx.array = pairs,
+        byte_offsets: mx.array = fp_bytes,
+        group_size: int = 64,
+        bits: int = 4,
+        code_bits: int = 13,
+    ) -> mx.array:
+        return gather_qmm_sorted_pair_codes(
+            x,
+            w,
+            scales.view(mx.uint8),
+            pairs,
+            offsets,
+            byte_offsets,
+            n=case.output_size,
+            group_size=group_size,
+            bits=bits,
+            code_bits=code_bits,
+        )
+
     def call_unquantized(
         x: mx.array = x,
         offsets: mx.array = offsets,
@@ -342,6 +446,16 @@ def test_rejects_unsupported_arguments() -> None:
         lambda: call(
             x=x[..., :208], biases=None, byte_offsets=fp_bytes, mode="nvfp4", group_size=16
         ),
+        lambda: call_pair_codes(group_size=48),
+        lambda: call_pair_codes(bits=7),
+        lambda: call_pair_codes(x=x[:, 0]),
+        lambda: call_pair_codes(x=x[..., :200]),
+        lambda: call_pair_codes(pairs=pairs.astype(mx.float32)),
+        lambda: call_pair_codes(pairs=pairs.reshape(-1)),
+        lambda: call_pair_codes(pairs=mx.zeros((MAX_PAIRS, 3), dtype=case.dtype)),
+        lambda: call_pair_codes(byte_offsets=affine_bytes),
+        lambda: call_pair_codes(code_bits=0),
+        lambda: call_pair_codes(code_bits=17),
         lambda: call_unquantized(x=x.astype(mx.int32)),
         lambda: call_unquantized(x=x[:, 0]),
         lambda: call_unquantized(n=0),

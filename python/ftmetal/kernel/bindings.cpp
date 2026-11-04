@@ -32,6 +32,7 @@ NB_MODULE(_C, m) {
       "init_gather_sorted_libraries",
       &ftmetal::init_gather_sorted_libraries,
       "affine_source"_a,
+      "affine_pair_codes_source"_a,
       "fp_source"_a,
       "unquantized_source"_a);
   m.def("init_sample_tokens_library", &ftmetal::init_sample_tokens_library, "source"_a);
@@ -183,6 +184,23 @@ NB_MODULE(_C, m) {
       "x[b] @ dequantize(expert e's weights at its byte offsets).T for the rows b of each expert e; returns [B, 1, n].");
 
   m.def(
+      "gather_qmm_sorted_pair_codes",
+      &ftmetal::gather_qmm_sorted_pair_codes,
+      "x"_a,
+      "w"_a,
+      "codes"_a,
+      "pairs"_a,
+      "expert_offsets"_a,
+      "expert_bytes"_a,
+      "n"_a,
+      "group_size"_a,
+      "bits"_a,
+      "code_bits"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      "gather_qmm_sorted for affine experts in pair-code rows, each group's scale and bias the pair table's at its code; returns [B, 1, n].");
+
+  m.def(
       "gather_mm_sorted",
       &ftmetal::gather_mm_sorted,
       "x"_a,
@@ -198,6 +216,7 @@ NB_MODULE(_C, m) {
   m.attr("EXPERT_STAGING_BYTES") = ftmetal::EXPERT_STAGING_BYTES;
   m.attr("FILL_FILE") = ftmetal::FILL_FILE;
   m.attr("QMM_TILE_K") = ftmetal::QMM_TILE_K;
+  m.attr("MAX_PAIR_CODE_BITS") = ftmetal::MAX_PAIR_CODE_BITS;
   nb::enum_<ftmetal::MailboxWord>(m, "MailboxWord", nb::is_arithmetic())
       .value("STATE", ftmetal::MailboxWord::State)
       .value("SEQUENCE", ftmetal::MailboxWord::Sequence)

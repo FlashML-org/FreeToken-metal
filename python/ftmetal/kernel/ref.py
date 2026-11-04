@@ -3,8 +3,10 @@ one test uses lives in that test."""
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from ftmetal.core import host_ints
+from ftmetal.kernel.moe.affine.affine_gather_qmv_pair_codes import PAIR_CODE_ROW_ALIGNMENT
 from ftmetal.kernel.moe.moe_align import ExpertAlignment
 
 # Queries per SDPA call of flash_prefill_ref, which materializes [Hq, rows, keys] fp32 scores.
@@ -168,6 +170,22 @@ def moe_combine_ref(
     return weighted.sum(axis=1).astype(expert_out.dtype)
 
 
+def pair_code_bank_ref(
+    codes: np.ndarray, pairs: mx.array, output_size: int, code_bits: int
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Pair-code bank rows of codes [S, N * G] (row-major over [N, G], each below 2^code_bits)
+    and the scales and biases they stand for: rows uint8 [S, row bytes], each code's code_bits
+    bits least significant first, zero padded to whole 64-byte lines; scales and biases
+    [S, N, G], pairs[code, 0] and pairs[code, 1]."""
+    num_slots = codes.shape[0]
+    bits = codes[..., None] >> np.arange(code_bits, dtype=np.uint32) & 1
+    stream = np.packbits(bits.astype(np.uint8).reshape(num_slots, -1), axis=1, bitorder="little")
+    row_bytes = -(-stream.shape[1] // PAIR_CODE_ROW_ALIGNMENT) * PAIR_CODE_ROW_ALIGNMENT
+    rows = np.pad(stream, ((0, 0), (0, row_bytes - stream.shape[1])))
+    code_ids = mx.array(codes.astype(np.int32)).reshape(num_slots, output_size, -1)
+    return mx.array(rows), pairs[:, 0][code_ids], pairs[:, 1][code_ids]
+
+
 def hc_mix_ref(up: mx.array, normed: mx.array, hc_count: int) -> mx.array:
     """kernel.hc.hc_mix in MLX ops: the mean over the streams of sigmoid(up) * normed in fp32,
     cast once."""
@@ -259,6 +277,7 @@ __all__ = [
     "moe_align_ref",
     "moe_combine_ref",
     "moe_topk_ref",
+    "pair_code_bank_ref",
     "scatter_rows_ref",
     "zero_rows_ref",
 ]

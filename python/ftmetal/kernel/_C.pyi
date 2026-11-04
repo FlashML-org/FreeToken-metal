@@ -12,6 +12,7 @@ MAILBOX_WORDS: int
 EXPERT_STAGING_BYTES: int
 FILL_FILE: int
 QMM_TILE_K: int
+MAX_PAIR_CODE_BITS: int
 PLE_MAILBOX_WORDS: int
 MAX_PLE_ROWS: int
 
@@ -221,7 +222,7 @@ def init_gdn_decode_library(source: str) -> None: ...
 def init_mha_decode_library(source: str) -> None: ...
 def init_mha_prefill_library(source: str) -> None: ...
 def init_gather_sorted_libraries(
-    affine_source: str, fp_source: str, unquantized_source: str
+    affine_source: str, affine_pair_codes_source: str, fp_source: str, unquantized_source: str
 ) -> None: ...
 def init_sample_tokens_library(source: str) -> None: ...
 def init_moe_lookup_library(source: str) -> None: ...
@@ -344,6 +345,20 @@ def gather_qmm_sorted(
     group_size: int,
     bits: int,
     mode: str,
+    *,
+    stream: Stream = None,
+) -> mx.array: ...
+def gather_qmm_sorted_pair_codes(
+    x: mx.array,
+    w: mx.array,
+    codes: mx.array,
+    pairs: mx.array,
+    expert_offsets: mx.array,
+    expert_bytes: mx.array,
+    n: int,
+    group_size: int,
+    bits: int,
+    code_bits: int,
     *,
     stream: Stream = None,
 ) -> mx.array: ...

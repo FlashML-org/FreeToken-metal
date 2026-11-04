@@ -57,6 +57,7 @@ _C.init_mha_decode_library(metal_source(KERNEL_DIR / "attention" / "mha" / "mha_
 _C.init_mha_prefill_library(metal_source(KERNEL_DIR / "attention" / "mha" / "mha_prefill.metal"))
 _C.init_gather_sorted_libraries(
     metal_source(KERNEL_DIR / "moe" / "affine" / "affine_gather_qmm_sorted.metal"),
+    metal_source(KERNEL_DIR / "moe" / "affine" / "affine_gather_qmm_sorted_pair_codes.metal"),
     metal_source(KERNEL_DIR / "moe" / "fp" / "fp_gather_qmm_sorted.metal"),
     metal_source(KERNEL_DIR / "moe" / "unquantized" / "gather_mm_sorted.metal"),
 )
