@@ -177,6 +177,56 @@ ExpertService::ExpertService(
           " do not tile every bank row exactly once");
     }
   }
+  // A record layer: each stored segment of every expert in one file at one offset from the
+  // expert's record start, the records evenly spaced and no longer than their spacing (a
+  // checkpoint's parts, each a tensor of its own, are not).
+  records_.assign(num_layers, RecordLayout{});
+  for (int layer_id = 0; layer_id < num_layers; ++layer_id) {
+    const ExpertLocation* layer_locations =
+        &locations_[static_cast<size_t>(layer_id) * segments_per_layer_ * num_experts];
+    std::vector<int> stored;
+    bool is_record = true;
+    for (int s = 0; s < segments_per_layer_; ++s) {
+      bool is_fill = layer_locations[s * num_experts].file_index == FILL_FILE;
+      for (int e = 0; e < num_experts; ++e) {
+        is_record = is_record &&
+            (layer_locations[s * num_experts + e].file_index == FILL_FILE) == is_fill;
+      }
+      if (!is_fill) {
+        stored.push_back(s);
+      }
+    }
+    if (!is_record || stored.empty()) {
+      continue;
+    }
+    RecordLayout record;
+    record.file_index = layer_locations[stored[0] * num_experts].file_index;
+    std::vector<int64_t> starts(num_experts, INT64_MAX);
+    std::vector<int64_t> ends(num_experts, 0);
+    for (int s : stored) {
+      int64_t expert_bytes = segments_[layer_id * segments_per_layer_ + s].expert_bytes;
+      for (int e = 0; e < num_experts; ++e) {
+        const ExpertLocation& location = layer_locations[s * num_experts + e];
+        is_record = is_record && location.file_index == record.file_index;
+        starts[e] = std::min(starts[e], location.file_offset);
+        ends[e] = std::max(ends[e], location.file_offset + expert_bytes);
+      }
+    }
+    record.first = starts[0];
+    record.bytes = ends[0] - starts[0];
+    record.stride = num_experts > 1 ? starts[1] - starts[0] : record.bytes;
+    for (int s : stored) {
+      int64_t record_offset = layer_locations[s * num_experts].file_offset - starts[0];
+      for (int e = 0; e < num_experts; ++e) {
+        is_record = is_record &&
+            layer_locations[s * num_experts + e].file_offset - starts[e] == record_offset &&
+            starts[e] == record.first + e * record.stride;
+      }
+    }
+    if (is_record && record.bytes <= record.stride && record.bytes <= MAX_READ_BYTES) {
+      records_[layer_id] = record;
+    }
+  }
   stats_.hits.assign(num_layers, 0);
   stats_.misses.assign(num_layers, 0);
   stats_.requests.assign(num_layers, 0);
@@ -342,11 +392,16 @@ void ExpertService::submit(
   batch.error.clear();
   batch.held_fills.clear();
   bool is_held = batch.is_held.load(std::memory_order_relaxed);
+  const RecordLayout& record = records_[layer_id];
   std::vector<ReadTask> tasks;
   for (int s = 0; s < segments_per_layer_; ++s) {
     int64_t segment_index = layer_id * segments_per_layer_ + s;
     const ExpertSegment& segment = segments_[segment_index];
     const ExpertLocation* locations = &locations_[segment_index * num_experts_];
+    if (record.stride > 0 && locations[0].file_index != FILL_FILE) {
+      // Read with the records below.
+      continue;
+    }
     for (int32_t first = 0; first < num_experts_;) {
       const ExpertLocation& start = locations[first];
       if (batch.index_of_expert[first] < 0) {
@@ -374,6 +429,26 @@ void ExpertService::submit(
         tasks.push_back(
             {&batch, s, start.file_index, base, begin, std::min(begin + MAX_READ_BYTES, run_end)});
       }
+      first = last;
+    }
+  }
+  if (record.stride > 0) {
+    // The records one read takes: the last one's bytes, a stride for each of the others.
+    int32_t records_per_read =
+        static_cast<int32_t>(1 + (MAX_READ_BYTES - record.bytes) / record.stride);
+    for (int32_t first = 0; first < num_experts_;) {
+      if (batch.index_of_expert[first] < 0) {
+        ++first;
+        continue;
+      }
+      int32_t last = first + 1;
+      while (last < num_experts_ && last - first < records_per_read &&
+             batch.index_of_expert[last] >= 0) {
+        ++last;
+      }
+      int64_t begin = record.first + first * record.stride;
+      int64_t end = begin + (last - 1 - first) * record.stride + record.bytes;
+      tasks.push_back({&batch, -1, record.file_index, record.first, begin, end});
       first = last;
     }
   }
@@ -418,7 +493,6 @@ void ExpertService::work(int thread_index) {
 
 void ExpertService::read(const ReadTask& task, uint8_t* staging) {
   ReadBatch& batch = *task.batch;
-  const ExpertSegment& segment = segments_[batch.layer_id * segments_per_layer_ + task.segment];
   int64_t aligned_begin = task.begin / READ_ALIGNMENT * READ_ALIGNMENT;
   int64_t aligned_end = (task.end + READ_ALIGNMENT - 1) / READ_ALIGNMENT * READ_ALIGNMENT;
   int descriptor = file_descriptors_[task.file_index];
@@ -445,16 +519,36 @@ void ExpertService::read(const ReadTask& task, uint8_t* staging) {
   while (batch.is_held.load(std::memory_order_acquire)) {
     __builtin_arm_yield();
   }
-  int64_t first = (task.begin - task.base) / segment.expert_bytes;
-  int64_t last = (task.end - 1 - task.base) / segment.expert_bytes;
-  for (int64_t expert = first; expert <= last; ++expert) {
-    int64_t expert_begin = task.base + expert * segment.expert_bytes;
-    int64_t piece_begin = std::max(task.begin, expert_begin);
-    int64_t piece_end = std::min(task.end, expert_begin + segment.expert_bytes);
-    std::memcpy(
-        expert_row(batch, segment, expert) + (piece_begin - expert_begin),
-        staging + (piece_begin - aligned_begin),
-        piece_end - piece_begin);
+  if (task.segment < 0) {
+    const RecordLayout& record = records_[batch.layer_id];
+    int64_t first = (task.begin - task.base) / record.stride;
+    int64_t last = (task.end - 1 - task.base) / record.stride;
+    for (int64_t expert = first; expert <= last; ++expert) {
+      for (int s = 0; s < segments_per_layer_; ++s) {
+        int64_t segment_index = batch.layer_id * segments_per_layer_ + s;
+        const ExpertLocation& location = locations_[segment_index * num_experts_ + expert];
+        if (location.file_index != FILL_FILE) {
+          const ExpertSegment& segment = segments_[segment_index];
+          std::memcpy(
+              expert_row(batch, segment, expert),
+              staging + (location.file_offset - aligned_begin),
+              segment.expert_bytes);
+        }
+      }
+    }
+  } else {
+    const ExpertSegment& segment = segments_[batch.layer_id * segments_per_layer_ + task.segment];
+    int64_t first = (task.begin - task.base) / segment.expert_bytes;
+    int64_t last = (task.end - 1 - task.base) / segment.expert_bytes;
+    for (int64_t expert = first; expert <= last; ++expert) {
+      int64_t expert_begin = task.base + expert * segment.expert_bytes;
+      int64_t piece_begin = std::max(task.begin, expert_begin);
+      int64_t piece_end = std::min(task.end, expert_begin + segment.expert_bytes);
+      std::memcpy(
+          expert_row(batch, segment, expert) + (piece_begin - expert_begin),
+          staging + (piece_begin - aligned_begin),
+          piece_end - piece_begin);
+    }
   }
 }
 

@@ -76,6 +76,8 @@ from ftmetal.models.register import (
     read_checkpoint,
 )
 from ftmetal.moe.offload_cache import STAGING_BYTES, OffloadMoeCache
+from ftmetal.moe.pack import ExpertPack, StalePack, use_pack
+from ftmetal.moe.pair_codes import coded_layout
 from ftmetal.moe.slot_pools import (
     HOT_EXPERTS_FILE,
     SlotLayout,
@@ -296,6 +298,9 @@ class Engine:
         moe_layers: list[OffloadMoELayer] = []
         layouts: list[dict[str, BankSpec]] = []
         expert_source: ExpertSource | None = None
+        expert_pack: ExpertPack | None = None
+        # The expert pack the offload cache reads, if any.
+        self.expert_pack: ExpertPack | None = None
         if is_offload:
             moe_layers = offload_layers(self.model)
             layouts, resident_arrays = bank_layouts(
@@ -324,6 +329,23 @@ class Engine:
                 checkpoint.expert_bytes,
                 resident_arrays,
             )
+            try:
+                expert_pack = (
+                    use_pack(config.model_path, expert_source) if config.moe_pack else None
+                )
+            except StalePack as error:
+                logger.warning(f"MoE offload: {error}; reading the experts from the checkpoint")
+                expert_pack = None
+            self.expert_pack = expert_pack
+            code_bits = None if expert_pack is None else expert_pack.code_bits
+            layouts = (
+                layouts
+                if code_bits is None
+                else [coded_layout(layout, code_bits) for layout in layouts]
+            )
+            if expert_pack is not None:
+                codes = "" if code_bits is None else f", {code_bits}-bit pair codes"
+                logger.info(f"MoE offload: reading the experts from {expert_pack.path}{codes}")
         load_weights(self.model, checkpoint.state, rules, skip_experts=is_offload)
         # Host memory is the GPU's too on unified memory: a host row cache counts as weights.
         host_bytes = 0
@@ -464,6 +486,7 @@ class Engine:
                 prefill_overlap_min_tokens=config.moe_prefill_overlap_min_tokens,
                 expert_counts=expert_counts,
                 victim_cache_bytes=victim_bytes,
+                pairs=None if expert_pack is None else expert_pack.pairs,
             )
             pool_slots = [pool.num_slots for pool in slot_layout.pools]
             logger.info(

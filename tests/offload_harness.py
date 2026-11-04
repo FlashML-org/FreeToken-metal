@@ -9,7 +9,9 @@ stores one tensor per expert in the Hugging Face layout instead, which the model
 mlx_layout stacks. An identifying checkpoint (affine only) fills every packed weight word of
 an expert's projection with expert_code(layer, projection, expert) instead, so a bank row
 read anywhere names the expert it holds. A cache may have a victim cache, its budget a
-number of entries of entry_bytes.
+number of entries of entry_bytes, and read its experts from an expert pack of the checkpoint,
+whose affine experts hold pair codes where their shapes and pairs allow; expected_code_rows is
+the code rows the cache holds of such a layer.
 
 ReferenceLru is the offload simulation's token-granular LRU per pool: per slot, the expert
 it holds and the step it was last used. A call first marks its hits used at this step, then
@@ -26,11 +28,14 @@ from typing import Literal
 import mlx.core as mx
 import numpy as np
 
+from ftmetal.kernel.ref import pair_code_bank_ref
 from ftmetal.layers.quantization.config import AffineScheme, BankSpec
 from ftmetal.layers.quantization.moe import ExpertSchemes, MoEConfig, moe_method
 from ftmetal.models.loader import ExpertBytes, FuseRule, WeightRules, load_checkpoint
 from ftmetal.models.qwen3_5_moe.weight import mlx_layout
 from ftmetal.moe.offload_cache import STALL_TIMEOUT_S, OffloadMoeCache
+from ftmetal.moe.pack import use_pack, write_pack
+from ftmetal.moe.pair_codes import coded_layout
 from ftmetal.moe.slot_pools import MoePoolGrouping, PrefillBufferPlacement, plan_slot_layout
 from ftmetal.moe.source import ExpertSource
 
@@ -226,14 +231,25 @@ def build_cache(
     victim_cache_bytes: int = 0,
     stall_timeout_s: float = STALL_TIMEOUT_S,
     run_coordinator: bool = True,
+    is_packed: bool = False,
+    with_pair_codes: bool = False,
 ) -> tuple[OffloadMoeCache, ExpertSource]:
-    """The cache over a new checkpoint of spec written to directory, and its source."""
+    """The cache over a new checkpoint of spec written to directory, and its source; is_packed:
+    read from a pack of it, with pair codes when with_pair_codes."""
     write_checkpoint(directory, spec)
     state, expert_bytes = read_state(directory, spec)
     source = ExpertSource(str(directory), checkpoint_rules(spec), state, expert_bytes)
+    if is_packed:
+        write_pack(str(directory), source, with_pair_codes=with_pair_codes)
+        pack = use_pack(str(directory), source)
+        assert pack is not None
+        pairs, code_bits = pack.pairs, pack.code_bits
+    else:
+        pairs, code_bits = None, None
+    layouts = layer_layouts(spec)
     slot_layout = plan_slot_layout(
         cache_size,
-        layer_layouts(spec),
+        layouts if code_bits is None else [coded_layout(layout, code_bits) for layout in layouts],
         spec.num_experts,
         TOP_K,
         grouping=grouping,
@@ -247,10 +263,29 @@ def build_cache(
         prefill_overlap=prefill_overlap,
         prefill_overlap_min_tokens=PREFILL_OVERLAP_MIN_TOKENS,
         victim_cache_bytes=victim_cache_bytes,
+        pairs=pairs,
         stall_timeout_s=stall_timeout_s,
         run_coordinator=run_coordinator,
     )
     return cache, source
+
+
+def expected_code_rows(scales: mx.array, biases: mx.array, pairs: mx.array) -> np.ndarray:
+    """The pair-code bank rows uint8 [E, row bytes] of experts' scales and biases [E, N, G] in a
+    pair table pairs [2^code_bits, 2], each pair's first entry."""
+    bits = mx.uint16 if scales.dtype.size == 2 else mx.uint32
+
+    def keys(values: mx.array) -> np.ndarray:
+        """Each (scale, bias) of values [..., 2] as one key."""
+        both = np.array(values.view(bits)).astype(np.uint64)
+        return both[..., 0] << 32 | both[..., 1]
+
+    unique, first = np.unique(keys(pairs), return_index=True)
+    wanted = keys(mx.stack([scales, biases], axis=-1)).reshape(scales.shape[0], -1)
+    position = np.minimum(np.searchsorted(unique, wanted), unique.size - 1)
+    assert (unique[position] == wanted).all(), "a pair the table does not hold"
+    code_bits = pairs.shape[0].bit_length() - 1
+    return np.array(pair_code_bank_ref(first[position], pairs, scales.shape[1], code_bits)[0])
 
 
 class ReferenceLru:

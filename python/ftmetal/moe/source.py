@@ -7,7 +7,8 @@ range of a checkpoint file: its e-th slice as stored, or wherever the rewrite in
 layout found it (ExpertBytes: one tensor per expert, a slice of a fused tensor), or bytes of
 one value the checkpoint does not store. A fused bank row (gate_up = gate then up) is its
 parts' ranges back to back, and a layout that keeps the parts apart takes each as a bank of
-its own. Only the safetensors headers are read.
+its own. Only the safetensors headers are read. An expert pack (moe/pack.py) relocates the
+stored parts into its records.
 """
 
 from __future__ import annotations
@@ -158,6 +159,13 @@ class ExpertSource:
     @property
     def num_layers(self) -> int:
         return len(self.layer_prefixes)
+
+    def relocate(self, file: str, parts: list[dict[str, list[ExpertPart]]]) -> None:
+        """Read the MoE layers' parts from file (an expert pack) instead: parts, per layer, the
+        roles' parts as file holds them, file at the next file index."""
+        assert len(parts) == self.num_layers, "a pack holds every MoE layer"
+        self.files.append(file)
+        self.parts = parts
 
     def segment_table(self, layouts: list[dict[str, BankSpec]]) -> tuple[np.ndarray, np.ndarray]:
         """Each layout bank's checkpoint parts per MoE layer, a fused role's parts back to back

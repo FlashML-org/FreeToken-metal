@@ -62,6 +62,15 @@ def moe_prefill_buffer_from_env() -> PrefillBufferPlacement:
         raise ValueError(f"FTMETAL_MOE_PREFILL_BUFFER must be overlay or dedicated, got {value!r}")
 
 
+def moe_pack_from_env() -> bool:
+    """FTMETAL_MOE_PACK: 1 (default) reads offloaded experts from the model's expert pack when it
+    holds them, 0 from the checkpoint."""
+    value = read_env("MOE_PACK")
+    if value not in (None, "0", "1"):
+        raise ValueError(f"FTMETAL_MOE_PACK must be 0 or 1, got {value!r}")
+    return value != "0"
+
+
 def moe_prefill_overlap_min_tokens_from_env() -> int:
     """FTMETAL_MOE_PREFILL_OVERLAP_MIN_TOKENS: the overlap prefill threshold, for tests."""
     value = read_env("MOE_PREFILL_OVERLAP_MIN_TOKENS")
@@ -124,6 +133,8 @@ class EngineConfig:
     moe_prefill_overlap_min_tokens: int = field(
         default_factory=moe_prefill_overlap_min_tokens_from_env
     )
+    # Offloaded experts come from the expert pack (ftm pack) when the model directory has one.
+    moe_pack: bool = field(default_factory=moe_pack_from_env)
     # The offload cache's victim cache in host memory beyond Metal's working set, in GiB, or
     # auto (that memory less a host reserve); 0: none.
     moe_victim_cache_gib: float | Literal["auto"] = 0
@@ -225,6 +236,7 @@ __all__ = [
     "EngineConfig",
     "MoeStrategyChoice",
     "command_graph_from_env",
+    "moe_pack_from_env",
     "moe_prefill_buffer_from_env",
     "moe_prefill_overlap_min_tokens_from_env",
 ]

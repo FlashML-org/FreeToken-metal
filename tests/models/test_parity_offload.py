@@ -19,11 +19,16 @@ decode forwards: unquantized, MLX's float modes, the Hugging Face layout (one te
 expert, or each layer's experts in two banks) and the ModelOpt and compressed-tensors
 exports, NVFP4 or FP8 (whose unit scales the checkpoint does not store) with per-expert
 output scales. A victim cache of a few entries, affine and NVFP4, serves the same forwards
-from the experts the slots evict.
+from the experts the slots evict. So does an expert pack (ftm pack): of an affine checkpoint
+(16-bit pair codes for its fp32 scales), of one whose coarse scales take narrower codes, of an
+export (its parts beside unit scales and output scales) and of a Hugging Face layout one, every
+expert read a whole record at a time; a stale pack and FTMETAL_MOE_PACK=0 read the checkpoint.
 """
 
 from __future__ import annotations
 
+import json
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -35,10 +40,12 @@ import pytest
 from mlx.utils import tree_flatten
 from mlx_lm.models import qwen3_5 as reference
 
+from ftmetal.cli import run_pack
 from ftmetal.core import SamplingParams
 from ftmetal.engine.config import EngineConfig
 from ftmetal.layers.quantization.config import FP_BLOCK_SHAPES
 from ftmetal.models.config import MoeStrategy
+from ftmetal.moe.pack import PACK_FILE
 from ftmetal.moe.slot_pools import MoePoolGrouping, PrefillBufferPlacement
 from ftmetal.scheduler.scheduler import Scheduler
 from tiny_model import (
@@ -107,6 +114,11 @@ class Case:
     expert_format: ExpertFormat = "affine"
     # The offload's victim cache (0: none).
     victim_cache_gib: float = 0
+    # Offload reads an expert pack of the checkpoint (ftm pack), and whether it holds pair codes;
+    # coarse: 256-wide experts whose scales and biases take 32 levels each (narrow codes).
+    is_packed: bool = False
+    has_pair_codes: bool = False
+    is_coarse: bool = False
 
 
 CASES = [
@@ -234,7 +246,46 @@ CASES = [
         expert_format="nvfp4",
         victim_cache_gib=8e-5,
     ),
+    # From an expert pack: affine, whose fp32 scales and biases take 16-bit pair codes; an
+    # export's parts beside its unit scales (not stored) and output scales (resident), gate and up
+    # apart; one tensor per expert.
+    Case(
+        "packed",
+        (100, 9),
+        overlap_min_tokens=48,
+        reads_buffers=True,
+        is_packed=True,
+        has_pair_codes=True,
+    ),
+    Case(
+        "modelopt-up-fp8-packed",
+        (100, 9),
+        overlap_min_tokens=48,
+        reads_buffers=True,
+        expert_format="modelopt-up-fp8",
+        is_packed=True,
+    ),
+    Case(
+        "hf-unquantized-packed",
+        (100, 9),
+        overlap_min_tokens=48,
+        reads_buffers=True,
+        expert_format="hf-unquantized",
+        is_packed=True,
+    ),
+    Case(
+        "pair-codes-packed",
+        (100, 9),
+        overlap_min_tokens=48,
+        reads_buffers=True,
+        is_packed=True,
+        has_pair_codes=True,
+        is_coarse=True,
+    ),
 ]
+# The routed experts' width under pair codes, and the levels their scales and biases take.
+CODED_EXPERT_WIDTH = 256
+CODED_LEVELS = 32
 
 
 def is_expert_projection(module_path: str, module: nn.Module) -> bool:
@@ -244,10 +295,15 @@ def is_expert_projection(module_path: str, module: nn.Module) -> bool:
 def write_checkpoint(path: Path, case: Case) -> None:
     """The reference model with its experts in the case's format: affine quantized alone,
     layer 0's up in up_bits and the last layer's in last_layer_bits, or another."""
-    model = build_reference(seed=11, text_config=OFFLOAD_TEXT_CONFIG)
+    text_config = (
+        {**OFFLOAD_TEXT_CONFIG, "moe_intermediate_size": CODED_EXPERT_WIDTH}
+        if case.is_coarse
+        else OFFLOAD_TEXT_CONFIG
+    )
+    model = build_reference(seed=11, text_config=text_config)
     match case.expert_format:
         case "affine":
-            write_affine_checkpoint(path, model, case.up_bits, case.last_layer_bits)
+            write_affine_checkpoint(path, model, case.up_bits, case.last_layer_bits, case.is_coarse)
         case "mxfp4" | "nvfp4" | "mxfp8" as mode:
             bits, group_size = FP_BLOCK_SHAPES[mode]
             nn.quantize(model, group_size, bits, mode=mode, class_predicate=is_expert_projection)
@@ -296,8 +352,10 @@ def write_checkpoint(path: Path, case: Case) -> None:
 
 
 def write_affine_checkpoint(
-    path: Path, model: reference.Model, up_bits: int, last_layer_bits: int
+    path: Path, model: reference.Model, up_bits: int, last_layer_bits: int, is_coarse: bool
 ) -> None:
+    """The model's experts affine quantized, with is_coarse each projection's scales and biases
+    rounded to CODED_LEVELS levels (few enough pairs for pair codes)."""
     num_layers = OFFLOAD_TEXT_CONFIG["num_hidden_layers"]
     assert isinstance(num_layers, int)
     last_layer = f"language_model.model.layers.{num_layers - 1}.mlp.switch_mlp"
@@ -314,6 +372,14 @@ def write_affine_checkpoint(
             return up if module_path == first_up else True
 
     nn.quantize(model, group_size=EXPERT_GROUP_SIZE, bits=EXPERT_BITS, class_predicate=predicate)
+    if is_coarse:
+        for module_path, module in model.named_modules():
+            if "switch_mlp" in module_path and hasattr(module, "biases"):
+                for name in ("scales", "biases"):
+                    values = getattr(module, name)
+                    low, high = values.min(), values.max()
+                    step = (high - low) / (CODED_LEVELS - 1)
+                    setattr(module, name, low + mx.round((values - low) / step) * step)
     mx.eval(model.parameters())
     quantization: dict[str, object] = {
         "group_size": EXPERT_GROUP_SIZE,
@@ -376,6 +442,8 @@ def test_offload_matches_resident_experts(
 ) -> None:
     monkeypatch.setenv("FTMETAL_MOE_PREFILL_OVERLAP_MIN_TOKENS", str(case.overlap_min_tokens))
     write_checkpoint(tmp_path, case)
+    if case.is_packed:
+        assert run_pack(["--model", str(tmp_path)]) == 0
     rng = np.random.default_rng(len(case.name))
     prompts = [[int(t) for t in rng.integers(1, 120, size=n)] for n in case.prompt_lens]
 
@@ -386,6 +454,8 @@ def test_offload_matches_resident_experts(
 
     cache = scheduler.engine.moe_offload_cache
     assert cache is not None
+    assert (scheduler.engine.expert_pack is not None) == case.is_packed
+    assert (cache.pairs is not None) == case.has_pair_codes
     # Dedicated buffers take two layers of the slots out of the pools.
     dedicated = 2 * NUM_EXPERTS if case.buffer_placement == "dedicated" else 0
     assert cache.cache_size == case.cache_size - dedicated
@@ -404,7 +474,38 @@ def test_offload_matches_resident_experts(
     copied = sum(stats.victim_hits) + sum(stats.victim_buffer_hits)
     assert (sum(stats.experts_read) + copied > sum(stats.misses)) == case.reads_buffers
     assert (copied > 0) == (case.victim_cache_gib > 0)
+    if case.is_packed:
+        # Every read a run of whole records: the records' bytes alone, FILL parts or not.
+        with (tmp_path / PACK_FILE).open("rb") as f:
+            header = json.loads(f.read(struct.unpack("<Q", f.read(8))[0]))
+        for layer_id, layer in enumerate(header["layers"]):
+            assert stats.bytes_read[layer_id] == stats.experts_read[layer_id] * layer["stride"]
     cache.check_healthy()
+
+
+@pytest.mark.parametrize("fallback", ["stale", "ignored"])
+def test_offload_reads_the_checkpoint_past_its_pack(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fallback: Literal["stale", "ignored"],
+) -> None:
+    """A pack of another checkpoint (one file grown since) is logged and passed over;
+    FTMETAL_MOE_PACK=0 passes over a good one."""
+    case = Case("pack-fallback", (9,))
+    write_checkpoint(tmp_path, case)
+    assert run_pack(["--model", str(tmp_path)]) == 0
+    if fallback == "stale":
+        with next(tmp_path.glob("*.safetensors")).open("ab") as f:
+            f.write(b"\0")
+    else:
+        monkeypatch.setenv("FTMETAL_MOE_PACK", "0")
+    scheduler = make_scheduler(tmp_path, case, "offload")
+    cache = scheduler.engine.moe_offload_cache
+    assert cache is not None and cache.pairs is None
+    assert scheduler.engine.expert_pack is None
+    is_warned = any("reading the experts from the checkpoint" in r.message for r in caplog.records)
+    assert is_warned == (fallback == "stale")
 
 
 def test_offload_refuses_layers_in_different_banks(tmp_path: Path) -> None:

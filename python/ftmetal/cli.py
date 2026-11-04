@@ -1,15 +1,19 @@
-"""ftm: serve a model over the OpenAI API, or chat with a running server.
+"""ftm: serve a model over the OpenAI API, chat with a running server, or pack a model's
+routed experts for MoE offload.
 
     ftm serve --model <checkpoint dir> [--host H] [--port P] [...]
     ftm shell [--server URL]
+    ftm pack --model <checkpoint dir>
 
 The shell is an ordinary client of POST /v1/chat/completions, so it gets the prompt
-rendering, sampling defaults and reasoning split every other client gets.
+rendering, sampling defaults and reasoning split every other client gets. The pack
+(experts.packed, in the checkpoint directory) lets an offloaded expert be read in one piece.
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import http.client
 import json
 import logging
@@ -21,7 +25,13 @@ from collections.abc import Iterator
 
 from pydantic import BaseModel
 
+from ftmetal.engine.config import EngineConfig
+from ftmetal.engine.engine import offload_layers
 from ftmetal.env import read_env
+from ftmetal.models.register import create_model, model_weight_rules, read_checkpoint
+from ftmetal.moe.pack import write_pack
+from ftmetal.moe.slot_pools import bank_layouts
+from ftmetal.moe.source import ExpertSource
 from ftmetal.server.api_models import (
     ChatCompletionRequest,
     Message,
@@ -221,6 +231,37 @@ def run_shell(argv: list[str]) -> int:
                 history = [*messages, Message(role="assistant", content=answer)]
 
 
+def run_pack(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="ftm pack",
+        description="Write the checkpoint's routed experts, one record per expert, to "
+        "experts.packed in its directory, which MoE offload then reads them from.",
+    )
+    parser.add_argument("--model", required=True, help="checkpoint directory")
+    args = parser.parse_args(argv)
+    config = EngineConfig(model_path=args.model)
+    rules = model_weight_rules(config.architecture, config.model_config)
+    checkpoint = read_checkpoint(config.architecture, config.model_path)
+    # The arrays the offload layers hold themselves (an export's output_scale) stay out.
+    model_config = dataclasses.replace(config.model_config, moe_strategy="offload")
+    model = create_model(config.architecture, model_config, config.dtype)
+    method_layouts = [layer.quant_method.layout() for layer in offload_layers(model)]
+    source = ExpertSource(
+        config.model_path,
+        rules,
+        checkpoint.state,
+        checkpoint.expert_bytes,
+        bank_layouts(method_layouts)[1],
+    )
+    started = time.perf_counter()
+    path = write_pack(config.model_path, source)
+    print(
+        f"wrote {path}: {path.stat().st_size / 2**30:.2f} GiB in "
+        f"{time.perf_counter() - started:.0f} s"
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     if not args or args[0] in ("-h", "--help"):
@@ -233,8 +274,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     elif command == "shell":
         return run_shell(rest)
+    elif command == "pack":
+        logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+        return run_pack(rest)
     else:
-        print(f"unknown command {command!r}; expected serve or shell", file=sys.stderr)
+        print(f"unknown command {command!r}; expected serve, shell or pack", file=sys.stderr)
         return 2
 
 

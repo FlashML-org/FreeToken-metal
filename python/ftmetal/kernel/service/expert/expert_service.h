@@ -2,8 +2,9 @@
 // pool of IO threads that read expert rows straight from the checkpoint into the bank
 // slots: raw read-around (each read widened to 4 KiB boundaries, F_NOCACHE, no read-ahead)
 // into a per-thread aligned staging buffer, then one memcpy per expert into its row. A run
-// of consecutive experts whose bytes follow on in one file is one read; a part the
-// checkpoint does not store is filled as the read is submitted instead. Idle threads block; a
+// of consecutive experts whose bytes follow on in one file is one read, and in a record layer
+// (a pack's: every segment of an expert in one record) a run of consecutive records is; a part
+// the checkpoint does not store is filled as the read is submitted instead. Idle threads block; a
 // caller waits for its reads by spinning on a completion counter. A coordinator thread
 // answers the GPU lookups' mailbox requests (see moe/moe_lookup.h) with the same reads, and a
 // watchdog thread fails a request the coordinator leaves unanswered. With a victim cache
@@ -111,10 +112,20 @@ struct ReadBatch {
   std::vector<std::pair<int64_t, int32_t>> held_fills;
 };
 
+// A layer whose stored segments lie, for every expert, inside one record of one file (a
+// pack's), expert e's record at first + e * stride and bytes long; stride 0: no record layer.
+struct RecordLayout {
+  int64_t file_index = 0;
+  int64_t first = 0;
+  int64_t stride = 0;
+  int64_t bytes = 0;
+};
+
 // The bytes [begin, end) of file file_index for one segment of the batch's layer, all inside
-// one run of the batch's experts, expert e of the run at base + e * expert_bytes; or, with
-// entry set, a copy between that victim cache entry and the batch layer's row at index (a
-// slot, or a row of the batch's buffer), into the entry when is_store.
+// one run of the batch's experts, expert e of the run at base + e * expert_bytes, or for
+// segment -1 the records of a run of experts of a record layer; or, with entry set, a copy
+// between that victim cache entry and the batch layer's row at index (a slot, or a row of the
+// batch's buffer), into the entry when is_store.
 struct ReadTask {
   ReadBatch* batch = nullptr;
   int segment = 0;
@@ -262,6 +273,8 @@ class ExpertService {
   std::vector<ExpertSegment> segments_;
   std::vector<ExpertLocation> locations_;
   int segments_per_layer_;
+  // Per layer: read a record (or a run of records) at a time, the fills as the reads submit.
+  std::vector<RecordLayout> records_;
 
   std::mutex call_mutex_;
   ReadBatch ensure_batch_;

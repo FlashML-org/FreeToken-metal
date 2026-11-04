@@ -7,7 +7,8 @@ and every slot slot_of maps), and at every slot of a prefetched prefill layer's 
 whose resident experts keep their slots. Large experts make one run of reads longer than
 a staging buffer; gate and up in different bits load as two banks in every layer; one pool
 for every layer and prefill buffers over the pools (which drop the experts under them as a
-prefill begins) take the same checks. With a victim cache the same scripts must also leave
+prefill begins) take the same checks, and so do some of the cases reading every stored part
+from an expert pack of the checkpoint. With a victim cache the same scripts must also leave
 no expert both in a slot and in the victim cache, and every miss or prefetched absent expert
 must be read or copied from it. The victim cache on its own: an evicted expert asked for again
 is copied back, not read, and its entries drop their oldest when full; purged entries are
@@ -30,6 +31,7 @@ import pytest
 from mlx.utils import tree_flatten
 
 from ftmetal.engine.config import EngineConfig
+from ftmetal.kernel._ext import _C
 from ftmetal.layers.moe import MoELayer, OffloadMoELayer
 from ftmetal.layers.quantization.config import AffineScheme, FpBlockScheme
 from ftmetal.layers.quantization.moe import ExpertSchemes
@@ -51,6 +53,7 @@ from offload_harness import (
     build_cache,
     checkpoint_rules,
     entry_bytes,
+    expected_code_rows,
     moe_layout,
     read_state,
     weight_rules,
@@ -90,6 +93,9 @@ class Case:
     is_per_expert: bool = False
     # The victim cache's budget in entries of the widest layer (0: none).
     victim_cache_entries: int = 0
+    # Read from an expert pack of the checkpoint, with pair codes.
+    is_packed: bool = False
+    has_pair_codes: bool = False
 
     @property
     def spec(self) -> CheckpointSpec:
@@ -112,10 +118,11 @@ class Case:
         overlap = f"-{self.buffer_placement}" if self.prefill_overlap else ""
         per_expert = "-per-expert" if self.is_per_expert else ""
         victims = f"-V{self.victim_cache_entries}" if self.victim_cache_entries else ""
+        packed = "-coded" if self.has_pair_codes else "-packed" if self.is_packed else ""
         return (
             f"{self.naming}-L{self.num_layers}-E{self.num_experts}-H{self.hidden_size}"
             f"-I{self.intermediate_size}-S{self.cache_size}-{self.grouping}{overlap}-{scheme}"
-            f"{per_expert}{victims}"
+            f"{per_expert}{victims}{packed}"
         )
 
 
@@ -361,6 +368,57 @@ CASES = [
 ]
 
 
+# The same from an expert pack: decode misses, overlap prefills, bf16, an expert of 6.75 MiB (one
+# record a read), gate and up apart, pools of two layouts (two record strides), one tensor per
+# expert, a victim cache.
+CASES += [
+    replace(case, is_packed=True)
+    for case in (CASES[0], CASES[1], CASES[2], CASES[3], CASES[4], CASES[7], CASES[10], CASES[13])
+]
+# Pair codes: hidden 256 and intermediate 128 in groups of 64 (512 codes per projection part,
+# whole lines in any width; 4 experts, a few thousand pairs), on decode misses, overlap prefills
+# in Gemma4 names, gate and up apart, pools of two layouts with the buffers over them, a victim
+# cache; hidden 192 (192 codes per part: whole lines in 8 or 16 bits, so 16 for its pairs); and
+# the 6.75 MiB expert.
+CODED_SCRIPT: tuple[Step | Prefill, ...] = (
+    ((0, (0, 1)), (1, (3,)), (2, (1, 2))),
+    ((0, (2, 3)), (1, (0, 1, 2)), (2, (3, 0))),
+    ((1, (3, 1)), (2, (1, 2))),
+)
+CASES += [
+    Case(3, 4, 256, 128, 8, False, script=CODED_SCRIPT, is_packed=True, has_pair_codes=True),
+    replace(CASES[1], hidden_size=256, is_packed=True, has_pair_codes=True),
+    replace(CASES[5], hidden_size=256, intermediate_size=128, is_packed=True, has_pair_codes=True),
+    Case(
+        3,
+        4,
+        256,
+        128,
+        10,
+        True,
+        script=(((0, (0, 1)), (2, (1, 2, 3))), Prefill((0, 1, 2)), ((0, (2, 3)), (2, (0, 1)))),
+        last_layer_bits=8,
+        grouping="unified",
+        is_packed=True,
+        has_pair_codes=True,
+    ),
+    Case(
+        3,
+        4,
+        256,
+        128,
+        8,
+        False,
+        script=CODED_SCRIPT,
+        victim_cache_entries=3,
+        is_packed=True,
+        has_pair_codes=True,
+    ),
+    replace(CASES[0], is_packed=True, has_pair_codes=True),
+    replace(CASES[3], is_packed=True, has_pair_codes=True),
+]
+
+
 def build(directory: Path, case: Case) -> tuple[OffloadMoeCache, dict[str, mx.array], ExpertSource]:
     """The cache over the case's checkpoint, the fused reference state and the source."""
     cache, source = build_cache(
@@ -371,6 +429,8 @@ def build(directory: Path, case: Case) -> tuple[OffloadMoeCache, dict[str, mx.ar
         grouping=case.grouping,
         buffer_placement=case.buffer_placement,
         victim_cache_bytes=case.victim_cache_entries * entry_bytes(case.spec),
+        is_packed=case.is_packed,
+        with_pair_codes=case.has_pair_codes,
     )
     reference = apply_rules(read_state(directory, case.spec)[0], checkpoint_rules(case.spec))
     return cache, reference, source
@@ -402,8 +462,17 @@ def expected_rows(
         experts = f"{prefixes[layer_id]}.experts"
         layer_rows = {}
         for role in layout:
-            bank = reference[f"{experts}.{role}"]
-            layer_rows[role] = np.array(bank.view(mx.uint8)).reshape(bank.shape[0], -1)
+            projection, _, array = role.rpartition(".")
+            if array == "codes":
+                assert cache.pairs is not None, "code rows come with pair tables"
+                layer_rows[role] = expected_code_rows(
+                    reference[f"{experts}.{projection}.scales"],
+                    reference[f"{experts}.{projection}.biases"],
+                    cache.pairs[layer_id],
+                )
+            else:
+                bank = reference[f"{experts}.{role}"]
+                layer_rows[role] = np.array(bank.view(mx.uint8)).reshape(bank.shape[0], -1)
         rows[layer_id] = layer_rows
     return rows
 
@@ -438,7 +507,12 @@ def test_rows_match_checkpoint(tmp_path: Path, case: Case) -> None:
     expected = expected_rows(cache, reference, source.layer_prefixes)
     layouts = [cache.slot_layout.pools[pool].layout for pool in cache.layer_pools]
     locations = source.segment_table(layouts)[1]
-    assert (locations[..., 1] % 4096 != 0).any(), "all aligned"
+    assert (cache.pairs is not None) == case.has_pair_codes
+    if case.is_packed:
+        stored = locations[..., 0] != _C.FILL_FILE
+        assert (locations[..., 0][stored] == len(source.files) - 1).all(), "not all from the pack"
+    else:
+        assert (locations[..., 1] % 4096 != 0).any(), "all aligned"
     cache.fill_initial()
     rows = resident_rows(cache)
     assert len(rows) == sum(pool.num_slots for pool in cache.slot_layout.pools)
@@ -498,6 +572,12 @@ def test_rows_match_checkpoint(tmp_path: Path, case: Case) -> None:
     calls = [call for entry in case.script if not isinstance(entry, Prefill) for call in entry]
     assert sum(stats.hits) + sum(stats.misses) == sum(len(expert_ids) for _, expert_ids in calls)
     assert sum(stats.requests) == calls_with_misses
+    if case.is_packed:
+        # Whole records, read in runs and never around: the records' bytes alone.
+        for layer_id, roles in enumerate(source.parts):
+            part = next(iter(roles.values()))[0]
+            stride = int(part.locations[1, 1] - part.locations[0, 1])
+            assert stats.bytes_read[layer_id] == stats.experts_read[layer_id] * stride, layer_id
     copied = sum(stats.victim_hits) + sum(stats.victim_buffer_hits)
     assert sum(stats.experts_read) + copied == sum(stats.misses) + buffered
     assert (copied > 0) == (case.victim_cache_entries > 0)
@@ -802,6 +882,7 @@ def test_real_checkpoint_rows() -> None:
         prefill_overlap=False,
         prefill_overlap_min_tokens=128,
         victim_cache_bytes=0,
+        pairs=None,
     )
     if is_apart:
         apart = {f"{prefix}.experts.gate_up_proj" for prefix in source.layer_prefixes}

@@ -68,6 +68,7 @@ class OffloadMoeCache:
         prefill_overlap_min_tokens: int,
         expert_counts: np.ndarray | None = None,
         victim_cache_bytes: int,
+        pairs: list[mx.array] | None,
         stall_timeout_s: float = STALL_TIMEOUT_S,
         run_coordinator: bool = True,
     ) -> None:
@@ -75,7 +76,8 @@ class OffloadMoeCache:
         then a prefill of prefill_overlap_min_tokens or more reads its layers ahead;
         expert_counts int64 [num_layers, num_experts], the hot-expert table it was planned
         with (None: none), picks the experts the pools start with; victim_cache_bytes is the
-        host victim cache's budget, split over the pools by their slots' bytes (0: none).
+        host victim cache's budget, split over the pools by their slots' bytes (0: none); pairs:
+        each layer's pair table when the layouts hold pair codes (an expert pack's), else None.
         Without run_coordinator nobody answers the lookups (a stalled coordinator, for
         tests); the watchdog fails a request unanswered for stall_timeout_s."""
         self.slot_layout = slot_layout
@@ -91,6 +93,7 @@ class OffloadMoeCache:
         self.cache_size = slot_layout.num_slots
         self.prefill_overlap = prefill_overlap
         self.prefill_overlap_min_tokens = prefill_overlap_min_tokens
+        self.pairs = pairs
         pools = slot_layout.pools
         layouts = [pools[pool_id].layout for pool_id in self.layer_pools]
         widths = slot_layout.bank_widths
@@ -105,7 +108,12 @@ class OffloadMoeCache:
         self.mailbox = mx.zeros((_C.MAILBOX_WORDS,), dtype=mx.uint32)
         self.hit_stats = mx.zeros((num_layers, 2), dtype=mx.uint32)
         mx.eval(
-            list(self.banks.values()), self.slot_of, self.last_use, self.mailbox, self.hit_stats
+            list(self.banks.values()),
+            self.slot_of,
+            self.last_use,
+            self.mailbox,
+            self.hit_stats,
+            self.pairs or [],
         )
         # Each pool's rows in its layout, views of the banks.
         self.pool_banks = [
@@ -184,8 +192,12 @@ class OffloadMoeCache:
 
     def layer_banks(self, layer_id: int) -> dict[str, mx.array]:
         """Role -> the [num_slots, ...] rows of the layer's pool, which its lookups' slots
-        index."""
-        return self.pool_banks[self.layer_pools[layer_id]]
+        index, and its layer_pairs."""
+        return {**self.pool_banks[self.layer_pools[layer_id]], **self.layer_pairs(layer_id)}
+
+    def layer_pairs(self, layer_id: int) -> dict[str, mx.array]:
+        """pairs -> the layer's pair table [pairs, 2] when its rows hold pair codes, else none."""
+        return {} if self.pairs is None else {"pairs": self.pairs[layer_id]}
 
     def prepare(self, batch: Batch) -> None:
         """Choose the forward's mode and start its first step; before the model builds it. A
@@ -304,8 +316,9 @@ class OffloadMoeCache:
         self.service.wait_prefill_layer(layer_id)
 
     def graph_externals(self) -> list[mx.array]:
-        """The banks and slot_of: a graph binds them in place, the CPU writes them."""
-        return [*self.banks.values(), self.slot_of]
+        """The banks and slot_of, which a graph binds in place and the CPU writes, and any pair
+        tables."""
+        return [*self.banks.values(), self.slot_of, *(self.pairs or [])]
 
     def table_arrays(self) -> list[mx.array]:
         """mailbox, last_use and hit_stats: the lookups update them in place, so a graph

@@ -11,7 +11,9 @@ A method reads its experts from resident banks (apply), from an offload pool's s
 like the layout (apply_slots), and from an offload cache's raw byte banks at each expert's byte
 offsets (apply_sorted, on the expert-sorted kernels); a resident array (an export's
 output_scale, FreeToken's resident BankSpec) stays the layer's and is indexed by expert in all
-three.
+three. An offload pool's affine rows may hold pair codes (an expert pack's, moe/pack.py) in place
+of their scales and biases, which the pair-code kernels look up in the layer's pair table of
+2^code_bits rows.
 """
 
 from __future__ import annotations
@@ -24,7 +26,13 @@ from typing import Literal, Protocol
 import mlx.core as mx
 from mlx.utils import tree_unflatten
 
-from ftmetal.kernel.moe.gather_sorted import FLOAT_INPUT_TILE, gather_mm_sorted, gather_qmm_sorted
+from ftmetal.kernel.moe.affine.affine_gather_qmv_pair_codes import affine_gather_qmv_pair_codes
+from ftmetal.kernel.moe.gather_sorted import (
+    FLOAT_INPUT_TILE,
+    gather_mm_sorted,
+    gather_qmm_sorted,
+    gather_qmm_sorted_pair_codes,
+)
 from ftmetal.kernel.moe.moe_align import ExpertAlignment, moe_align, moe_combine
 from ftmetal.layers.activation import gelu_tanh_and_mul, silu_and_mul
 from ftmetal.layers.base import BaseOP
@@ -305,18 +313,32 @@ class AffineMoEMethod(UnquantizedMoEMethod):
             return super().gather(projection, banks, x, indices, sorted_indices)
         else:
             assert isinstance(scheme, AffineScheme), f"{projection} is not affine quantized"
-            return mx.gather_qmm(
-                x,
-                banks[f"{projection}.weight"],
-                banks[f"{projection}.scales"],
-                banks[f"{projection}.biases"],
-                rhs_indices=indices,
-                transpose=True,
-                group_size=scheme.group_size,
-                bits=scheme.bits,
-                mode="affine",
-                sorted_indices=sorted_indices,
-            )
+            if f"{projection}.codes" in banks:
+                assert not sorted_indices, "pair codes are an offload pool's rows, gathered by slot"
+                pairs = banks["pairs"]
+                return affine_gather_qmv_pair_codes(
+                    x,
+                    banks[f"{projection}.weight"],
+                    banks[f"{projection}.codes"],
+                    pairs,
+                    indices,
+                    group_size=scheme.group_size,
+                    bits=scheme.bits,
+                    code_bits=pairs.shape[0].bit_length() - 1,
+                )
+            else:
+                return mx.gather_qmm(
+                    x,
+                    banks[f"{projection}.weight"],
+                    banks[f"{projection}.scales"],
+                    banks[f"{projection}.biases"],
+                    rhs_indices=indices,
+                    transpose=True,
+                    group_size=scheme.group_size,
+                    bits=scheme.bits,
+                    mode="affine",
+                    sorted_indices=sorted_indices,
+                )
 
     def gather_sorted(
         self,
@@ -331,18 +353,33 @@ class AffineMoEMethod(UnquantizedMoEMethod):
             return super().gather_sorted(projection, banks, x, expert_offsets, expert_bytes)
         else:
             assert isinstance(scheme, AffineScheme), f"{projection} is not affine quantized"
-            return gather_qmm_sorted(
-                x,
-                banks[f"{projection}.weight"],
-                banks[f"{projection}.scales"],
-                banks[f"{projection}.biases"],
-                expert_offsets,
-                expert_bytes,
-                n=output_size,
-                group_size=scheme.group_size,
-                bits=scheme.bits,
-                mode="affine",
-            )
+            if f"{projection}.codes" in banks:
+                pairs = banks["pairs"]
+                return gather_qmm_sorted_pair_codes(
+                    x,
+                    banks[f"{projection}.weight"],
+                    banks[f"{projection}.codes"],
+                    pairs,
+                    expert_offsets,
+                    expert_bytes,
+                    n=output_size,
+                    group_size=scheme.group_size,
+                    bits=scheme.bits,
+                    code_bits=pairs.shape[0].bit_length() - 1,
+                )
+            else:
+                return gather_qmm_sorted(
+                    x,
+                    banks[f"{projection}.weight"],
+                    banks[f"{projection}.scales"],
+                    banks[f"{projection}.biases"],
+                    expert_offsets,
+                    expert_bytes,
+                    n=output_size,
+                    group_size=scheme.group_size,
+                    bits=scheme.bits,
+                    mode="affine",
+                )
 
 
 class FpBlockMoEMethod(UnquantizedMoEMethod):

@@ -120,7 +120,7 @@ class OffloadMoELayer(MoELayer):
             cache.begin_prefill_forward()
         mx.async_eval(hidden_states, topk_weights, topk_ids)
         expert_bytes = cache.expert_bytes(self.moe_layer_id)
-        banks = {**cache.banks, **resident}
+        banks = {**cache.banks, **cache.layer_pairs(self.moe_layer_id), **resident}
         out = self.quant_method.apply_sorted(
             banks, hidden_states, topk_weights, topk_ids, expert_bytes
         )
