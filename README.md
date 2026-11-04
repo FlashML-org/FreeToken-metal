@@ -25,6 +25,7 @@ uv run ftm serve --model /path/to/Qwen3.6-35B-A3B-MLX      # OpenAI API on 127.0
 uv run ftm serve --model /path/to/model --port 8000 --max-running-requests 8 --max-seq-len 65536
 uv run ftm shell                                            # chat with the running server
 uv run ftm shell --server http://127.0.0.1:8000             # or FTMETAL_HOST=http://...
+uv run ftm pack --model /path/to/Qwen3.6-35B-A3B-MLX       # expert pack for MoE offload
 ```
 
 `ftm serve` exposes FreeToken's routes: the OpenAI `POST /v1/chat/completions` (streamed
@@ -57,6 +58,11 @@ them from an offload cache that reads them from the checkpoint on demand
 `--kv-reserve-tokens` first and the experts the rest), `--disable-moe-prefill-overlap`
 stops long prefills from reading each layer's experts ahead, and `--memory-ratio` sets the
 budget as a fraction of Metal's recommended working set, which also emulates a smaller Mac.
+`ftm pack --model DIR` writes `DIR/experts.packed`, each routed expert as one record (an
+affine checkpoint's scales and biases as codes into a per-layer table of their pairs), which
+the offload cache then reads instead of the checkpoint: one read per expert, and smaller
+affine slots, which `--moe-cache-auto` turns into more of them. A pack the checkpoint has
+changed under is passed over with a warning; `FTMETAL_MOE_PACK=0` ignores it.
 
 ```bash
 FTMETAL_TEST_MODEL_PATH=/path/to/Qwen3.6-35B-A3B-MLX uv run pytest tests/server tests/test_tokenizer.py -q
