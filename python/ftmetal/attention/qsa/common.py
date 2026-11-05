@@ -149,21 +149,24 @@ class QSAAttnBackend(FullAttnBackend):
         # Raw keys first: a block closing at a query pools the keys of its window's slots.
         pool.store_index_keys(index.keys, batch.out_loc, layer_id)
         pooled = self.window_mean(pool.index_cache(layer_id), metadata.window_slots)
-        positions = batch.positions
-        rope_positions = batch.get_attn_positions()
-        if rope_positions.ndim == 1:
-            starts = mx.maximum(positions - (self.block_size - 1), 0)
-        elif metadata.block_starts is None:
-            # A block's first token is its window's first slot, and an earlier forward may
-            # have written it: the forward's tokens keep their 3-axis positions at their slots.
-            pool.store_rope_positions(rope_positions, batch.out_loc)
-            assert pool.rope_positions is not None
-            starts = pool.rope_positions[metadata.window_slots[:, 0]].T
-            metadata.block_starts = starts
-        else:
-            starts = metadata.block_starts
-        closing = (positions % self.block_size == self.block_size - 1)[:, None]
-        stored = mx.where(closing, index.block_key_norm(pooled, starts), index.keys)
+        if metadata.block_starts is None or metadata.block_closing is None:
+            positions = batch.positions
+            rope_positions = batch.get_attn_positions()
+            if rope_positions.ndim == 1:
+                metadata.block_starts = mx.maximum(positions - (self.block_size - 1), 0)
+            else:
+                # A block's first token is its window's first slot, and an earlier forward may
+                # have written it: the forward's tokens keep their 3-axis positions at their
+                # slots.
+                pool.store_rope_positions(rope_positions, batch.out_loc)
+                assert pool.rope_positions is not None
+                metadata.block_starts = pool.rope_positions[metadata.window_slots[:, 0]].T
+            metadata.block_closing = (positions % self.block_size == self.block_size - 1)[:, None]
+        stored = mx.where(
+            metadata.block_closing,
+            index.block_key_norm(pooled, metadata.block_starts),
+            index.keys,
+        )
         pool.store_index_keys(stored, batch.out_loc, layer_id)
         if metadata.max_seqlen_q == 1:
             return self.sparse_decode(q, index.queries, layer_id, metadata)

@@ -18,13 +18,16 @@ from pathlib import Path
 
 import mlx.core as mx
 
-from ftmetal.kernel._ext import metal_source
+from ftmetal.kernel._ext import metal_kernel_header, metal_source
 from ftmetal.kernel.custom import metal_kernel
 
 SCORE_SIMDGROUPS = 8
 # Each simdgroup scores this many consecutive blocks: their page-table and key loads issue
 # together and the queries are read once.
 BLOCKS_PER_SIMDGROUP = 4
+# Score threadgroups per request at most (eight per M4 Pro GPU core; PR #3's SCORE_THREADGROUPS):
+# wider rows loop.
+SCORE_THREADGROUPS = 160
 # One threadgroup per request, the largest Metal allows.
 TOPK_THREADS = 1024
 
@@ -52,6 +55,7 @@ TOPK_KERNEL = metal_kernel(
     input_names=["scores", "seq_lens", "num_blocks_in"],
     output_names=["selected"],
     source=TOPK_SOURCE,
+    header=metal_kernel_header(Path(__file__).with_name("qsa_indexer_topk.h")),
 )
 
 TABLE_SOURCE = metal_source(Path(__file__).with_name("qsa_indexer_key_table.metal"))
@@ -91,7 +95,7 @@ def qsa_block_scores(
     bs, heads, head_dim = queries.shape
     assert head_dim % 32 == 0 and index_keys.shape[1] == head_dim
     blocks_per_threadgroup = SCORE_SIMDGROUPS * BLOCKS_PER_SIMDGROUP
-    num_threadgroups = -(-num_blocks // blocks_per_threadgroup)
+    num_threadgroups = min(-(-num_blocks // blocks_per_threadgroup), SCORE_THREADGROUPS)
     (scores,) = SCORES_KERNEL(
         inputs=[queries, index_keys, page_table, seq_lens, page_size, num_blocks, head_dim**-0.5],
         template=[
@@ -123,7 +127,6 @@ def qsa_topk(scores: mx.array, seq_lens: mx.array, topk: int, block_size: int) -
             ("TOPK", topk),
             ("BLOCK_SIZE", block_size),
             ("THREADS", TOPK_THREADS),
-            ("PER_THREAD", max(1, -(-num_blocks // TOPK_THREADS))),
         ],
         grid=(TOPK_THREADS, bs, 1),
         threadgroup=(TOPK_THREADS, 1, 1),

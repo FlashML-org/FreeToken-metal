@@ -1,10 +1,10 @@
-// One threadgroup per request, thread t holding the order-preserving uint keys of blocks
-// [t * per, t * per + per) in registers. Four 8-bit radix passes find the topk-th largest key:
-// each counts the candidates' digits with one atomic add per (simdgroup, distinct digit), a
-// capped loop retiring the lanes that share the lowest pending lane's digit each round, and
-// simdgroup 0 finds the digit by a prefix sum over the bins, highest first. The blocks above
-// that key, then its ties lowest index first, are written in index order.
-
+// One threadgroup of THREADS per request (PR #3's qsa_topk_bisect): the topk-th largest of the
+// complete blocks' order-preserving uint keys from a 4096-bin histogram of their high 12 bits,
+// then a bisection of the low 20 bits over the threshold bin's keys (gathered in threadgroup
+// memory, or re-read when more than 4096 share the bin): three passes over the row. The blocks
+// above that key, then its ties lowest index first, are written in index order. Keys:
+// score_order_key (qsa_indexer_topk.h).
+static_assert(THREADS * 4 == 4096, "each thread sums four histogram bins");
 const uint row = threadgroup_position_in_grid.y;
 const uint tid = thread_position_in_threadgroup.x;
 const uint lane = thread_index_in_simdgroup;
@@ -18,110 +18,160 @@ if (complete <= uint(TOPK)) {
   }
   return;
 }
+// auto: MLX binds an input of under 8 elements as constant, not device.
 auto row_scores = scores + row * num_blocks;
+// The histogram, then (once the threshold bin is known) that bin's keys.
+threadgroup atomic_uint bins[4096];
+threadgroup uint sums[THREADS / 32];
+threadgroup uint shared_state[3];
+for (uint b = tid; b < 4096; b += THREADS) {
+  atomic_store_explicit(&bins[b], 0u, memory_order_relaxed);
+}
+if (tid == 0) {
+  shared_state[2] = 0;
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+for (uint i = tid; i < complete; i += THREADS) {
+  const uint key = score_order_key(row_scores[i]);
+  atomic_fetch_add_explicit(&bins[key >> 20], 1u, memory_order_relaxed);
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+// Thread t holds bins 4095 - 4 t .. 4092 - 4 t, highest first.
+uint counts[4];
+uint total = 0;
+for (uint j = 0; j < 4; ++j) {
+  counts[j] = atomic_load_explicit(&bins[4095u - 4u * tid - j], memory_order_relaxed);
+  total += counts[j];
+}
+uint above = simd_prefix_exclusive_sum(total);
+if (lane == 31) {
+  sums[simdgroup] = above + total;
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+for (uint g = 0; g < simdgroup; ++g) {
+  above += sums[g];
+}
+if (above < uint(TOPK) && uint(TOPK) <= above + total) {
+  for (uint j = 0; j < 4; ++j) {
+    if (above + counts[j] >= uint(TOPK)) {
+      shared_state[0] = 4095u - 4u * tid - j;
+      shared_state[1] = uint(TOPK) - above;
+      break;
+    }
+    above += counts[j];
+  }
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+const uint bin = shared_state[0];
+const uint need = shared_state[1];
+threadgroup uint* candidates = reinterpret_cast<threadgroup uint*>(bins);
+for (uint i = tid; i < complete; i += THREADS) {
+  const uint key = score_order_key(row_scores[i]);
+  if ((key >> 20) == bin) {
+    const uint slot = atomic_fetch_add_explicit(
+        reinterpret_cast<threadgroup atomic_uint*>(&shared_state[2]), 1u, memory_order_relaxed);
+    if (slot < 4096u) {
+      candidates[slot] = key;
+    }
+  }
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+const uint num_candidates = shared_state[2];
+// The need-th largest key of the bin: the largest prefix with at least need keys at or above.
+uint prefix = bin << 20;
+if (num_candidates <= 4096u) {
+  if (simdgroup == 0) {
+    for (int bit = 19; bit >= 0; --bit) {
+      const uint candidate = prefix | (1u << bit);
+      uint at_least = 0;
+      for (uint c = lane; c < num_candidates; c += 32) {
+        at_least += candidates[c] >= candidate;
+      }
+      if (simd_sum(at_least) >= need) {
+        prefix = candidate;
+      }
+    }
+    if (lane == 0) {
+      shared_state[0] = prefix;
+    }
+  }
+} else {
+  threadgroup uint partial[2][THREADS / 32];
+  for (int bit = 19; bit >= 0; --bit) {
+    const uint candidate = prefix | (1u << bit);
+    uint at_least = 0;
+    for (uint i = tid; i < complete; i += THREADS) {
+      const uint key = score_order_key(row_scores[i]);
+      at_least += (key >> 20) == bin && key >= candidate;
+    }
+    at_least = simd_sum(at_least);
+    if (lane == 0) {
+      partial[bit & 1][simdgroup] = at_least;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint count = 0;
+    for (uint g = 0; g < THREADS / 32; ++g) {
+      count += partial[bit & 1][g];
+    }
+    if (count >= need) {
+      prefix = candidate;
+    }
+  }
+  if (tid == 0) {
+    shared_state[0] = prefix;
+  }
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+prefix = shared_state[0];
+// prefix is the k-th largest key; ties equal to it are taken, lowest index first, each
+// thread over a contiguous range so the selection comes out ascending.
 const uint per = (complete + THREADS - 1) / THREADS;
 const uint begin = metal::min(tid * per, complete);
-const uint count = metal::min(begin + per, complete) - begin;
-uint keys[PER_THREAD];
-for (uint j = 0; j < uint(PER_THREAD); ++j) {
-  const uint bits = j < count ? as_type<uint>(row_scores[begin + j]) : 0u;
-  keys[j] = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
-}
-threadgroup atomic_uint histogram[256];
-threadgroup uint shared_state[2];
-uint prefix = 0;
-uint mask = 0;
-uint remaining = TOPK;
-for (int shift = 24; shift >= 0; shift -= 8) {
-  for (uint b = tid; b < 256; b += THREADS) {
-    atomic_store_explicit(&histogram[b], 0u, memory_order_relaxed);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint j = 0; j < uint(PER_THREAD); ++j) {
-    bool pending = j < count && (keys[j] & mask) == prefix;
-    const uint bin = (keys[j] >> shift) & 255u;
-    for (uint round = 0; round < 32; ++round) {
-      const uint votes = uint(ulong(simd_ballot(pending)));
-      if (votes == 0) {
-        break;
-      }
-      const uint leader = ctz(votes);
-      const uint leader_bin = simd_shuffle(bin, ushort(leader));
-      const bool same = pending && bin == leader_bin;
-      const uint same_votes = uint(ulong(simd_ballot(same)));
-      if (lane == leader) {
-        atomic_fetch_add_explicit(
-            &histogram[leader_bin], popcount(same_votes), memory_order_relaxed);
-      }
-      pending = pending && !same;
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (simdgroup == 0) {
-    // Lane l holds bins 255 - 8 l .. 248 - 8 l, highest first.
-    uint counts[8];
-    uint total = 0;
-    for (uint k = 0; k < 8; ++k) {
-      counts[k] = atomic_load_explicit(&histogram[255u - 8u * lane - k], memory_order_relaxed);
-      total += counts[k];
-    }
-    uint above = simd_prefix_exclusive_sum(total);
-    if (above < remaining && remaining <= above + total) {
-      uint bin = 255u - 8u * lane;
-      for (uint k = 0; k < 8; ++k) {
-        if (above + counts[k] >= remaining) {
-          bin = 255u - 8u * lane - k;
-          break;
-        }
-        above += counts[k];
-      }
-      shared_state[0] = bin;
-      shared_state[1] = remaining - above;
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  prefix |= shared_state[0] << shift;
-  mask |= 255u << shift;
-  remaining = shared_state[1];
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-}
-// prefix is the topk-th largest key; the first remaining keys equal to it are taken.
+const uint end = metal::min(begin + per, complete);
 uint greater = 0;
 uint equal = 0;
-for (uint j = 0; j < uint(PER_THREAD); ++j) {
-  greater += j < count && keys[j] > prefix;
-  equal += j < count && keys[j] == prefix;
+for (uint i = begin; i < end; ++i) {
+  const uint key = score_order_key(row_scores[i]);
+  greater += key > prefix;
+  equal += key == prefix;
 }
-threadgroup uint sums[THREADS / 32];
-// Exclusive prefix sums over the threads, in index order.
-uint equal_before = simd_prefix_exclusive_sum(equal);
+threadgroup uint greater_sums[THREADS / 32];
+const uint simd_greater = simd_sum(greater);
+uint eq_before = simd_prefix_exclusive_sum(equal);
 if (lane == 31) {
-  sums[simdgroup] = equal_before + equal;
+  sums[simdgroup] = eq_before + equal;
+}
+if (lane == 0) {
+  greater_sums[simdgroup] = simd_greater;
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
-for (uint j = 0; j < simdgroup; ++j) {
-  equal_before += sums[j];
+uint remaining = uint(TOPK);
+for (uint g = 0; g < THREADS / 32; ++g) {
+  remaining -= greater_sums[g];
+}
+for (uint g = 0; g < simdgroup; ++g) {
+  eq_before += sums[g];
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
-const uint ties =
-    equal_before >= remaining ? 0 : metal::min(equal, remaining - equal_before);
+const uint ties = eq_before >= remaining ? 0 : metal::min(equal, remaining - eq_before);
 const uint mine = greater + ties;
 uint before = simd_prefix_exclusive_sum(mine);
 if (lane == 31) {
   sums[simdgroup] = before + mine;
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
-for (uint j = 0; j < simdgroup; ++j) {
-  before += sums[j];
+for (uint g = 0; g < simdgroup; ++g) {
+  before += sums[g];
 }
 uint taken_ties = 0;
-for (uint j = 0; j < uint(PER_THREAD); ++j) {
-  bool take = j < count && keys[j] > prefix;
-  if (j < count && keys[j] == prefix && taken_ties < ties) {
+for (uint i = begin; i < end; ++i) {
+  const uint key = score_order_key(row_scores[i]);
+  bool take = key > prefix;
+  if (key == prefix && taken_ties < ties) {
     take = true;
     ++taken_ties;
   }
   if (take) {
-    out[before++] = int(begin + j);
+    out[before++] = int(i);
   }
 }

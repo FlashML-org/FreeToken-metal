@@ -63,9 +63,11 @@ class FullAttnMetadata(BaseAttnMetadata):
     # QSA, int32 [num_tokens, block_size]: the token slots of the block window ending at each
     # query, positions p - block_size + 1 .. p clamped at 0.
     window_slots: mx.array | None = None
-    # QSA under the 3-axis rope, int32 [3, num_tokens]: each window's first token's position,
-    # read back from the pool by the forward's first QSA layer for the others.
+    # QSA, set by the forward's first QSA layer for the others: each window's first token's
+    # position, int32 [num_tokens] ([3, num_tokens] under the 3-axis rope, read back from the
+    # pool), and whether each query closes its block, bool [num_tokens, 1].
     block_starts: mx.array | None = None
+    block_closing: mx.array | None = None
 
     def get_last_indices(self, bs: int) -> mx.array:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
