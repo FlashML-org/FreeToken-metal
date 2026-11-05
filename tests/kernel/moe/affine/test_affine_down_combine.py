@@ -12,7 +12,8 @@ test models' (tests/tiny_model.py: hidden 64, width 96 or 256, group 32, top 2-4
 tests/offload_harness.py: hidden 128 / 192 / 256 / 2048, width 64 / 128 / 2048, group 64), bits
 2-6 and 8, each dtype, plain scales and pair codes of 13 and 16 bits, with and without the shared
 expert; top_k 1 and 12; routing weights of -0.0, whose products sum to +0 in MLX. Pair codes off
-the fast step take the gathered rows' combine, also at top_k 1 and on -0.0 weights.
+the fast step whose last part-block is not split over both lane halves (a tail over half a block,
+or FTMETAL_QMV_HALF_REM=0) take the gathered rows' combine, also at top_k 1 and on -0.0 weights.
 """
 
 from __future__ import annotations
@@ -92,9 +93,10 @@ CASES = [
     # -0.0 routing weights: the products are signed zeros MLX's sum turns into +0.
     Case(3, 8, 256, 512, weights="negative_zero", has_shared=False),
     Case(2, 4, 64, 96, group_size=32, weights="negative_zero", num_slots=4),
-    # Pair codes off the fast step, gathered then combined: one expert, -0.0 weights.
+    # Pair codes off the fast step: one expert, -0.0 weights; a tail of 192 (gathered).
     Case(3, 1, 64, 96, group_size=32, code_bits=13, num_slots=4),
     Case(2, 4, 64, 96, group_size=32, code_bits=13, weights="negative_zero", num_slots=4),
+    Case(2, 8, 256, 704, group_size=32, code_bits=13),
 ]
 
 

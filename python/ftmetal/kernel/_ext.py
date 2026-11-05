@@ -16,12 +16,19 @@ if version("mlx") != REQUIRED_MLX_VERSION:
 # mlx.core must be imported first: _C resolves libmlx symbols from the loaded module.
 import mlx.core  # noqa: E402  (import order is the loading contract)
 
+from ftmetal.env import read_env  # noqa: E402
 from ftmetal.kernel import _C  # noqa: E402
 
 # Runtime Metal compilation has no include path, so a source gets the headers it includes
 # inlined: mlx/... from the mlx wheel, any other path from this package (relative to kernel/).
 MLX_INCLUDE_DIR = Path(mlx.core.__file__).parent / "include"
 INCLUDE_PATTERN = re.compile(r'^#include "([^"]+)"$|^#pragma once$', re.MULTILINE)
+# Compile-time switches of shared headers, from the environment, defined just before the header is
+# inlined. FTMETAL_QMV_HALF_REM=0: affine_slot_qmv.h's matvec off MLX's fast step runs its last
+# part-block on the lower lanes alone, as MLX's qmv_impl does, instead of on both halves.
+HEADER_DEFINES = {
+    "moe/affine/affine_slot_qmv.h": {"QMV_HALF_REM": int(read_env("QMV_HALF_REM") != "0")},
+}
 
 
 def inline_headers(source: str, included: set[str]) -> str:
@@ -34,7 +41,9 @@ def inline_headers(source: str, included: set[str]) -> str:
         else:
             included.add(header)
             root = MLX_INCLUDE_DIR if header.startswith("mlx/") else KERNEL_DIR
-            return inline_headers((root / header).read_text(), included)
+            defines = HEADER_DEFINES.get(header, {})
+            prefix = "".join(f"#define {name} {value}\n" for name, value in defines.items())
+            return prefix + inline_headers((root / header).read_text(), included)
 
     return INCLUDE_PATTERN.sub(inline, source)
 

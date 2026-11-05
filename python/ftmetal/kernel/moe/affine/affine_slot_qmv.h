@@ -13,7 +13,16 @@
 // and the sizes come by value. The rest is MLX's code unchanged.
 // note (jason-fxz): coupled to mlx==0.32.3's quantized.h; re-diff both impls against the new one
 // on any MLX upgrade, the bit-exact tests against mx.gather_qmm are the guard.
+//
+// qmv_rows' last part-block on half the lanes or less (Qwen3.8's down, K 640: 128 values on lanes
+// 0-15) leaves the other half idle; with QMV_HALF_REM (kernel/_ext.py's switch, PR #3's
+// down_combine_gated half_rem) lane l + 16 computes the upper half of the rows on lane l's values
+// and hands them down: every lane adds the same products in the same order.
 #pragma once
+
+#ifndef QMV_HALF_REM
+#define QMV_HALF_REM 1
+#endif
 
 #include "mlx/backend/metal/kernels/steel/gemm/gemm.h"
 #include "mlx/backend/metal/kernels/quantized_utils.h"
@@ -150,19 +159,55 @@ METAL_FUNC void qmv_rows(
     group += block_size / group_size;
     x += block_size;
   }
-  const int remaining = clamp(
-      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
-      0,
-      values_per_thread);
-  if (remaining > 0) {
-    U sum = load_vector_safe<T, U, values_per_thread, bits>(x, x_thread, remaining);
+  constexpr int half_lanes = SIMD_SIZE / 2;
+  if (QMV_HALF_REM && ROWS % 2 == 0 && half_lanes % scale_step_per_thread == 0 &&
+      in_vec_size - k <= block_size / 2) {
+    // Lane l + 16 reads lane l's values (pointers moved back by 16 lanes) for the upper rows.
+    const int upper = simd_lid >= half_lanes;
+    const int lane_shift = upper * half_lanes;
+    const int remaining = clamp(
+        static_cast<int>(in_vec_size - k - (int(simd_lid) - lane_shift) * values_per_thread),
+        0,
+        values_per_thread);
+    U part[ROWS / 2];
+    for (int j = 0; j < ROWS / 2; j++) {
+      part[j] = 0;
+    }
+    if (remaining > 0) {
+      U sum = load_vector_safe<T, U, values_per_thread, bits>(
+          x - lane_shift * values_per_thread, x_thread, remaining);
+      for (int j = 0; j < ROWS / 2; j++) {
+        const int row = upper * (ROWS / 2) + j;
+        auto wl = (const device uint8_t*)(ws - lane_shift * packs_per_thread * bytes_per_pack +
+                                          rows[row] * in_vec_size_w);
+        U s;
+        U b;
+        scales.group(rows[row] * in_vec_size_g + group - lane_shift / scale_step_per_thread, s, b);
+        part[j] = qdot_safe<U, values_per_thread, bits>(wl, x_thread, s, b, sum, remaining);
+      }
+    }
+    for (int j = 0; j < ROWS / 2; j++) {
+      const U upper_part = simd_shuffle_down(part[j], half_lanes);
+      if (!upper && remaining > 0) {
+        result[j] += part[j];
+        result[ROWS / 2 + j] += upper_part;
+      }
+    }
+  } else {
+    const int remaining = clamp(
+        static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
+        0,
+        values_per_thread);
+    if (remaining > 0) {
+      U sum = load_vector_safe<T, U, values_per_thread, bits>(x, x_thread, remaining);
 
-    for (int row = 0; row < ROWS; row++) {
-      auto wl = (const device uint8_t*)(ws + rows[row] * in_vec_size_w);
-      U s;
-      U b;
-      scales.group(rows[row] * in_vec_size_g + group, s, b);
-      result[row] += qdot_safe<U, values_per_thread, bits>(wl, x_thread, s, b, sum, remaining);
+      for (int row = 0; row < ROWS; row++) {
+        auto wl = (const device uint8_t*)(ws + rows[row] * in_vec_size_w);
+        U s;
+        U b;
+        scales.group(rows[row] * in_vec_size_g + group, s, b);
+        result[row] += qdot_safe<U, values_per_thread, bits>(wl, x_thread, s, b, sum, remaining);
+      }
     }
   }
 

@@ -7,8 +7,9 @@ picks), then (y.squeeze(-2) * weights[..., None]).sum(axis=-2) in the dtype, its
 partial sums rounded and ordered as MLX's multiply and column reduction round and order them,
 then, given the shared expert's output and gate logit, layers/activation.py's sigmoid_gated_add.
 The output equals that sequence of ops' bit for bit. One threadgroup per output rows computes every
-pair's rows and combines them, except on pair codes off the fast step (Qwen3.8's down, width 640):
-there affine_gather_qmv_pair_codes gathers the rows and affine_down_combine_gathered combines them.
+pair's rows and combines them, except on pair codes off the fast step whose last part-block
+QMV_HALF_REM does not split (kernel/_ext.py's switch off, or a tail over half a block): there
+affine_gather_qmv_pair_codes gathers the rows and affine_down_combine_gathered combines them.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from pathlib import Path
 
 import mlx.core as mx
 
-from ftmetal.kernel._ext import metal_kernel_header, metal_source
+from ftmetal.kernel._ext import HEADER_DEFINES, metal_kernel_header, metal_source
 from ftmetal.kernel.custom import MetalKernel, TemplateValue, metal_kernel
 from ftmetal.kernel.moe.affine.affine_gather_qmv_pair_codes import (
     GATHER_QMV_FAST_INPUT_STEP,
@@ -34,6 +35,18 @@ ROWS_PER_THREADGROUP = 4
 MAX_TOP_K = 31
 # affine_down_combine_gathered's threads per threadgroup.
 GATHERED_THREADS = 256
+# affine_slot_qmv.h's half-lane split of the off-fast-step last part-block (FTMETAL_QMV_HALF_REM).
+QMV_HALF_REM = bool(HEADER_DEFINES["moe/affine/affine_slot_qmv.h"]["QMV_HALF_REM"])
+# MLX's qmv_impl values per lane per block, by bit width (its pack factor).
+QMV_VALUES_PER_LANE = {2: 16, 3: 8, 4: 8, 5: 8, 6: 4, 8: 4}
+
+
+def splits_last_block(intermediate_size: int, group_size: int, bits: int) -> bool:
+    """Whether affine_slot_qmv.h's qmv_rows runs its last part-block on both lane halves."""
+    values = QMV_VALUES_PER_LANE[bits]
+    block = SIMD_WIDTH * values
+    tail = intermediate_size - (intermediate_size - 1) // block * block
+    return QMV_HALF_REM and (SIMD_WIDTH // 2) % (group_size // values) == 0 and tail <= block // 2
 
 
 SOURCE = metal_source(Path(__file__).with_name("affine_down_combine.metal"))
@@ -150,10 +163,15 @@ def affine_down_combine(
         assert shared.shape == (tokens, hidden_size) and shared_gate.shape == (tokens, 1)
         assert shared.dtype == shared_gate.dtype == act.dtype, (shared.dtype, shared_gate.dtype)
         shared_inputs = [shared, shared_gate]
-    if isinstance(scales, PairCodeScales) and not is_fast:
-        # note (jason-fxz): on this impl one threadgroup over the pairs ran 8-14 % slower than the
-        # gather and a combine pass (Qwen3.8's down: 65 against 59 us at T 1, 423 against 366 at
-        # T 8); plain scales and the fast impl lose nothing.
+    if (
+        isinstance(scales, PairCodeScales)
+        and not is_fast
+        and not splits_last_block(intermediate_size, group_size, bits)
+    ):
+        # note (jason-fxz): on this impl, its last part-block on half the lanes, one threadgroup
+        # over the pairs ran 8-14 % slower than the gather and a combine pass (Qwen3.8's down: 65
+        # against 59 us at T 1, 423 against 366 at T 8); split over both halves it matches the
+        # gather alone (320 against 313 us at T 8). Plain scales and the fast impl lose nothing.
         y = affine_gather_qmv_pair_codes(
             act,
             w,
