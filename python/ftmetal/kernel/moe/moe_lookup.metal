@@ -1,9 +1,11 @@
 // MoeLookup (see moe_lookup.h): one threadgroup of MAX_EXPERTS threads, thread e owning expert e.
 // The real rows' experts are marked in a threadgroup bitmap and looked up in slot_of; when some are
-// absent thread 0 posts them, absent first, waits for the CPU's answer (common/mailbox_wait.h) and
-// their slots are looked up again. Memory the CPU shares is accessed volatile coherent(system),
-// with system-scope fences around the handshake. Buffers: 0 topk_ids, 1 moe_step, 2 slot_of, 3
-// mailbox, 4 last_use, 5 hit_stats, 6 slots, 7 slot_map, 8 params.
+// absent thread 0 posts them, absent first. moe_lookup then waits for the CPU's answer
+// (common/mailbox_wait.h) and looks their slots up again; moe_lookup_issue returns, leaving the
+// pairs it cannot resolve to its request's waiters (common/mailbox.h). Memory the CPU shares is
+// accessed volatile coherent(system), with system-scope fences around the handshake. Buffers: 0
+// topk_ids, 1 moe_step, 2 slot_of, 3 mailbox, 4 last_use, 5 hit_stats, 6 slots, 7 slot_map
+// (moe_lookup) or issued (moe_lookup_issue), 8 params.
 #pragma METAL internals : enable
 #ifndef __METAL_MEMORY_SCOPE_SYSTEM__
 #define __METAL_MEMORY_SCOPE_SYSTEM__ 3
@@ -34,12 +36,15 @@ constant constexpr uint STATE_IDLE = uint(MailboxState::Idle);
 constant constexpr uint STATE_POSTED = uint(MailboxState::Posted);
 constant constexpr uint STATE_SHUTDOWN = uint(MailboxState::Shutdown);
 constant constexpr uint KIND_PROBE = uint(MoeLookupKind::Probe);
+constant constexpr uint ISSUED_SEQUENCE = uint(IssuedWord::Sequence);
+constant constexpr uint ISSUED_NUM_MISSES = uint(IssuedWord::NumMisses);
 constant constexpr uint MAX_EXPERTS = MAX_LOOKUP_EXPERTS;
 
 constant constexpr uint SIMD_WIDTH = 32;
 constant constexpr uint NUM_SIMDGROUPS = MAX_EXPERTS / SIMD_WIDTH;
 
-[[kernel]] void moe_lookup(
+template <bool IS_ISSUE>
+[[kernel]] void lookup_experts(
     device const int* topk_ids [[buffer(0)]],
     device const int* moe_step [[buffer(1)]],
     volatile coherent(system) device const int* slot_of [[buffer(2)]],
@@ -47,7 +52,7 @@ constant constexpr uint NUM_SIMDGROUPS = MAX_EXPERTS / SIMD_WIDTH;
     volatile coherent(system) device uint* last_use [[buffer(4)]],
     device uint* hit_stats [[buffer(5)]],
     device int* slots [[buffer(6)]],
-    device int* slot_map [[buffer(7)]],
+    device int* slot_map_or_issued [[buffer(7)]],
     constant const LookupParams& params [[buffer(8)]],
     uint expert [[thread_position_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -126,6 +131,8 @@ constant constexpr uint NUM_SIMDGROUPS = MAX_EXPERTS / SIMD_WIDTH;
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     if (expert == 0) {
       bool answered = false;
+      uint sequence = 0;
+      bool is_posted = false;
       // After a shutdown, or once a wait gave up, nobody answers: post nothing. The shutdown
       // word, unlike the state, is never overwritten here, so a shutdown racing this post still
       // releases the wait.
@@ -137,33 +144,50 @@ constant constexpr uint NUM_SIMDGROUPS = MAX_EXPERTS / SIMD_WIDTH;
         mailbox[WORD_NUM_IDS] = num_ids;
         mailbox[WORD_NUM_MISSES] = num_misses;
         system_fence();
-        const uint sequence = mailbox[WORD_SEQUENCE] + 1;
+        sequence = mailbox[WORD_SEQUENCE] + 1;
         mailbox[WORD_SEQUENCE] = sequence;
         system_fence();
         mailbox[WORD_STATE] = STATE_POSTED;
-        answered = wait_for_answer(mailbox, sequence);
-        // A wait that gave up leaves the handshake to the CPU, if it is still there.
-        if (mailbox[WORD_ABANDONED] == 0) {
-          mailbox[WORD_STATE] = mailbox[WORD_SHUTDOWN] != 0 ? STATE_SHUTDOWN : STATE_IDLE;
+        is_posted = true;
+        if (IS_ISSUE) {
           system_fence();
+        } else {
+          answered = wait_for_answer(mailbox, sequence);
+          // A wait that gave up leaves the handshake to the CPU, if it is still there.
+          if (mailbox[WORD_ABANDONED] == 0) {
+            mailbox[WORD_STATE] = mailbox[WORD_SHUTDOWN] != 0 ? STATE_SHUTDOWN : STATE_IDLE;
+            system_fence();
+          }
         }
+      }
+      if (IS_ISSUE) {
+        slot_map_or_issued[ISSUED_SEQUENCE] = int(sequence);
+        slot_map_or_issued[ISSUED_NUM_MISSES] = is_posted ? int(num_misses) : 0;
       }
       is_answered = answered;
     }
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     system_fence();
-    if (is_miss) {
+    if (!IS_ISSUE && is_miss) {
       expert_slot[expert] = is_answered ? slot_of[flat_id] : -1;
     }
+  } else if (IS_ISSUE && expert == 0) {
+    slot_map_or_issued[ISSUED_SEQUENCE] = 0;
+    slot_map_or_issued[ISSUED_NUM_MISSES] = 0;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   // Padding rows, unused experts and unanswered misses read the slot of the first real
   // pair: the step already uses it, so no later layer of the step can rewrite it while the
-  // GPU caches may hold it.
+  // GPU caches may hold it. An issued lookup leaves that slot to the waiters while the first
+  // pair's expert is absent.
   const int first_id = num_real_rows > 0 ? topk_ids[0] : -1;
-  const int first_slot = first_id >= 0 && first_id < num_experts ? expert_slot[first_id] : -1;
-  const int fallback_slot = max(first_slot, params.slot_base) - params.slot_base;
+  const bool is_first_valid = first_id >= 0 && first_id < num_experts;
+  const int first_slot = is_first_valid ? expert_slot[first_id] : -1;
+  const bool is_fallback_pending = IS_ISSUE && is_first_valid && first_slot < 0;
+  const int fallback_slot = is_fallback_pending
+      ? PENDING_FALLBACK_SLOT
+      : max(first_slot, params.slot_base) - params.slot_base;
   if (expert == 0 && !is_probe) {
     hit_stats[2 * params.layer_id] += 1;
     hit_stats[2 * params.layer_id + 1] += num_hits;
@@ -172,10 +196,21 @@ constant constexpr uint NUM_SIMDGROUPS = MAX_EXPERTS / SIMD_WIDTH;
     const int id = topk_ids[i];
     const bool is_real = i < num_real_rows * top_k && id >= 0 && id < num_experts;
     const int slot = is_real ? expert_slot[id] : -1;
-    slots[i] = slot >= 0 ? slot - params.slot_base : fallback_slot;
+    if (slot >= 0) {
+      slots[i] = slot - params.slot_base;
+    } else if (IS_ISSUE && is_real) {
+      slots[i] = -1 - id;
+    } else {
+      slots[i] = fallback_slot;
+    }
   }
-  if (int(expert) < num_experts) {
+  if (!IS_ISSUE && int(expert) < num_experts) {
     const int slot = expert_slot[expert];
-    slot_map[expert] = slot >= 0 && is_used ? slot - params.slot_base : fallback_slot;
+    slot_map_or_issued[expert] = slot >= 0 && is_used ? slot - params.slot_base : fallback_slot;
   }
 }
+
+template [[host_name("moe_lookup")]] [[kernel]] decltype(lookup_experts<false>)
+    lookup_experts<false>;
+template [[host_name("moe_lookup_issue")]] [[kernel]] decltype(lookup_experts<true>)
+    lookup_experts<true>;

@@ -17,7 +17,11 @@ the least recently used slot keeps it, a failed read and a layer routing more ex
 pool holds fail their requests, a corrupted sequence is a protocol error, a shutdown releases a
 waiting lookup, also one whose post overwrote the shutdown's refusal, the watchdog fails a
 request nobody answers, and with no CPU to answer at all the lookup gives up past the mailbox's
-spin limit, after which nothing posts.
+spin limit, after which nothing posts. Last moe_lookup_issue, step by step on a filled cache:
+the resident pairs get their slots, an absent expert's pairs -1 - expert, the padding rows the
+first pair's slot or, while it is absent, PENDING_FALLBACK_SLOT; issued names the request, which
+the coordinator answers with the misses' slots in slot_of; a request without misses or real rows
+posts nothing, nor one after the shutdown word.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ import pytest
 
 from ftmetal.command_graph import capture, replay
 from ftmetal.kernel._ext import _C
+from ftmetal.kernel.moe.moe_lookup import moe_lookup_issue
 from ftmetal.moe.offload_cache import STALL_TIMEOUT_S, OffloadMoeCache
 from ftmetal.moe.slot_pools import MoePoolGrouping
 from offload_harness import CheckpointSpec, Naming, ReferenceLru, build_cache, expert_code
@@ -91,7 +96,7 @@ CASES = [
 
 def mailbox_words(cache: OffloadMoeCache) -> npt.NDArray[np.uint32]:
     """A view of the mailbox the GPU and the coordinator share."""
-    return np.asarray(memoryview(cache.mailbox))
+    return np.asarray(memoryview(cache.mailbox)).view(np.uint32)
 
 
 def chain(cache: OffloadMoeCache, case: Case, topk_ids: mx.array, moe_step: mx.array) -> mx.array:
@@ -448,3 +453,101 @@ def test_lookup_gives_up_past_its_spin_limit(tmp_path: Path) -> None:
         cache.check_healthy()
     mx.eval(lookup(cache, [[2, 3]], 1, 2), cache.mailbox)
     assert words[Word.SEQUENCE] == 1
+
+
+@dataclass(frozen=True)
+class IssueStep:
+    """One issued lookup of layer 0 and what it must return: each pair's resident expert, -1 -
+    its absent expert, FIRST for the first pair's slot or PENDING for PENDING_FALLBACK_SLOT; the
+    misses posted (0: none)."""
+
+    topk_ids: list[list[int]]
+    num_real_rows: int
+    expected: list[list[int | str]]
+    num_misses: int
+
+
+FIRST = "first"
+PENDING = "pending"
+# After fill_initial layer 0's pool holds its experts 0-3, expert e in slot 3 - e.
+ISSUE_STEPS = [
+    # Experts 4 and 5 absent; padding rows take the first pair's slot, expert 1's.
+    IssueStep([[1, 4], [2, 5], [6, 7]], 2, [[1, -5], [2, -6], [FIRST, FIRST]], 2),
+    # The first pair's expert absent: the padding row's slot is left to the waiters.
+    IssueStep([[6, 1], [0, 2]], 1, [[-7, 1], [PENDING, PENDING]], 1),
+    # Every expert resident, then no real row: nothing posted.
+    IssueStep([[1, 6]], 1, [[1, 6]], 0),
+    IssueStep([[3, 7], [0, 1]], 0, [[FIRST, FIRST], [FIRST, FIRST]], 0),
+]
+
+
+def issue(cache: OffloadMoeCache, step: IssueStep, step_number: int) -> tuple[mx.array, mx.array]:
+    """Layer 0's issued slots and issued words, evaluated."""
+    outputs = moe_lookup_issue(
+        mx.array(step.topk_ids, dtype=mx.int32),
+        mx.array([step.num_real_rows, step_number], dtype=mx.int32),
+        cache.slot_of,
+        cache.mailbox,
+        cache.last_use,
+        cache.hit_stats,
+        layer_id=0,
+        slot_base=0,
+    )
+    cache.set_table_arrays([outputs.mailbox, outputs.last_use, outputs.hit_stats])
+    mx.eval(outputs.slots, outputs.issued, cache.table_arrays())
+    return outputs.slots, outputs.issued
+
+
+def test_issue_leaves_absent_pairs_to_the_waiters(tmp_path: Path) -> None:
+    cache = small_cache(tmp_path)
+    cache.fill_initial()
+    words = mailbox_words(cache)
+    num_posted = 0
+    for step_number, step in enumerate(ISSUE_STEPS, start=1):
+        slot_of = np.array(cache.slot_of)
+        resident = {expert: int(slot_of[expert]) for expert in range(8) if slot_of[expert] >= 0}
+        cache.arm()
+        slots, issued = issue(cache, step, step_number)
+        first = resident.get(step.topk_ids[0][0], 0) if step.num_real_rows > 0 else 0
+
+        def expected_slot(entry: int | str) -> int:
+            if entry == FIRST:
+                return first
+            elif entry == PENDING:
+                return _C.PENDING_FALLBACK_SLOT
+            else:
+                assert isinstance(entry, int)
+                return resident[entry] if entry >= 0 else entry
+
+        expected = [[expected_slot(entry) for entry in row] for row in step.expected]
+        assert np.array(slots).tolist() == expected, step_number
+        num_posted += step.num_misses > 0
+        sequence = num_posted if step.num_misses > 0 else 0
+        assert np.array(issued).tolist() == [sequence, step.num_misses], step_number
+        assert words[Word.SEQUENCE] == num_posted, step_number
+        hits = {e for row in step.topk_ids[: step.num_real_rows] for e in row} & resident.keys()
+        last_use = np.array(cache.last_use)
+        assert all(last_use[resident[expert]] == step_number for expert in hits), step_number
+        deadline = time.monotonic() + 10.0
+        while words[Word.ACKNOWLEDGED] != num_posted:
+            assert time.monotonic() < deadline, f"request {num_posted} was never answered"
+            time.sleep(0.001)
+        cache.check_healthy()
+        # The answer reads the absent experts into slots.
+        absent = [-1 - e for row in step.expected for e in row if isinstance(e, int) and e < 0]
+        assert (np.array(cache.slot_of)[absent] >= 0).all(), step_number
+    # Nobody returns an issued request's answer to IDLE.
+    assert words[Word.STATE] == State.DONE
+    stats = cache.stats()
+    assert stats.lookups[0] == len(ISSUE_STEPS) and stats.misses[0] == 3
+
+
+def test_issue_posts_nothing_after_the_shutdown_word(tmp_path: Path) -> None:
+    cache = small_cache(tmp_path, run_coordinator=False, stall_timeout_s=600.0)
+    words = mailbox_words(cache)
+    words[Word.SHUTDOWN] = 1
+    step = IssueStep([[0, 1]], 1, [[-1, -2]], 0)
+    slots, issued = issue(cache, step, 1)
+    assert np.array(slots).tolist() == [[-1, -2]]
+    assert np.array(issued).tolist() == [0, 0]
+    assert words[Word.SEQUENCE] == 0 and words[Word.STATE] == State.IDLE

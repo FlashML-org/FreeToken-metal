@@ -4,7 +4,9 @@ The offload cache keeps routed experts in bank slots that slot_of maps. The look
 distinct experts of the real rows (moe_step's first entry); when some are absent it posts them to
 the mailbox and waits in the kernel until the CPU has read them into victim slots (or gives up on a
 CPU gone silent past the spin limit), so a forward with lookups needs no host synchronization and
-replays as a command graph. A probe posts no experts and only checks that the CPU answers.
+replays as a command graph. A probe posts no experts and only checks that the CPU answers. A decode
+may instead issue its lookup: moe_lookup_issue posts the absent experts and returns, and the kernels
+after it (affine_swiglu_pending) wait for the answer only where they need the absent experts' rows.
 """
 
 from __future__ import annotations
@@ -53,4 +55,35 @@ def moe_lookup(
     return MoeLookupOutputs(slots, slot_map, mailbox, last_use, hit_stats)
 
 
-__all__ = ["MoeLookupOutputs", "moe_lookup"]
+class MoeLookupIssueOutputs(NamedTuple):
+    # int32 [T, top_k]: each pair's slot in its layer's pool where moe_lookup_issue could
+    # resolve it, else negative (-1 - expert for an absent expert, PENDING_FALLBACK_SLOT for a
+    # padding pair whose fallback is absent): its request's waiters resolve those.
+    slots: mx.array
+    # int32 [ISSUED_WORDS]: the posted request, by IssuedWord.
+    issued: mx.array
+    mailbox: mx.array
+    last_use: mx.array
+    hit_stats: mx.array
+
+
+def moe_lookup_issue(
+    topk_ids: mx.array,
+    moe_step: mx.array,
+    slot_of: mx.array,
+    mailbox: mx.array,
+    last_use: mx.array,
+    hit_stats: mx.array,
+    *,
+    layer_id: int,
+    slot_base: int,
+) -> MoeLookupIssueOutputs:
+    """moe_lookup of a decode's routed experts without the wait: the absent experts are posted
+    and the pairs moe_lookup would have waited for are left negative."""
+    slots, issued, mailbox, last_use, hit_stats = _C.moe_lookup_issue(
+        topk_ids, moe_step, slot_of, mailbox, last_use, hit_stats, layer_id, slot_base
+    )
+    return MoeLookupIssueOutputs(slots, issued, mailbox, last_use, hit_stats)
+
+
+__all__ = ["MoeLookupIssueOutputs", "MoeLookupOutputs", "moe_lookup", "moe_lookup_issue"]

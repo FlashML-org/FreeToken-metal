@@ -6,11 +6,18 @@
 // (CLAIMED), answers DONE or FAILED, writes the reply and last Acknowledged = Sequence. The
 // watchdog answers a stuck request FAILED the same way; a shutdown sets the shutdown word, then
 // Acknowledged = Sequence, then State SHUTDOWN. moe_lookup and ple_wait wait in one threadgroup and
-// return State to IDLE (SHUTDOWN after a shutdown) themselves. A wait never outlives its CPU: after
-// the spin limit unanswered (some 20 s, past the watchdog's timeout, which answers first while the
-// CPU lives) it sets the abandoned word and takes the request as unanswered; from then on no kernel
-// posts or waits, and check_healthy raises (common/mailbox_wait.h). A process stopped that long (a
-// debugger, SIGTSTP) while a wait is pending also fails its services.
+// return State to IDLE (SHUTDOWN after a shutdown) themselves. moe_lookup_issue posts and returns;
+// the waiters of its request (affine_swiglu_pending's threadgroups, any number) each spin until
+// Acknowledged equals the issued sequence, or the shutdown word is set, and take the request as
+// answered when State then reads DONE. Nobody returns State to IDLE after an issued request: it
+// holds the answer until the next post, and no post may run before every waiter finished: the
+// waiters return the mailbox, which the next post takes (a later forward's router ids need not
+// depend on them). Only a shutdown overwrites an answer, so waiters released by one may disagree:
+// the service has failed, and every slot they take is still the layer's. A wait never outlives its
+// CPU: after the spin limit unanswered (some 20 s, past the watchdog's timeout, which answers first
+// while the CPU lives) it sets the abandoned word and takes the request as unanswered; from then on
+// no kernel posts or waits, and check_healthy raises (common/mailbox_wait.h). A process stopped
+// that long (a debugger, SIGTSTP) while a wait is pending also fails its services.
 #pragma once
 
 #ifdef __METAL_VERSION__
@@ -58,6 +65,20 @@ enum class MailboxWord : int {
 MAILBOX_CONSTANT int MAILBOX_WORDS = 1024;
 // The id lines hold this many uint16 ids, one threadgroup thread per expert.
 MAILBOX_CONSTANT int MAX_LOOKUP_EXPERTS = 512;
+
+// moe_lookup_issue's int32 [ISSUED_WORDS] for its request's waiters.
+enum class IssuedWord : int {
+  Sequence = 0,
+  // The absent experts posted; 0 when nothing was posted (none absent, or the shutdown word
+  // refused the post), and the waiters take the absent ones as unanswered.
+  NumMisses = 1,
+};
+
+MAILBOX_CONSTANT int ISSUED_WORDS = 2;
+// moe_lookup_issue's slots of the pairs it leaves to the waiters are negative: -1 - expert for
+// a pair whose expert is absent, PENDING_FALLBACK_SLOT for a padding pair whose fallback, the
+// first pair's slot, is itself absent.
+MAILBOX_CONSTANT int PENDING_FALLBACK_SLOT = -1 - MAX_LOOKUP_EXPERTS;
 
 enum class MailboxState : uint32_t {
   Idle = 0,

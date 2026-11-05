@@ -883,6 +883,7 @@ def test_real_checkpoint_rows() -> None:
         prefill_overlap_min_tokens=128,
         victim_cache_bytes=0,
         pairs=None,
+        split_lookup=False,
     )
     if is_apart:
         apart = {f"{prefix}.experts.gate_up_proj" for prefix in source.layer_prefixes}

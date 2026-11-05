@@ -1,10 +1,11 @@
-// MoeLookup: one MoE layer's routed experts -> bank slots of the offload cache, on the GPU.
-// The distinct experts of the real rows are looked up in slot_of; when some are absent the
-// kernel posts them to the mailbox and waits (common/mailbox_wait.h) until the CPU
-// (ExpertService's coordinator) has read them into victim slots, then looks them up again.
-// mailbox, last_use and hit_stats are updated in place: the outputs alias the inputs (see
-// kvcache/pool_rows.h) and callers rebind them. slot_of and the banks are written by the CPU behind
-// MLX's back and read coherently.
+// MoeLookup: one MoE layer's routed experts -> bank slots of the offload cache, on the GPU. The
+// distinct experts of the real rows are looked up in slot_of; when some are absent the kernel posts
+// them to the mailbox and waits (common/mailbox_wait.h) until the CPU (ExpertService's coordinator)
+// has read them into victim slots, then looks them up again. The issue form posts them and returns:
+// its request's waiters resolve the pairs it leaves negative (common/mailbox.h). mailbox, last_use
+// and hit_stats are updated in place: the outputs alias the inputs (see kvcache/pool_rows.h) and
+// callers rebind them. slot_of and the banks are written by the CPU behind MLX's back and read
+// coherently.
 #pragma once
 
 #include <cstdint>
@@ -39,11 +40,27 @@ std::vector<mx::array> moe_lookup(
     MoeLookupKind kind,
     mx::StreamOrDevice s = {});
 
+// moe_lookup's decode lookup without the wait. Returns {slots int32 [T, top_k], issued int32
+// [ISSUED_WORDS], mailbox, last_use, hit_stats}: a pair's slot is its pool slot when its
+// expert is resident, else negative (-1 - expert, or PENDING_FALLBACK_SLOT for a padding pair
+// whose fallback is pending); issued names the posted request.
+std::vector<mx::array> moe_lookup_issue(
+    const mx::array& topk_ids,
+    const mx::array& moe_step,
+    const mx::array& slot_of,
+    const mx::array& mailbox,
+    const mx::array& last_use,
+    const mx::array& hit_stats,
+    int layer_id,
+    int slot_base,
+    mx::StreamOrDevice s = {});
+
 struct MoeLookupConfig {
   int layer_id;
   int num_experts;
   MoeLookupKind kind;
   int slot_base;
+  bool is_issue;
 
   bool operator==(const MoeLookupConfig&) const = default;
 };
@@ -58,7 +75,7 @@ class MoeLookup : public mx::Primitive {
       override;
 
   const char* name() const override {
-    return "MoeLookup";
+    return config_.is_issue ? "MoeLookupIssue" : "MoeLookup";
   }
 
   bool is_equivalent(const mx::Primitive& other) const override;

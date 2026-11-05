@@ -264,6 +264,7 @@ def build_cache(
         prefill_overlap_min_tokens=PREFILL_OVERLAP_MIN_TOKENS,
         victim_cache_bytes=victim_cache_bytes,
         pairs=pairs,
+        split_lookup=False,
         stall_timeout_s=stall_timeout_s,
         run_coordinator=run_coordinator,
     )

@@ -1,4 +1,4 @@
-// Norm helpers shared by the norm/ and hc/ metal_kernels. Adapted from MLX v0.32.3 (MIT
+// Norm helpers shared by the norm/, hc/ and moe/affine/ kernels. Adapted from MLX v0.32.3 (MIT
 // License): precise_sigmoid is Sigmoid in mlx/backend/metal/kernels/unary_ops.h (308-314,
 // Copyright © 2023-2024 Apple Inc.); row_inv_rms is the reduction of rms_single_row in
 // mlx/backend/metal/kernels/rms_norm.metal (44-64, Copyright © 2024 Apple Inc.).

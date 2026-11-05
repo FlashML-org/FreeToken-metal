@@ -1,17 +1,19 @@
 """Routed experts: resident banks or an offload cache's, run by the layer's MoE method.
 
-Port of FreeToken layers/moe.py (MoELayer, OffloadMoELayer). Divergences: routing is computed
-by the model and handed to forward; the experts are one gate_up_proj bank (gate_proj and
-up_proj banks under it when the checkpoint stores them in different schemes) and one down_proj
-bank per layer, gated by silu or gelu_tanh, which the MoE method of
-layers/quantization/moe.py allocates and runs.
-OffloadMoELayer serves its experts from the context's offload cache, whose layers share one
-set of banks (gate and up apart in all layers once one keeps them apart), and holds only its
-method's resident arrays. A decode or copy-miss forward gathers the slots its lookup returns
-from its pool's rows, unsorted (below four rows per expert the per-row matvec is the fast
-path); an overlap prefill sorts its pairs and reads each expert at its byte offsets in the
+Port of FreeToken layers/moe.py (MoELayer, OffloadMoELayer). Divergences: routing is computed by
+the model and handed to forward; the experts are one gate_up_proj bank (gate_proj and up_proj
+banks under it when the checkpoint stores them in different schemes) and one down_proj bank per
+layer, gated by silu or gelu_tanh, which the MoE method of layers/quantization/moe.py allocates
+and runs. OffloadMoELayer serves its experts from the context's offload cache, whose layers
+share one set of banks (gate and up apart in all layers once one keeps them apart), and holds
+only its method's resident arrays. A decode or copy-miss forward gathers the slots its lookup
+returns from its pool's rows, unsorted (below four rows per expert the per-row matvec is the
+fast path); an overlap prefill sorts its pairs and reads each expert at its byte offsets in the
 banks (the expert-sorted kernels), its prefill buffers and the order of its reads and layers
-kept by the host, where FreeToken waits on CUDA events.
+kept by the host, where FreeToken waits on CUDA events. A decode under split_lookup whose method
+has the pending kernels issues its lookup instead (layers/quantization/moe_pending.py). A
+forward given a shared expert (FreeToken's model computes it apart) adds its gated output, which
+apply_pending fuses into its last kernel.
 """
 
 from __future__ import annotations
@@ -22,9 +24,28 @@ import mlx.core as mx
 from mlx.utils import tree_flatten
 
 from ftmetal.context import get_global_ctx
+from ftmetal.layers.activation import sigmoid_gated_add
 from ftmetal.layers.base import BaseOP
-from ftmetal.layers.quantization.moe import ExpertSchemes, MoEConfig, moe_method
+from ftmetal.layers.quantization.moe import (
+    AffineMoEMethod,
+    ExpertSchemes,
+    MoEConfig,
+    SharedExpertForward,
+    moe_method,
+)
+from ftmetal.layers.quantization.moe_pending import apply_pending, supports_pending
 from ftmetal.moe.offload_cache import OffloadMoeCache
+
+
+def add_shared_expert(
+    routed: mx.array, x: mx.array, shared_expert: SharedExpertForward | None
+) -> mx.array:
+    """The routed experts' output plus the shared expert's of x, gated."""
+    if shared_expert is None:
+        return routed
+    else:
+        shared, shared_gate = shared_expert(x)
+        return sigmoid_gated_add(routed, shared, shared_gate)
 
 
 class MoELayer(BaseOP):
@@ -57,12 +78,17 @@ class MoELayer(BaseOP):
         self.quant_method.create_weights(self)
 
     def forward(
-        self, hidden_states: mx.array, topk_weights: mx.array, topk_ids: mx.array
+        self,
+        hidden_states: mx.array,
+        topk_weights: mx.array,
+        topk_ids: mx.array,
+        shared_expert: SharedExpertForward | None = None,
     ) -> mx.array:
         """Expert compute for a routing decision (FreeToken's routed_forward): hidden [T, H],
         weights / ids [T, top_k]; the model computes the routing."""
         banks = dict(tree_flatten(self.parameters()))
-        return self.quant_method.apply(banks, hidden_states, topk_weights, topk_ids)
+        routed = self.quant_method.apply(banks, hidden_states, topk_weights, topk_ids)
+        return add_shared_expert(routed, hidden_states, shared_expert)
 
 
 class OffloadMoELayer(MoELayer):
@@ -92,19 +118,37 @@ class OffloadMoELayer(MoELayer):
         self.moe_layer_id = moe_layer_id
 
     def forward(
-        self, hidden_states: mx.array, topk_weights: mx.array, topk_ids: mx.array
+        self,
+        hidden_states: mx.array,
+        topk_weights: mx.array,
+        topk_ids: mx.array,
+        shared_expert: SharedExpertForward | None = None,
     ) -> mx.array:
         cache = get_global_ctx().moe_offload_cache
         assert cache is not None, "an offload MoE layer runs on the engine's offload cache"
         resident = dict(tree_flatten(self.parameters()))
+        method = self.quant_method
         if cache.mode == "overlap":
-            return self.prefill_forward(cache, resident, hidden_states, topk_weights, topk_ids)
+            routed = self.prefill_forward(cache, resident, hidden_states, topk_weights, topk_ids)
+            return add_shared_expert(routed, hidden_states, shared_expert)
+        elif (
+            cache.mode == "decode"
+            and cache.split_lookup
+            and isinstance(method, AffineMoEMethod)
+            and supports_pending(method, hidden_states, topk_weights)
+        ):
+            lookup = cache.issue_lookup(self.moe_layer_id, topk_ids)
+            banks = {**cache.layer_banks(self.moe_layer_id), **resident}
+            outputs = apply_pending(
+                method, banks, hidden_states, topk_weights, lookup, shared_expert
+            )
+            cache.end_issued_lookup(outputs.mailbox)
+            return outputs.out
         else:
             slots = cache.lookup_slots(self.moe_layer_id, topk_ids, hidden_states)
             banks = {**cache.layer_banks(self.moe_layer_id), **resident}
-            return self.quant_method.apply_slots(
-                banks, hidden_states, topk_weights, topk_ids, slots
-            )
+            routed = method.apply_slots(banks, hidden_states, topk_weights, topk_ids, slots)
+            return add_shared_expert(routed, hidden_states, shared_expert)
 
     def prefill_forward(
         self,

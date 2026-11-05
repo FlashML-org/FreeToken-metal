@@ -487,6 +487,7 @@ class Engine:
                 expert_counts=expert_counts,
                 victim_cache_bytes=victim_bytes,
                 pairs=None if expert_pack is None else expert_pack.pairs,
+                split_lookup=config.moe_split_lookup,
             )
             pool_slots = [pool.num_slots for pool in slot_layout.pools]
             logger.info(

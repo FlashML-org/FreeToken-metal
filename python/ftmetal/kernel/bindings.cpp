@@ -11,6 +11,8 @@
 #include "attention/mha/mha_prefill.h"
 #include "embedding/ple_lookup.h"
 #include "kvcache/pool_rows.h"
+#include "moe/affine/affine_swiglu_pending.h"
+#include "moe/affine/affine_swiglu_pending_shared.h"
 #include "moe/gather_sorted.h"
 #include "moe/moe_lookup.h"
 #include "sample/sample_tokens.h"
@@ -37,6 +39,10 @@ NB_MODULE(_C, m) {
       "unquantized_source"_a);
   m.def("init_sample_tokens_library", &ftmetal::init_sample_tokens_library, "source"_a);
   m.def("init_moe_lookup_library", &ftmetal::init_moe_lookup_library, "source"_a);
+  m.def(
+      "init_affine_swiglu_pending_library",
+      &ftmetal::init_affine_swiglu_pending_library,
+      "source"_a);
   m.def("init_ple_lookup_library", &ftmetal::init_ple_lookup_library, "source"_a);
 
   m.def(
@@ -217,7 +223,10 @@ NB_MODULE(_C, m) {
   m.attr("FILL_FILE") = ftmetal::FILL_FILE;
   m.attr("QMM_TILE_K") = ftmetal::QMM_TILE_K;
   m.attr("MAX_PAIR_CODE_BITS") = ftmetal::MAX_PAIR_CODE_BITS;
+  m.attr("ISSUED_WORDS") = ftmetal::ISSUED_WORDS;
+  m.attr("PENDING_FALLBACK_SLOT") = ftmetal::PENDING_FALLBACK_SLOT;
   m.attr("MAILBOX_SPIN_LIMIT") = ftmetal::MAILBOX_SPIN_LIMIT;
+  m.attr("ACT_ROWS_PER_SIMDGROUP") = ftmetal::ACT_ROWS_PER_SIMDGROUP;
   nb::enum_<ftmetal::MailboxWord>(m, "MailboxWord", nb::is_arithmetic())
       .value("STATE", ftmetal::MailboxWord::State)
       .value("SEQUENCE", ftmetal::MailboxWord::Sequence)
@@ -251,6 +260,9 @@ NB_MODULE(_C, m) {
       .value("PROTOCOL", ftmetal::MailboxError::Protocol)
       .value("SHUTDOWN", ftmetal::MailboxError::Shutdown)
       .value("CAPACITY", ftmetal::MailboxError::Capacity);
+  nb::enum_<ftmetal::IssuedWord>(m, "IssuedWord", nb::is_arithmetic())
+      .value("SEQUENCE", ftmetal::IssuedWord::Sequence)
+      .value("NUM_MISSES", ftmetal::IssuedWord::NumMisses);
   nb::enum_<ftmetal::MoeLookupKind>(m, "MoeLookupKind", nb::is_arithmetic())
       .value("DECODE", ftmetal::MoeLookupKind::Decode)
       .value("PREFILL_COPY_MISS", ftmetal::MoeLookupKind::PrefillCopyMiss)
@@ -271,6 +283,45 @@ NB_MODULE(_C, m) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       "Pool slots of one MoE layer's routed experts, the absent read by the CPU first; returns (slots, slot_map, mailbox, last_use, hit_stats).");
+
+  m.def(
+      "moe_lookup_issue",
+      &ftmetal::moe_lookup_issue,
+      "topk_ids"_a,
+      "moe_step"_a,
+      "slot_of"_a,
+      "mailbox"_a,
+      "last_use"_a,
+      "hit_stats"_a,
+      "layer_id"_a,
+      "slot_base"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      "moe_lookup for a decode without the wait: the absent experts posted, their pairs' slots negative; returns (slots, issued, mailbox, last_use, hit_stats).");
+
+  m.def(
+      "affine_swiglu_pending",
+      &ftmetal::affine_swiglu_pending,
+      "x"_a,
+      "w"_a,
+      "scales_or_codes"_a,
+      "biases_or_pairs"_a,
+      "gate_up_resident"_a,
+      "slots"_a,
+      "issued"_a,
+      "slot_of"_a,
+      "mailbox"_a,
+      "after"_a,
+      "layer_id"_a,
+      "slot_base"_a,
+      "num_experts"_a,
+      "group_size"_a,
+      "bits"_a,
+      "code_bits"_a,
+      "is_fast"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      "silu_and_mul of a MoE layer's routed gate_up rows, the pending pairs' computed once the CPU answered moe_lookup_issue's request; returns (act, slots, mailbox).");
 
   nb::class_<ftmetal::SlotLru>(m, "SlotLru")
       .def(

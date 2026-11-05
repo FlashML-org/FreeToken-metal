@@ -1,5 +1,6 @@
-// What the Metal-backed primitives share: templating a kernel source per configuration,
-// and the paged-attention inputs and split-KV partials of mha_decode and mha_prefill.
+// What the Metal-backed primitives share: the affine quantizations MLX instantiates, templating a
+// kernel source per configuration, and the paged-attention inputs and split-KV partials of
+// mha_decode and mha_prefill.
 #pragma once
 
 #include <stdexcept>
@@ -27,6 +28,17 @@ inline std::string metal_type(mx::Dtype dtype, const std::string& kernel) {
     default:
       throw std::invalid_argument(
           "ftmetal " + kernel + ": unsupported dtype " + mx::type_to_name(dtype));
+  }
+}
+
+// The affine (group size, bits) MLX instantiates.
+inline void check_affine_quantization(const std::string& op_name, int group_size, int bits) {
+  bool is_instantiated = (group_size == 32 || group_size == 64 || group_size == 128) &&
+      (bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8);
+  if (!is_instantiated) {
+    throw std::invalid_argument(
+        "ftmetal " + op_name + ": affine group size must be 32, 64 or 128 and bits 2-6 or 8, " +
+        "not (" + std::to_string(group_size) + ", " + std::to_string(bits) + ")");
   }
 }
 

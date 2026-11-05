@@ -43,17 +43,6 @@ const std::map<std::string, std::pair<int, int>> FP_BLOCK_SHAPES = {
     {"mxfp8", {8, 32}},
 };
 
-// The affine (group size, bits) MLX instantiates.
-void check_affine_quantization(const std::string& op_name, int group_size, int bits) {
-  bool is_instantiated = (group_size == 32 || group_size == 64 || group_size == 128) &&
-      (bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8);
-  if (!is_instantiated) {
-    throw std::invalid_argument(
-        "ftmetal " + op_name + ": affine group size must be 32, 64 or 128 and bits 2-6 or 8, " +
-        "not (" + std::to_string(group_size) + ", " + std::to_string(bits) + ")");
-  }
-}
-
 // x's K is whole groups and whole packed words.
 void check_whole_groups(const std::string& op_name, const mx::array& x, int group_size, int bits) {
   int K = x.shape(2);

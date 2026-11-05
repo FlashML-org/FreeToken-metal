@@ -23,13 +23,18 @@ from the experts the slots evict. So does an expert pack (ftm pack): of an affin
 (16-bit pair codes for its fp32 scales), of one whose coarse scales take narrower codes, of an
 export (its parts beside unit scales and output scales) and of a Hugging Face layout one, every
 expert read a whole record at a time; a stale pack and FTMETAL_MOE_PACK=0 read the checkpoint.
+Affine decodes with gate and up together issue their lookups (split lookup) unless a case turns
+it off: replayed and eager, with and without pair codes. With split lookup on and off, every
+forward's logits as the sampler gets them must be equal bit for bit, and the decode steps must
+miss: a replayed and an eager decode, two requests, pair codes.
 """
 
 from __future__ import annotations
 
 import json
 import struct
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -41,10 +46,16 @@ from mlx.utils import tree_flatten
 from mlx_lm.models import qwen3_5 as reference
 
 from ftmetal.cli import run_pack
-from ftmetal.core import SamplingParams
+from ftmetal.core import Batch, SamplingParams
 from ftmetal.engine.config import EngineConfig
+from ftmetal.engine.engine import ForwardOutput
+from ftmetal.engine.sample import BatchSamplingArgs
+from ftmetal.layers import moe as moe_layers
 from ftmetal.layers.quantization.config import FP_BLOCK_SHAPES
+from ftmetal.layers.quantization.moe import AffineMoEMethod, SharedExpertForward
+from ftmetal.layers.quantization.moe_pending import PendingOutputs
 from ftmetal.models.config import MoeStrategy
+from ftmetal.moe.offload_cache import IssuedLookup
 from ftmetal.moe.pack import PACK_FILE
 from ftmetal.moe.slot_pools import MoePoolGrouping, PrefillBufferPlacement
 from ftmetal.scheduler.scheduler import Scheduler
@@ -119,11 +130,15 @@ class Case:
     is_packed: bool = False
     has_pair_codes: bool = False
     is_coarse: bool = False
+    # An affine decode with gate and up together issues its lookups (moe_split_lookup).
+    split_lookup: bool = True
 
 
 CASES = [
     Case("replayed-decode-copy-miss-prefill", (9,)),
     Case("eager-decode", (9,), command_graph=False),
+    Case("replayed-decode-split-off", (9, 17), split_lookup=False),
+    Case("eager-decode-split-off", (9,), command_graph=False, split_lookup=False),
     Case("overlap-prefill", (40,), overlap_min_tokens=16, reads_buffers=True),
     # 64 tokens through the buffers, then 36 looked up.
     Case("chunks-across-the-threshold", (100,), overlap_min_tokens=48, reads_buffers=True),
@@ -406,6 +421,7 @@ def make_scheduler(path: Path, case: Case, strategy: MoeStrategy) -> Scheduler:
         moe_prefill_overlap=case.prefill_overlap,
         moe_prefill_buffer=case.buffer_placement,
         moe_victim_cache_gib=case.victim_cache_gib if strategy == "offload" else 0,
+        moe_split_lookup=case.split_lookup,
     )
     return Scheduler(config, eos_token_ids={127})
 
@@ -448,6 +464,21 @@ def test_offload_matches_resident_experts(
     prompts = [[int(t) for t in rng.integers(1, 120, size=n)] for n in case.prompt_lens]
 
     resident_logits, resident_tokens, _ = serve(tmp_path, case, "fused", prompts)
+    pending_layers: list[int] = []
+    apply_pending = moe_layers.apply_pending
+
+    def recorded_apply_pending(
+        method: AffineMoEMethod,
+        banks: Mapping[str, mx.array],
+        x: mx.array,
+        topk_weights: mx.array,
+        lookup: IssuedLookup,
+        shared_expert: SharedExpertForward | None,
+    ) -> PendingOutputs:
+        pending_layers.append(lookup.layer_id)
+        return apply_pending(method, banks, x, topk_weights, lookup, shared_expert)
+
+    monkeypatch.setattr(moe_layers, "apply_pending", recorded_apply_pending)
     logits, tokens, scheduler = serve(tmp_path, case, "offload", prompts)
     assert tokens == resident_tokens
     assert mx.allclose(logits, resident_logits, atol=LOGITS_TOLERANCE, rtol=LOGITS_TOLERANCE)
@@ -464,6 +495,8 @@ def test_offload_matches_resident_experts(
     assert all(
         ("gate_up_proj.weight" not in pool.layout) == is_apart for pool in cache.slot_layout.pools
     )
+    is_split = case.split_lookup and case.expert_format == "affine" and not is_apart
+    assert set(pending_layers) == (set(range(cache.num_layers)) if is_split else set())
     assert cache.slot_layout.max_decode_rows == case.max_decode_rows
     max_running = max(2, len(case.prompt_lens))
     assert len(scheduler.table_manager.free_slots) == min(max_running, case.max_decode_rows)
@@ -481,6 +514,72 @@ def test_offload_matches_resident_experts(
         for layer_id, layer in enumerate(header["layers"]):
             assert stats.bytes_read[layer_id] == stats.experts_read[layer_id] * layer["stride"]
     cache.check_healthy()
+
+
+# Split lookup on against off: a replayed and an eager decode, two requests, pair codes.
+SPLIT_TWIN_CASES = [
+    case
+    for case in CASES
+    if case.name
+    in ("replayed-decode-copy-miss-prefill", "eager-decode", "two-requests", "pair-codes-packed")
+]
+
+
+def serve_logits(
+    path: Path, case: Case, prompts: list[list[int]]
+) -> tuple[list[mx.array], int, int]:
+    """Every forward's logits as the sampler gets them while the prompts decode together under
+    offload, and the cache's misses as the third decode forward starts (the forwards before it
+    drained) and at the end."""
+    scheduler = make_scheduler(path, case, "offload")
+    engine = scheduler.engine
+    cache = engine.moe_offload_cache
+    assert cache is not None
+    seen: list[mx.array] = []
+    decodes = 0
+    misses_at_third_decode = 0
+    forward_batch, sample = engine.forward_batch, engine.sampler.sample
+
+    def recording_forward_batch(batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+        nonlocal decodes, misses_at_third_decode
+        if batch.is_decode:
+            decodes += 1
+            if decodes == 3:
+                misses_at_third_decode = sum(cache.stats().misses)
+        return forward_batch(batch, args)
+
+    def recording_sample(logits: mx.array, args: BatchSamplingArgs) -> mx.array:
+        seen.append(logits)
+        return sample(logits, args)
+
+    engine.forward_batch = recording_forward_batch
+    engine.sampler.sample = recording_sample
+    for uid, prompt in enumerate(prompts):
+        params = SamplingParams(temperature=0.0, max_tokens=STEPS, ignore_eos=True)
+        scheduler.add_request(uid, np.array(prompt, dtype=np.int32), params)
+    scheduler.run_until_idle()
+    assert decodes >= 3
+    cache.check_healthy()
+    return seen, misses_at_third_decode, sum(cache.stats().misses)
+
+
+@pytest.mark.parametrize("case", SPLIT_TWIN_CASES, ids=lambda case: case.name)
+def test_split_lookup_logits_equal_the_waiting_lookups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: Case
+) -> None:
+    monkeypatch.setenv("FTMETAL_MOE_PREFILL_OVERLAP_MIN_TOKENS", str(case.overlap_min_tokens))
+    write_checkpoint(tmp_path, case)
+    if case.is_packed:
+        assert run_pack(["--model", str(tmp_path)]) == 0
+    rng = np.random.default_rng(len(case.name))
+    prompts = [[int(t) for t in rng.integers(1, 120, size=n)] for n in case.prompt_lens]
+    split, misses_at_third_decode, misses = serve_logits(tmp_path, case, prompts)
+    waiting, _, _ = serve_logits(tmp_path, replace(case, split_lookup=False), prompts)
+    assert len(split) == len(waiting)
+    for forward, (got, expected) in enumerate(zip(split, waiting, strict=True)):
+        assert mx.array_equal(got, expected).item(), f"forward {forward}"
+    # The later decode steps read experts: the split path waited for some.
+    assert misses > misses_at_third_decode
 
 
 @pytest.mark.parametrize("fallback", ["stale", "ignored"])

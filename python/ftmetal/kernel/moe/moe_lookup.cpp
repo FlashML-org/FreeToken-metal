@@ -24,13 +24,8 @@ void check_array(
   }
 }
 
-} // namespace
-
-void init_moe_lookup_library(const std::string& source) {
-  moe_lookup_source = source;
-}
-
-std::vector<mx::array> moe_lookup(
+// moe_lookup or, is_issue, moe_lookup_issue.
+std::vector<mx::array> make_lookup(
     const mx::array& topk_ids,
     const mx::array& moe_step,
     const mx::array& slot_of,
@@ -40,6 +35,7 @@ std::vector<mx::array> moe_lookup(
     int layer_id,
     int slot_base,
     MoeLookupKind kind,
+    bool is_issue,
     mx::StreamOrDevice s) {
   if (topk_ids.dtype() != mx::int32 || topk_ids.ndim() != 2 || topk_ids.size() == 0) {
     throw std::invalid_argument("ftmetal moe_lookup: topk_ids must be int32 [T, top_k], T >= 1");
@@ -74,18 +70,69 @@ std::vector<mx::array> moe_lookup(
     throw std::invalid_argument("ftmetal moe_lookup: unknown lookup kind");
   }
   auto stream = mx::to_stream(s);
+  mx::Shape slot_map_or_issued_shape = is_issue ? mx::Shape{ISSUED_WORDS} : mx::Shape{num_experts};
   // The shared tables stay as they are (see kvcache/pool_rows.h); eval_gpu checks they are row contiguous.
   return mx::array::make_arrays(
-      {topk_ids.shape(), {num_experts}, mailbox.shape(), last_use.shape(), hit_stats.shape()},
+      {topk_ids.shape(),
+       slot_map_or_issued_shape,
+       mailbox.shape(),
+       last_use.shape(),
+       hit_stats.shape()},
       {mx::int32, mx::int32, mx::uint32, mx::uint32, mx::uint32},
       std::make_shared<MoeLookup>(
-          stream, MoeLookupConfig{layer_id, num_experts, kind, slot_base}),
+          stream, MoeLookupConfig{layer_id, num_experts, kind, slot_base, is_issue}),
       {mx::contiguous(topk_ids, false, stream),
        mx::contiguous(moe_step, false, stream),
        slot_of,
        mailbox,
        last_use,
        hit_stats});
+}
+
+} // namespace
+
+void init_moe_lookup_library(const std::string& source) {
+  moe_lookup_source = source;
+}
+
+std::vector<mx::array> moe_lookup(
+    const mx::array& topk_ids,
+    const mx::array& moe_step,
+    const mx::array& slot_of,
+    const mx::array& mailbox,
+    const mx::array& last_use,
+    const mx::array& hit_stats,
+    int layer_id,
+    int slot_base,
+    MoeLookupKind kind,
+    mx::StreamOrDevice s) {
+  return make_lookup(
+      topk_ids, moe_step, slot_of, mailbox, last_use, hit_stats, layer_id, slot_base, kind, false,
+      s);
+}
+
+std::vector<mx::array> moe_lookup_issue(
+    const mx::array& topk_ids,
+    const mx::array& moe_step,
+    const mx::array& slot_of,
+    const mx::array& mailbox,
+    const mx::array& last_use,
+    const mx::array& hit_stats,
+    int layer_id,
+    int slot_base,
+    mx::StreamOrDevice s) {
+  return make_lookup(
+      topk_ids,
+      moe_step,
+      slot_of,
+      mailbox,
+      last_use,
+      hit_stats,
+      layer_id,
+      slot_base,
+      MoeLookupKind::Decode,
+      true,
+      s);
 }
 
 bool MoeLookup::is_equivalent(const mx::Primitive& other) const {
@@ -106,9 +153,9 @@ void MoeLookup::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::a
     }
   }
   auto& slots = outputs[0];
-  auto& slot_map = outputs[1];
+  auto& slot_map_or_issued = outputs[1];
   slots.set_data(mx::allocator::malloc(slots.nbytes()));
-  slot_map.set_data(mx::allocator::malloc(slot_map.nbytes()));
+  slot_map_or_issued.set_data(mx::allocator::malloc(slot_map_or_issued.nbytes()));
   outputs[2].copy_shared_buffer(inputs[3]);
   outputs[3].copy_shared_buffer(inputs[4]);
   outputs[4].copy_shared_buffer(inputs[5]);
@@ -116,7 +163,7 @@ void MoeLookup::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::a
   auto s = stream();
   auto& d = mx::metal::device(s.device);
   auto* library = d.get_library(LIBRARY_NAME, [&]() { return moe_lookup_source; });
-  auto* kernel = d.get_kernel("moe_lookup", library);
+  auto* kernel = d.get_kernel(config_.is_issue ? "moe_lookup_issue" : "moe_lookup", library);
 
   auto& encoder = mx::metal::get_command_encoder(s);
   encoder.set_compute_pipeline_state(kernel);
@@ -127,7 +174,7 @@ void MoeLookup::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::a
     encoder.set_output_array(outputs[i], i + 1);
   }
   encoder.set_output_array(slots, 6);
-  encoder.set_output_array(slot_map, 7);
+  encoder.set_output_array(slot_map_or_issued, 7);
   LookupParams params{
       config_.layer_id,
       config_.num_experts,

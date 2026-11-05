@@ -10,7 +10,8 @@ bits 2-6 and 8 with group sizes 32, 64 and 128 on both impls, each dtype; output
 8-row tile or fewer than one tile; a last code whose high word opens the row's second 64-byte
 line; one-pair and nearly full tables, and every table's largest code at a used row's end; codes
 of 13 bits (Qwen3.6's and Qwen3.8's), of 16 (an OptiQ checkpoint's 8-bit layers) on both impls,
-and of 1, 9, 11 and 12 bits.
+and of 1, 9, 11 and 12 bits. With skip_pending (the offload decode's resident pass) the pairs whose
+slot is negative are skipped, the others' rows unchanged.
 """
 
 from __future__ import annotations
@@ -43,6 +44,8 @@ class Case:
     num_slots: int = 16
     num_pairs: int = MAX_PAIRS
     code_bits: int = 13
+    # Pairs left pending (a negative slot), run with skip_pending.
+    num_pending: int = 0
 
     def __str__(self) -> str:
         dtype = {mx.bfloat16: "bf16", mx.float16: "fp16", mx.float32: "fp32"}[self.dtype]
@@ -50,7 +53,7 @@ class Case:
         return (
             f"T{self.tokens}-k{self.top_k}-N{self.output_size}-K{self.input_size}-b{self.bits}"
             f"-g{self.group_size}-{dtype}-x{x_rows}-S{self.num_slots}-P{self.num_pairs}"
-            f"-c{self.code_bits}"
+            f"-c{self.code_bits}{f'-p{self.num_pending}' if self.num_pending else ''}"
         )
 
 
@@ -100,6 +103,11 @@ CASES = [
     Case(3, 4, 128, 512, num_pairs=512, code_bits=9),
     Case(4, 4, 96, 384, bits=6, dtype=mx.float16, num_pairs=2000, code_bits=11),
     Case(2, 3, 8, 320, num_slots=5, num_pairs=4096, code_bits=12),
+    # Pending pairs skipped: Qwen3.6's and Qwen3.8's gate_up, some on the other impl, every pair.
+    Case(3, 8, 1024, 2048, num_pending=5),
+    Case(2, 10, 1280, 2560, group_size=32, dtype=mx.float16, num_pending=3),
+    Case(4, 4, 96, 384, bits=6, num_pending=5),
+    Case(4, 4, 96, 384, bits=6, num_pending=16),
 ]
 
 
@@ -126,6 +134,9 @@ def test_matches_gather_qmm(case: Case) -> None:
     x_shape = (case.tokens, case.top_k if case.is_per_pair else 1, 1, case.input_size)
     x = mx.array(rng.standard_normal(x_shape, dtype=np.float32)).astype(case.dtype)
     indices = mx.array(slots)
+    issued_slots = slots.copy()
+    pending = rng.choice(slots.size, case.num_pending, replace=False)
+    issued_slots.reshape(-1)[pending] = -1 - rng.integers(0, 64, case.num_pending)
     expected = mx.gather_qmm(
         x,
         w,
@@ -143,9 +154,11 @@ def test_matches_gather_qmm(case: Case) -> None:
         w,
         rows,
         pairs,
-        indices,
+        mx.array(issued_slots),
         group_size=case.group_size,
         bits=case.bits,
         code_bits=case.code_bits,
+        skip_pending=case.num_pending > 0,
     )
-    check_equal(got, expected)
+    resident = (mx.array(issued_slots) >= 0)[..., None, None]
+    check_equal(mx.where(resident, got, expected), expected)

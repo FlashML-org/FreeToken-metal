@@ -5,7 +5,8 @@ Port of FreeToken models/qwen3_5_moe/moe.py, shared by Qwen3.5 / 3.6 and Qwen3.8
 qwen4_exp (FreeToken's Qwen4ExpMoE subclasses it unchanged). Divergences: the router is the fused
 kernel/moe/moe_topk Metal kernel (fp32 softmax, top-k, renorm in one launch) and the
 experts are the resident MoELayer, or OffloadMoELayer under the offload strategy (FreeToken's
-make_moe_layer choice, made here).
+make_moe_layer choice, made here), whose forward adds the gated shared expert, so that an offload
+decode runs it while its absent experts are read.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from __future__ import annotations
 import mlx.core as mx
 
 from ftmetal.kernel.moe.moe_topk import moe_topk
-from ftmetal.layers.activation import sigmoid_gated_add, silu_and_mul
+from ftmetal.layers.activation import silu_and_mul
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
 from ftmetal.layers.moe import MoELayer, OffloadMoELayer
@@ -102,9 +103,11 @@ class SharedExpertMoE(BaseOP):
         topk_ids, topk_weights = moe_topk(
             self.gate.forward(hidden_states), self.top_k, self.norm_topk_prob
         )
-        routed = self.experts.forward(hidden_states, topk_weights, topk_ids)
-        shared = self.shared_expert.forward(hidden_states)
-        return sigmoid_gated_add(routed, shared, self.shared_expert_gate.forward(hidden_states))
+        return self.experts.forward(hidden_states, topk_weights, topk_ids, self.gated_shared_expert)
+
+    def gated_shared_expert(self, x: mx.array) -> tuple[mx.array, mx.array]:
+        """The shared expert's output and its gate logit, which the experts add gated."""
+        return self.shared_expert.forward(x), self.shared_expert_gate.forward(x)
 
 
 __all__ = ["GATE_UP_PARTS", "SharedExpert", "SharedExpertMoE"]

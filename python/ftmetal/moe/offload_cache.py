@@ -1,43 +1,44 @@
 """OffloadMoeCache: a slot cache of routed experts read on demand from the checkpoint.
 
-Port of FreeToken moe/offload_cache.py (OffloadMoeCache). Divergences: memory is unified,
-so there are no host banks: one raw byte buffer per bank role holds the cache's expert rows
-(each pool's in its layers' layout), filled straight from the checkpoint files by
-_C.ExpertService (in C++: a token-granular LRU per pool of slots, the IO threads, the two
-prefill buffers), laid out by moe/slot_pools.py (FreeToken's slot pool design, its pools of
-one slot width placed smallest first, not in layer order; the layers' layouts share their
-banks); slot_of and last_use are shared arrays the C++ side writes in place; ensure_experts
-takes the forward's step and returns the slots; prefetch_prefill_layer returns where each
-of the layer's experts lies (resident experts in their slots, only the absent read into
-the prefill buffer) instead of copying a whole layer, which the expert-sorted gather reads
-at byte offsets. Decode and short prefills look their experts up on the GPU
-(kernel/moe/moe_lookup.py): misses go to the C++ coordinator through a mailbox instead of
-FreeToken's per-layer ready/done flags, with a watchdog (FreeToken cpu_executor.py) failing an
-unanswered request. Each forward is prepared like an attention backend's metadata: a decode, or a
-prefill below prefill_overlap_min_tokens, looks its experts up (a copy-miss prefill: its
-misses join the LRU, where FreeToken's prefill streams whole layers); a longer prefill
-reads each layer's absent experts into a prefill buffer one layer ahead, ordered by the
-host. No slot a step reads may be rewritten within the step, since the GPU caches may keep
-its old row: a decode's rows are capped so that each pool holds its layers' experts of the
-whole decode at once (FreeToken caps per layer), one step as a graph replay must, and a
-copy-miss prefill whose experts may not all fit the pools at once runs as several steps,
-each its own command buffer. Below the slots, a victim cache in pageable host memory outside
-the GPU budget (victim_cache_bytes, 0: none; FreeToken has none) keeps the experts that leave
-their slots, purgeable under memory pressure: a later miss, or an overlap prefill's absent
-expert, is copied from it instead of read from the checkpoint. Only where a slot's bytes come
-from changes; the lookups and slot_of never see it.
+Port of FreeToken moe/offload_cache.py (OffloadMoeCache). Divergences: memory is unified, so
+there are no host banks: one raw byte buffer per bank role holds the cache's expert rows (each
+pool's in its layers' layout), filled straight from the checkpoint files by _C.ExpertService (in
+C++: a token-granular LRU per pool of slots, the IO threads, the two prefill buffers), laid out
+by moe/slot_pools.py (FreeToken's slot pool design, its pools of one slot width placed smallest
+first, not in layer order; the layers' layouts share their banks); slot_of and last_use are
+shared arrays the C++ side writes in place; ensure_experts takes the forward's step and returns
+the slots; prefetch_prefill_layer returns where each of the layer's experts lies (resident
+experts in their slots, only the absent read into the prefill buffer) instead of copying a whole
+layer, which the expert-sorted gather reads at byte offsets. Decode and short prefills look
+their experts up on the GPU (kernel/moe/moe_lookup.py): misses go to the C++ coordinator through
+a mailbox instead of FreeToken's per-layer ready/done flags, with a watchdog (FreeToken
+cpu_executor.py) failing an unanswered request. A decode layer may issue its lookup instead
+(split_lookup): the misses are posted without the wait, which the kernels reading their rows do,
+so the layer's resident pairs and shared expert run during the read. Each forward is prepared
+like an attention backend's metadata: a decode, or a prefill below prefill_overlap_min_tokens,
+looks its experts up (a copy-miss prefill: its misses join the LRU, where FreeToken's prefill
+streams whole layers); a longer prefill reads each layer's absent experts into a prefill buffer
+one layer ahead, ordered by the host. No slot a step reads may be rewritten within the step,
+since the GPU caches may keep its old row: a decode's rows are capped so that each pool holds
+its layers' experts of the whole decode at once (FreeToken caps per layer), one step as a graph
+replay must, and a copy-miss prefill whose experts may not all fit the pools at once runs as
+several steps, each its own command buffer. Below the slots, a victim cache in pageable host
+memory outside the GPU budget (victim_cache_bytes, 0: none; FreeToken has none) keeps the
+experts that leave their slots, purgeable under memory pressure: a later miss, or an overlap
+prefill's absent expert, is copied from it instead of read from the checkpoint. Only where a
+slot's bytes come from changes; the lookups and slot_of never see it.
 """
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import mlx.core as mx
 import numpy as np
 
 from ftmetal.core import Batch
 from ftmetal.kernel._ext import _C
-from ftmetal.kernel.moe.moe_lookup import moe_lookup
+from ftmetal.kernel.moe.moe_lookup import moe_lookup, moe_lookup_issue
 from ftmetal.moe.slot_pools import SlotLayout, initial_experts
 from ftmetal.moe.source import ExpertSource
 
@@ -59,6 +60,19 @@ MAX_STEP = 2**31 - 1
 MoeForwardMode = Literal["decode", "copy_miss", "overlap"]
 
 
+class IssuedLookup(NamedTuple):
+    """A decode layer's lookup posted without its wait (moe_lookup_issue), for the kernels that
+    wait for it (affine_swiglu_pending)."""
+
+    # int32 [T, top_k]: each pair's slot in the layer's pool, negative where it is pending.
+    slots: mx.array
+    issued: mx.array
+    slot_of: mx.array
+    mailbox: mx.array
+    layer_id: int
+    slot_base: int
+
+
 class OffloadMoeCache:
     def __init__(
         self,
@@ -70,6 +84,7 @@ class OffloadMoeCache:
         expert_counts: np.ndarray | None = None,
         victim_cache_bytes: int,
         pairs: list[mx.array] | None,
+        split_lookup: bool,
         stall_timeout_s: float = STALL_TIMEOUT_S,
         run_coordinator: bool = True,
     ) -> None:
@@ -78,9 +93,11 @@ class OffloadMoeCache:
         expert_counts int64 [num_layers, num_experts], the hot-expert table it was planned
         with (None: none), picks the experts the pools start with; victim_cache_bytes is the
         host victim cache's budget, split over the pools by their slots' bytes (0: none); pairs:
-        each layer's pair table when the layouts hold pair codes (an expert pack's), else None.
-        Without run_coordinator nobody answers the lookups (a stalled coordinator, for
-        tests); the watchdog fails a request unanswered for stall_timeout_s."""
+        each layer's pair table when the layouts hold pair codes (an expert pack's), else None;
+        split_lookup: a decode layer whose method can issue its lookup (issue_lookup) and
+        computes its resident pairs while the CPU reads the absent ones. Without run_coordinator
+        nobody answers the lookups (a stalled coordinator, for tests); the watchdog fails a
+        request unanswered for stall_timeout_s."""
         self.slot_layout = slot_layout
         self.layer_pools = slot_layout.layer_pools
         num_layers, num_experts = len(self.layer_pools), slot_layout.num_experts
@@ -95,7 +112,10 @@ class OffloadMoeCache:
         self.prefill_overlap = prefill_overlap
         self.prefill_overlap_min_tokens = prefill_overlap_min_tokens
         self.pairs = pairs
+        self.split_lookup = split_lookup
         pools = slot_layout.pools
+        # Each layer's first slot, which its lookups' slots count from.
+        self.slot_bases = [pools[pool_id].first_slot for pool_id in self.layer_pools]
         layouts = [pools[pool_id].layout for pool_id in self.layer_pools]
         widths = slot_layout.bank_widths
         self.banks = {
@@ -254,6 +274,39 @@ class OffloadMoeCache:
         slots, _ = self.lookup(layer_id, topk_ids, self.moe_step, kind)
         return slots
 
+    def issue_lookup(self, layer_id: int, topk_ids: mx.array) -> IssuedLookup:
+        """A decode layer's lookup of its routed pairs topk_ids int32 [T, top_k] that posts the
+        absent experts and returns, for the waiters to resolve their pairs."""
+        assert self.mode == "decode", f"a {self.mode} forward looks its experts up"
+        outputs = moe_lookup_issue(
+            topk_ids,
+            self.moe_step,
+            self.slot_of,
+            self.mailbox,
+            self.last_use,
+            self.hit_stats,
+            layer_id=layer_id,
+            slot_base=self.slot_bases[layer_id],
+        )
+        self.mailbox, self.last_use, self.hit_stats = (
+            outputs.mailbox,
+            outputs.last_use,
+            outputs.hit_stats,
+        )
+        return IssuedLookup(
+            outputs.slots,
+            outputs.issued,
+            self.slot_of,
+            outputs.mailbox,
+            layer_id,
+            self.slot_bases[layer_id],
+        )
+
+    def end_issued_lookup(self, mailbox: mx.array) -> None:
+        """Take the mailbox as an issued lookup's waits return it: the next post, a later forward's
+        too, runs after them."""
+        self.mailbox = mailbox
+
     def begin_prefill_forward(self) -> None:
         """Layer 0 of an overlap prefill: wait for the GPU (the forward before may still read
         the prefill buffers' slots), take the buffers back and start reading layers 0 and 1."""
@@ -343,7 +396,7 @@ class OffloadMoeCache:
             self.last_use,
             self.hit_stats,
             layer_id=layer_id,
-            slot_base=self.slot_layout.pools[self.layer_pools[layer_id]].first_slot,
+            slot_base=self.slot_bases[layer_id],
             kind=kind,
         )
         self.mailbox, self.last_use, self.hit_stats = (
@@ -392,6 +445,7 @@ __all__ = [
     "MAX_STEP",
     "STAGING_BYTES",
     "STALL_TIMEOUT_S",
+    "IssuedLookup",
     "MoeForwardMode",
     "OffloadMoeCache",
 ]

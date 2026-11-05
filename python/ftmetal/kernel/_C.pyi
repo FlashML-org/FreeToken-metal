@@ -13,6 +13,9 @@ EXPERT_STAGING_BYTES: int
 FILL_FILE: int
 QMM_TILE_K: int
 MAX_PAIR_CODE_BITS: int
+ISSUED_WORDS: int
+PENDING_FALLBACK_SLOT: int
+ACT_ROWS_PER_SIMDGROUP: int
 MAILBOX_SPIN_LIMIT: int
 PLE_MAILBOX_WORDS: int
 MAX_PLE_ROWS: int
@@ -53,6 +56,10 @@ class MailboxError(enum.IntEnum):
     SHUTDOWN = 4
     CAPACITY = 5
 
+class IssuedWord(enum.IntEnum):
+    SEQUENCE = 0
+    NUM_MISSES = 1
+
 class MoeLookupKind(enum.IntEnum):
     DECODE = 1
     PREFILL_COPY_MISS = 2
@@ -79,6 +86,39 @@ def moe_lookup(
     layer_id: int,
     slot_base: int,
     kind: MoeLookupKind,
+    *,
+    stream: Stream = None,
+) -> list[mx.array]: ...
+def moe_lookup_issue(
+    topk_ids: mx.array,
+    moe_step: mx.array,
+    slot_of: mx.array,
+    mailbox: mx.array,
+    last_use: mx.array,
+    hit_stats: mx.array,
+    layer_id: int,
+    slot_base: int,
+    *,
+    stream: Stream = None,
+) -> list[mx.array]: ...
+def affine_swiglu_pending(
+    x: mx.array,
+    w: mx.array,
+    scales_or_codes: mx.array,
+    biases_or_pairs: mx.array,
+    gate_up_resident: mx.array,
+    slots: mx.array,
+    issued: mx.array,
+    slot_of: mx.array,
+    mailbox: mx.array,
+    after: mx.array,
+    layer_id: int,
+    slot_base: int,
+    num_experts: int,
+    group_size: int,
+    bits: int,
+    code_bits: int,
+    is_fast: bool,
     *,
     stream: Stream = None,
 ) -> list[mx.array]: ...
@@ -231,6 +271,7 @@ def init_gather_sorted_libraries(
 ) -> None: ...
 def init_sample_tokens_library(source: str) -> None: ...
 def init_moe_lookup_library(source: str) -> None: ...
+def init_affine_swiglu_pending_library(source: str) -> None: ...
 def init_ple_lookup_library(source: str) -> None: ...
 def ple_post(
     input_ids: mx.array,

@@ -13,7 +13,8 @@ offsets (apply_sorted, on the expert-sorted kernels); a resident array (an expor
 output_scale, FreeToken's resident BankSpec) stays the layer's and is indexed by expert in all
 three. An offload pool's affine rows may hold pair codes (an expert pack's, moe/pack.py) in place
 of their scales and biases, which the pair-code kernels look up in the layer's pair table of
-2^code_bits rows.
+2^code_bits rows. An affine offload decode may instead run on its issued lookup
+(layers/quantization/moe_pending.py).
 """
 
 from __future__ import annotations
@@ -77,8 +78,8 @@ class ExpertSchemes:
 @dataclass(frozen=True, kw_only=True)
 class MoEConfig:
     """What a MoE method sizes and computes by: the layer's shape, activation and float dtype,
-    each projection's scheme, and where its banks live. top_k is FreeToken's field, read by
-    no method yet."""
+    each projection's scheme, and where its banks live. top_k is FreeToken's field; the pending
+    kernels' eligibility reads it (moe_pending.py)."""
 
     num_experts: int
     top_k: int
@@ -96,6 +97,13 @@ class ExpertProjection(Protocol):
     """One bank projection (a key of ExpertSchemes.projections) of x for a forward's experts."""
 
     def __call__(self, projection: str, x: mx.array, /) -> mx.array: ...
+
+
+class SharedExpertForward(Protocol):
+    """A shared expert's output and gate logit [T, 1] for x [T, H]; the MoE output adds the
+    output gated by the logit's sigmoid."""
+
+    def __call__(self, x: mx.array, /) -> tuple[mx.array, mx.array]: ...
 
 
 class MoEMethod(ABC):
@@ -513,6 +521,7 @@ __all__ = [
     "FpBlockMoEMethod",
     "MoEConfig",
     "MoEMethod",
+    "SharedExpertForward",
     "UnquantizedMoEMethod",
     "moe_method",
 ]

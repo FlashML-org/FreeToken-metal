@@ -6,8 +6,10 @@ layer's pair table [P, 2] of (scale, bias) in x's dtype: code n * G + g for outp
 group g of G = K / group_size, least significant bit first, the row zero padded to whole 64-byte
 lines. This is MLX's
 affine_gather_qmv_fast and affine_gather_qmv (quantized.h) with each group's scale and bias
-looked up by its code, on the impl MLX's gather_qmv picks for the shape, so every output equals
-mx.gather_qmm's (unsorted, one row per pair) on the expanded scales and biases bit for bit.
+looked up by its code, on the impl MLX's gather_qmv picks for the shape (affine_slot_qmv.h), so
+every output equals mx.gather_qmm's (unsorted, one row per pair) on the expanded scales and biases
+bit for bit. With skip_pending, the offload decode's resident pass, a pair whose slot is negative
+(its expert pending, moe_lookup_issue) is left unwritten.
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from ftmetal.kernel._ext import _C, metal_kernel_header, metal_source
 from ftmetal.kernel.custom import metal_kernel
 
 SIMD_WIDTH = 32
-# MLX gather_qmv's threadgroup: two simdgroups of four output rows each.
+# MLX gather_qmv's threadgroup: two simdgroups of four output rows each (affine_slot_qmv.h).
 SIMDGROUPS_PER_THREADGROUP = 2
 QMV_TILE_ROWS = 8
 # MLX's qmv_fast_k_alignment per bit width: gather_qmv takes the fast kernel when K is a
@@ -38,7 +40,7 @@ KERNEL = metal_kernel(
     input_names=["x", "w", "codes", "pairs", "indices"],
     output_names=["y"],
     source=SOURCE,
-    header=metal_kernel_header(Path(__file__).with_name("affine_gather_qmv_pair_codes.h")),
+    header=metal_kernel_header(Path(__file__).with_name("affine_slot_qmv.h")),
 )
 
 
@@ -59,20 +61,24 @@ def affine_gather_qmv_pair_codes(
     group_size: int,
     bits: int,
     code_bits: int,
+    skip_pending: bool = False,
 ) -> mx.array:
     """mx.gather_qmm(x, w, scales, biases, rhs_indices=indices, transpose=True) bit for bit, the
     scales and biases [S, N, K / group_size] being pairs[code, 0] and pairs[code, 1].
 
     x [T, 1 or top_k, 1, K] in float32, float16 or bfloat16; indices [T, top_k] int32 or uint32
     slot ids; w [S, N, K * bits / 32] uint32; codes [S, pair_code_row_bytes(N * K / group_size,
-    code_bits)] uint8; pairs [P, 2] in x's dtype. Returns [T, top_k, 1, N] in x's dtype.
+    code_bits)] uint8; pairs [P, 2] in x's dtype. Returns [T, top_k, 1, N] in x's dtype; with
+    skip_pending (indices int32) the rows of negative indices are left unwritten.
     """
     tokens, top_k = indices.shape
     num_slots, output_size, words = w.shape
     input_size = x.shape[-1]
     assert x.dtype in (mx.float32, mx.float16, mx.bfloat16), x.dtype
     assert x.ndim == 4 and x.shape[0] == tokens and x.shape[1] in (1, top_k) and x.shape[2] == 1
-    assert indices.dtype in (mx.int32, mx.uint32), indices.dtype
+    assert indices.dtype == mx.int32 or (indices.dtype == mx.uint32 and not skip_pending), (
+        indices.dtype
+    )
     assert bits in GATHER_QMV_FAST_INPUT_STEP and group_size in GROUP_SIZES, (bits, group_size)
     assert 1 <= code_bits <= MAX_PAIR_CODE_BITS, code_bits
     assert input_size % group_size == 0 and words * 32 == input_size * bits, (w.shape, x.shape)
@@ -95,6 +101,7 @@ def affine_gather_qmv_pair_codes(
             ("CODE_ROW_BYTES", codes.shape[1]),
             ("PAIRS_PER_INPUT", top_k // x.shape[1]),
             ("FAST", is_fast),
+            ("SKIP_PENDING", skip_pending),
         ],
         grid=(
             SIMD_WIDTH,
