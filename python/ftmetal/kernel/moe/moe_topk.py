@@ -1,7 +1,10 @@
 """Fused MoE router: softmax over the experts, top-k selection and renormalization.
 
 One simdgroup per token row on mx.fast.metal_kernel; replaces the softmax,
-argpartition, take_along_axis, sum and divide dispatches of the ops path (kernel/ref.py).
+argpartition, take_along_axis, sum and divide dispatches of the ops path (kernel/ref.py). The
+selection runs on per-lane registers (PR #3's kernel/router.py router_topk_registers): no
+threadgroup memory or barrier on its serial path. A row's logits may be the first experts of a
+wider row (a fused gate projection's), read in place.
 """
 
 from __future__ import annotations
@@ -25,14 +28,20 @@ KERNEL = metal_kernel(
 )
 
 
-def moe_topk(gates: mx.array, top_k: int, norm_topk_prob: bool) -> tuple[mx.array, mx.array]:
-    """gates [T, E] logits -> (expert ids int32 [T, top_k], weights [T, top_k] in gates' dtype)."""
-    num_rows, num_experts = gates.shape
+def moe_topk(
+    gates: mx.array, top_k: int, norm_topk_prob: bool, num_experts: int | None = None
+) -> tuple[mx.array, mx.array]:
+    """gates [T, E] logits -> (expert ids int32 [T, top_k], weights [T, top_k] in gates' dtype);
+    with num_experts, gates is [T, S] and a row's logits its first num_experts columns."""
+    num_rows, stride = gates.shape
+    num_experts = stride if num_experts is None else num_experts
+    assert 1 <= top_k <= num_experts <= stride, (top_k, num_experts, stride)
     ids, scores = KERNEL(
         inputs=[gates],
         template=[
             ("InT", gates.dtype),
             ("E", num_experts),
+            ("GS", stride),
             ("K", top_k),
             ("NORM", norm_topk_prob),
         ],

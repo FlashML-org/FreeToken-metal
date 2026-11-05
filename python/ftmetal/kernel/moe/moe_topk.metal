@@ -1,48 +1,70 @@
+// One simdgroup per row, the probabilities in registers: lane l holds experts l, l + 32, ...
+// (PER of them). Each lane keeps its best expert (ties to its lowest); a pick takes the simdgroup's
+// best (ties to the lowest expert) and only the winning lane rescans its own, so the serial
+// selection reads no threadgroup memory and takes no barrier. The logits of row r are gates[r * GS
+// + e], e < E.
+constexpr int PER = (E + 31) / 32;
 const uint row = thread_position_in_grid.x / 32;
-const uint lane = thread_index_in_simdgroup;
-threadgroup float probs[E];
-auto logits = gates + row * E;
+const int lane = thread_index_in_simdgroup;
+auto logits = gates + row * GS;
 
+float probs[PER];
 float row_max = -INFINITY;
-for (int e = lane; e < E; e += 32) {
-  const float x = static_cast<float>(logits[e]);
-  probs[e] = x;
-  row_max = max(row_max, x);
+for (int i = 0; i < PER; ++i) {
+  const int e = lane + 32 * i;
+  probs[i] = e < E ? static_cast<float>(logits[e]) : -1.0f;
+  if (e < E) {
+    row_max = max(row_max, probs[i]);
+  }
 }
 row_max = simd_max(row_max);
 float total = 0.0f;
-for (int e = lane; e < E; e += 32) {
-  const float p = exp(probs[e] - row_max);
-  probs[e] = p;
-  total += p;
+for (int i = 0; i < PER; ++i) {
+  if (lane + 32 * i < E) {
+    const float p = exp(probs[i] - row_max);
+    probs[i] = p;
+    total += p;
+  }
 }
 total = simd_sum(total);
 const float inv_total = 1.0f / total;
-for (int e = lane; e < E; e += 32) {
-  probs[e] *= inv_total;
+for (int i = 0; i < PER; ++i) {
+  if (lane + 32 * i < E) {
+    probs[i] *= inv_total;
+  }
 }
-simdgroup_barrier(mem_flags::mem_threadgroup);
+float best = -1.0f;
+int best_expert = E;
+for (int i = 0; i < PER; ++i) {
+  if (probs[i] > best) {
+    best = probs[i];
+    best_expert = lane + 32 * i;
+  }
+}
 
 // K serial selections; ties go to the lowest expert index.
 float picked_total = 0.0f;
 for (int k = 0; k < K; ++k) {
-  float best = -1.0f;
-  int best_expert = E;
-  for (int e = lane; e < E; e += 32) {
-    if (probs[e] > best) {
-      best = probs[e];
-      best_expert = e;
-    }
-  }
   const float group_best = simd_max(best);
   const int chosen = simd_min(best == group_best ? best_expert : E);
   picked_total += group_best;
   if (lane == 0) {
     ids[row * K + k] = chosen;
     scores[row * K + k] = static_cast<InT>(group_best);
-    probs[chosen] = -1.0f;
   }
-  simdgroup_barrier(mem_flags::mem_threadgroup);
+  if (best_expert == chosen) {
+    best = -1.0f;
+    best_expert = E;
+    for (int i = 0; i < PER; ++i) {
+      if (lane + 32 * i == chosen) {
+        probs[i] = -1.0f;
+      }
+      if (probs[i] > best) {
+        best = probs[i];
+        best_expert = lane + 32 * i;
+      }
+    }
+  }
 }
 if (NORM && lane == 0) {
   for (int k = 0; k < K; ++k) {
