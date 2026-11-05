@@ -26,6 +26,7 @@ from ftmetal.layers.base import BaseOP
 from ftmetal.layers.embedding import Embedding
 from ftmetal.layers.gdn import IN_PROJ_BA_PARTS, IN_PROJ_QKVZ_PARTS, GatedDeltaNet
 from ftmetal.layers.linear import Linear
+from ftmetal.layers.projection import project
 from ftmetal.layers.quantization.config import QuantScheme
 from ftmetal.layers.quantization.moe import ExpertSchemes
 from ftmetal.layers.shared_expert_moe import GATE_UP_PARTS, SharedExpertMoE
@@ -37,7 +38,6 @@ from ftmetal.models.qwen4_exp.attention import Qwen4ExpAttention
 from ftmetal.models.qwen4_exp.config import Qwen4ExpConfig
 from ftmetal.models.qwen4_exp.norm import HyperConnection, PendingBranch, inject
 from ftmetal.models.qwen4_exp.ple import Qwen4ExpPLE
-from ftmetal.models.qwen4_exp.projection import project
 from ftmetal.models.qwen4_exp.weight import QKV_PARTS, checkpoint_module
 
 # Decode rows one step's PLE lookup posts; a larger batch looks its rows up on the host.

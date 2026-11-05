@@ -19,9 +19,9 @@ from ftmetal.kernel.hc.hc_up_mix import hc_up_mix, supports_hc_up_mix
 from ftmetal.kernel.norm.offset_rms_norm import hc_norm, offset_rms_norm
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear
+from ftmetal.layers.projection import project, qmv_scheme
 from ftmetal.layers.quantization.config import QuantScheme
 from ftmetal.layers.quantization.linear import AffineLinearMethod
-from ftmetal.models.qwen4_exp.projection import project, qmv_scheme
 
 # The branch an attention or MLP sublayer adds back to the streams: its output [T, H] and its
 # raw inject logits [T, hc_count].

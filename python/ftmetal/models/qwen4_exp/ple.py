@@ -36,12 +36,12 @@ from ftmetal.kernel.kvcache.pool_rows import scatter_rows
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.gdn import DepthwiseConv1d
 from ftmetal.layers.linear import Linear
+from ftmetal.layers.projection import project
 from ftmetal.layers.quantization.config import QuantScheme
 from ftmetal.mm import restore_placeholder
 from ftmetal.models.loader import weight_files
 from ftmetal.models.qwen4_exp.config import Qwen4ExpConfig, ple_context_state, ple_conv_state
 from ftmetal.models.qwen4_exp.norm import CenteredRMSNorm
-from ftmetal.models.qwen4_exp.projection import project
 from ftmetal.models.qwen4_exp.weight import ple_table_prefix
 
 SHARD_KEY = re.compile(r"ngram_embedding\.shards\.(\d+)\.(weight|scales|biases)$")

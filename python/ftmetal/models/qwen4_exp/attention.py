@@ -19,12 +19,12 @@ from ftmetal.kernel.norm.offset_rms_norm import offset_rms_norm_rope, supports_o
 from ftmetal.layers.activation import sigmoid_gate
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
+from ftmetal.layers.projection import project, project_split
 from ftmetal.layers.quantization.config import QuantScheme
 from ftmetal.layers.rotary import MRotaryEmbedding, RotaryEmbedding
 from ftmetal.models.config import QSAAttentionGroupConfig, RotaryConfig
 from ftmetal.models.qwen4_exp.config import Qwen4ExpConfig
 from ftmetal.models.qwen4_exp.norm import CenteredRMSNorm
-from ftmetal.models.qwen4_exp.projection import project, project_split
 from ftmetal.models.qwen4_exp.weight import QKV_PARTS
 
 # Forwards of at most this many tokens norm and rope each head in one launch (the same

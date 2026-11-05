@@ -18,6 +18,7 @@ from ftmetal.layers.activation import silu_and_mul
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
 from ftmetal.layers.moe import MoELayer, OffloadMoELayer
+from ftmetal.layers.projection import project
 from ftmetal.layers.quantization.config import QuantScheme
 from ftmetal.layers.quantization.moe import ExpertSchemes
 from ftmetal.models.config import ModelConfig
@@ -47,7 +48,7 @@ class SharedExpert(BaseOP):
         self.down_proj = Linear(intermediate_size, hidden_size, scheme=down_scheme, dtype=dtype)
 
     def forward(self, x: mx.array) -> mx.array:
-        return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
+        return project(self.down_proj, silu_and_mul(project(self.gate_up_proj, x)))
 
 
 class SharedExpertMoE(BaseOP):
@@ -101,13 +102,13 @@ class SharedExpertMoE(BaseOP):
 
     def forward(self, hidden_states: mx.array) -> mx.array:
         topk_ids, topk_weights = moe_topk(
-            self.gate.forward(hidden_states), self.top_k, self.norm_topk_prob
+            project(self.gate, hidden_states), self.top_k, self.norm_topk_prob
         )
         return self.experts.forward(hidden_states, topk_weights, topk_ids, self.gated_shared_expert)
 
     def gated_shared_expert(self, x: mx.array) -> tuple[mx.array, mx.array]:
         """The shared expert's output and its gate logit, which the experts add gated."""
-        return self.shared_expert.forward(x), self.shared_expert_gate.forward(x)
+        return self.shared_expert.forward(x), project(self.shared_expert_gate, x)
 
 
 __all__ = ["GATE_UP_PARTS", "SharedExpert", "SharedExpertMoE"]
