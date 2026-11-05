@@ -139,6 +139,13 @@ class Qwen3_5MoeForCausalLM(BaseLLMModel):
             self.visual = Qwen3VLVisionModel(config.vision_config, channels_last=False)
             self.visual.set_dtype(dtype)
 
+    def finish_loading(self, model_path: str) -> int:
+        """Fuse each MoE block's router and shared expert gates (SharedExpertMoE.fuse_gates);
+        holds no host memory."""
+        for layer in self.model.layers:
+            layer.mlp.fuse_gates()
+        return 0
+
     def forward(self, batch: Batch) -> mx.array:
         hidden = select_last_rows(self.model.forward(batch), batch)
         if self.config.tie_word_embeddings:

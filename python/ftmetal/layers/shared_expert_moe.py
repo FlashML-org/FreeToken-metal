@@ -6,7 +6,10 @@ qwen4_exp (FreeToken's Qwen4ExpMoE subclasses it unchanged). Divergences: the ro
 kernel/moe/moe_topk Metal kernel (fp32 softmax, top-k, renorm in one launch) and the
 experts are the resident MoELayer, or OffloadMoELayer under the offload strategy (FreeToken's
 make_moe_layer choice, made here), whose forward adds the gated shared expert, so that an offload
-decode runs it while its absent experts are read.
+decode runs it while its absent experts are read. Once loaded, an affine router gate and shared
+expert gate of one scheme are one projection of their rows (fuse_gates): a decode token computes
+both in one GEMV (the shared gate's one row alone would take a whole launch), the router reading
+its experts' columns in place.
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ from ftmetal.layers.activation import silu_and_mul
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
 from ftmetal.layers.moe import MoELayer, OffloadMoELayer
-from ftmetal.layers.projection import project
+from ftmetal.layers.projection import fuse_rows, project, qmv_scheme, rows_forward
 from ftmetal.layers.quantization.config import QuantScheme
 from ftmetal.layers.quantization.moe import ExpertSchemes
 from ftmetal.models.config import ModelConfig
@@ -65,6 +68,7 @@ class SharedExpertMoE(BaseOP):
         dtype: mx.Dtype,
     ) -> None:
         super().__init__()
+        self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
         self.gate = Linear(config.hidden_size, config.num_experts, scheme=gate_scheme, dtype=dtype)
@@ -100,15 +104,39 @@ class SharedExpertMoE(BaseOP):
             config.hidden_size, 1, scheme=shared_gate_scheme, dtype=dtype
         )
 
-    def forward(self, hidden_states: mx.array) -> mx.array:
-        topk_ids, topk_weights = moe_topk(
-            project(self.gate, hidden_states), self.top_k, self.norm_topk_prob
-        )
-        return self.experts.forward(hidden_states, topk_weights, topk_ids, self.gated_shared_expert)
+    def fuse_gates(self) -> None:
+        """Replace the router gate and the shared expert gate, when both are affine in one scheme,
+        by one projection of their rows (fuse_rows)."""
+        fused = fuse_rows([self.gate, self.shared_expert_gate])
+        if fused is not None:
+            self.gates = fused
+            self.pop("gate")
+            self.pop("shared_expert_gate")
 
-    def gated_shared_expert(self, x: mx.array) -> tuple[mx.array, mx.array]:
-        """The shared expert's output and its gate logit, which the experts add gated."""
-        return self.shared_expert.forward(x), project(self.shared_expert_gate, x)
+    def forward(self, hidden_states: mx.array) -> mx.array:
+        num_experts = self.num_experts
+        shared_gate: mx.array | None = None
+        if "gates" not in self:
+            topk_ids, topk_weights = moe_topk(
+                project(self.gate, hidden_states), self.top_k, self.norm_topk_prob
+            )
+        elif qmv_scheme(self.gates, hidden_states) is not None:
+            logits = project(self.gates, hidden_states)
+            topk_ids, topk_weights = moe_topk(
+                logits, self.top_k, self.norm_topk_prob, num_experts=num_experts
+            )
+            shared_gate = logits[:, num_experts : num_experts + 1]
+        else:
+            router_logits = rows_forward(self.gates, hidden_states, 0, num_experts)
+            topk_ids, topk_weights = moe_topk(router_logits, self.top_k, self.norm_topk_prob)
+            shared_gate = rows_forward(self.gates, hidden_states, num_experts, num_experts + 1)
+
+        def gated_shared_expert(x: mx.array) -> tuple[mx.array, mx.array]:
+            """The shared expert's output and its gate logit, which the experts add gated."""
+            gate = project(self.shared_expert_gate, x) if shared_gate is None else shared_gate
+            return self.shared_expert.forward(x), gate
+
+        return self.experts.forward(hidden_states, topk_weights, topk_ids, gated_shared_expert)
 
 
 __all__ = ["GATE_UP_PARTS", "SharedExpert", "SharedExpertMoE"]

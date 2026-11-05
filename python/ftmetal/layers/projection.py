@@ -4,15 +4,23 @@ simdgroups.
 A CommandGraph replays a decode step's dispatches back to back, so a GEMV with few
 threadgroups per output row waits on memory latency; qmv_rows computes mx.quantized_matmul's
 sums with one output row per simdgroup. Other shapes and schemes, and biased projections, run
-Linear.forward.
+Linear.forward. Projections that read the same input fuse into one of their rows once loaded
+(fuse_rows), so a decode token computes them in one GEMV; several tokens run each part's rows
+(rows_forward), as they did apart.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import mlx.core as mx
 import numpy as np
 
-from ftmetal.kernel.gemm.affine.affine_qmv_rows import qmv_rows, supports_qmv_rows
+from ftmetal.kernel.gemm.affine.affine_qmv_rows import (
+    QMV_FAST_OUTPUT_TILE,
+    qmv_rows,
+    supports_qmv_rows,
+)
 from ftmetal.layers.linear import Linear, LinearMerged
 from ftmetal.layers.quantization.config import AffineScheme
 from ftmetal.layers.quantization.linear import AffineLinearMethod
@@ -61,4 +69,42 @@ def project_split(merged: LinearMerged, x: mx.array) -> list[mx.array]:
         return project(merged, x).split(bounds, axis=-1)
 
 
-__all__ = ["project", "project_split", "qmv_scheme"]
+def fuse_rows(linears: Sequence[Linear]) -> Linear | None:
+    """One affine linear of the linears' output rows in turn, then zero rows up to a whole
+    qmv_rows tile; None unless every one is affine in one scheme, without a bias."""
+    methods = [linear.quant_method for linear in linears]
+    affine = [method for method in methods if isinstance(method, AffineLinearMethod)]
+    if len(affine) != len(methods) or any("bias" in linear for linear in linears):
+        return None
+    first = affine[0]
+    if any(method.scheme != first.scheme for method in affine):
+        return None
+    used = sum(linear["weight"].shape[0] for linear in linears)
+    rows = -(-used // QMV_FAST_OUTPUT_TILE) * QMV_FAST_OUTPUT_TILE
+    dtype = linears[0]["scales"].dtype
+    fused = Linear(linears[0].input_size, rows, scheme=first.scheme, dtype=dtype)
+    for name in ("weight", "scales", "biases"):
+        parts = [linear[name] for linear in linears]
+        pad = mx.zeros((rows - used, parts[0].shape[1]), parts[0].dtype)
+        fused[name] = mx.concatenate([*parts, pad])
+    mx.eval(fused.parameters())
+    return fused
+
+
+def rows_forward(linear: Linear, x: mx.array, start: int, stop: int) -> mx.array:
+    """x through the output rows start..stop of an affine linear."""
+    method = linear.quant_method
+    assert isinstance(method, AffineLinearMethod)
+    return mx.quantized_matmul(
+        x,
+        linear["weight"][start:stop],
+        linear["scales"][start:stop],
+        linear["biases"][start:stop],
+        transpose=True,
+        group_size=method.scheme.group_size,
+        bits=method.scheme.bits,
+        mode="affine",
+    )
+
+
+__all__ = ["fuse_rows", "project", "project_split", "qmv_scheme", "rows_forward"]

@@ -229,13 +229,15 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
     def finish_loading(self, model_path: str) -> int:
         """Open each PLE layer's n-gram table in the checkpoint files and fuse each
-        hyper-connection's down and inject projections; returns the tables' row cache bytes."""
+        hyper-connection's down and inject projections and each MoE block's gates; returns the
+        tables' row cache bytes."""
         cache_bytes = 0
         for layer in self.model.layers:
             if layer.has_ple:
                 cache_bytes += layer.ple.open_table(model_path)
             layer.attn_hyper_connection.fuse_down_inject()
             layer.mlp_hyper_connection.fuse_down_inject()
+            layer.mlp.fuse_gates()
         return cache_bytes
 
     @property

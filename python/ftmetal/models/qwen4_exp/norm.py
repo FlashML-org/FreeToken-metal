@@ -19,15 +19,13 @@ from ftmetal.kernel.hc.hc_up_mix import hc_up_mix, supports_hc_up_mix
 from ftmetal.kernel.norm.offset_rms_norm import hc_norm, offset_rms_norm
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear
-from ftmetal.layers.projection import project, qmv_scheme
+from ftmetal.layers.projection import fuse_rows, project, qmv_scheme, rows_forward
 from ftmetal.layers.quantization.config import QuantScheme
 from ftmetal.layers.quantization.linear import AffineLinearMethod
 
 # The branch an attention or MLP sublayer adds back to the streams: its output [T, H] and its
 # raw inject logits [T, hc_count].
 PendingBranch = tuple[mx.array, mx.array]
-# qmv_rows' output rows come in tiles of this many.
-QMV_ROW_TILE = 8
 
 
 class CenteredRMSNorm(BaseOP):
@@ -55,22 +53,6 @@ def inject(hyper: mx.array, branch: mx.array, logits: mx.array) -> mx.array:
     streams = hyper.astype(mx.float32).reshape(num_tokens, hc_count, -1)
     added = streams + branch.astype(mx.float32)[:, None, :] * gates[:, :, None]
     return added.reshape(hyper.shape).astype(hyper.dtype)
-
-
-def rows_forward(linear: Linear, x: mx.array, start: int, stop: int) -> mx.array:
-    """x through the output rows start..stop of an affine linear."""
-    method = linear.quant_method
-    assert isinstance(method, AffineLinearMethod)
-    return mx.quantized_matmul(
-        x,
-        linear["weight"][start:stop],
-        linear["scales"][start:stop],
-        linear["biases"][start:stop],
-        transpose=True,
-        group_size=method.scheme.group_size,
-        bits=method.scheme.bits,
-        mode="affine",
-    )
 
 
 class HyperConnection(BaseOP):
@@ -105,22 +87,9 @@ class HyperConnection(BaseOP):
     def fuse_down_inject(self) -> None:
         """Replace the down and inject projections, when both are affine in one scheme, by one
         of their rows, then zero rows up to a whole qmv_rows tile."""
-        down, inject_linear = self.input_mix_weight_down, self.block_inject_weight
-        down_method, inject_method = down.quant_method, inject_linear.quant_method
-        if not (
-            isinstance(down_method, AffineLinearMethod)
-            and isinstance(inject_method, AffineLinearMethod)
-            and down_method.scheme == inject_method.scheme
-        ):
+        fused = fuse_rows([self.input_mix_weight_down, self.block_inject_weight])
+        if fused is None:
             return
-        rows = -(-(self.lowrank + self.hc_count) // QMV_ROW_TILE) * QMV_ROW_TILE
-        fused = Linear(down.input_size, rows, scheme=down_method.scheme, dtype=down["scales"].dtype)
-        for name in ("weight", "scales", "biases"):
-            pad = mx.zeros(
-                (rows - self.lowrank - self.hc_count, down[name].shape[1]), down[name].dtype
-            )
-            fused[name] = mx.concatenate([down[name], inject_linear[name], pad])
-        mx.eval(fused.parameters())
         self.down_inject = fused
         self.pop("input_mix_weight_down")
         self.pop("block_inject_weight")
