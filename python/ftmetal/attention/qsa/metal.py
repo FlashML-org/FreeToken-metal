@@ -5,7 +5,8 @@ A decode step scores each request's complete blocks (qsa_block_scores), keeps th
 (qsa_key_table) and runs flash_decode over that list as a page-size-1 table, all at the
 page table's width with no host value, so a CommandGraph replays it. A prefill whose
 queries all fit the budget runs flash_prefill; otherwise each request's queries, in chunks,
-select blocks with MLX ops and attend them with flash_prefill's block-sparse mode.
+score the blocks with MLX ops, take each query's topk with qsa_topk (no sort; the blocks MLX's
+select_blocks would take) and attend them with flash_prefill's block-sparse mode.
 """
 
 from __future__ import annotations
@@ -24,10 +25,19 @@ from ftmetal.kernel.attention.qsa.qsa_indexer import (
     qsa_window_mean,
 )
 
+
+def topk_select(scores: mx.array, query_ends: mx.array, block_size: int, topk: int) -> mx.array:
+    """BlockSelect on qsa_topk: each query's topk complete blocks, ties to the lower block."""
+    selected = qsa_topk(scores, query_ends, topk, block_size)
+    chosen = mx.zeros(scores.shape, dtype=mx.bool_)
+    return mx.put_along_axis(chosen, selected, mx.array(True), axis=1)
+
+
 # Prefill queries selecting at once, at most: bounds their [queries, blocks] scores and masks.
 QUERY_CHUNK = 256
-# A chunk's selection holds about this many fp32 [queries, blocks] arrays at once (the scores,
-# their sort, the tie ranks, the masks); the chunk shrinks so they stay in the workspace.
+# A chunk's selection holds about this many fp32 [queries, blocks] arrays at once (the scores and
+# a head's product, the selection and visibility masks); the chunk shrinks so they stay in the
+# workspace.
 SELECTION_ARRAYS = 6
 SELECTION_WORKSPACE_BYTES = 128 << 20
 
@@ -99,7 +109,12 @@ class QSAMetalBackend(QSAAttnBackend, FullAttnMetalBackend):
                 queries = slice(start + row, start + row + rows)
                 scores = block_scores(index_queries[queries], block_keys[: key_len // block_size])
                 visible = visible_blocks(
-                    scores, query_ends, block_size, self.topk_blocks, -(-key_len // block_size)
+                    scores,
+                    query_ends,
+                    block_size,
+                    self.topk_blocks,
+                    -(-key_len // block_size),
+                    topk_select,
                 )
                 out = flash_prefill_qsa(
                     q[queries],

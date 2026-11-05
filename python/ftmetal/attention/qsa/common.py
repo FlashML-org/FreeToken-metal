@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 from abc import abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -72,16 +73,34 @@ def block_scores(queries: mx.array, block_keys: mx.array) -> mx.array:
     return scores / math.sqrt(queries.shape[-1])
 
 
+# A query's topk blocks as bool [Q, N], from its scores [Q, N] over the complete blocks of the key
+# span and its end (position + 1, int32 [Q]): the blocks past its own complete ones excluded.
+BlockSelect = Callable[[mx.array, mx.array, int, int], mx.array]
+
+
+def select_query_blocks(
+    scores: mx.array, query_ends: mx.array, block_size: int, topk: int
+) -> mx.array:
+    """BlockSelect on MLX ops: select_blocks over each query's complete blocks."""
+    block_ids = mx.arange(scores.shape[1], dtype=mx.int32)[None]
+    complete = query_ends // block_size
+    return select_blocks(mx.where(block_ids < complete[:, None], scores, -mx.inf), topk)
+
+
 def visible_blocks(
-    scores: mx.array, query_ends: mx.array, block_size: int, topk: int, num_blocks: int
+    scores: mx.array,
+    query_ends: mx.array,
+    block_size: int,
+    topk: int,
+    num_blocks: int,
+    select: BlockSelect = select_query_blocks,
 ) -> mx.array:
     """bool [Q, num_blocks]: the blocks each query ending at query_ends [Q] (its position + 1)
     attends, its own (incomplete) block included; scores [Q, N] cover the complete blocks."""
     complete = query_ends // block_size
     block_ids = mx.arange(num_blocks, dtype=mx.int32)[None]
     width = scores.shape[1]
-    scores = mx.where(block_ids[:, :width] < complete[:, None], scores, -mx.inf)
-    chosen = select_blocks(scores, topk)
+    chosen = select(scores, query_ends, block_size, topk)
     if width < num_blocks:
         chosen = mx.concatenate(
             [chosen, mx.zeros((chosen.shape[0], num_blocks - width), dtype=mx.bool_)], axis=1
