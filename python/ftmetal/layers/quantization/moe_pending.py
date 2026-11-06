@@ -3,10 +3,11 @@ run while the CPU reads the absent experts, which affine_swiglu_pending waits fo
 
 No FreeToken donor. A decode layer whose lookup moe_lookup_issue posted without its wait (an
 OffloadMoeCache under split_lookup) runs four kernels where AffineMoEMethod.apply_slots and the
-shared expert's gated add run six or more: the resident gate_up pass (affine_gather_qmv, or
+shared expert's add run six or more: the resident gate_up pass (affine_gather_qmv, or
 affine_gather_qmv_pair_codes with skip_pending), the shared expert, affine_swiglu_pending (the
 absent pairs' gate_up once read, silu_and_mul for all) and affine_down_combine (down, the routing
-weighted sum and the shared expert's gated add). The output equals the other path's bit for bit.
+weighted sum and the shared expert's add, gated when it has a gate). The output equals the other
+path's bit for bit.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ from ftmetal.moe.offload_cache import IssuedLookup
 
 
 class PendingOutputs(NamedTuple):
-    # [T, H]: the routed experts' output, plus the shared expert's gated output when given.
+    # [T, H]: the routed experts' output, plus the shared expert's when given.
     out: mx.array
     # int32 [T, top_k]: each pair's slot in the layer's pool, as the waiting lookup resolves it.
     slots: mx.array
@@ -78,7 +79,7 @@ def apply_pending(
     shared_expert: SharedExpertForward | None,
 ) -> PendingOutputs:
     """method.apply_slots of x [T, H] over the issued lookup's slots in banks (the layer's pool
-    rows and resident arrays), plus the shared expert's gated output when given."""
+    rows and resident arrays), plus the shared expert's output when given."""
 
     def expert_scales(projection: str) -> ExpertScales:
         if f"{projection}.codes" in banks:
@@ -122,7 +123,10 @@ def apply_pending(
         # would run before the lookup posts, not during the read.
         (shared_x,) = mx.depends([x], [lookup.issued])
         shared, shared_gate = shared_expert(shared_x)
-        (after,) = mx.depends([shared], [shared_gate])
+        if shared_gate is None:
+            after = shared
+        else:
+            (after,) = mx.depends([shared], [shared_gate])
     act, slots, mailbox = affine_swiglu_pending(
         h,
         gate_up_weight,

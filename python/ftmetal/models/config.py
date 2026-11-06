@@ -1,9 +1,9 @@
 """Model configuration: attention groups and the per-model geometry.
 
 Port of FreeToken models/config.py, reduced to the FULL, SWA, LINEAR and QSA group kinds
-and the fields Qwen3.5-style hybrid MoE and Gemma4 models use. Divergences: the quantization
+and the fields Qwen3.5-style hybrid MoE, Gemma4 and Flint models use. Divergences: the quantization
 config is the checkpoint's MLX scheme map; no tensor parallelism or MTP; the MoE
-strategy is fused or offload and every layer of a MoE model routes experts; the
+strategy is fused or offload; the
 LINEAR group emits a KVCacheGroupSpec too (its per-slot conv and state shapes), so every
 pool is sized from a spec; the rope variant is a rope_type field, not a scaling
 dictionary; vision_config is the checkpoint's raw section, which the tower parses.
@@ -229,6 +229,12 @@ class ModelConfig:
     quant: QuantConfig | None = None
     moe_enabled: bool = False
     shared_expert_intermediate_size: int = 0
+    # The leading decoder layers with a dense MLP instead of routed experts.
+    first_k_dense_replace: int = 0
+    # Route on each logit's sigmoid, not the row's softmax.
+    is_sigmoid_router: bool = False
+    # The shared expert's output is added through a learned gate (else as it is).
+    has_shared_expert_gate: bool = True
     use_qk_norm: bool = False
     attn_output_gate: bool = False
     # None: head_dim ** -0.5 of each attention group.
@@ -255,8 +261,8 @@ class ModelConfig:
 
     @property
     def num_moe_layers(self) -> int:
-        """Decoder layers with routed experts: all of them in the served MoE families."""
-        return self.num_layers if self.moe_enabled else 0
+        """Decoder layers with routed experts, all but the leading dense ones."""
+        return self.num_layers - self.first_k_dense_replace if self.moe_enabled else 0
 
     @property
     def is_multimodal(self) -> bool:

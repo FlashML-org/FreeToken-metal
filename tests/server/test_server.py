@@ -80,6 +80,10 @@ QWEN3_CODER_CET = (
     "</tool_call>"
 )
 GEMMA4_PARIS = '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>,days:3}<tool_call|>'
+FLINT_PARIS = (
+    "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>"
+    "<arg_key>days</arg_key><arg_value>3</arg_value></tool_call>"
+)
 GEMMA4_CET = '<|tool_call>call:get_time{zone:<|"|>CET<|"|>}<tool_call|>'
 PARIS_CALL: tuple[str, JsonValue] = ("get_weather", {"city": "Paris", "days": 3})
 CET_CALL: tuple[str, JsonValue] = ("get_time", {"zone": "CET"})
@@ -212,6 +216,18 @@ CHAT_CASES: list[
         "tool_calls",
     ),
     ("gemma4", "gemma4", "Forty-two.", {}, "", "Forty-two.", [], "stop"),
+    (
+        "glm47",
+        "flint",
+        f"<think>Checking the weather.</think>{FLINT_PARIS}",
+        {"tools": TOOLS},
+        "Checking the weather.",
+        "",
+        [PARIS_CALL],
+        "tool_calls",
+    ),
+    # Tools offered, and no think block: its text is the answer, not reasoning.
+    ("glm47", "flint", "Forty-two.", {"tools": TOOLS}, "", "Forty-two.", [], "stop"),
 ]
 
 
@@ -780,11 +796,13 @@ GEMMA4_CONFIG: dict[str, JsonValue] = {
     "model_type": "gemma4",
     "text_config": {"model_type": "gemma4_text"},
 }
+FLINT_CONFIG: dict[str, JsonValue] = {"architectures": ["FlintForCausalLM"], "model_type": "flint"}
 
 # (config.json, flags, tool-call parser, reasoning parser)
 PARSER_SELECTION_CASES: list[tuple[dict[str, JsonValue] | None, list[str], str, str | None]] = [
     (QWEN3_6_CONFIG, [], "qwen3_coder", "qwen3"),
     (GEMMA4_CONFIG, [], "gemma4", "gemma4"),
+    (FLINT_CONFIG, [], "glm47", "flint"),
     (None, [], "llama3", None),
     (QWEN3_6_CONFIG, ["--reasoning-parser", "off"], "qwen3_coder", None),
     (
@@ -811,6 +829,28 @@ def test_parsers_follow_the_model_family(
     args = parse_args(["--model", str(tiny_model_dir), *flags], prog="ftm serve")
     assert (args.tool_call_parser, args.reasoning_parser) == (tool_call_parser, reasoning_parser)
     assert args.served_model_name == "tiny-model"
+
+
+# (directory name, config.json, tool-call parser, reasoning parser)
+FLINT_MARKER_CASES: list[tuple[str, dict[str, JsonValue], str, str | None]] = [
+    ("flint-probe", {"architectures": ["MistralForCausalLM"]}, "mistral", None),
+    ("qwen-vs-flint", FLINT_CONFIG, "glm47", "flint"),
+]
+
+
+@pytest.mark.parametrize(("name", "config", "tool_parser", "reasoning"), FLINT_MARKER_CASES)
+def test_flint_follows_its_config_not_its_path(
+    tmp_path: Path,
+    name: str,
+    config: dict[str, JsonValue],
+    tool_parser: str,
+    reasoning: str | None,
+) -> None:
+    model_dir = tmp_path / name
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps(config))
+    assert infer_tool_call_parser(str(model_dir)) == tool_parser
+    assert infer_reasoning_parser(str(model_dir)) == reasoning
 
 
 def test_cache_type_flag_defaults_to_radix(tiny_model_dir: Path) -> None:

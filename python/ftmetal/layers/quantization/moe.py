@@ -116,9 +116,9 @@ class SortedSplit(NamedTuple):
 
 class SharedExpertForward(Protocol):
     """A shared expert's output and gate logit [T, 1] for x [T, H]; the MoE output adds the
-    output gated by the logit's sigmoid."""
+    output gated by the logit's sigmoid, or as it is when the expert has no gate (None)."""
 
-    def __call__(self, x: mx.array, /) -> tuple[mx.array, mx.array]: ...
+    def __call__(self, x: mx.array, /) -> tuple[mx.array, mx.array | None]: ...
 
 
 class MoEMethod(ABC):

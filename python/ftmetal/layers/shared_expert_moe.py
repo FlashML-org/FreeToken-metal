@@ -1,11 +1,11 @@
-"""Sparse MoE block of the Qwen3.5 families: softmax top-k router, routed experts, a shared
-expert gated by sigmoid(shared_expert_gate(x)).
+"""Sparse MoE block of the Qwen3.5 families and Flint: top-k router, routed experts, a shared
+expert gated by sigmoid(shared_expert_gate(x)), or added as it is under Flint's sigmoid router.
 
-Port of FreeToken models/qwen3_5_moe/moe.py, shared by Qwen3.5 / 3.6 and Qwen3.8's
-qwen4_exp (FreeToken's Qwen4ExpMoE subclasses it unchanged). Divergences: the router is the fused
-kernel/moe/moe_topk Metal kernel (fp32 softmax, top-k, renorm in one launch) and the
-experts are the resident MoELayer, or OffloadMoELayer under the offload strategy (FreeToken's
-make_moe_layer choice, made here), whose forward adds the gated shared expert, so that an offload
+Port of FreeToken models/qwen3_5_moe/moe.py and models/flint/moe.py, shared by Qwen3.5 / 3.6,
+Qwen3.8's qwen4_exp (FreeToken's Qwen4ExpMoE subclasses it unchanged) and Flint. Divergences: the
+router is the fused kernel/moe/moe_topk Metal kernel (fp32 scores, top-k, renorm in one launch) and
+the experts are the resident MoELayer, or OffloadMoELayer under the offload strategy (FreeToken's
+make_moe_layer choice, made here), whose forward adds the shared expert, so that an offload
 decode runs it while its absent experts are read. Once loaded, an affine router gate and shared
 expert gate of one scheme are one LinearMerged of their rows (fuse_gates): a decode token computes
 both in one GEMV (the shared gate's one row alone would take a whole launch).
@@ -72,12 +72,12 @@ class SharedExpertMoE(BaseOP):
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
+        self.is_sigmoid_router = config.is_sigmoid_router
         self.gate = Linear(config.hidden_size, config.num_experts, scheme=gate_scheme, dtype=dtype)
         self.experts: MoELayer
         if config.moe_strategy == "offload":
-            # Every decoder layer routes experts, so the MoE layer index is the layer's.
             self.experts = OffloadMoELayer(
-                layer_id,
+                layer_id - config.first_k_dense_replace,
                 config.num_experts,
                 config.num_experts_per_tok,
                 config.hidden_size,
@@ -101,9 +101,10 @@ class SharedExpertMoE(BaseOP):
             down_scheme=shared_down_scheme,
             dtype=dtype,
         )
-        self.shared_expert_gate = Linear(
-            config.hidden_size, 1, scheme=shared_gate_scheme, dtype=dtype
-        )
+        if config.has_shared_expert_gate:
+            self.shared_expert_gate = Linear(
+                config.hidden_size, 1, scheme=shared_gate_scheme, dtype=dtype
+            )
 
     def fuse_gates(self) -> None:
         """Replace the router gate and the shared expert gate, when both are affine in one scheme,
@@ -121,7 +122,7 @@ class SharedExpertMoE(BaseOP):
             logits = self.gate.forward(hidden_states)
         else:
             logits = self.gates.forward_split(hidden_states)[0]
-        return moe_topk(logits, self.top_k, self.norm_topk_prob)[0]
+        return moe_topk(logits, self.top_k, self.norm_topk_prob, self.is_sigmoid_router)[0]
 
     def forward(self, hidden_states: mx.array) -> mx.array:
         shared_gate: mx.array | None = None
@@ -129,14 +130,22 @@ class SharedExpertMoE(BaseOP):
             router_logits = self.gate.forward(hidden_states)
         else:
             router_logits, shared_gate = self.gates.forward_split(hidden_states)
-        topk_ids, topk_weights = moe_topk(router_logits, self.top_k, self.norm_topk_prob)
+        topk_ids, topk_weights = moe_topk(
+            router_logits, self.top_k, self.norm_topk_prob, self.is_sigmoid_router
+        )
 
-        def gated_shared_expert(x: mx.array) -> tuple[mx.array, mx.array]:
-            """The shared expert's output and its gate logit, which the experts add gated."""
-            gate = self.shared_expert_gate.forward(x) if shared_gate is None else shared_gate
+        def shared_expert_output(x: mx.array) -> tuple[mx.array, mx.array | None]:
+            """The shared expert's output and its gate logit, which the experts add gated, or
+            None for a block without a gate."""
+            if shared_gate is not None:
+                gate = shared_gate
+            elif "shared_expert_gate" in self:
+                gate = self.shared_expert_gate.forward(x)
+            else:
+                gate = None
             return self.shared_expert.forward(x), gate
 
-        return self.experts.forward(hidden_states, topk_weights, topk_ids, gated_shared_expert)
+        return self.experts.forward(hidden_states, topk_weights, topk_ids, shared_expert_output)
 
 
 def offload_routers(model: nn.Module) -> dict[int, Callable[[mx.array], mx.array]]:

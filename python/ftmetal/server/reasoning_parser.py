@@ -844,6 +844,7 @@ class ReasoningParser:
         "deepseekv32": DeepSeekV32ReasoningParser,
         "gpt_oss": GptOssHarmonyReasoningParser,
         "qwen3": ThinkReasoningParser,
+        "flint": ThinkReasoningParser,
         "glm": ThinkReasoningParser,
         "minimax": ThinkReasoningParser,
         "minimax_m3": MiniMaxM3ReasoningParser,

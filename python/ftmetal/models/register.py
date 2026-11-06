@@ -127,6 +127,9 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
     "Qwen4ExpForCausalLM": ModelSpec(
         "ftmetal.models.qwen4_exp", "Qwen4ExpForCausalLM", has_offload=True
     ),
+    "FlintForCausalLM": ModelSpec(
+        "ftmetal.models.flint", "FlintForCausalLM", mlx_layout="mlx_layout", has_offload=True
+    ),
 }
 
 

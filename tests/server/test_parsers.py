@@ -36,6 +36,8 @@ REASONING_CASES: list[tuple[str, bool, list[str], str, str, str]] = [
     ),
     ("gemma4", False, ["Just ", "the answer."], "", "Just the answer.", "Just the answer."),
     ("gemma4", True, ["Thinking<channel|>", "Done"], "Thinking", "Done", "Done"),
+    ("flint", False, ["<thi", "nk>Let me th", "ink.</think>Done"], "Let me think.", "Done", "Done"),
+    ("flint", False, ["Just ", "the answer."], "", "Just the answer.", "Just the answer."),
     (
         "deepseekv32",
         True,

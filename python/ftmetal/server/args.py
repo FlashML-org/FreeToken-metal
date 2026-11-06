@@ -71,6 +71,7 @@ REASONING_PARSER_CHOICES = (
     "minimax_m3",
     "muse_glimmer",
     "gemma4",
+    "flint",
 )
 
 
@@ -181,13 +182,12 @@ class DeprecatedAlias(argparse.Action):
         setattr(namespace, self.dest, values)
 
 
-def model_family_marker(model_path: str) -> str:
-    """The path, model types and architectures of a checkpoint, lowercased into one string."""
+def model_type_marker(model_path: str) -> str:
+    """The model types and architectures of a checkpoint, lowercased into one string."""
     config = read_json_object(Path(model_path) / "config.json")
     text_config = config.get("text_config")
     text_config = text_config if isinstance(text_config, dict) else {}
     candidates = [
-        model_path,
         str(config.get("model_type", "")),
         str(text_config.get("model_type", "")),
     ]
@@ -197,7 +197,15 @@ def model_family_marker(model_path: str) -> str:
     return " ".join(candidates).lower()
 
 
+def model_family_marker(model_path: str) -> str:
+    """The path, model types and architectures of a checkpoint, lowercased into one string."""
+    return f"{model_path.lower()} {model_type_marker(model_path)}"
+
+
 def infer_tool_call_parser(model_path: str) -> str:
+    # note (jason-fxz): by config, not path: "flint" is a common word in a directory's name.
+    if "flint" in model_type_marker(model_path):
+        return "glm47"
     marker = model_family_marker(model_path)
     if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
         return "gpt_oss"
@@ -229,6 +237,8 @@ def infer_tool_call_parser(model_path: str) -> str:
 
 
 def infer_reasoning_parser(model_path: str) -> str | None:
+    if "flint" in model_type_marker(model_path):
+        return "flint"
     marker = model_family_marker(model_path)
     if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
         return "gpt_oss"
@@ -497,7 +507,7 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         choices=REASONING_PARSER_CHOICES,
         default="auto",
         help="splits the chain-of-thought into reasoning_content; auto picks the model "
-        "family's (<think> for qwen3, the thought channel for gemma4), off disables it",
+        "family's (<think> for qwen3 and flint, the thought channel for gemma4), off disables it",
     )
     parser.add_argument(
         "--text-model-only",

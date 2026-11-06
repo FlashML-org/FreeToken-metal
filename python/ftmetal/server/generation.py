@@ -409,6 +409,9 @@ def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
         # model then emits just the closing tag); "adaptive" (default) leaves the
         # model to open the tag itself and "disabled" pre-closes it.
         force_reasoning = (spec.chat_template_kwargs or {}).get("thinking_mode") == "enabled"
+    elif parser_name == "flint":
+        # Flint opens its own optional think block, tools or not.
+        force_reasoning = False
     else:
         force_reasoning = (
             resolve_thinking_mode(spec.chat_template_kwargs, spec.template_tools) == "thinking"

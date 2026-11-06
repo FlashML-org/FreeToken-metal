@@ -29,8 +29,8 @@ uv run ftm pack --model /path/to/Qwen3.6-35B-A3B-MLX       # expert pack for MoE
 ```
 
 `ftm serve` exposes FreeToken's routes: the OpenAI `POST /v1/chat/completions` (streamed
-or not; `reasoning_content` carries the reasoning, the `<think>` block on Qwen3.6 and the
-thought channel on Gemma4, and `tools` come back as `tool_calls`;
+or not; `reasoning_content` carries the reasoning, the `<think>` block on Qwen3.6 and Flint and
+the thought channel on Gemma4, and `tools` come back as `tool_calls`;
 `chat_template_kwargs: {"enable_thinking": false}` or `thinking: {"type": "disabled"}`
 turns thinking off, and so does `reasoning_effort: "none"`; any other effort turns it on and
 reaches a chat template that grades effort as the nearest level it accepts, which `/v1/models`

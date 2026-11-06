@@ -12,8 +12,8 @@ fast path); an overlap prefill sorts its pairs and reads each expert at its byte
 banks (the expert-sorted kernels), its prefill buffers and the order of its reads and layers
 kept by the host, where FreeToken waits on CUDA events. A decode under split_lookup whose method
 has the pending kernels issues its lookup instead (layers/quantization/moe_pending.py). A
-forward given a shared expert (FreeToken's model computes it apart) adds its gated output, which
-apply_pending fuses into its last kernel.
+forward given a shared expert (FreeToken's model computes it apart) adds its output, gated when
+it has a gate, which apply_pending fuses into its last kernel.
 """
 
 from __future__ import annotations
@@ -37,15 +37,19 @@ from ftmetal.layers.quantization.moe_pending import apply_pending, supports_pend
 from ftmetal.moe.offload_cache import OffloadMoeCache
 
 
+def add_shared_output(routed: mx.array, shared: mx.array, gate: mx.array | None) -> mx.array:
+    """The routed experts' output plus a shared expert's, by its gate logit when it has one."""
+    return routed + shared if gate is None else sigmoid_gated_add(routed, shared, gate)
+
+
 def add_shared_expert(
     routed: mx.array, x: mx.array, shared_expert: SharedExpertForward | None
 ) -> mx.array:
-    """The routed experts' output plus the shared expert's of x, gated."""
+    """The routed experts' output plus the shared expert's of x."""
     if shared_expert is None:
         return routed
     else:
-        shared, shared_gate = shared_expert(x)
-        return sigmoid_gated_add(routed, shared, shared_gate)
+        return add_shared_output(routed, *shared_expert(x))
 
 
 class MoELayer(BaseOP):
@@ -175,7 +179,7 @@ class OffloadMoELayer(MoELayer):
             mx.async_eval(predicted)
         shared = None if shared_expert is None else shared_expert(hidden_states)
         if shared is not None:
-            mx.async_eval(*shared)
+            mx.async_eval(*(array for array in shared if array is not None))
         cache.route_prefill_layer(self.moe_layer_id, topk_ids, predicted)
         banks = {**cache.banks, **cache.layer_pairs(self.moe_layer_id), **resident}
         method = self.quant_method
@@ -200,7 +204,7 @@ class OffloadMoELayer(MoELayer):
             out = method.apply_sorted_rest(banks, split, topk_weights, topk_ids, expert_bytes)
         mx.async_eval(out)
         cache.end_prefill_layer(self.moe_layer_id, out)
-        return out if shared is None else sigmoid_gated_add(out, *shared)
+        return out if shared is None else add_shared_output(out, *shared)
 
 
 __all__ = ["MoELayer", "OffloadMoELayer"]
