@@ -39,7 +39,7 @@ import numpy as np
 from ftmetal.core import Batch
 from ftmetal.kernel._ext import _C
 from ftmetal.kernel.moe.moe_lookup import moe_lookup, moe_lookup_issue
-from ftmetal.moe.slot_pools import SlotLayout, initial_experts
+from ftmetal.moe.slot_pools import MoeCachePolicy, SlotLayout, VictimMemoryKind, initial_experts
 from ftmetal.moe.source import ExpertSource
 
 # The instance NVMe saturates near queue depth 4 (io_bench); 8 threads keep it there while
@@ -53,6 +53,20 @@ STALL_TIMEOUT_S = 10.0
 STAGING_BYTES = IO_THREADS * _C.EXPERT_STAGING_BYTES
 # moe_step carries the step as int32.
 MAX_STEP = 2**31 - 1
+# A pool's spare slots for deferred victim stores (ExpertService): a decode lookup's victim hit
+# that evicts a resident takes a spare, and the evicted expert is stored once the lookup is
+# answered, so the GPU waits for one copy instead of two (PR #3's 4). Only in pools far larger
+# than one step's experts: the scheduler's cap on a step's rows counts every slot of a pool.
+DEFERRED_STORE_SPARES = 4
+DEFERRED_STORE_MIN_POOL_SLOTS = 4096
+# --moe-cache-policy lrfu's half-life in steps (PR #3's): an expert a conversation keeps coming
+# back to outlasts one-off ones; longer ones lost long replies there, whose new working set they
+# evicted while earlier turns' frequent experts held their slots.
+LRFU_HALF_LIFE = 20.0
+VICTIM_MEMORY = {
+    "purgeable": _C.VictimMemory.PURGEABLE,
+    "reserved": _C.VictimMemory.ANONYMOUS,
+}
 
 # What a forward does with the routed experts: looks them up (a decode, or a short prefill:
 # copy-miss) or reads each layer's absent ones into a prefill buffer ahead of it (a long
@@ -85,6 +99,10 @@ class OffloadMoeCache:
         victim_cache_bytes: int,
         pairs: list[mx.array] | None,
         split_lookup: bool,
+        victim_memory: VictimMemoryKind = "purgeable",
+        cache_policy: MoeCachePolicy = "lru",
+        ssd_keepalive_us: int = 0,
+        deferred_store_spares: list[int] | None = None,
         stall_timeout_s: float = STALL_TIMEOUT_S,
         run_coordinator: bool = True,
     ) -> None:
@@ -95,9 +113,13 @@ class OffloadMoeCache:
         host victim cache's budget, split over the pools by their slots' bytes (0: none); pairs:
         each layer's pair table when the layouts hold pair codes (an expert pack's), else None;
         split_lookup: a decode layer whose method can issue its lookup (issue_lookup) and
-        computes its resident pairs while the CPU reads the absent ones. Without run_coordinator
-        nobody answers the lookups (a stalled coordinator, for tests); the watchdog fails a
-        request unanswered for stall_timeout_s."""
+        computes its resident pairs while the CPU reads the absent ones. victim_memory: the victim
+        cache's memory kind; cache_policy: the slots' eviction order; ssd_keepalive_us: the SSD
+        keepalive's read interval (0: none); deferred_store_spares: each pool's spare slots for
+        deferred victim stores (None: DEFERRED_STORE_SPARES in each pool of
+        DEFERRED_STORE_MIN_POOL_SLOTS or more). Without run_coordinator nobody answers the
+        lookups (a stalled coordinator, for tests); the watchdog fails a request unanswered for
+        stall_timeout_s."""
         self.slot_layout = slot_layout
         self.layer_pools = slot_layout.layer_pools
         num_layers, num_experts = len(self.layer_pools), slot_layout.num_experts
@@ -172,6 +194,12 @@ class OffloadMoeCache:
         for index, role in enumerate(self.banks):
             self.projection_banks.setdefault(role.rpartition(".")[0], []).append(index)
         segments, locations = source.segment_table(layouts)
+        if deferred_store_spares is None:
+            deferred_store_spares = [
+                DEFERRED_STORE_SPARES if pool.num_slots >= DEFERRED_STORE_MIN_POOL_SLOTS else 0
+                for pool in pools
+            ]
+        self.cache_policy = cache_policy
         self.service = _C.ExpertService(
             num_layers,
             num_experts,
@@ -193,6 +221,10 @@ class OffloadMoeCache:
             IO_THREADS,
             stall_timeout_s,
             run_coordinator,
+            victim_memory=VICTIM_MEMORY[victim_memory],
+            pool_spares=deferred_store_spares,
+            lrfu_half_life=LRFU_HALF_LIFE if cache_policy == "lrfu" else 0.0,
+            ssd_keepalive_us=ssd_keepalive_us,
         )
         # The forward being built (prepare): its mode and real rows, the layers that start a
         # new step, the last step (from 1) and moe_step int32 [2] = (real rows, step), the
@@ -224,6 +256,14 @@ class OffloadMoeCache:
         """Choose the forward's mode and start its first step; before the model builds it. A
         prefill too long to look up reads its layers ahead whatever its length."""
         max_tokens = self.slot_layout.max_lookup_tokens
+        if (
+            self.cache_policy == "lrfu"
+            and not batch.is_decode
+            and all(req.cached_len == 0 for req in batch.reqs)
+        ):
+            # A request that starts with nothing cached (a new conversation): the use counts
+            # back to recency.
+            self.service.reset_scores()
         if batch.is_decode:
             self.begin_lookups("decode", batch.size)
         elif self.prefill_overlap and (

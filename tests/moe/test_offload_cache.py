@@ -41,8 +41,10 @@ from ftmetal.models.qwen3_5_moe.weight import GATE_UP_PARTS
 from ftmetal.models.register import model_weight_rules, read_checkpoint
 from ftmetal.moe.offload_cache import OffloadMoeCache
 from ftmetal.moe.slot_pools import (
+    MoeCachePolicy,
     MoePoolGrouping,
     PrefillBufferPlacement,
+    VictimMemoryKind,
     bank_layouts,
     plan_slot_layout,
 )
@@ -96,6 +98,12 @@ class Case:
     # Read from an expert pack of the checkpoint, with pair codes.
     is_packed: bool = False
     has_pair_codes: bool = False
+    # Every pool's spare slots for deferred victim stores (None: the cache's default, none in
+    # pools this small), the victim cache's memory, the eviction order, the SSD keepalive.
+    deferred_store_spares: int | None = None
+    victim_memory: VictimMemoryKind = "purgeable"
+    cache_policy: MoeCachePolicy = "lru"
+    ssd_keepalive_us: int = 0
 
     @property
     def spec(self) -> CheckpointSpec:
@@ -119,10 +127,14 @@ class Case:
         per_expert = "-per-expert" if self.is_per_expert else ""
         victims = f"-V{self.victim_cache_entries}" if self.victim_cache_entries else ""
         packed = "-coded" if self.has_pair_codes else "-packed" if self.is_packed else ""
+        spares = "" if self.deferred_store_spares is None else f"-D{self.deferred_store_spares}"
+        memory = "-reserved" if self.victim_memory == "reserved" else ""
+        policy = "-lrfu" if self.cache_policy == "lrfu" else ""
+        keepalive = f"-K{self.ssd_keepalive_us}" if self.ssd_keepalive_us else ""
         return (
             f"{self.naming}-L{self.num_layers}-E{self.num_experts}-H{self.hidden_size}"
             f"-I{self.intermediate_size}-S{self.cache_size}-{self.grouping}{overlap}-{scheme}"
-            f"{per_expert}{victims}{packed}"
+            f"{per_expert}{victims}{packed}{spares}{memory}{policy}{keepalive}"
         )
 
 
@@ -419,6 +431,49 @@ CASES += [
 ]
 
 
+def decode_steps(seed: int, num_steps: int) -> tuple[Step, ...]:
+    """num_steps decode steps of 4 layers, each 2 of its 4 experts."""
+    rng = np.random.default_rng(seed)
+    return tuple(
+        tuple(
+            (layer_id, tuple(int(e) for e in rng.choice(4, 2, replace=False)))
+            for layer_id in range(4)
+        )
+        for _ in range(num_steps)
+    )
+
+
+# Deferred victim stores: the overlap prefills free the slots under their buffers, the spares
+# come from them, and the decode's victim hits that evict a resident take one, the resident
+# stored after the answer. The same with reserved victim memory, and under LRFU.
+DEFERRED_SCRIPT = (
+    *decode_steps(0, 6),
+    Prefill((0, 1, 2, 3)),
+    *decode_steps(1, 30),
+    Prefill((1, 2)),
+    *decode_steps(2, 20),
+)
+DEFERRED_CASE = Case(
+    4,
+    4,
+    128,
+    64,
+    12,
+    True,
+    script=DEFERRED_SCRIPT,
+    grouping="unified",
+    victim_cache_entries=4,
+    deferred_store_spares=2,
+)
+CASES += [
+    DEFERRED_CASE,
+    replace(DEFERRED_CASE, victim_memory="reserved"),
+    replace(DEFERRED_CASE, cache_policy="lrfu"),
+    replace(CASES[3], cache_policy="lrfu"),
+    replace(CASES[0], ssd_keepalive_us=50),
+]
+
+
 def build(directory: Path, case: Case) -> tuple[OffloadMoeCache, dict[str, mx.array], ExpertSource]:
     """The cache over the case's checkpoint, the fused reference state and the source."""
     cache, source = build_cache(
@@ -431,6 +486,10 @@ def build(directory: Path, case: Case) -> tuple[OffloadMoeCache, dict[str, mx.ar
         victim_cache_bytes=case.victim_cache_entries * entry_bytes(case.spec),
         is_packed=case.is_packed,
         with_pair_codes=case.has_pair_codes,
+        victim_memory=case.victim_memory,
+        cache_policy=case.cache_policy,
+        deferred_store_spares=case.deferred_store_spares,
+        ssd_keepalive_us=case.ssd_keepalive_us,
     )
     reference = apply_rules(read_state(directory, case.spec)[0], checkpoint_rules(case.spec))
     return cache, reference, source
@@ -581,6 +640,7 @@ def test_rows_match_checkpoint(tmp_path: Path, case: Case) -> None:
     copied = sum(stats.victim_hits) + sum(stats.victim_buffer_hits)
     assert sum(stats.experts_read) + copied == sum(stats.misses) + buffered
     assert (copied > 0) == (case.victim_cache_entries > 0)
+    assert (sum(stats.deferred_stores) > 0) == bool(case.deferred_store_spares)
 
 
 def check_resident_rows(cache: OffloadMoeCache, expected: dict[int, dict[str, np.ndarray]]) -> None:
@@ -606,9 +666,11 @@ VICTIM_LRU_SCRIPT: list[tuple[tuple[int, ...], tuple[int, ...], int]] = [
 ]
 
 
-def test_victim_cache_serves_evicted_experts(tmp_path: Path) -> None:
+@pytest.mark.parametrize("memory", ["purgeable", "reserved"])
+def test_victim_cache_serves_evicted_experts(tmp_path: Path, memory: VictimMemoryKind) -> None:
     cache, reference, source = build(
-        tmp_path / "checkpoint", Case(1, 8, 128, 64, 2, False, victim_cache_entries=2)
+        tmp_path / "checkpoint",
+        Case(1, 8, 128, 64, 2, False, victim_cache_entries=2, victim_memory=memory),
     )
     expected = expected_rows(cache, reference, source.layer_prefixes)
     assert cache.stats().victim_entries == 2
@@ -640,6 +702,33 @@ def test_purged_victim_entries_are_read_again(tmp_path: Path) -> None:
         check_resident_rows(cache, expected)
     stats = cache.stats()
     assert (stats.victim_drops, stats.victim_hits, stats.experts_read) == ([2], [1], [4])
+
+
+def test_spares_give_way_to_a_step_that_needs_every_slot(tmp_path: Path) -> None:
+    """A pool of 12 slots, 2 of them spares once a lookup claims them: a copy-miss step whose
+    three layers take every slot (the scheduler counts them all) gets the spares back."""
+    case = Case(
+        4,
+        4,
+        128,
+        64,
+        12,
+        True,
+        grouping="unified",
+        victim_cache_entries=4,
+        deferred_store_spares=2,
+    )
+    cache, reference, source = build(tmp_path / "checkpoint", case)
+    expected = expected_rows(cache, reference, source.layer_prefixes)
+    cache.fill_initial()
+    cache.begin_prefill()
+    absent = [e for e in range(4) if (0, e) not in resident_rows(cache)]
+    cache.ensure_experts(0, absent[:1], 1)
+    assert cache.slot_layout.step_starts(4) == [3]
+    for layer_id in range(3):
+        cache.ensure_experts(layer_id, [0, 1, 2, 3], 2)
+    check_resident_rows(cache, expected)
+    cache.check_healthy()
 
 
 def test_begin_prefill_stores_the_experts_it_drops(tmp_path: Path) -> None:

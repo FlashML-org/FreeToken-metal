@@ -82,10 +82,15 @@ struct ExpertServiceStats {
   std::vector<int64_t> victim_buffer_hits;
   std::vector<int64_t> victim_stores;
   std::vector<int64_t> victim_drops;
+  // Victim hits that took a spare slot, their evicted resident's store deferred past the
+  // answer (pool_spares); victim_stores counts the store once it is done.
+  std::vector<int64_t> deferred_stores;
   // Time spent copying to and from its entries, over every thread; its entries and bytes.
   int64_t victim_copy_ns = 0;
   int64_t victim_entries = 0;
   int64_t victim_bytes = 0;
+  // Of those, the bytes wired (anonymous memory).
+  int64_t victim_locked_bytes = 0;
 };
 
 // A read from the checkpoint failed; the cache maps slots whose rows are incomplete.
@@ -157,9 +162,11 @@ class ExpertService {
   // entries, in segment order; destinations: per layer and bank, the byte
   // offset of slot 0's row and the row's bytes (slot s at offset + s * row); buffer_bytes:
   // each prefill buffer's bytes in each bank, from byte 0; victim_cache_bytes: the victim
-  // cache's budget (0: none). The watchdog fails a request left unanswered for
-  // stall_timeout_s; without run_coordinator nobody answers (a stalled coordinator, for
-  // tests).
+  // cache's budget (0: none), in victim_memory. The watchdog fails a request left unanswered
+  // for stall_timeout_s; without run_coordinator nobody answers (a stalled coordinator, for
+  // tests). pool_spares: each pool's spare slots for deferred victim stores (empty: none);
+  // lrfu_half_life: SlotLru's (0: LRU); ssd_keepalive_us: while the coordinator is hot, a small
+  // read of an expert file every this many microseconds keeps the SSD awake (0: none).
   ExpertService(
       int num_layers,
       int num_experts,
@@ -180,7 +187,11 @@ class ExpertService {
       int64_t victim_cache_bytes,
       int io_threads,
       double stall_timeout_s,
-      bool run_coordinator);
+      bool run_coordinator,
+      VictimMemory victim_memory = VictimMemory::Purgeable,
+      std::vector<int32_t> pool_spares = {},
+      double lrfu_half_life = 0,
+      int64_t ssd_keepalive_us = 0);
   ~ExpertService();
 
   ExpertService(const ExpertService&) = delete;
@@ -198,6 +209,8 @@ class ExpertService {
   // Drain the prefill buffers' reads, forget the layers they hold and drop the experts their
   // slots hold, into the victim cache.
   void begin_prefill();
+  // SlotLru::reset_scores, before a new conversation's prefill.
+  void reset_scores();
 
   // Start reading the layer's non-resident experts into prefill buffer layer_id % 2; returns its
   // slot map (SlotLru::prefill_slot_map).
@@ -259,6 +272,16 @@ class ExpertService {
       int layer_id,
       const std::vector<ExpertLoad>& loads,
       std::vector<std::pair<int32_t, int32_t>>& hits);
+  // A victim hit that evicts a resident takes a spare slot of its pool, and the evicted expert
+  // is stored once the request is answered: the GPU waits for one copy, not two. A pool holds
+  // at most its pool_spares slots, spares and deferred stores together, and none after a step
+  // ran short of victims for them (serve). Store the deferred victims, their slots back to
+  // spares; call_mutex_ held.
+  // try_finish_deferred_stores: the coordinator's, when it idles.
+  void finish_deferred_stores();
+  void try_finish_deferred_stores();
+  // Finish the deferred stores and give the spares back (before a prefill or a fill).
+  void release_spares();
 
   SlotLru lru_;
   int num_layers_;
@@ -283,6 +306,14 @@ class ExpertService {
   // Null without a victim cache.
   std::unique_ptr<VictimCache> victims_;
   std::atomic<int64_t> victim_copy_ns_{0};
+  // Deferred stores: the spares wanted per pool, the spare slots, the stores still to do
+  // (slot, flat id), each pending flat id's slot.
+  std::vector<int32_t> pool_spares_;
+  std::vector<std::vector<int32_t>> spares_;
+  std::vector<uint8_t> can_claim_spares_;
+  std::vector<std::pair<int32_t, int32_t>> pending_stores_;
+  std::vector<int32_t> pending_slot_of_;
+  std::atomic<bool> has_pending_stores_{false};
 
   std::mutex queue_mutex_;
   std::condition_variable queue_ready_;
@@ -312,6 +343,12 @@ class ExpertService {
   std::condition_variable watchdog_wake_;
   std::thread coordinator_;
   std::thread watchdog_;
+  // The SSD keepalive's reads (ssd_keepalive_us).
+  std::thread ssd_keepalive_;
+  std::atomic<bool> is_stopping_keepalive_{false};
+  std::mutex keepalive_mutex_;
+  std::condition_variable keepalive_wake_;
+  void keep_ssd_awake(int64_t interval_us);
   std::once_flag shutdown_once_;
 };
 

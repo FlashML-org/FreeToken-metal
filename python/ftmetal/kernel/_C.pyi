@@ -48,6 +48,10 @@ class MailboxState(enum.IntEnum):
     FAILED = 4
     SHUTDOWN = 5
 
+class VictimMemory(enum.Enum):
+    PURGEABLE = 0
+    ANONYMOUS = 1
+
 class MailboxError(enum.IntEnum):
     NONE = 0
     IO = 1
@@ -134,9 +138,11 @@ class SlotLru:
         pool_volatile: list[int],
         slot_of: mx.array,
         last_use: mx.array,
+        lrfu_half_life: float = 0.0,
     ) -> None: ...
     @property
     def num_slots(self) -> int: ...
+    def reset_scores(self) -> None: ...
     def fill(self, flat_ids: list[int]) -> list[int]: ...
     def resolve(
         self, layer_id: int, expert_ids: list[int], step: int
@@ -172,11 +178,15 @@ class ExpertServiceStats:
     @property
     def victim_drops(self) -> list[int]: ...
     @property
+    def deferred_stores(self) -> list[int]: ...
+    @property
     def victim_copy_ns(self) -> int: ...
     @property
     def victim_entries(self) -> int: ...
     @property
     def victim_bytes(self) -> int: ...
+    @property
+    def victim_locked_bytes(self) -> int: ...
 
 class ExpertService:
     def __init__(
@@ -201,7 +211,12 @@ class ExpertService:
         io_threads: int,
         stall_timeout_s: float,
         run_coordinator: bool,
+        victim_memory: VictimMemory = ...,
+        pool_spares: list[int] = ...,
+        lrfu_half_life: float = 0.0,
+        ssd_keepalive_us: int = 0,
     ) -> None: ...
+    def reset_scores(self) -> None: ...
     def fill_initial(self, flat_ids: list[int]) -> None: ...
     def ensure_experts(self, layer_id: int, expert_ids: list[int], step: int) -> list[int]: ...
     def begin_prefill(self) -> None: ...

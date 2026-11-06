@@ -2,8 +2,12 @@
 
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <sys/mman.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -12,7 +16,7 @@ namespace ftmetal {
 namespace {
 
 // Set an entry's purgeable state; returns the one before (VM_PURGABLE_EMPTY: purged).
-int set_state(uint8_t* data, int state) {
+int set_purgeable_state(uint8_t* data, int state) {
   int previous = state;
   kern_return_t result = mach_vm_purgable_control(
       mach_task_self(),
@@ -33,7 +37,8 @@ VictimCache::VictimCache(
     const std::vector<int32_t>& layer_pools,
     const std::vector<int64_t>& entry_bytes,
     const std::vector<int64_t>& pool_slots,
-    int64_t budget_bytes)
+    int64_t budget_bytes,
+    VictimMemory memory)
     : num_experts_(num_experts),
       layer_pools_(layer_pools),
       pools_(entry_bytes.size()),
@@ -62,6 +67,53 @@ VictimCache::VictimCache(
           std::max<int64_t>(pool_experts[pool] - pool_slots[pool], 0));
     }
   }
+  is_anonymous_ = memory == VictimMemory::Anonymous;
+  if (is_anonymous_) {
+    allocate_anonymous();
+  } else {
+    allocate_purgeable();
+  }
+  // The lowest entries first off each free list.
+  for (int32_t entry = static_cast<int32_t>(entries_.size()) - 1; entry >= 0; --entry) {
+    free_entry(entry);
+  }
+}
+
+void VictimCache::allocate_anonymous() {
+  for (const Pool& pool : pools_) {
+    region_bytes_ += static_cast<size_t>(pool.capacity * pool.entry_bytes);
+  }
+  if (region_bytes_ == 0) {
+    return;
+  }
+  void* data = mmap(nullptr, region_bytes_, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+  if (data == MAP_FAILED) {
+    throw std::runtime_error(std::string("VictimCache: mmap: ") + std::strerror(errno));
+  }
+  region_ = static_cast<uint8_t*>(data);
+  // Wire 64 MiB at a time until the OS refuses (its wired limit, which the GPU's wired memory
+  // shares); the rest stays pageable.
+  const size_t chunk = size_t(64) << 20;
+  size_t locked = 0;
+  while (locked < region_bytes_) {
+    size_t length = std::min(chunk, region_bytes_ - locked);
+    if (mlock(region_ + locked, length) != 0) {
+      break;
+    }
+    locked += length;
+  }
+  locked_bytes_ = static_cast<int64_t>(locked);
+  uint8_t* next = region_;
+  for (size_t pool = 0; pool < pools_.size(); ++pool) {
+    for (int64_t i = 0; i < pools_[pool].capacity; ++i) {
+      entries_.push_back({next, static_cast<int32_t>(pool)});
+      next += pools_[pool].entry_bytes;
+    }
+  }
+  num_bytes_ = static_cast<int64_t>(region_bytes_);
+}
+
+void VictimCache::allocate_purgeable() {
   for (size_t pool = 0; pool < pools_.size(); ++pool) {
     for (int64_t i = 0; i < pools_[pool].capacity; ++i) {
       mach_vm_address_t address = 0;
@@ -81,17 +133,25 @@ VictimCache::VictimCache(
       num_bytes_ += (pools_[pool].entry_bytes + page - 1) / page * page;
     }
   }
-  // The lowest entries first off each free list.
-  for (int32_t entry = static_cast<int32_t>(entries_.size()) - 1; entry >= 0; --entry) {
-    free_entry(entry);
-  }
 }
 
 VictimCache::~VictimCache() {
   deallocate();
 }
 
+int VictimCache::set_state(uint8_t* data, int state) {
+  return is_anonymous_ ? VM_PURGABLE_NONVOLATILE : set_purgeable_state(data, state);
+}
+
 void VictimCache::deallocate() {
+  if (is_anonymous_) {
+    if (region_ != nullptr) {
+      munmap(region_, region_bytes_);
+    }
+    region_ = nullptr;
+    entries_.clear();
+    return;
+  }
   for (const Entry& entry : entries_) {
     mach_vm_deallocate(
         mach_task_self(),

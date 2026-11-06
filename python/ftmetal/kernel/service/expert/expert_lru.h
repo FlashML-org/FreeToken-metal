@@ -1,5 +1,6 @@
 // SlotLru: the bookkeeping of the routed-expert slot cache. The MoE layers are grouped into
-// pools, each a run of slots with a token-granular LRU of its own over its layers' experts.
+// pools, each a run of slots with a token-granular LRU (or LRFU: lrfu_half_life) of its own over
+// its layers' experts.
 // An expert is named by its flat id layer_id * num_experts + expert. slot_of
 // [num_layers * num_experts] int32 (-1: absent) and last_use [num_slots] uint32 (the step a
 // slot was last used, 0: never) are mx.arrays the GPU reads, written here in place through
@@ -9,7 +10,8 @@
 // begins. A miss evicts a slot of its own pool, never one used earlier in the same step: the
 // step's command buffer could read the old row from the GPU caches. Every expert leaving a
 // slot, evicted or dropped, is reported with the slot whose row still holds its bytes, for the
-// victim cache (victim_cache.h) to keep.
+// victim cache (victim_cache.h) to keep. A held slot (the service's spares and deferred stores)
+// is never a victim.
 #pragma once
 
 #include <compare>
@@ -55,7 +57,8 @@ class SlotLru {
       const std::vector<int32_t>& pool_bounds,
       const std::vector<int32_t>& pool_volatile,
       mx::array slot_of,
-      mx::array last_use);
+      mx::array last_use,
+      double lrfu_half_life = 0);
 
   int num_slots() const {
     return pool_bounds_.back();
@@ -77,6 +80,27 @@ class SlotLru {
   // layer_id % 2, the absent taking rows 0, 1, ... in expert order, which the loads list as
   // (expert, row). The LRU is not touched.
   SlotAssignment prefill_slot_map(int layer_id) const;
+
+  // ExpertService's deferred victim stores: a held slot is never a victim. A free slot of the
+  // pool that this call and step do not use, held (a spare), or -1 when there is none.
+  int32_t claim_free_slot(int32_t pool, uint32_t step);
+  // The expert resolve just loaded into slot from moves to the held free slot to (its slot_of
+  // and last use); from is left free, never used and held: its row still holds the evicted
+  // expert's bytes until the caller copies them out.
+  void move_load(int32_t from, int32_t to);
+  void release_held(int32_t slot) {
+    is_held_[slot] = 0;
+  }
+  int32_t pool_of_layer(int layer_id) const {
+    return layer_pools_[layer_id];
+  }
+  int32_t pool_slots(int32_t pool) const {
+    return pool_bounds_[pool + 1] - pool_bounds_[pool];
+  }
+
+  // LRFU (lrfu_half_life > 0): forget the use counts, each slot scoring as if used once at its
+  // last use (LRU's order until it is used again).
+  void reset_scores();
 
  private:
   // Victim order: least recently used first, then a free slot (flat id -1), then the lowest
@@ -102,6 +126,18 @@ class SlotLru {
   int32_t* slot_of_data_;
   uint32_t* last_use_data_;
   std::vector<int32_t> id_of_slot_;
+  std::vector<uint8_t> is_held_;
+  // LRFU: count the uses last_use recorded since the last count, at a step's first miss: a use
+  // in a step of hits alone counts at the next count, unless its slot is used again first.
+  void count_uses(uint32_t step);
+  void score_load(int32_t slot, uint32_t step);
+  // Victim order: LRU's, or LRFU's free slots, then the lowest score, then LRU's.
+  bool is_victim_before(const Candidate& a, const Candidate& b) const;
+  // LRFU: half-life in steps (0: off); per slot log2(score) + last counted use / half-life.
+  double half_life_ = 0;
+  std::vector<double> score_;
+  std::vector<uint32_t> counted_use_;
+  uint32_t counted_step_ = 0;
   // Per-call marks: a slot this call uses, an expert this call names.
   uint32_t call_ = 0;
   std::vector<uint32_t> slot_call_;

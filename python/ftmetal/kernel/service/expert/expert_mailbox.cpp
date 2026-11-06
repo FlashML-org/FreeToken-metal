@@ -85,6 +85,9 @@ void ExpertService::coordinate() {
     if (mailbox_word(MailboxWord::State).load(std::memory_order_acquire) ==
         state_code(MailboxState::Posted)) {
       answer();
+      if (has_pending_stores_.load(std::memory_order_relaxed)) {
+        try_finish_deferred_stores();
+      }
       last_answered = Clock::now();
       empty_polls = 0;
       is_dozing = false;
@@ -97,6 +100,9 @@ void ExpertService::coordinate() {
       }
       auto now = Clock::now();
       if (now - last_answered < HOT_WINDOW || is_armed(now)) {
+        if (has_pending_stores_.load(std::memory_order_relaxed)) {
+          try_finish_deferred_stores();
+        }
         continue;
       }
       is_dozing = true;

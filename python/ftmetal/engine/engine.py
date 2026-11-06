@@ -488,6 +488,9 @@ class Engine:
                 victim_cache_bytes=victim_bytes,
                 pairs=None if expert_pack is None else expert_pack.pairs,
                 split_lookup=config.moe_split_lookup,
+                victim_memory=config.moe_victim_memory,
+                cache_policy=config.moe_cache_policy,
+                ssd_keepalive_us=config.moe_ssd_keepalive_us,
             )
             pool_slots = [pool.num_slots for pool in slot_layout.pools]
             logger.info(
@@ -499,9 +502,15 @@ class Engine:
             )
             if victim_bytes > 0:
                 stats = self.moe_offload_cache.stats()
+                locked = (
+                    f", {stats.victim_locked_bytes / GIB:.2f} GiB of it wired"
+                    if config.moe_victim_memory == "reserved"
+                    else ""
+                )
                 logger.info(
                     f"MoE offload: victim cache {stats.victim_bytes / GIB:.2f} GiB "
-                    f"({stats.victim_entries} entries), outside the budget"
+                    f"({stats.victim_entries} entries, {config.moe_victim_memory}{locked}), "
+                    f"outside the budget"
                 )
             self.moe_offload_cache.fill_initial()
             self.moe_offload_cache.probe()

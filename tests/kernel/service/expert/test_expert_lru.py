@@ -163,6 +163,7 @@ def make_lru(
     layer_pools: tuple[int, ...],
     pool_bounds: list[int],
     pool_volatile: list[int] | None = None,
+    lrfu_half_life: float = 0.0,
 ) -> tuple[_C.SlotLru, mx.array, mx.array]:
     num_layers = len(layer_pools)
     slot_of = mx.full((num_layers * num_experts,), -1, dtype=mx.int32)
@@ -178,6 +179,7 @@ def make_lru(
         volatile,
         slot_of,
         last_use,
+        lrfu_half_life,
     )
     assert lru.num_slots == pool_bounds[-1]
     return lru, slot_of, last_use
@@ -256,3 +258,22 @@ def test_overlaid_prefill_buffers() -> None:
     assert lru.prefill_slot_map(1) == ([-1, -2, -3, -4], [(0, 0), (1, 1), (2, 2), (3, 3)])
     # The dropped slots are free again: a miss of layer 1 takes its pool's first.
     assert lru.resolve(1, [2], 2) == ([0], [(2, 0)])
+
+
+# LRFU: one pool of 3 slots filled with experts 0-2; 0 is used at steps 1-5, 1 at step 6 and 2
+# at step 7, then expert 3 misses at step 8. LRU evicts 0 (the least recent); LRFU 1 (the
+# fewest uses, decayed by the half-life); reset_scores before the miss turns LRFU back to LRU's
+# order. (half-life, reset, the expert evicted)
+LRFU_CASES = [(0.0, False, 0), (20.0, False, 1), (20.0, True, 0)]
+
+
+@pytest.mark.parametrize("half_life, reset, evicted", LRFU_CASES)
+def test_lrfu_evicts_the_least_used(half_life: float, reset: bool, evicted: int) -> None:
+    lru, slot_of, _ = make_lru(6, 0, (0,), [0, 3], lrfu_half_life=half_life)
+    slots = lru.fill([0, 1, 2])
+    for step, expert in [(1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 1), (7, 2)]:
+        assert lru.resolve(0, [expert], step) == ([slots[expert]], [])
+    if reset:
+        lru.reset_scores()
+    assert lru.resolve(0, [3], 8) == ([slots[evicted]], [(3, slots[evicted])])
+    assert np.array(slot_of)[evicted] == -1

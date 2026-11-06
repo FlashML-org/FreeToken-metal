@@ -36,7 +36,13 @@ from ftmetal.models.qwen3_5_moe.weight import mlx_layout
 from ftmetal.moe.offload_cache import STALL_TIMEOUT_S, OffloadMoeCache
 from ftmetal.moe.pack import use_pack, write_pack
 from ftmetal.moe.pair_codes import coded_layout
-from ftmetal.moe.slot_pools import MoePoolGrouping, PrefillBufferPlacement, plan_slot_layout
+from ftmetal.moe.slot_pools import (
+    MoeCachePolicy,
+    MoePoolGrouping,
+    PrefillBufferPlacement,
+    VictimMemoryKind,
+    plan_slot_layout,
+)
 from ftmetal.moe.source import ExpertSource
 
 Naming = Literal["qwen", "gemma4"]
@@ -233,9 +239,14 @@ def build_cache(
     run_coordinator: bool = True,
     is_packed: bool = False,
     with_pair_codes: bool = False,
+    victim_memory: VictimMemoryKind = "purgeable",
+    cache_policy: MoeCachePolicy = "lru",
+    deferred_store_spares: int | None = None,
+    ssd_keepalive_us: int = 0,
 ) -> tuple[OffloadMoeCache, ExpertSource]:
     """The cache over a new checkpoint of spec written to directory, and its source; is_packed:
-    read from a pack of it, with pair codes when with_pair_codes."""
+    read from a pack of it, with pair codes when with_pair_codes; deferred_store_spares: every
+    pool's (None: the cache's default)."""
     write_checkpoint(directory, spec)
     state, expert_bytes = read_state(directory, spec)
     source = ExpertSource(str(directory), checkpoint_rules(spec), state, expert_bytes)
@@ -265,6 +276,12 @@ def build_cache(
         victim_cache_bytes=victim_cache_bytes,
         pairs=pairs,
         split_lookup=False,
+        victim_memory=victim_memory,
+        cache_policy=cache_policy,
+        ssd_keepalive_us=ssd_keepalive_us,
+        deferred_store_spares=None
+        if deferred_store_spares is None
+        else [deferred_store_spares] * len(slot_layout.pools),
         stall_timeout_s=stall_timeout_s,
         run_coordinator=run_coordinator,
     )

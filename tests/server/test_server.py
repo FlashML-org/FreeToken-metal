@@ -988,6 +988,7 @@ REFUSED_MOE_FLAG_CASES: list[tuple[list[str], str]] = [
     (["--moe-cache-policy", "lfu"], "invalid choice: 'lfu'"),
     (["--moe-victim-cache-gib", "-1"], "expected auto or a non-negative number"),
     (["--moe-victim-cache-gib", "inf"], "expected auto or a non-negative number"),
+    (["--moe-victim-memory", "anonymous"], "invalid choice"),
 ]
 
 
@@ -1005,6 +1006,44 @@ def test_victim_cache_flag_reaches_the_server_args(
 ) -> None:
     args = parse_args(["--model", str(tiny_model_dir), *flags], prog="ftm serve")
     assert args.moe_victim_cache_gib == expected
+
+
+# (flags, --moe-victim-memory and --moe-cache-policy as the server args hold them)
+OFFLOAD_POLICY_FLAG_CASES: list[tuple[list[str], str, str]] = [
+    ([], "purgeable", "lru"),
+    (["--moe-victim-memory", "reserved"], "reserved", "lru"),
+    (["--moe-cache-policy", "lrfu"], "purgeable", "lrfu"),
+]
+
+
+# (FTMETAL_MOE_SSD_KEEPALIVE_US, the interval the server args hold, or the error)
+SSD_KEEPALIVE_ENV_CASES: list[tuple[str | None, int | str]] = [
+    (None, 0),
+    ("50", 50),
+    ("fast", "must be a whole number"),
+]
+
+
+@pytest.mark.parametrize(("value", "expected"), SSD_KEEPALIVE_ENV_CASES)
+def test_ssd_keepalive_env_reaches_the_server_args(
+    tiny_model_dir: Path, monkeypatch: pytest.MonkeyPatch, value: str | None, expected: int | str
+) -> None:
+    if value is not None:
+        monkeypatch.setenv("FTMETAL_MOE_SSD_KEEPALIVE_US", value)
+    if isinstance(expected, str):
+        with pytest.raises(ValueError, match=expected):
+            parse_args(["--model", str(tiny_model_dir)], prog="ftm serve")
+    else:
+        args = parse_args(["--model", str(tiny_model_dir)], prog="ftm serve")
+        assert args.moe_ssd_keepalive_us == expected
+
+
+@pytest.mark.parametrize(("flags", "memory", "policy"), OFFLOAD_POLICY_FLAG_CASES)
+def test_offload_policy_flags_reach_the_server_args(
+    tiny_model_dir: Path, flags: list[str], memory: str, policy: str
+) -> None:
+    args = parse_args(["--model", str(tiny_model_dir), *flags], prog="ftm serve")
+    assert (args.moe_victim_memory, args.moe_cache_policy) == (memory, policy)
 
 
 @pytest.mark.parametrize(("flags", "error"), REFUSED_MOE_FLAG_CASES)

@@ -62,7 +62,11 @@ ExpertService::ExpertService(
     int64_t victim_cache_bytes,
     int io_threads,
     double stall_timeout_s,
-    bool run_coordinator)
+    bool run_coordinator,
+    VictimMemory victim_memory,
+    std::vector<int32_t> pool_spares,
+    double lrfu_half_life,
+    int64_t ssd_keepalive_us)
     : lru_(
           num_layers,
           num_experts,
@@ -71,7 +75,8 @@ ExpertService::ExpertService(
           pool_bounds,
           pool_volatile,
           std::move(slot_of),
-          std::move(last_use)),
+          std::move(last_use),
+          lrfu_half_life),
       num_layers_(num_layers),
       num_experts_(num_experts),
       banks_(std::move(banks)),
@@ -238,9 +243,26 @@ ExpertService::ExpertService(
   stats_.victim_buffer_hits.assign(num_layers, 0);
   stats_.victim_stores.assign(num_layers, 0);
   stats_.victim_drops.assign(num_layers, 0);
+  stats_.deferred_stores.assign(num_layers, 0);
+  size_t num_pools = pool_bounds.size() - 1;
+  if (!pool_spares.empty() && pool_spares.size() != num_pools) {
+    throw std::invalid_argument("ExpertService: pool_spares must hold one count per pool");
+  }
+  pool_spares_ = pool_spares.empty() ? std::vector<int32_t>(num_pools, 0) : std::move(pool_spares);
+  for (size_t pool = 0; pool < num_pools; ++pool) {
+    if (pool_spares_[pool] < 0 || pool_spares_[pool] >= pool_bounds[pool + 1] - pool_bounds[pool]) {
+      throw std::invalid_argument(
+          "ExpertService: pool " + std::to_string(pool) + "'s spares must be in [0, its slots)");
+    }
+  }
+  if (ssd_keepalive_us < 0) {
+    throw std::invalid_argument("ExpertService: ssd_keepalive_us must not be negative");
+  }
+  spares_.resize(pool_bounds.size() - 1);
+  can_claim_spares_.assign(pool_bounds.size() - 1, 1);
+  pending_slot_of_.assign(static_cast<size_t>(num_layers) * num_experts, -1);
   if (victim_cache_bytes > 0) {
     // An entry holds a row of every bank, whose bytes a pool's layers share.
-    size_t num_pools = pool_bounds.size() - 1;
     std::vector<int64_t> entry_bytes(num_pools, 0);
     std::vector<int64_t> pool_slots(num_pools);
     for (size_t pool = 0; pool < num_pools; ++pool) {
@@ -260,7 +282,7 @@ ExpertService::ExpertService(
       pool_bytes = layer_bytes;
     }
     victims_ = std::make_unique<VictimCache>(
-        num_experts, layer_pools, entry_bytes, pool_slots, victim_cache_bytes);
+        num_experts, layer_pools, entry_bytes, pool_slots, victim_cache_bytes, victim_memory);
     if (victims_->num_entries() == 0) {
       // A budget below one entry per pool is no cache: the plain path, without the hold.
       victims_.reset();
@@ -311,6 +333,10 @@ ExpertService::ExpertService(
       threads_.emplace_back(&ExpertService::work, this, i);
     }
     watchdog_ = std::thread(&ExpertService::watch, this);
+    // Without a coordinator (tests) nothing dozes: no keepalive.
+    if (ssd_keepalive_us > 0 && run_coordinator) {
+      ssd_keepalive_ = std::thread(&ExpertService::keep_ssd_awake, this, ssd_keepalive_us);
+    }
     if (run_coordinator) {
       coordinator_ = std::thread(&ExpertService::coordinate, this);
     }
@@ -324,8 +350,52 @@ ExpertService::~ExpertService() {
   shutdown();
 }
 
+void ExpertService::keep_ssd_awake(int64_t interval_us) {
+  // While the coordinator is hot, a 16 KiB read of an expert file, then interval_us asleep:
+  // after >= 0.5 ms idle the SSD answers a read ~0.05 ms slower, and decode's misses come one
+  // layer at a time with idle gaps between them (PR #3's 9981c36).
+  const int64_t read_bytes = 16384;
+  std::vector<std::pair<int, int64_t>> files;
+  for (int descriptor : file_descriptors_) {
+    off_t size = descriptor >= 0 ? lseek(descriptor, 0, SEEK_END) : -1;
+    if (size > 2 * read_bytes) {
+      files.emplace_back(descriptor, static_cast<int64_t>(size) / read_bytes - 1);
+    }
+  }
+  void* memory = nullptr;
+  if (files.empty() || posix_memalign(&memory, STAGING_ALIGNMENT, read_bytes) != 0) {
+    return;
+  }
+  uint64_t state = 0x9E3779B97F4A7C15ull;
+  while (!is_stopping_keepalive_.load(std::memory_order_acquire)) {
+    // Idle between requests (the coordinator dozes): no reads, the device may sleep.
+    if (is_dozing_.load(std::memory_order_relaxed)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      continue;
+    }
+    state = state * 6364136223846793005ull + 1442695040888963407ull;
+    const auto& [descriptor, blocks] = files[(state >> 33) % files.size()];
+    off_t offset =
+        static_cast<off_t>((state >> 11) % static_cast<uint64_t>(blocks)) * read_bytes;
+    (void)!pread(descriptor, memory, read_bytes, offset);
+    std::unique_lock<std::mutex> lock(keepalive_mutex_);
+    keepalive_wake_.wait_for(lock, std::chrono::microseconds(interval_us), [this] {
+      return is_stopping_keepalive_.load(std::memory_order_acquire);
+    });
+  }
+  std::free(memory);
+}
+
 void ExpertService::shutdown() {
   std::call_once(shutdown_once_, [this] {
+    {
+      std::lock_guard<std::mutex> lock(keepalive_mutex_);
+      is_stopping_keepalive_.store(true, std::memory_order_release);
+    }
+    keepalive_wake_.notify_all();
+    if (ssd_keepalive_.joinable()) {
+      ssd_keepalive_.join();
+    }
     fail(MailboxError::Shutdown, "the service was shut down");
     is_stopping_coordination_.store(true, std::memory_order_release);
     // The shutdown word first: a lookup that has not posted yet posts nothing, and one that
@@ -596,6 +666,57 @@ void ExpertService::copy_entry(
   victim_copy_ns_.fetch_add(nanoseconds_since(started), std::memory_order_relaxed);
 }
 
+void ExpertService::finish_deferred_stores() {
+  for (const auto& [slot, flat_id] : pending_stores_) {
+    int layer_id = flat_id / num_experts_;
+    int32_t entry = victims_->claim(flat_id);
+    if (entry != NO_ENTRY) {
+      copy_entry(victims_->data(entry), layer_id, -1, slot, true);
+      victims_->unpin(entry);
+      stats_.victim_stores[layer_id] += 1;
+    }
+    pending_slot_of_[flat_id] = -1;
+    // Its slot is the pool's next spare, the held slots at most pool_spares_.
+    int32_t pool = lru_.pool_of_layer(layer_id);
+    if (spares_[pool].size() < static_cast<size_t>(pool_spares_[pool])) {
+      spares_[pool].push_back(slot);
+    } else {
+      lru_.release_held(slot);
+    }
+  }
+  pending_stores_.clear();
+}
+
+void ExpertService::try_finish_deferred_stores() {
+  std::unique_lock<std::mutex> lock(call_mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    return;
+  }
+  try {
+    if (victims_) {
+      finish_deferred_stores();
+    }
+  } catch (const std::exception& error) {
+    pending_stores_.clear();
+    fail(MailboxError::Io, std::string("ExpertService: victim cache: ") + error.what());
+  }
+  has_pending_stores_.store(false, std::memory_order_relaxed);
+}
+
+void ExpertService::release_spares() {
+  if (victims_) {
+    finish_deferred_stores();
+  }
+  has_pending_stores_.store(false, std::memory_order_relaxed);
+  for (std::vector<int32_t>& spares : spares_) {
+    for (int32_t spare : spares) {
+      lru_.release_held(spare);
+    }
+    spares.clear();
+  }
+  std::fill(can_claim_spares_.begin(), can_claim_spares_.end(), 1);
+}
+
 std::vector<ExpertLoad> ExpertService::split_victim_hits(
     int layer_id,
     const std::vector<ExpertLoad>& loads,
@@ -632,6 +753,7 @@ void ExpertService::finish_buffer(PrefillBuffer& buffer, int64_t wait_ns) {
 void ExpertService::fill_initial(const std::vector<int32_t>& flat_ids) {
   std::lock_guard<std::mutex> lock(call_mutex_);
   check_healthy();
+  release_spares();
   for (PrefillBuffer& buffer : buffers_) {
     if (!buffer.is_waited) {
       auto started = std::chrono::steady_clock::now();
@@ -688,7 +810,29 @@ SlotAssignment ExpertService::serve(
           " is still being read into its prefill buffer; wait for it first");
     }
   }
-  SlotAssignment assignment = lru_.resolve(layer_id, expert_ids, step);
+  if (victims_ && !pending_stores_.empty()) {
+    // An expert whose store is still deferred is wanted again: store it first (a victim hit).
+    for (int32_t expert : expert_ids) {
+      if (pending_slot_of_[layer_id * num_experts_ + expert] >= 0) {
+        finish_deferred_stores();
+        break;
+      }
+    }
+  }
+  SlotAssignment assignment;
+  try {
+    assignment = lru_.resolve(layer_id, expert_ids, step);
+  } catch (const std::runtime_error&) {
+    // The scheduler fits a step's experts to its pools counting every slot: the held ones
+    // (spares and deferred stores) go back, and the pool holds none until the next prefill.
+    int32_t pool = lru_.pool_of_layer(layer_id);
+    if (!victims_ || (spares_[pool].empty() && pending_stores_.empty())) {
+      throw;
+    }
+    release_spares();
+    can_claim_spares_[pool] = 0;
+    assignment = lru_.resolve(layer_id, expert_ids, step);
+  }
   int64_t num_loads = static_cast<int64_t>(assignment.loads.size());
   stats_.hits[layer_id] += static_cast<int64_t>(expert_ids.size()) - num_loads;
   stats_.misses[layer_id] += num_loads;
@@ -707,13 +851,60 @@ SlotAssignment ExpertService::serve(
       std::vector<ExpertLoad> reads = split_victim_hits(layer_id, assignment.loads, hits);
       ensure_batch_.is_held.store(true, std::memory_order_relaxed);
       submit(ensure_batch_, layer_id, reads);
+      std::vector<int32_t>& spares = spares_[lru_.pool_of_layer(layer_id)];
       for (const auto& [flat_id, slot] : assignment.evicted) {
+        auto hit = std::find_if(hits.begin(), hits.end(), [slot](const auto& h) {
+          return h.second == slot;
+        });
+        if (hit != hits.end() && !spares.empty()) {
+          // A victim hit evicting a resident: the hit goes to a spare slot now, and the
+          // evicted expert is copied out of its slot (the next spare) once answered.
+          int32_t spare = spares.back();
+          spares.pop_back();
+          lru_.move_load(slot, spare);
+          hit->second = spare;
+          for (auto& load : assignment.loads) {
+            if (load.second == slot) {
+              load.second = spare;
+            }
+          }
+          for (int32_t& assigned : assignment.slots) {
+            if (assigned == slot) {
+              assigned = spare;
+            }
+          }
+          pending_stores_.emplace_back(slot, flat_id);
+          pending_slot_of_[flat_id] = slot;
+          stats_.deferred_stores[layer_id] += 1;
+          continue;
+        }
         int32_t entry = victims_->claim(flat_id);
         if (entry != NO_ENTRY) {
           copy_entry(victims_->data(entry), layer_id, -1, slot, true);
           victims_->unpin(entry);
           stats_.victim_stores[layer_id] += 1;
         }
+      }
+      if (!pending_stores_.empty()) {
+        has_pending_stores_.store(true, std::memory_order_relaxed);
+      }
+      // Spares come from free slots (a prefill leaves some), then circulate; no scan for them
+      // once none is left.
+      int32_t pool = lru_.pool_of_layer(layer_id);
+      auto held = [&] {
+        size_t pending = 0;
+        for (const auto& [slot, flat_id] : pending_stores_) {
+          pending += lru_.pool_of_layer(flat_id / num_experts_) == pool;
+        }
+        return spares.size() + pending;
+      };
+      while (can_claim_spares_[pool] && held() < static_cast<size_t>(pool_spares_[pool])) {
+        int32_t spare = lru_.claim_free_slot(pool, step);
+        if (spare < 0) {
+          can_claim_spares_[pool] = 0;
+          break;
+        }
+        spares.push_back(spare);
       }
       ensure_batch_.is_held.store(false, std::memory_order_release);
       for (const auto& [segment_index, expert] : ensure_batch_.held_fills) {
@@ -747,9 +938,15 @@ SlotAssignment ExpertService::serve(
   return assignment;
 }
 
+void ExpertService::reset_scores() {
+  std::lock_guard<std::mutex> lock(call_mutex_);
+  lru_.reset_scores();
+}
+
 void ExpertService::begin_prefill() {
   std::lock_guard<std::mutex> lock(call_mutex_);
   check_healthy();
+  release_spares();
   for (PrefillBuffer& buffer : buffers_) {
     if (!buffer.is_waited) {
       auto started = std::chrono::steady_clock::now();
@@ -877,6 +1074,7 @@ ExpertServiceStats ExpertService::stats() {
     if (victims_) {
       stats.victim_entries = victims_->num_entries();
       stats.victim_bytes = victims_->num_bytes();
+      stats.victim_locked_bytes = victims_->locked_bytes();
     }
   }
   stats.victim_copy_ns = victim_copy_ns_.load(std::memory_order_relaxed);

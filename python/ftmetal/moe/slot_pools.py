@@ -32,6 +32,12 @@ MoePoolGrouping = Literal["unified", "per-layer"]
 MoePoolSlots = Literal["equal", "profile"]
 # Where the prefill buffers go: over the first pools' slots, or before the pools.
 PrefillBufferPlacement = Literal["overlay", "dedicated"]
+# Which slot a miss evicts: the least recently used, or the lowest LRFU score (SlotLru).
+MoeCachePolicy = Literal["lru", "lrfu"]
+# The victim cache's host memory (VictimCache): purgeable (entries the system may discard
+# under memory pressure) or reserved (one anonymous mapping, wired as far as the OS
+# allows, that it never discards).
+VictimMemoryKind = Literal["purgeable", "reserved"]
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -315,11 +321,13 @@ def initial_experts(layout: SlotLayout, counts: np.ndarray | None) -> list[int]:
 
 __all__ = [
     "HOT_EXPERTS_FILE",
+    "MoeCachePolicy",
     "MoePoolGrouping",
     "MoePoolSlots",
     "PrefillBufferPlacement",
     "SlotLayout",
     "SlotPool",
+    "VictimMemoryKind",
     "bank_layouts",
     "find_expert_counts",
     "initial_experts",

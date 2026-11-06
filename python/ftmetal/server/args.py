@@ -35,7 +35,7 @@ from ftmetal.engine.config import (
 )
 from ftmetal.kvcache.linear_state_pool import CONVERSATION_SNAPSHOTS, DEFAULT_GDN_SNAPSHOTS
 from ftmetal.mm.config import ENCODER_KINDS, EncoderKind, MultimodalConfig
-from ftmetal.moe.slot_pools import MoePoolGrouping, MoePoolSlots
+from ftmetal.moe.slot_pools import MoeCachePolicy, MoePoolGrouping, MoePoolSlots, VictimMemoryKind
 from ftmetal.tokenizer import read_json_object
 
 TOOL_CALL_PARSER_CHOICES = (
@@ -418,9 +418,11 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
     )
     parser.add_argument(
         "--moe-cache-policy",
-        choices=["lru"],
+        choices=list(get_args(MoeCachePolicy)),
         default=ServerArgs.moe_cache_policy,
-        help="the MoE offload cache's eviction policy",
+        help="the MoE offload cache's eviction policy: lru (default) evicts the least recently "
+        "used expert, lrfu the one with the lowest use count decayed by a 20-step half-life (an "
+        "expert the decode keeps coming back to outlasts one-off ones)",
     )
     parser.add_argument(
         "--moe-pool",
@@ -455,6 +457,15 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         "set, which the system may reclaim, so a later miss copies them back instead of "
         f"reading the checkpoint: GiB of it, or auto (that memory less a "
         f"{VICTIM_CACHE_HOST_RESERVE_BYTES // GIB} GiB reserve); 0 (default) keeps none",
+    )
+    parser.add_argument(
+        "--moe-victim-memory",
+        choices=list(get_args(VictimMemoryKind)),
+        default=ServerArgs.moe_victim_memory,
+        help="the victim cache's memory: purgeable (default), which the system takes back "
+        "under memory pressure, losing the experts it held; or reserved, kept for the engine "
+        "(wired as far as the OS allows) and never taken back: no lost hits, at the cost of "
+        "memory other apps cannot have",
     )
     parser.add_argument(
         "--expert-load",
@@ -624,6 +635,7 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         moe_pool_profile=namespace.moe_pool_slots[1],
         moe_prefill_overlap=namespace.moe_prefill_overlap,
         moe_victim_cache_gib=namespace.moe_victim_cache_gib,
+        moe_victim_memory=namespace.moe_victim_memory,
         mm=MultimodalConfig(
             disabled_encoders=frozenset(disabled_encoders),
             image_min_tokens=image_min_tokens,

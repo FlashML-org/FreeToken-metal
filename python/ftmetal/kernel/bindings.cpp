@@ -253,6 +253,10 @@ NB_MODULE(_C, m) {
       .value("DONE", ftmetal::MailboxState::Done)
       .value("FAILED", ftmetal::MailboxState::Failed)
       .value("SHUTDOWN", ftmetal::MailboxState::Shutdown);
+  nb::enum_<ftmetal::VictimMemory>(m, "VictimMemory")
+      .value("PURGEABLE", ftmetal::VictimMemory::Purgeable)
+      .value("ANONYMOUS", ftmetal::VictimMemory::Anonymous);
+
   nb::enum_<ftmetal::MailboxError>(m, "MailboxError", nb::is_arithmetic())
       .value("NONE", ftmetal::MailboxError::None)
       .value("IO", ftmetal::MailboxError::Io)
@@ -333,7 +337,8 @@ NB_MODULE(_C, m) {
               const std::vector<int32_t>&,
               const std::vector<int32_t>&,
               mx::array,
-              mx::array>(),
+              mx::array,
+              double>(),
           "num_layers"_a,
           "num_experts"_a,
           "buffer_size"_a,
@@ -342,8 +347,11 @@ NB_MODULE(_C, m) {
           "pool_volatile"_a,
           "slot_of"_a,
           "last_use"_a,
-          "Per-pool token-granular LRUs over the slots; writes slot_of and last_use in place.")
+          "lrfu_half_life"_a = 0.0,
+          "Per-pool token-granular LRUs (or LRFUs) over the slots; writes slot_of and last_use "
+          "in place.")
       .def_prop_ro("num_slots", &ftmetal::SlotLru::num_slots)
+      .def("reset_scores", &ftmetal::SlotLru::reset_scores, "Forget the LRFU use counts.")
       .def(
           "fill",
           &ftmetal::SlotLru::fill,
@@ -387,9 +395,11 @@ NB_MODULE(_C, m) {
       .def_ro("victim_buffer_hits", &ftmetal::ExpertServiceStats::victim_buffer_hits)
       .def_ro("victim_stores", &ftmetal::ExpertServiceStats::victim_stores)
       .def_ro("victim_drops", &ftmetal::ExpertServiceStats::victim_drops)
+      .def_ro("deferred_stores", &ftmetal::ExpertServiceStats::deferred_stores)
       .def_ro("victim_copy_ns", &ftmetal::ExpertServiceStats::victim_copy_ns)
       .def_ro("victim_entries", &ftmetal::ExpertServiceStats::victim_entries)
-      .def_ro("victim_bytes", &ftmetal::ExpertServiceStats::victim_bytes);
+      .def_ro("victim_bytes", &ftmetal::ExpertServiceStats::victim_bytes)
+      .def_ro("victim_locked_bytes", &ftmetal::ExpertServiceStats::victim_locked_bytes);
 
   using Int64Table3 = nb::ndarray<const int64_t, nb::ndim<3>, nb::c_contig, nb::device::cpu>;
   using Int64Table4 = nb::ndarray<const int64_t, nb::ndim<4>, nb::c_contig, nb::device::cpu>;
@@ -416,7 +426,11 @@ NB_MODULE(_C, m) {
              int64_t victim_cache_bytes,
              int io_threads,
              double stall_timeout_s,
-             bool run_coordinator) {
+             bool run_coordinator,
+             ftmetal::VictimMemory victim_memory,
+             std::vector<int32_t> pool_spares,
+             double lrfu_half_life,
+             int64_t ssd_keepalive_us) {
             if (segments.shape(0) != static_cast<size_t>(num_layers) || segments.shape(2) != 3) {
               throw std::invalid_argument("ExpertService: segments must be int64 [num_layers, n, 3]");
             }
@@ -462,7 +476,11 @@ NB_MODULE(_C, m) {
                 victim_cache_bytes,
                 io_threads,
                 stall_timeout_s,
-                run_coordinator);
+                run_coordinator,
+                victim_memory,
+                std::move(pool_spares),
+                lrfu_half_life,
+                ssd_keepalive_us);
           },
           "num_layers"_a,
           "num_experts"_a,
@@ -484,7 +502,16 @@ NB_MODULE(_C, m) {
           "io_threads"_a,
           "stall_timeout_s"_a,
           "run_coordinator"_a,
+          "victim_memory"_a = ftmetal::VictimMemory::Purgeable,
+          "pool_spares"_a = std::vector<int32_t>(),
+          "lrfu_half_life"_a = 0.0,
+          "ssd_keepalive_us"_a = 0,
           "The slot cache's LRU, IO threads, victim cache, lookup coordinator and watchdog.")
+      .def(
+          "reset_scores",
+          &ftmetal::ExpertService::reset_scores,
+          nb::call_guard<nb::gil_scoped_release>(),
+          "Experiment (LRFU): forget the slots' use counts.")
       .def(
           "fill_initial",
           &ftmetal::ExpertService::fill_initial,

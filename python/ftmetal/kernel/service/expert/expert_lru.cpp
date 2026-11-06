@@ -1,6 +1,7 @@
 #include "service/expert/expert_lru.h"
 
 #include <algorithm>
+#include <cmath>
 #include <functional>
 #include <stdexcept>
 
@@ -67,7 +68,8 @@ SlotLru::SlotLru(
     const std::vector<int32_t>& pool_bounds,
     const std::vector<int32_t>& pool_volatile,
     mx::array slot_of,
-    mx::array last_use)
+    mx::array last_use,
+    double lrfu_half_life)
     : num_layers_(num_layers),
       num_experts_(num_experts),
       buffer_size_(buffer_size),
@@ -88,10 +90,17 @@ SlotLru::SlotLru(
     throw std::invalid_argument("SlotLru: last_use must be uint32 [num_slots]");
   }
   id_of_slot_.assign(num_slots(), -1);
+  is_held_.assign(num_slots(), 0);
   slot_call_.assign(num_slots(), 0);
   std::fill(slot_of_data_, slot_of_data_ + slot_of_.size(), -1);
   std::fill(last_use_data_, last_use_data_ + num_slots(), 0u);
   candidates_.reserve(num_slots());
+  if (!(lrfu_half_life >= 0)) {
+    throw std::invalid_argument("SlotLru: lrfu_half_life must be >= 0");
+  }
+  half_life_ = lrfu_half_life;
+  score_.assign(num_slots(), 0.0);
+  counted_use_.assign(num_slots(), 0u);
 }
 
 void SlotLru::check_layer(int layer_id, const char* method) const {
@@ -106,6 +115,11 @@ std::vector<int32_t> SlotLru::fill(const std::vector<int32_t>& flat_ids) {
   std::fill(slot_of_data_, slot_of_data_ + slot_of_.size(), -1);
   std::fill(last_use_data_, last_use_data_ + num_slots(), 0u);
   std::fill(id_of_slot_.begin(), id_of_slot_.end(), -1);
+  std::fill(is_held_.begin(), is_held_.end(), 0);
+  if (half_life_ != 0) {
+    std::fill(score_.begin(), score_.end(), 0.0);
+    std::fill(counted_use_.begin(), counted_use_.end(), 0u);
+  }
   int32_t num_ids = num_layers_ * num_experts_;
   std::vector<int32_t> next_slot(pool_bounds_.begin(), pool_bounds_.end() - 1);
   std::vector<int32_t> slots(flat_ids.size());
@@ -141,6 +155,7 @@ SlotAssignment SlotLru::resolve(
     std::fill(expert_call_.begin(), expert_call_.end(), 0u);
     call_ = 1;
   }
+  count_uses(step);
   SlotAssignment assignment;
   assignment.slots.resize(expert_ids.size());
   misses_.clear();
@@ -169,7 +184,9 @@ SlotAssignment SlotLru::resolve(
   int32_t pool_begin = pool_bounds_[pool];
   int32_t pool_end = pool_bounds_[pool + 1];
   for (int32_t slot = pool_begin; slot < pool_end; ++slot) {
-    if (slot_call_[slot] != call_) {
+    // LRFU's order could put a slot an earlier layer used this step first; LRU's never does.
+    if (slot_call_[slot] != call_ && !is_held_[slot] &&
+        (half_life_ == 0 || last_use_data_[slot] < step)) {
       candidates_.push_back({last_use_data_[slot], id_of_slot_[slot], slot});
     }
   }
@@ -181,7 +198,9 @@ SlotAssignment SlotLru::resolve(
         " experts; the scheduler caps a forward's rows to fit");
   }
   auto victims_end = candidates_.begin() + static_cast<std::ptrdiff_t>(misses_.size());
-  std::partial_sort(candidates_.begin(), victims_end, candidates_.end());
+  std::partial_sort(
+      candidates_.begin(), victims_end, candidates_.end(),
+      [this](const Candidate& a, const Candidate& b) { return is_victim_before(a, b); });
   // The cache splits a forward into steps whose experts fit every pool at once, so the
   // victims were all last used before this step.
   const Candidate& newest = *(victims_end - 1);
@@ -203,10 +222,97 @@ SlotAssignment SlotLru::resolve(
     id_of_slot_[victim.slot] = flat_id;
     slot_of_data_[flat_id] = victim.slot;
     last_use_data_[victim.slot] = step;
+    score_load(victim.slot, step);
     assignment.slots[i] = victim.slot;
     assignment.loads.emplace_back(expert_ids[i], victim.slot);
   }
   return assignment;
+}
+
+int32_t SlotLru::claim_free_slot(int32_t pool, uint32_t step) {
+  for (int32_t slot = pool_bounds_[pool]; slot < pool_bounds_[pool + 1]; ++slot) {
+    if (id_of_slot_[slot] < 0 && !is_held_[slot] && last_use_data_[slot] < step &&
+        slot_call_[slot] != call_) {
+      is_held_[slot] = 1;
+      return slot;
+    }
+  }
+  return -1;
+}
+
+void SlotLru::move_load(int32_t from, int32_t to) {
+  int32_t flat_id = id_of_slot_[from];
+  if (flat_id < 0 || id_of_slot_[to] >= 0 || !is_held_[to] || is_held_[from]) {
+    throw std::logic_error(
+        "SlotLru.move_load: slot " + std::to_string(from) + " holds no load or slot " +
+        std::to_string(to) + " is no spare");
+  }
+  id_of_slot_[to] = flat_id;
+  slot_of_data_[flat_id] = to;
+  last_use_data_[to] = last_use_data_[from];
+  slot_call_[to] = slot_call_[from];
+  if (half_life_ != 0) {
+    score_[to] = score_[from];
+    counted_use_[to] = counted_use_[from];
+  }
+  is_held_[to] = 0;
+  id_of_slot_[from] = -1;
+  // Never read in this step (its evicted expert was a victim, the load moved before the GPU saw
+  // it): once released it may take a load of this step again.
+  last_use_data_[from] = 0;
+  is_held_[from] = 1;
+}
+
+void SlotLru::reset_scores() {
+  if (half_life_ == 0) {
+    return;
+  }
+  count_uses(0);
+  for (int32_t slot = 0; slot < num_slots(); ++slot) {
+    score_[slot] = counted_use_[slot] / half_life_;
+  }
+}
+
+void SlotLru::count_uses(uint32_t step) {
+  // Once per step: a slot is used at most once in a step, and last_use keeps the last.
+  if (half_life_ == 0 || (step != 0 && step == counted_step_)) {
+    return;
+  }
+  counted_step_ = step;
+  for (int32_t slot = 0; slot < num_slots(); ++slot) {
+    uint32_t last_use = last_use_data_[slot];
+    if (last_use > counted_use_[slot] && id_of_slot_[slot] >= 0) {
+      // score * 2^-(age / half-life) + 1, in log2 with the decay to step 0 folded in.
+      double now = last_use / half_life_;
+      score_[slot] = std::log2(std::exp2(score_[slot] - now) + 1.0) + now;
+      counted_use_[slot] = last_use;
+    }
+  }
+}
+
+void SlotLru::score_load(int32_t slot, uint32_t step) {
+  if (half_life_ != 0) {
+    score_[slot] = step / half_life_;
+    counted_use_[slot] = step;
+  }
+}
+
+bool SlotLru::is_victim_before(const Candidate& a, const Candidate& b) const {
+  if (half_life_ == 0) {
+    return a < b;
+  }
+  // Free slots first, then the lowest score, then LRU's order.
+  bool a_free = a.flat_id < 0;
+  bool b_free = b.flat_id < 0;
+  if (a_free != b_free) {
+    return a_free;
+  }
+  double a_score = a_free ? 0.0 : score_[a.slot];
+  double b_score = b_free ? 0.0 : score_[b.slot];
+  if (a_score != b_score) {
+    return a_score < b_score;
+  }
+  return a < b;
 }
 
 std::vector<SlotExpert> SlotLru::invalidate_prefill_buffers() {

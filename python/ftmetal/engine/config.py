@@ -18,7 +18,7 @@ import os
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
 import mlx.core as mx
 
@@ -28,7 +28,13 @@ from ftmetal.mm.processor import active_encoders
 from ftmetal.models.config import ModelConfig
 from ftmetal.models.loader import config_str_list, read_model_config
 from ftmetal.models.register import parse_model_config, read_checkpoint
-from ftmetal.moe.slot_pools import MoePoolGrouping, MoePoolSlots, PrefillBufferPlacement
+from ftmetal.moe.slot_pools import (
+    MoeCachePolicy,
+    MoePoolGrouping,
+    MoePoolSlots,
+    PrefillBufferPlacement,
+    VictimMemoryKind,
+)
 
 # Prefix reuse: radix (the hybrid radix on a model with linear attention) or naive (none).
 CacheTypeChoice = Literal["naive", "radix"]
@@ -69,6 +75,19 @@ def moe_pack_from_env() -> bool:
     if value not in (None, "0", "1"):
         raise ValueError(f"FTMETAL_MOE_PACK must be 0 or 1, got {value!r}")
     return value != "0"
+
+
+def moe_ssd_keepalive_us_from_env() -> int:
+    """FTMETAL_MOE_SSD_KEEPALIVE_US: while an offload's lookups run, read 16 KiB of an expert
+    file every this many microseconds so the SSD does not drop into its idle state between
+    decode misses (50 on this Mac's internal SSD: -1 ms/token); unset or 0 (default): no
+    reads."""
+    value = read_env("MOE_SSD_KEEPALIVE_US")
+    if value is None:
+        return 0
+    elif not value.isdigit():
+        raise ValueError(f"FTMETAL_MOE_SSD_KEEPALIVE_US must be a whole number, got {value!r}")
+    return int(value)
 
 
 def moe_split_lookup_from_env() -> bool:
@@ -129,7 +148,7 @@ class EngineConfig:
     moe_cache_auto: bool = False
     # KV tokens auto keeps before the experts: auto's fused fit check and cache sizing.
     kv_reserve_tokens: int = 8192
-    moe_cache_policy: Literal["lru"] = "lru"
+    moe_cache_policy: MoeCachePolicy = "lru"
     # How the offload cache groups the MoE layers into pools of slots, and splits its slots
     # among them: evenly per layer, or by a hot-expert table (moe_pool_profile, else the model
     # directory's, else the one shipped for the model).
@@ -149,6 +168,11 @@ class EngineConfig:
     # The offload cache's victim cache in host memory beyond Metal's working set, in GiB, or
     # auto (that memory less a host reserve); 0: none.
     moe_victim_cache_gib: float | Literal["auto"] = 0
+    # Its memory: purgeable (the system may take it back under memory pressure) or reserved
+    # (kept for the engine, never taken back).
+    moe_victim_memory: VictimMemoryKind = "purgeable"
+    # The offload's SSD keepalive read interval in microseconds; 0: none.
+    moe_ssd_keepalive_us: int = field(default_factory=moe_ssd_keepalive_us_from_env)
     # The memory budget as a fraction of Metal's recommended working set; None: the working
     # set less its headroom. A fraction also emulates a smaller Mac.
     memory_ratio: float | None = None
@@ -165,6 +189,12 @@ class EngineConfig:
         ]
         if len(cache_flags) > 1:
             raise ValueError(f"{' and '.join(cache_flags)} are exclusive: set at most one")
+        if self.moe_cache_policy not in get_args(MoeCachePolicy):
+            raise ValueError(f"moe_cache_policy must be lru or lrfu, got {self.moe_cache_policy!r}")
+        if self.moe_victim_memory not in get_args(VictimMemoryKind):
+            raise ValueError(
+                f"moe_victim_memory must be purgeable or reserved, got {self.moe_victim_memory!r}"
+            )
         if self.moe_cache_size < 0:
             raise ValueError(f"moe_cache_size must not be negative, got {self.moe_cache_size}")
         if self.moe_cache_rate is not None and not 0 <= self.moe_cache_rate <= 1:
@@ -251,4 +281,5 @@ __all__ = [
     "moe_prefill_buffer_from_env",
     "moe_prefill_overlap_min_tokens_from_env",
     "moe_split_lookup_from_env",
+    "moe_ssd_keepalive_us_from_env",
 ]
