@@ -233,7 +233,9 @@ class Engine:
             elif all(encoder.kind in config.mm.disabled_encoders for encoder in configured):
                 reason = "--text-model-only" if config.mm.text_model_only else "--mm-disable"
             else:
-                prefixes = ", ".join(encoder.weight_prefix for encoder in configured)
+                prefixes = ", ".join(
+                    prefix for encoder in configured for prefix in encoder.weight_prefixes
+                )
                 reason = f"the checkpoint has no tower weights under {prefixes}"
             logger.info(f"Multimodal disabled: {reason}")
 

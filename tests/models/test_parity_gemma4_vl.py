@@ -8,15 +8,21 @@ Greedy decode must agree token for token on both attention backends whether the 
 one chunk or chunked around the images, whether the image prefix comes from the radix cache
 (a match ending inside an image) or is encoded again, whether decode replays CommandGraphs
 and whether a request waits a pass for its image; a text-only prompt on the vision-serving
-model decodes as mlx-lm. The images are 16 tokens (longer than the window of 8) and 10. The
-soft tokens come from the engine's own encode, so nothing here depends on the tower's
-numerics (tests/models/test_gemma4_vision.py holds those).
+model decodes as mlx-lm; the checkpoint in the Hugging Face layout (the tower under
+model.vision_tower.) serves its images, each encoded as the MLX layout's (to float32
+rounding, by which the encode of one image varies from call to call). The images are 16
+tokens (longer than the window of 8) and 10. The soft tokens come from the engine's own
+encode, so nothing here depends on the tower's numerics (tests/models/test_gemma4_vision.py
+holds those).
 """
 
 from __future__ import annotations
 
 import dataclasses
 import json
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import mlx.core as mx
@@ -24,7 +30,14 @@ import numpy as np
 import pytest
 from mlx.utils import tree_flatten
 from mlx_lm.models import gemma4 as reference
-from test_parity_gemma4 import EOS, WINDOW, build_reference, reference_greedy, text_config
+from test_parity_gemma4 import (
+    EOS,
+    WINDOW,
+    build_reference,
+    hf_layout_weights,
+    reference_greedy,
+    text_config,
+)
 
 from ftmetal.core import SamplingParams
 from ftmetal.engine.config import EngineConfig
@@ -33,6 +46,7 @@ from ftmetal.mm.item import MMItem
 from ftmetal.mm.processor import MMResult
 from ftmetal.mm.processors.gemma4 import Gemma4MMProcessor
 from ftmetal.models.blocks import SupportsMultimodal
+from ftmetal.models.gemma4.weight import CONDITIONAL_GENERATION
 from ftmetal.models.loader import read_model_config
 from ftmetal.scheduler.scheduler import Scheduler
 from tiny_vl_model import (
@@ -49,18 +63,18 @@ MAX_SOFT_TOKENS = 16
 SQUARE, WIDE = (64, 64), (128, 64)
 
 
-def build_checkpoint(seed: int, path: Path) -> reference.Model:
+def build_checkpoint(seed: int, path: Path, moe: bool = False) -> reference.Model:
     """The text model in the MLX layout plus a random tower; returns the text reference."""
-    model = build_reference(seed, moe=False)
+    model = build_reference(seed, moe=moe)
     weights = dict(tree_flatten(model.parameters()))
-    hidden_size = text_config(moe=False)["hidden_size"]
+    hidden_size = text_config(moe=moe)["hidden_size"]
     assert isinstance(hidden_size, int)
     weights |= gemma4_tower_weights(TINY_GEMMA4_VISION_CONFIG, hidden_size, seed)
     mx.save_safetensors(str(path / "model.safetensors"), weights)
     config = {
         "architectures": ["Gemma4ForConditionalGeneration"],
         "model_type": "gemma4",
-        "text_config": {**text_config(moe=False), "use_bidirectional_attention": "vision"},
+        "text_config": {**text_config(moe=moe), "use_bidirectional_attention": "vision"},
         "vision_config": TINY_GEMMA4_VISION_CONFIG,
         "boi_token_id": BOI_TOKEN_ID,
         "image_token_id": IMAGE_TOKEN_ID,
@@ -144,6 +158,7 @@ def make_scheduler(
     command_graph: bool = False,
     mm: MultimodalConfig | None = None,
     max_running_req: int = 2,
+    moe_cache_size: int = 0,
 ) -> Scheduler:
     config = EngineConfig(
         model_path=str(path),
@@ -155,6 +170,8 @@ def make_scheduler(
         max_extend_tokens_override=max_extend_tokens,
         command_graph=command_graph,
         mm=MultimodalConfig() if mm is None else mm,
+        moe_strategy="offload" if moe_cache_size else "auto",
+        moe_cache_size=moe_cache_size,
     )
     return Scheduler(config, eos_token_ids={EOS})
 
@@ -303,3 +320,68 @@ def test_text_prompt_decodes_as_mlx_lm(
     assert (scheduler.engine.encoder_cache is None) == bool(disabled_encoders)
     params = SamplingParams(temperature=0.0, max_tokens=STEPS, ignore_eos=True)
     assert scheduler.generate(np.array(prompt, dtype=np.int32), params) == expected
+
+
+def test_images_on_offloaded_experts_match_the_reference(tmp_path: Path) -> None:
+    """The 26B shape's image prompt, its 48 experts served from 30 slots that miss and evict."""
+    model = build_checkpoint(6, tmp_path, moe=True)
+    texts = random_texts(6, TEXT_LENGTHS)
+    scheduler = make_scheduler(tmp_path, "metal", moe_cache_size=30)
+    prompt = image_prompt(tmp_path, texts, [SQUARE, WIDE], seed=60)
+    expected = reference_vl_greedy(model, scheduler, prompt)
+    add_prompt(scheduler, 0, image_prompt(tmp_path, texts, [SQUARE, WIDE], seed=60))
+    assert run_in_steps(scheduler)[1] == {0: expected}
+    cache = scheduler.engine.moe_offload_cache
+    assert cache is not None and sum(cache.stats().misses) > 0
+    cache.check_healthy()
+
+
+def hugging_face_copy(mlx_dir: Path, hf_dir: Path) -> None:
+    hf_dir.mkdir()
+    weights = mx.load(str(mlx_dir / "model.safetensors"))
+    assert isinstance(weights, dict)
+    hf_weights = hf_layout_weights(weights, CONDITIONAL_GENERATION, has_expert_banks=False)
+    assert any(key.startswith("model.vision_tower.") for key in hf_weights)
+    mx.save_safetensors(str(hf_dir / "model.safetensors"), hf_weights)
+    for name in ("config.json", "processor_config.json"):
+        shutil.copy(mlx_dir / name, hf_dir / name)
+
+
+def test_frontend_finds_the_tower_without_a_model_package(tmp_path: Path) -> None:
+    """In both layouts: at run time what test_cache_budget.py's probe checks at import."""
+    mlx_dir, hf_dir = tmp_path / "mlx", tmp_path / "hf"
+    mlx_dir.mkdir()
+    build_checkpoint(7, mlx_dir)
+    hugging_face_copy(mlx_dir, hf_dir)
+    for path in (mlx_dir, hf_dir):
+        probe = (
+            "import json, sys\n"
+            "from ftmetal.mm.config import MultimodalConfig\n"
+            "from ftmetal.mm.processor import get_mm_processor\n"
+            f"processor = get_mm_processor({str(path)!r}, MultimodalConfig())\n"
+            "print(json.dumps([processor is not None, 'ftmetal.models.gemma4' in sys.modules]))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+        )
+        assert json.loads(result.stdout) == [True, False]
+
+
+def test_hugging_face_layout_serves_images(tmp_path: Path) -> None:
+    mlx_dir, hf_dir = tmp_path / "mlx", tmp_path / "hf"
+    mlx_dir.mkdir()
+    model = build_checkpoint(5, mlx_dir)
+    hugging_face_copy(mlx_dir, hf_dir)
+    texts = random_texts(5, TEXT_LENGTHS)
+    schedulers = [make_scheduler(path, "metal") for path in (mlx_dir, hf_dir)]
+    encoded = []
+    for scheduler in schedulers:
+        served = scheduler.engine.model
+        assert isinstance(served, SupportsMultimodal)
+        items = image_prompt(hf_dir, texts, [SQUARE, WIDE], seed=50).mm_items
+        encoded.append([served.encode(item) for item in items])
+    assert all(mx.allclose(hf, mlx, atol=1e-5, rtol=1e-5) for mlx, hf in zip(*encoded, strict=True))
+    prompt = image_prompt(hf_dir, texts, [SQUARE, WIDE], seed=50)
+    expected = reference_vl_greedy(model, schedulers[1], prompt)
+    add_prompt(schedulers[1], 0, image_prompt(hf_dir, texts, [SQUARE, WIDE], seed=50))
+    assert run_in_steps(schedulers[1])[1] == {0: expected}

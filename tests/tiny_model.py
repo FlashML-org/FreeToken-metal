@@ -2,11 +2,11 @@
 
 The mlx-lm model is the reference; save_checkpoint writes it in the MLX checkpoint
 layout, save_hf_checkpoint in the Hugging Face layout (hf_layout_weights), save_export as a
-ModelOpt or compressed-tensors export, quantized the way each stores it (NVFP4: e2m1 codes
-packed low nibble first, e4m3 scales per 16 and a per-tensor global scale; FP8: e4m3 bytes
-and a per-tensor scale) from the format definitions rather than MLX's kernels, with the
-activation and KV-cache scales the exports carry; reference_greedy is the contiguous-cache
-greedy decode.
+ModelOpt or compressed-tensors export, its weights quantized by quantize_export (which takes
+any family's MLX layout weights) the way each stores them (NVFP4: e2m1 codes packed low
+nibble first, e4m3 scales per 16 and a per-tensor global scale; FP8: e4m3 bytes and a
+per-tensor scale) from the format definitions rather than MLX's kernels, with the activation
+and KV-cache scales the exports carry; reference_greedy is the contiguous-cache greedy decode.
 TINY_FULL_ATTENTION_CONFIG drops the linear layers, so the engine has no GDN state pool.
 """
 
@@ -221,40 +221,38 @@ def fp8(weight: np.ndarray, headroom: float) -> tuple[np.ndarray, float, np.ndar
     return encoded, scale, values * scale
 
 
-def save_export(
+def quantize_export(
+    weights: dict[str, mx.array],
     dialect: str,
-    seed: int,
-    path: Path,
+    formats: tuple[str, str],
     dtype: mx.Dtype,
-    *,
-    text_config: dict[str, object] | None = None,
-    formats: tuple[str, str] | None = None,
-    is_hf_layout: bool = True,
-) -> dict[str, mx.array]:
-    """Write the tiny model (of text_config) as a ModelOpt or compressed-tensors export, the
-    modules formats (FP8 and NVFP4 module patterns, the dialect's EXPORT_FORMATS by default)
-    names quantized and its other tensors in dtype, in the Hugging Face layout or, without
-    is_hf_layout, under the MLX layout's names; returns the dequantized weights by reference
-    key."""
-    model = build_reference(seed, text_config)
-    fp8_modules, nvfp4_modules = EXPORT_FORMATS[dialect] if formats is None else formats
+    seed: int,
+) -> tuple[dict[str, mx.array], dict[str, mx.array]]:
+    """MLX layout weights as a ModelOpt or compressed-tensors export stores them, under the same
+    module names: the modules formats (FP8 and NVFP4 module patterns) names quantized, with the
+    activation and KV-cache scales the dialect stores, the other tensors in dtype; and the
+    dequantized weights by key."""
+    fp8_modules, nvfp4_modules = formats
     is_modelopt = dialect == "modelopt"
     dequantized_weights: dict[str, mx.array] = {}
     stored: dict[str, mx.array] = {}
     # The tiny model's tensors of a shape share one amax: a headroom drawn per tensor gives each
     # per-tensor scale its own value, so one read from the wrong expert or fused part shows.
     rng = np.random.default_rng(seed)
-    for key, value in tree_flatten(model.parameters()):
-        assert isinstance(value, mx.array)
+    for key, value in weights.items():
         module = key.removesuffix(".weight")
         # A bank is quantized expert by expert; its per-tensor scales stack per expert.
         tensors = np.array(value, dtype=np.float32).reshape(-1, *value.shape[-2:])
-        ones = mx.ones((len(tensors),), dtype=mx.float32)
+        # One per linear: ModelOpt's a scalar, compressed-tensors' of shape [1].
+        scale_shape = value.shape[:-2] if is_modelopt else (*value.shape[:-2], 1)
+        ones = mx.ones(scale_shape, dtype=mx.float32)
         headrooms = rng.uniform(1.0, 4.0, size=len(tensors))
         if re.search(fp8_modules, module):
             encoded, scales, dequantized = zip(*map(fp8, tensors, headrooms), strict=True)
             stored[f"{module}.weight"] = mx.array(np.stack(encoded).reshape(value.shape))
-            stored[f"{module}.weight_scale"] = mx.array(np.array(scales, np.float32))
+            stored[f"{module}.weight_scale"] = mx.array(
+                np.array(scales, np.float32).reshape(scale_shape)
+            )
             stored[f"{module}.input_scale"] = ones
         elif re.search(nvfp4_modules, module):
             packed, scale_bytes, global_scales, dequantized = zip(
@@ -266,7 +264,7 @@ def save_export(
             stored[f"{module}.weight_scale"] = mx.array(
                 np.stack(scale_bytes).reshape(*value.shape[:-1], -1)
             )
-            global_array = np.array(global_scales, np.float32)
+            global_array = np.array(global_scales, np.float32).reshape(scale_shape)
             if is_modelopt:
                 stored[f"{module}.weight_scale_2"] = mx.array(global_array)
                 stored[f"{module}.input_scale"] = ones
@@ -278,16 +276,37 @@ def save_export(
             dequantized_weights[key] = value
             continue
         dequantized_weights[key] = mx.array(np.stack(dequantized).reshape(value.shape))
-    # The full-attention layers' FP8 KV-cache scales.
+    # The attention layers' FP8 KV-cache scales.
     for key in list(stored):
         if key.endswith("self_attn.k_proj.weight"):
             attention = key.removesuffix(".k_proj.weight")
             kv_scale = f"{attention}.k_proj.k_scale" if is_modelopt else f"{attention}.k_scale"
-            stored[kv_scale] = mx.ones((1,), dtype=mx.float32)
-    # ModelOpt stores one scalar per linear.
-    for key, tensor in stored.items():
-        if is_modelopt and tensor.ndim == 1 and tensor.size == 1 and "switch_mlp" not in key:
-            stored[key] = tensor.reshape(())
+            stored[kv_scale] = mx.ones(() if is_modelopt else (1,), dtype=mx.float32)
+    return stored, dequantized_weights
+
+
+def save_export(
+    dialect: str,
+    seed: int,
+    path: Path,
+    dtype: mx.Dtype,
+    *,
+    text_config: dict[str, object] | None = None,
+    formats: tuple[str, str] | None = None,
+    is_hf_layout: bool = True,
+) -> dict[str, mx.array]:
+    """Write the tiny model (of text_config) as a ModelOpt or compressed-tensors export
+    (quantize_export of its weights, formats the dialect's EXPORT_FORMATS by default), in the
+    Hugging Face layout or, without is_hf_layout, under the MLX layout's names; returns the
+    dequantized weights by reference key."""
+    model = build_reference(seed, text_config)
+    stored, dequantized_weights = quantize_export(
+        dict(tree_flatten(model.parameters())),
+        dialect,
+        EXPORT_FORMATS[dialect] if formats is None else formats,
+        dtype,
+        seed,
+    )
     weights = hf_layout_weights(stored, "model.language_model.") if is_hf_layout else stored
     architecture = "Qwen3_5MoeForConditionalGeneration"
     save_hf_checkpoint(weights, model, path, architecture, EXPORT_CONFIGS[dialect])
@@ -329,6 +348,7 @@ __all__ = [
     "TINY_TEXT_CONFIG",
     "build_reference",
     "hf_layout_weights",
+    "quantize_export",
     "reference_greedy",
     "save_checkpoint",
     "save_export",

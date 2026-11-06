@@ -4,7 +4,7 @@ the global pages for naive and for the SWA radix cache. MoE offload on Qwen3.6-3
 checkpoint: what auto picks, the cache size each flag gives, and the experts line, on this
 box's budget and on fractions of it standing for 24 GB and 32 GB Macs; refused cache sizes
 and configs; the strategy resolution on a tiny checkpoint, auto keeping a family without
-offload resident; Gemma4's refusal of offload. The
+offload resident; Gemma4's offload layers. The
 vision towers' reserves, and that the budget and the image processor import no model package.
 
 The expected numbers were computed by the engine's sizing before pools were created per
@@ -44,7 +44,7 @@ from ftmetal.engine.cache_budget import (
     victim_cache_bytes,
 )
 from ftmetal.engine.config import EngineConfig, MoeStrategyChoice
-from ftmetal.engine.engine import resolve_moe_strategy
+from ftmetal.engine.engine import offload_layers, resolve_moe_strategy
 from ftmetal.kvcache import pool_costs
 from ftmetal.kvcache.base import PoolCost
 from ftmetal.models.config import MoeStrategy
@@ -55,6 +55,7 @@ from ftmetal.models.qwen3_5_moe.config import parse_config
 from ftmetal.models.qwen3_vl import vision as qwen_vision
 from ftmetal.models.register import (
     GEMMA4_VISION,
+    MODEL_REGISTRY,
     QWEN_VISION,
     EncoderSpec,
     model_weight_rules,
@@ -380,12 +381,14 @@ def test_gemma4_window_pool_beside_the_global_pages() -> None:
         assert report.lines() == case.lines, case.cache_type
 
 
-def test_gemma4_refuses_moe_offload() -> None:
+def test_gemma4_offloads_its_routed_experts() -> None:
     model_config = parse_gemma4_config(
         {**GEMMA4_26B_TEXT_CONFIG, "enable_moe_block": True, "num_experts": 128}
     )
-    with pytest.raises(ValueError, match="not supported for Gemma4 yet"):
-        Gemma4ForCausalLM(dataclasses.replace(model_config, moe_strategy="offload"))
+    model = Gemma4ForCausalLM(dataclasses.replace(model_config, moe_strategy="offload"))
+    layers = offload_layers(model)
+    assert len(layers) == model_config.num_layers
+    assert [layer.moe_layer_id for layer in layers] == list(range(model_config.num_layers))
 
 
 # Qwen3.6-35B-A3B's checkpoint, from its safetensors headers: the weights besides the routed
@@ -718,9 +721,12 @@ def test_moe_strategy_resolution(
     assert resolve_tiny_strategy(tmp_path, strategy, flags, budget) == expected
 
 
-def test_auto_keeps_experts_resident_without_offload(tmp_path: Path) -> None:
-    """Gemma4 has no offload cache: where auto would offload, its experts stay resident beside
-    less KV, or the model is refused before any weight is read when they leave no pages."""
+def test_auto_keeps_experts_resident_without_offload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gemma4 offloads where its experts would leave too little KV. A family with no offload cache
+    keeps them resident there beside less KV, or is refused before any weight is read when they
+    leave no pages."""
     expert_bank = "language_model.model.layers.0.experts.switch_glu.gate_proj.weight"
     mx.save_safetensors(str(tmp_path / "model.safetensors"), {expert_bank: mx.zeros((128, 8, 8))})
     text_config = {**GEMMA4_26B_TEXT_CONFIG, "enable_moe_block": True, "num_experts": 128}
@@ -732,6 +738,10 @@ def test_auto_keeps_experts_resident_without_offload(tmp_path: Path) -> None:
     (tmp_path / "config.json").write_text(json.dumps(checkpoint_config))
     # Its window pool alone takes 3.3 GiB beside the 1.5 GiB activation reserve.
     flags: dict[str, float | bool] = {"kv_reserve_tokens": 1 << 20}
+    assert resolve_tiny_strategy(tmp_path, "auto", flags, 8 * GIB) == "offload"
+    architecture = "Gemma4ForConditionalGeneration"
+    no_offload = dataclasses.replace(MODEL_REGISTRY[architecture], has_offload=False)
+    monkeypatch.setitem(MODEL_REGISTRY, architecture, no_offload)
     assert resolve_tiny_strategy(tmp_path, "auto", flags, 8 * GIB) == "fused"
     with pytest.raises(RuntimeError, match="model does not fit the memory budget"):
         resolve_tiny_strategy(tmp_path, "auto", {}, 4 * GIB)

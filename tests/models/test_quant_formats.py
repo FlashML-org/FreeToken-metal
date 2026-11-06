@@ -196,14 +196,14 @@ def test_unserved_exports_are_refused(quantization_config: dict[str, object], re
 def test_export_of_a_family_without_mlx_layout_is_refused(tmp_path: Path) -> None:
     mx.save_safetensors(str(tmp_path / "model.safetensors"), {"lm_head.weight": mx.zeros((4, 4))})
     config = {
-        "architectures": ["Gemma4ForCausalLM"],
+        "architectures": ["Qwen4ExpForCausalLM"],
         "quantization_config": EXPORT_CONFIGS["modelopt"],
     }
     (tmp_path / "config.json").write_text(json.dumps(config))
     with pytest.raises(
-        ValueError, match="Gemma4ForCausalLM serves MLX checkpoints only, not a 'modelopt' export"
+        ValueError, match="Qwen4ExpForCausalLM serves MLX checkpoints only, not a 'modelopt' export"
     ):
-        read_checkpoint("Gemma4ForCausalLM", str(tmp_path))
+        read_checkpoint("Qwen4ExpForCausalLM", str(tmp_path))
 
 
 def test_exported_embedding_table_is_refused() -> None:

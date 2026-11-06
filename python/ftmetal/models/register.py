@@ -3,7 +3,7 @@
 Port of FreeToken models/register.py, reduced to the served families, the hooks a package
 exposes (parse_config, weight_rules and, for a family served from Hugging Face layout
 checkpoints too, mlx_layout) and the multimodal processor and encoder towers. Divergences: an
-EncoderSpec names the checkpoint prefix of its tower's weights and the measured activation
+EncoderSpec names the checkpoint prefixes of its tower's weights and the measured activation
 sizes its memory reserve is computed from; read_checkpoint brings every checkpoint into the
 MLX layout and quantization the weight rules and methods read.
 """
@@ -39,8 +39,8 @@ class EncoderSpec:
     config_key: str
     # The inputs it serves.
     modalities: tuple[Modality, ...]
-    # The checkpoint name prefix the tower's weights load from.
-    weight_prefix: str
+    # The checkpoint name prefixes the tower's weights load from, one per layout that differs.
+    weight_prefixes: tuple[str, ...]
     # Hidden widths per patch at the tower's peak above its weights (engine/cache_budget.py).
     activation_widths: int
     # The rows its MLP runs at once: the tower's MLP_ROWS.
@@ -56,20 +56,20 @@ QWEN_VISION = EncoderSpec(
     "vision",
     "vision_config",
     ("image",),
-    "model.visual.",
+    ("model.visual.",),
     activation_widths=13,
     mlp_rows=4096,
     mlp_widths=2,
 )
 # Qwen3.8-Flash-Next's tower: Qwen3.6's geometry (its merger 2560 wide, not 2048), so its
 # measured widths, loaded from the MLX conversion's vision_tower. prefix.
-QWEN4_EXP_VISION = replace(QWEN_VISION, weight_prefix="vision_tower.")
+QWEN4_EXP_VISION = replace(QWEN_VISION, weight_prefixes=("vision_tower.",))
 # Gemma4's tower (its projection loads from embed_vision.), measured on the 26B-A4B in bf16.
 GEMMA4_VISION = EncoderSpec(
     "vision",
     "vision_config",
     ("image",),
-    "vision_tower.",
+    ("vision_tower.", "model.vision_tower."),
     activation_widths=24,
     mlp_rows=2560,
     mlp_widths=3,
@@ -113,10 +113,17 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
     "Gemma4ForConditionalGeneration": ModelSpec(
         "ftmetal.models.gemma4",
         "Gemma4ForCausalLM",
+        mlx_layout="mlx_layout",
         mm_processor="ftmetal.mm.processors.gemma4:Gemma4MMProcessor",
         encoders=(GEMMA4_VISION,),
+        has_offload=True,
     ),
-    "Gemma4ForCausalLM": ModelSpec("ftmetal.models.gemma4", "Gemma4ForCausalLM"),
+    "Gemma4ForCausalLM": ModelSpec(
+        "ftmetal.models.gemma4",
+        "Gemma4ForCausalLM",
+        mlx_layout="mlx_layout",
+        has_offload=True,
+    ),
     "Qwen4ExpForConditionalGeneration": ModelSpec(
         "ftmetal.models.qwen4_exp",
         "Qwen4ExpForCausalLM",

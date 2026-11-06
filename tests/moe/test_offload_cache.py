@@ -383,6 +383,9 @@ CASES = [
     ),
 ]
 
+# One tensor per expert in Gemma4's names, which its mlx_layout stacks: decode misses and overlap
+# prefills.
+CASES += [replace(CASES[1], is_per_expert=True)]
 
 # The same from an expert pack: decode misses, overlap prefills, bf16, an expert of 6.75 MiB (one
 # record a read), gate and up apart, pools of two layouts (two record strides), one tensor per

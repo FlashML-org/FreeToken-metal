@@ -274,7 +274,7 @@ def active_encoders(
             and encoder.kind not in mm.disabled_encoders
             and (
                 not has_weights
-                or any(name.startswith(encoder.weight_prefix) for name in tensor_names)
+                or any(name.startswith(encoder.weight_prefixes) for name in tensor_names)
             )
         )
 

@@ -4,11 +4,11 @@ offload tests.
 A synthetic checkpoint stacks each expert projection as MLX does, [experts, rows, ...]
 (affine quantized by mx.quantize, or bf16), in Qwen3.6 or Gemma4 names, over two files
 behind odd-sized filler tensors so that experts start off 4 KiB boundaries, with one
-layer's projections split across the files; a per-expert checkpoint (Qwen3.6 names only)
-stores one tensor per expert in the Hugging Face layout instead, which the model family's
-mlx_layout stacks. An identifying checkpoint (affine only) fills every packed weight word of
-an expert's projection with expert_code(layer, projection, expert) instead, so a bank row
-read anywhere names the expert it holds. A cache may have a victim cache, its budget a
+layer's projections split across the files; a per-expert checkpoint stores one tensor per
+expert in the Hugging Face layout instead, which the model family's mlx_layout stacks. An
+identifying checkpoint (affine only) fills every packed weight word of an expert's projection
+with expert_code(layer, projection, expert) instead, so a bank row read anywhere names the
+expert it holds. A cache may have a victim cache, its budget a
 number of entries of entry_bytes, and read its experts from an expert pack of the checkpoint,
 whose affine experts hold pair codes where their shapes and pairs allow; expected_code_rows is
 the code rows the cache holds of such a layer.
@@ -31,8 +31,9 @@ import numpy as np
 from ftmetal.kernel.ref import pair_code_bank_ref
 from ftmetal.layers.quantization.config import AffineScheme, BankSpec
 from ftmetal.layers.quantization.moe import ExpertSchemes, MoEConfig, moe_method
+from ftmetal.models.gemma4.weight import mlx_layout as gemma4_mlx_layout
 from ftmetal.models.loader import ExpertBytes, FuseRule, WeightRules, load_checkpoint
-from ftmetal.models.qwen3_5_moe.weight import mlx_layout
+from ftmetal.models.qwen3_5_moe.weight import mlx_layout as qwen_mlx_layout
 from ftmetal.moe.offload_cache import STALL_TIMEOUT_S, OffloadMoeCache
 from ftmetal.moe.pack import use_pack, write_pack
 from ftmetal.moe.pair_codes import coded_layout
@@ -159,11 +160,15 @@ def read_state(
 ) -> tuple[dict[str, mx.array], dict[str, ExpertBytes]]:
     """The checkpoint's lazily mapped state in the MLX layout, and its experts' bytes."""
     state = load_checkpoint(str(directory))
-    return mlx_layout(state) if spec.is_per_expert else (state, {})
+    if not spec.is_per_expert:
+        return state, {}
+    elif spec.naming == "qwen":
+        return qwen_mlx_layout(state)
+    else:
+        return gemma4_mlx_layout(state)
 
 
 def write_checkpoint(directory: Path, spec: CheckpointSpec) -> None:
-    assert not spec.is_per_expert or spec.naming == "qwen", "Hugging Face names are Qwen3.6's"
     rng = np.random.default_rng(spec.num_layers * 101 + spec.hidden_size)
     files: list[dict[str, mx.array]] = [
         {"filler.a": mx.zeros((1001,), dtype=mx.uint8)},
@@ -174,7 +179,8 @@ def write_checkpoint(directory: Path, spec: CheckpointSpec) -> None:
     def put(file: dict[str, mx.array], module: str, array: str, tensor: mx.array) -> None:
         if spec.is_per_expert:
             hf_module = module.replace("language_model.model.", "model.language_model.")
-            parent, _, projection = hf_module.rpartition(".switch_mlp.")
+            banks = ".switch_mlp." if spec.naming == "qwen" else ".experts.switch_glu."
+            parent, _, projection = hf_module.rpartition(banks)
             for expert in range(tensor.shape[0]):
                 file[f"{parent}.experts.{expert}.{projection}.{array}"] = tensor[expert]
         else:

@@ -5,8 +5,10 @@ with the encode of its Gemma4ForConditionalGeneration. Divergences: the batch fl
 forward explicitly; the feed-forward sandwich runs unfused in the decoder layer, which holds
 its norms, router and experts as the checkpoint lays them out; each Linear takes its scheme
 from the checkpoint's quantization map at construction; the final logit softcap runs in the
-logits' dtype; the experts are always resident (no offload strategy yet); one class serves
-both architectures and builds the vision tower when the config has one, in the engine dtype.
+logits' dtype; under the offload strategy the routed experts are an OffloadMoELayer (every
+layer routes, so its MoE layer index is the layer's) and the dense MLP stays apart from it; one
+class serves both architectures and builds the vision tower when the config has one, in the
+engine dtype.
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ from ftmetal.core import Batch
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.embedding import Embedding
 from ftmetal.layers.linear import Linear
-from ftmetal.layers.moe import MoELayer
+from ftmetal.layers.moe import MoELayer, OffloadMoELayer
 from ftmetal.layers.norm import RMSNorm
 from ftmetal.layers.quantization.moe import ExpertSchemes
 from ftmetal.mm.item import MMItem
@@ -77,15 +79,25 @@ class Gemma4DecoderLayer(BaseOP):
             self.router = Gemma4Router(
                 config, proj_scheme=scheme_of(config, f"{prefix}.router.proj"), dtype=dtype
             )
-            self.experts = MoELayer(
+            schemes = ExpertSchemes(
+                *schemes_of(config, experts, (*GATE_UP_PARTS, "down_proj")),
+                is_gate_up_apart=config.is_expert_gate_up_apart,
+            )
+            shape = (
                 config.num_experts,
                 config.num_experts_per_tok,
                 config.hidden_size,
                 config.moe_intermediate_size,
-                schemes=ExpertSchemes(*schemes_of(config, experts, (*GATE_UP_PARTS, "down_proj"))),
-                activation="gelu_tanh",
-                dtype=dtype,
             )
+            self.experts: MoELayer
+            if config.moe_strategy == "offload":
+                self.experts = OffloadMoELayer(
+                    layer_id, *shape, schemes=schemes, activation="gelu_tanh", dtype=dtype
+                )
+            else:
+                self.experts = MoELayer(
+                    *shape, schemes=schemes, activation="gelu_tanh", dtype=dtype
+                )
             self.pre_feedforward_layernorm_2 = RMSNorm(hidden, eps=eps, dtype=dtype)
             self.post_feedforward_layernorm_1 = RMSNorm(hidden, eps=eps, dtype=dtype)
             self.post_feedforward_layernorm_2 = RMSNorm(hidden, eps=eps, dtype=dtype)
@@ -134,11 +146,6 @@ class Gemma4Model(BaseOP):
 
 class Gemma4ForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig, *, dtype: mx.Dtype = mx.bfloat16) -> None:
-        if config.moe_strategy == "offload":
-            raise ValueError(
-                "MoE offload (--moe-strategy offload) is not supported for Gemma4 yet; serve "
-                "its experts resident with --moe-strategy fused"
-            )
         super().__init__()
         self.config = config
         self.model = Gemma4Model(config, dtype=dtype)
