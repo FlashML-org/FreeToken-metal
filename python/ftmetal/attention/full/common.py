@@ -9,7 +9,8 @@ subclass's attend(); one backend instance serves one type, FULL over MHAKVCache 
 paged half too, attention/qsa) or SWA over SWAKVCache, whose rows hold only the keys a
 step's windows reach, translated to window slots, so the kernels never see out-of-window
 keys (FreeToken translates the whole row and masks); a window layer type that attends
-within images carries the batch's block ends in row positions on its metadata.
+within images carries the batch's block ends in row positions on its metadata; an
+AttentionSpec passes a layer's learned sinks only, the window and scale being the backend's.
 prepare_for_replay swaps a decode batch's page table for its graph's fixed width (FULL,
 QSA: the requests' whole page-table rows; SWA: the window) and max_seqlen_k for that width
 (a window decode row is built that wide), so the flash-decode partition count is fixed per
@@ -233,14 +234,18 @@ class FullAttnBackend(BaseAttnBackend):
         batch: Batch,
         attn_spec: AttentionSpec | None = None,
     ) -> mx.array:
-        """q [T, num_heads, D], k / v [T, num_kv_heads, D] -> [T, num_heads, D]."""
-        if attn_spec is not None:
-            raise ValueError("full attention takes no per-call AttentionSpec")
+        """q [T, num_heads, D], k / v [T, num_kv_heads, D] -> [T, num_heads, D]; attn_spec's sinks
+        [num_heads], when given, join each head's softmax denominator."""
+        if attn_spec is not None and (
+            attn_spec.sliding_window is not None or attn_spec.sm_scale is not None
+        ):
+            raise ValueError("full attention takes its window and scale from its backend")
         metadata = batch.attn_metadata[self.attn_type]
         assert isinstance(metadata, FullAttnMetadata)
         out_loc = batch.out_loc if metadata.out_loc is None else metadata.out_loc
         self.kvcache.store_kv(k, v, out_loc, layer_id)
-        return self.attend(q, k, v, layer_id, batch, metadata)
+        sinks = None if attn_spec is None else attn_spec.sinks
+        return self.attend(q, k, v, layer_id, batch, metadata, sinks)
 
     @abstractmethod
     def attend(
@@ -251,6 +256,7 @@ class FullAttnBackend(BaseAttnBackend):
         layer_id: int,
         batch: Batch,
         metadata: FullAttnMetadata,
+        sinks: mx.array | None = None,
     ) -> mx.array:
         """Attention of q over the pool (which already holds k / v at out_loc)."""
 

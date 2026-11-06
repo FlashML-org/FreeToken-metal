@@ -11,7 +11,8 @@ as wide as the longest context, so flash-decode's grid holds the most partitions
 per-length metadata's results. Sliding-window attention runs on a window pool whose slots
 back only the keys a step's windows reach; every other full slot maps to the sentinel,
 which holds huge keys and values like every unused window slot, and the reference attends
-over the whole row under the window mask.
+over the whole row under the window mask. Learned sinks join each softmax's denominator, in decode
+and prefill, full and windowed, against the reference and the MLX backend.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+from ftmetal.attention.base import AttentionSpec
 from ftmetal.attention.full.metal import FullAttnMetalBackend, MetalAttnMetadata
 from ftmetal.attention.full.mlx import FullAttnMLXBackend
 from ftmetal.attention.metadata import AttnType
@@ -35,6 +37,8 @@ from ftmetal.models.qwen3_5_moe.config import parse_config
 PAGE_SIZE = 32
 SPARE_PAGES = 5
 UNREAD_VALUE = 1e3
+# Sinks about the size of the scores of normal q and k at scale D ** -0.5.
+SINK_SCALE = 2.0
 # Worst |error| over a row relative to the row's largest |value|, against the fp32
 # reference (one bf16 ulp); in decode the MLX backend's own rounding doubles it.
 TOLERANCE = {mx.bfloat16: 2**-7, mx.float32: 1e-5}
@@ -71,12 +75,21 @@ class Case:
     num_kv_heads: int = 2
     dtype: mx.Dtype = mx.bfloat16
     window: int | None = None
+    has_sinks: bool = False
 
     def __str__(self) -> str:
         lens = "+".join(f"{c}:{e}" for c, e in zip(self.cached_lens, self.extend_lens))
         label = f"{lens}-D{self.head_dim}-heads{self.num_heads}:{self.num_kv_heads}"
         label += "-bf16" if self.dtype == mx.bfloat16 else "-fp32"
+        label += "-sinks" if self.has_sinks else ""
         return label if self.window is None else f"{label}-W{self.window}"
+
+    def attn_spec(self) -> AttentionSpec | None:
+        if not self.has_sinks:
+            return None
+        return AttentionSpec(
+            sinks=(SINK_SCALE * mx.random.normal((self.num_heads,))).astype(self.dtype)
+        )
 
 
 def decode_lens(seq_lens: tuple[int, ...]) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -115,6 +128,11 @@ FULL_CASES = [
     Case((300,), (2,), 256, dtype=mx.float32),
     Case((0, 2049, 7), (100, 33, 1), 256),
     Case((5000, 0), (64, 2048), 512),
+    # Learned sinks at Flint's shape (Hq 32, Hkv 4, D 128): one key, long rows, a long prompt.
+    Case(*decode_lens((1,)), 128, num_heads=32, num_kv_heads=4, has_sinks=True),
+    Case(*EIGHT, 128, num_heads=32, num_kv_heads=4, has_sinks=True),
+    Case(*ONE_LONG, 128, num_heads=32, num_kv_heads=4, dtype=mx.float32, has_sinks=True),
+    Case((0, 2049, 7), (100, 33, 1), 128, num_heads=32, num_kv_heads=4, has_sinks=True),
 ]
 # Gemma4's window layers: D 256, 16 query heads over 8 kv heads.
 WINDOW_CASES = [
@@ -129,6 +147,9 @@ WINDOW_CASES = [
     Case(*FROM_EMPTY, 256, num_kv_heads=8, window=1024),
     Case(*FAR_TURN, 256, num_kv_heads=8, dtype=mx.float32, window=1024),
     Case(*ACROSS, 128, num_heads=8, num_kv_heads=1, window=1024),
+    # Learned sinks at Flint's window layers.
+    Case(*AROUND_1024, 128, num_heads=32, num_kv_heads=4, window=513, has_sinks=True),
+    Case(*ACROSS, 128, num_heads=32, num_kv_heads=4, window=513, has_sinks=True),
 ]
 
 
@@ -272,16 +293,20 @@ def test_step_matches_reference_and_mlx_backend(case: Case) -> None:
     q, k, v = new_tokens(
         sum(extend_lens), case.num_heads, case.num_kv_heads, case.head_dim, case.dtype
     )
-    out = metal_backend.forward(q, k, v, 0, batch)
+    attn_spec = case.attn_spec()
+    sinks = None if attn_spec is None else attn_spec.sinks
+    out = metal_backend.forward(q, k, v, 0, batch, attn_spec)
     # The MLX backend stores the same rows again, then reads the same pool.
-    expected = mlx_backend.forward(q, k, v, 0, batch)
+    expected = mlx_backend.forward(q, k, v, 0, batch, attn_spec)
     pools = (kv_cache.k_cache(0), kv_cache.v_cache(0), metadata.page_table)
     scale = case.head_dim**-0.5
     if batch.is_decode:
-        reference = flash_decode_ref(q, *pools, metadata.seq_lens, PAGE_SIZE, scale)
+        reference = flash_decode_ref(q, *pools, metadata.seq_lens, PAGE_SIZE, scale, sinks)
         mlx_tolerance = 2 * TOLERANCE[case.dtype]
     else:
-        reference = flash_prefill_ref(q, *pools, extend_lens, cached_lens, PAGE_SIZE, scale)
+        reference = flash_prefill_ref(
+            q, *pools, extend_lens, cached_lens, PAGE_SIZE, scale, sinks=sinks
+        )
         mlx_tolerance = PREFILL_MLX_TOLERANCE[case.dtype]
     assert out.shape == q.shape and out.dtype == case.dtype
     assert max_row_error(out, reference) < TOLERANCE[case.dtype]
@@ -427,6 +452,7 @@ def window_reference(
     cached_lens: list[int],
     extend_lens: list[int],
     scale: float,
+    sinks: mx.array | None = None,
 ) -> mx.array:
     """fp32 attention over each request's whole row of window slots (the sentinel before
     its window start) under the absolute-position window mask."""
@@ -447,6 +473,7 @@ def window_reference(
         1,
         scale,
         pool.sliding_window,
+        sinks=sinks,
     )
 
 
@@ -484,10 +511,12 @@ def test_window_step_matches_reference_and_mlx_backend(case: Case) -> None:
     q, k, v = new_tokens(
         sum(extend_lens), case.num_heads, case.num_kv_heads, case.head_dim, case.dtype
     )
-    out = metal_backend.forward(q, k, v, 0, batch)
-    expected = mlx_backend.forward(q, k, v, 0, batch)
+    attn_spec = case.attn_spec()
+    sinks = None if attn_spec is None else attn_spec.sinks
+    out = metal_backend.forward(q, k, v, 0, batch, attn_spec)
+    expected = mlx_backend.forward(q, k, v, 0, batch, attn_spec)
     scale = case.head_dim**-0.5
-    reference = window_reference(q, pool, page_table, cached_lens, extend_lens, scale)
+    reference = window_reference(q, pool, page_table, cached_lens, extend_lens, scale, sinks)
     assert out.shape == q.shape and out.dtype == case.dtype
     assert max_row_error(out, reference) < TOLERANCE[case.dtype]
     assert max_row_error(out, expected) < PREFILL_MLX_TOLERANCE[case.dtype]

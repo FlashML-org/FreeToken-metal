@@ -31,6 +31,7 @@ class FullAttnMLXBackend(FullAttnBackend):
         layer_id: int,
         batch: Batch,
         metadata: FullAttnMetadata,
+        sinks: mx.array | None = None,
     ) -> mx.array:
         k_cache = self.kvcache.k_cache(layer_id)
         v_cache = self.kvcache.v_cache(layer_id)
@@ -48,7 +49,7 @@ class FullAttnMLXBackend(FullAttnBackend):
             keys = k_cache[slots].transpose(0, 2, 1, 3)
             values = v_cache[slots].transpose(0, 2, 1, 3)
             out = mx.fast.scaled_dot_product_attention(
-                q[:, :, None, :], keys, values, scale=self.scale, mask=mask
+                q[:, :, None, :], keys, values, scale=self.scale, mask=mask, sinks=sinks
             )
             return out.reshape(num_tokens, num_heads, head_dim)
         outputs = []
@@ -86,6 +87,7 @@ class FullAttnMLXBackend(FullAttnBackend):
                 values.transpose(1, 0, 2)[None],
                 scale=self.scale,
                 mask=visible,
+                sinks=sinks,
             )
             outputs.append(out[0].transpose(1, 0, 2))
             start += extend_len

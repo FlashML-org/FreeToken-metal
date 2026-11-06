@@ -67,6 +67,7 @@ class FullAttnMetalBackend(FullAttnBackend):
         layer_id: int,
         batch: Batch,
         metadata: FullAttnMetadata,
+        sinks: mx.array | None = None,
     ) -> mx.array:
         if metadata.max_seqlen_q == 1:
             return flash_decode(
@@ -78,6 +79,7 @@ class FullAttnMetalBackend(FullAttnBackend):
                 metadata.max_seqlen_k,
                 self.table_page_size,
                 self.scale,
+                sinks,
             )
         else:
             assert isinstance(metadata, MetalAttnMetadata) and metadata.prefill_tiles is not None
@@ -91,6 +93,7 @@ class FullAttnMetalBackend(FullAttnBackend):
                 self.scale,
                 self.sliding_window,
                 block_ends=metadata.block_ends,
+                sinks=sinks,
             )
 
 
