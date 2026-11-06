@@ -120,6 +120,7 @@ NB_MODULE(_C, m) {
       "num_head_groups"_a,
       "num_simdgroups"_a,
       "scale"_a,
+      "sinks"_a.none() = nb::none(),
       nb::kw_only(),
       "stream"_a = nb::none(),
       "Paged flash-decode of one query per request over its first seq_lens[b] keys; returns [B, Hq, D].");
@@ -143,6 +144,7 @@ NB_MODULE(_C, m) {
       "mpp"_a,
       "scale"_a,
       "block_ends"_a.none() = nb::none(),
+      "sinks"_a.none() = nb::none(),
       nb::kw_only(),
       "stream"_a = nb::none(),
       "Paged causal flash-attention of each tile's queries over its request's keys; returns [T, Hq, D].");

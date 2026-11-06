@@ -11,7 +11,9 @@ dtype, the split-KV rule split and not, forced partitions with nothing to read. 
 sliding window, the keys before the batch's oldest window hold huge keys and values too,
 so a key the window should hide shows up in the output. Image spans (block ends) let their
 queries see the span's later keys: spans across tiles, from a cached prefix, cut at the
-chunk end, longer than the window, and with split-KV. Every case runs on both GEMM paths.
+chunk end, longer than the window, and with split-KV. Learned sinks join each softmax's denominator:
+in the one-pass kernel and the merge, beside partitions with no keys, under a window. Every case
+runs on both GEMM paths.
 """
 
 from __future__ import annotations
@@ -34,6 +36,8 @@ from ftmetal.kernel.ref import flash_prefill_ref
 NUM_KV_HEADS = 2
 SPARE_PAGES = 3
 UNREAD_VALUE = 1e3
+# Sinks about the size of the scores of normal q and k at scale D ** -0.5.
+SINK_SCALE = 2.0
 # Worst |error| over a row relative to the row's largest |value|. Past fp32 the kernel
 # rounds only its bf16 output, half an ulp at the row's top binade (2^-8); one ulp leaves
 # room for the fp32 summation order. fp32 inputs differ by summation order alone.
@@ -65,6 +69,7 @@ class Case:
     window: int | None = None
     # Per request, its image spans [start, end) in key positions.
     spans: tuple[tuple[tuple[int, int], ...], ...] | None = None
+    has_sinks: bool = False
 
     def __str__(self) -> str:
         lens = "+".join(f"{c}:{e}" for c, e in zip(self.cached_lens, self.extend_lens))
@@ -76,6 +81,8 @@ class Case:
             label += f"-W{self.window}"
         if self.spans is not None:
             label += "-spans" + "+".join(f"{lo}:{hi}" for spans in self.spans for lo, hi in spans)
+        if self.has_sinks:
+            label += "-sinks"
         return label
 
     def block_ends(self) -> list[int] | None:
@@ -164,6 +171,16 @@ CASES = [
     ),
     Case((0,), (48,), group=2, page_size=16, num_partitions=3, window=8, spans=(((4, 40),),)),
     Case((7,), (40,), head_dim=512, spans=(((8, 40),),)),
+    # Learned sinks at Flint's shape (D 128, G 8): one pass; a request split by the rule; forced
+    # partitions with no keys; under a window; one query seeing one key. D 256's head split.
+    Case((37,), (5,), head_dim=128, has_sinks=True),
+    Case(*UNEQUAL, head_dim=128, page_size=4, has_sinks=True),
+    Case((2048,), (1,), head_dim=128, has_sinks=True),
+    Case(*SHORT_AND_LONG, head_dim=128, dtype=mx.float32, num_partitions=3, has_sinks=True),
+    Case(*ACROSS, head_dim=128, page_size=16, window=13, has_sinks=True),
+    Case(*FAR_TURN, head_dim=128, num_partitions=3, window=513, has_sinks=True),
+    Case((0,), (1,), head_dim=128, has_sinks=True),
+    Case(*UNEQUAL, has_sinks=True),
 ]
 
 
@@ -222,7 +239,11 @@ def test_matches_sdpa(case: Case, mma: MhaPrefillMma) -> None:
     scale = case.head_dim**-0.5
     block_ends = case.block_ends()
     ends = None if block_ends is None else mx.array(block_ends, dtype=mx.int32)
-    out = flash_prefill(q, k_cache, v_cache, table, tiles, case.page_size, scale, window, mma, ends)
+    sinks = SINK_SCALE * mx.random.normal((num_heads,)) if case.has_sinks else None
+    sinks = None if sinks is None else sinks.astype(case.dtype)
+    out = flash_prefill(
+        q, k_cache, v_cache, table, tiles, case.page_size, scale, window, mma, ends, sinks
+    )
     expected = flash_prefill_ref(
         q,
         k_cache,
@@ -234,6 +255,7 @@ def test_matches_sdpa(case: Case, mma: MhaPrefillMma) -> None:
         scale,
         window,
         block_ends,
+        sinks,
     )
     assert out.shape == q.shape and out.dtype == case.dtype
     error = mx.abs(out.astype(mx.float32) - expected).max(axis=2)

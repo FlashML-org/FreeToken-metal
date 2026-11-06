@@ -39,6 +39,7 @@ mx::array flash_decode(
     int num_head_groups,
     int num_simdgroups,
     float scale,
+    const std::optional<mx::array>& sinks,
     mx::StreamOrDevice s) {
   if (q.ndim() != 3 || k_cache.ndim() != 3 || v_cache.ndim() != 3 || page_table.ndim() != 2 ||
       seq_lens.ndim() != 1) {
@@ -80,6 +81,9 @@ mx::array flash_decode(
   if (partition_tokens < 1 || min_partition_tokens < 1 || max_partitions < 1) {
     throw std::invalid_argument("ftmetal mha_decode: partition rule values must be >= 1");
   }
+  if (sinks && (sinks->ndim() != 1 || sinks->shape(0) != num_heads || sinks->dtype() != q.dtype())) {
+    throw std::invalid_argument("ftmetal mha_decode: sinks must be [Hq] in q's dtype");
+  }
   auto stream = mx::to_stream(s);
   FlashDecodeConfig config{
       head_dim,
@@ -90,12 +94,14 @@ mx::array flash_decode(
       {partition_tokens, min_partition_tokens, max_partitions, min_threadgroups},
       num_head_groups,
       num_simdgroups,
-      scale};
+      scale,
+      sinks.has_value()};
+  auto inputs = paged_attention_inputs(q, k_cache, v_cache, page_table, seq_lens, stream);
+  if (sinks) {
+    inputs.push_back(mx::contiguous(*sinks, false, stream));
+  }
   return mx::array(
-      q.shape(),
-      q.dtype(),
-      std::make_shared<FlashDecode>(stream, config),
-      paged_attention_inputs(q, k_cache, v_cache, page_table, seq_lens, stream));
+      q.shape(), q.dtype(), std::make_shared<FlashDecode>(stream, config), std::move(inputs));
 }
 
 bool FlashDecode::is_equivalent(const mx::Primitive& other) const {
@@ -105,7 +111,8 @@ bool FlashDecode::is_equivalent(const mx::Primitive& other) const {
       o->config_.page_size == config_.page_size &&
       o->config_.num_partitions == config_.num_partitions && o->config_.rule == config_.rule &&
       o->config_.num_head_groups == config_.num_head_groups &&
-      o->config_.num_simdgroups == config_.num_simdgroups && o->config_.scale == config_.scale;
+      o->config_.num_simdgroups == config_.num_simdgroups && o->config_.scale == config_.scale &&
+      o->config_.has_sinks == config_.has_sinks;
 }
 
 void FlashDecode::eval_cpu(const std::vector<mx::array>&, std::vector<mx::array>&) {
@@ -132,7 +139,7 @@ void FlashDecode::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx:
       std::to_string(c.num_head_groups) + "_" + std::to_string(c.num_simdgroups) + "_" +
       std::to_string(c.rule.partition_tokens) + "_" +
       std::to_string(c.rule.min_partition_tokens) + "_" + std::to_string(c.rule.max_partitions) +
-      "_" + std::to_string(c.rule.min_threadgroups);
+      "_" + std::to_string(c.rule.min_threadgroups) + (c.has_sinks ? "_sinks" : "");
 
   auto s = stream();
   auto& d = mx::metal::device(s.device);
@@ -151,6 +158,7 @@ void FlashDecode::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx:
     replace_all(source, "{{MIN_PARTITION_TOKENS}}", std::to_string(c.rule.min_partition_tokens));
     replace_all(source, "{{MAX_PARTITIONS}}", std::to_string(c.rule.max_partitions));
     replace_all(source, "{{MIN_THREADGROUPS}}", std::to_string(c.rule.min_threadgroups));
+    replace_all(source, "{{SINKS}}", c.has_sinks ? "1" : "0");
     return source;
   });
 
@@ -178,6 +186,9 @@ void FlashDecode::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx:
   encoder.set_input_array(inputs[4], 2);
   encoder.set_output_array(out, 3);
   encoder.set_bytes(c.num_partitions, 4);
+  if (c.has_sinks) {
+    encoder.set_input_array(inputs[5], 5);
+  }
   encoder.dispatch_threadgroups(
       MTL::Size(c.group, c.num_kv_heads, batch), MTL::Size(SIMD_WIDTH, 1, 1));
 }

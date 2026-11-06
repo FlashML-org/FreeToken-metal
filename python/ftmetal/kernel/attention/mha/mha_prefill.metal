@@ -33,6 +33,8 @@
 // and per-row (max, sum); a partition with no keys writes max -inf.
 // mha_prefill_merge, grid (32 * M, HKV, num_tiles): one simdgroup per query row merges the
 // row's partitions by log-sum-exp.
+// With SINKS each query head's learned logit, unscaled, joins the softmax's denominator where
+// the output is written (one pass, or the merge).
 #define MMA_SIMDGROUP 0
 #define MMA_MPP 1
 #define MMA {{MMA}}
@@ -55,6 +57,7 @@ using namespace metal;
 #define NPASS {{NPASS}}
 #define BLOCKS {{BLOCKS}}
 #define QSA {{QSA}}
+#define SINKS {{SINKS}}
 #define M (8 * NSG / DS)
 #define DH (D / DS)
 // Columns staged per pass.
@@ -260,7 +263,8 @@ inline void stage_value(
 // HKV, P, M, 2] fp32 (split-KV), 7 max_pages, 8 scale * log2(e), 9 block_ends
 // [num_tokens] int32 (BLOCKS only); QSA only: 10 qsa_blocks [num_tiles, list_width] int32,
 // 11 qsa_counts [num_tiles] int32, 12 qsa_bits [num_tokens, bits_width] uint32 (bit b of a
-// query's row: it sees QSA block b), 13 list_width, 14 bits_width.
+// query's row: it sees QSA block b), 13 list_width, 14 bits_width; SINKS only, one pass:
+// 15 sinks [HKV * G].
 #if BLOCKS
 #define BLOCK_ENDS_ARG , device const int* block_ends [[buffer(9)]]
 #define BLOCK_ENDS block_ends
@@ -280,6 +284,15 @@ inline void stage_value(
 #define QSA_ARGS
 #define QSA_LISTS nullptr, nullptr, nullptr, 0, 0
 #endif
+#if SINKS
+#define TILE_SINKS_ARG , device const T* sinks [[buffer(15)]]
+#define TILE_SINKS sinks
+#define MERGE_SINKS_ARG , device const T* sinks [[buffer(5)]]
+#else
+#define TILE_SINKS_ARG
+#define TILE_SINKS nullptr
+#define MERGE_SINKS_ARG
+#endif
 
 template <bool SPLIT>
 inline void mha_prefill_tile(
@@ -294,6 +307,7 @@ inline void mha_prefill_tile(
     device const uint* qsa_bits,
     int qsa_list_width,
     int qsa_bits_width,
+    device const T* sinks,
     device T* out,
     device float* part_acc,
     device float* part_ml,
@@ -474,7 +488,9 @@ inline void mha_prefill_tile(
       part_ml[part_row * 2 + 1] = l;
     }
   } else if (row_valid) {
-    const float inv_l = 1.0f / l;
+    // Every valid row sees its own key, so m is finite.
+    const float denominator = SINKS ? l + fast::exp2(float(sinks[head]) * M_LOG2E_F - m) : l;
+    const float inv_l = 1.0f / denominator;
     UNROLL for (int i = 0; i < O_LANE; i += 2) {
       *(device Vec2*)(out + q_offset + element_coord<OTile>(lane, i).x) =
           Vec2(float2(o[i], o[i + 1]) * inv_l);
@@ -490,15 +506,15 @@ inline void mha_prefill_tile(
     device const int4* tiles [[buffer(4)]],
     device T* out [[buffer(5)]],
     constant const int& max_pages [[buffer(7)]],
-    constant const float& scale_log2e [[buffer(8)]] BLOCK_ENDS_ARG QSA_ARGS,
+    constant const float& scale_log2e [[buffer(8)]] BLOCK_ENDS_ARG QSA_ARGS TILE_SINKS_ARG,
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
   threadgroup T kv_tg[KV_SHARED ? KV_SHARED_SIZE : K_SIZE + V_SIZE];
   threadgroup float2 s_tg[DS > 1 ? NSG * S_LANE / 2 * 32 : 1];
   mha_prefill_tile<false>(
-      q, k_cache, v_cache, page_table, tiles, BLOCK_ENDS, QSA_LISTS, out, nullptr, nullptr,
-      max_pages, scale_log2e, tgpig.x, tgpig.y, 0, 1, sg, lane, kv_tg,
+      q, k_cache, v_cache, page_table, tiles, BLOCK_ENDS, QSA_LISTS, TILE_SINKS, out, nullptr,
+      nullptr, max_pages, scale_log2e, tgpig.x, tgpig.y, 0, 1, sg, lane, kv_tg,
       kv_tg + (KV_SHARED ? 0 : K_SIZE), s_tg);
 }
 
@@ -519,19 +535,19 @@ inline void mha_prefill_tile(
   threadgroup T kv_tg[KV_SHARED ? KV_SHARED_SIZE : K_SIZE + V_SIZE];
   threadgroup float2 s_tg[DS > 1 ? NSG * S_LANE / 2 * 32 : 1];
   mha_prefill_tile<true>(
-      q, k_cache, v_cache, page_table, tiles, BLOCK_ENDS, QSA_LISTS, nullptr, part_acc, part_ml,
-      max_pages, scale_log2e, tgpig.x, tgpig.y, tgpig.z, tptg.z, sg, lane, kv_tg,
+      q, k_cache, v_cache, page_table, tiles, BLOCK_ENDS, QSA_LISTS, nullptr, nullptr, part_acc,
+      part_ml, max_pages, scale_log2e, tgpig.x, tgpig.y, tgpig.z, tptg.z, sg, lane, kv_tg,
       kv_tg + (KV_SHARED ? 0 : K_SIZE), s_tg);
 }
 
 // Buffers: 0 part_acc, 1 part_ml (as above), 2 tiles, 3 out [num_tokens, HKV * G, D],
-// 4 the partition count P.
+// 4 the partition count P, 5 sinks [HKV * G] (SINKS only).
 [[kernel]] void mha_prefill_merge(
     device const float* part_acc [[buffer(0)]],
     device const float* part_ml [[buffer(1)]],
     device const int4* tiles [[buffer(2)]],
     device T* out [[buffer(3)]],
-    constant const int& num_partitions [[buffer(4)]],
+    constant const int& num_partitions [[buffer(4)]] MERGE_SINKS_ARG,
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
   constexpr int LPD = D / 32;
@@ -545,6 +561,10 @@ inline void mha_prefill_tile(
   const size_t first_row = ((size_t)tile_index * HKV + kv_head) * num_partitions * M + row;
   float m_max = -INFINITY;
   for (int p = 0; p < num_partitions; ++p) m_max = max(m_max, part_ml[(first_row + p * M) * 2]);
+#if SINKS
+  const float sink = static_cast<float>(sinks[kv_head * G + row % G]) * M_LOG2E_F;
+  m_max = max(m_max, sink);
+#endif
   float l_sum = 0.0f;
   float o[LPD];
   UNROLL for (int i = 0; i < LPD; ++i) o[i] = 0.0f;
@@ -558,6 +578,9 @@ inline void mha_prefill_tile(
       o[i] += part_acc[part_row * D + lane * LPD + i] * weight;
     }
   }
+#if SINKS
+  l_sum += fast::exp2(sink - m_max);
+#endif
   const float inv_l = l_sum > 0.0f ? 1.0f / l_sum : 0.0f;
   const size_t out_offset =
       ((size_t)(tile.y + row / G) * HKV * G + kv_head * G + row % G) * D + lane * LPD;

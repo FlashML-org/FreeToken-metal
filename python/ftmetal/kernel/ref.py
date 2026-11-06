@@ -136,9 +136,14 @@ def gdn_prefill_inputs_ref(
     return q.astype(dtype), k.astype(dtype), v.astype(dtype), decay[None], beta[None]
 
 
-def moe_topk_ref(gates: mx.array, top_k: int, norm_topk_prob: bool) -> tuple[mx.array, mx.array]:
-    """The ops path of the router: fp32 softmax, argpartition, renormalized weights."""
-    scores = mx.softmax(gates, axis=-1, precise=True)
+def moe_topk_ref(
+    gates: mx.array, top_k: int, norm_topk_prob: bool, sigmoid: bool = False
+) -> tuple[mx.array, mx.array]:
+    """The ops path of the router: fp32 softmax or sigmoid, argpartition, renormalized weights."""
+    if sigmoid:
+        scores = mx.sigmoid(gates.astype(mx.float32))
+    else:
+        scores = mx.softmax(gates, axis=-1, precise=True)
     topk_ids = mx.argpartition(scores, kth=-top_k, axis=-1)[..., -top_k:]
     topk_weights = mx.take_along_axis(scores, topk_ids, axis=-1)
     if norm_topk_prob:
@@ -202,8 +207,10 @@ def flash_decode_ref(
     seq_lens: mx.array,
     page_size: int,
     scale: float,
+    sinks: mx.array | None = None,
 ) -> mx.array:
-    """fp32 attention of q [B, Hq, D] over each request's first seq_lens[b] paged keys."""
+    """fp32 attention of q [B, Hq, D] over each request's first seq_lens[b] paged keys; sinks
+    [Hq] add each head's logit to the softmax's denominator."""
     group = q.shape[1] // k_cache.shape[1]
     offsets = mx.arange(page_size, dtype=mx.int32)
     outputs = []
@@ -212,7 +219,12 @@ def flash_decode_ref(
         keys = mx.repeat(k_cache[slots].astype(mx.float32), group, axis=1)
         values = mx.repeat(v_cache[slots].astype(mx.float32), group, axis=1)
         scores = mx.einsum("hd,lhd->hl", q[i].astype(mx.float32), keys) * scale
-        outputs.append(mx.einsum("hl,lhd->hd", mx.softmax(scores, axis=-1), values))
+        if sinks is None:
+            probs = mx.softmax(scores, axis=-1)
+        else:
+            sink_scores = sinks.astype(mx.float32)[:, None]
+            probs = mx.softmax(mx.concatenate([sink_scores, scores], axis=-1), axis=-1)[:, 1:]
+        outputs.append(mx.einsum("hl,lhd->hd", probs, values))
     return mx.stack(outputs)
 
 
@@ -227,11 +239,12 @@ def flash_prefill_ref(
     scale: float,
     sliding_window: int | None = None,
     block_ends: list[int] | None = None,
+    sinks: mx.array | None = None,
 ) -> mx.array:
     """fp32 SDPA of each request's queries in q [T, Hq, D] over its paged keys, causal from
     its cached prefix, also seeing the keys before its block_ends entry when given, and,
-    with a sliding window W, limited to keys past p - W; at most PREFILL_REF_QUERY_ROWS
-    queries per call bound the scores."""
+    with a sliding window W, limited to keys past p - W; sinks [Hq] add each head's logit to the
+    softmax's denominator; at most PREFILL_REF_QUERY_ROWS queries per call bound the scores."""
     offsets = mx.arange(page_size, dtype=mx.int32)
     outputs = []
     row = 0
@@ -260,7 +273,12 @@ def flash_prefill_ref(
                 in_window = key_positions > positions - (sliding_window or visible)
                 mask = seen & in_window
             out = mx.fast.scaled_dot_product_attention(
-                queries, keys[:, :, :visible], values[:, :, :visible], scale=scale, mask=mask
+                queries,
+                keys[:, :, :visible],
+                values[:, :, :visible],
+                scale=scale,
+                mask=mask,
+                sinks=None if sinks is None else sinks.astype(mx.float32),
             )
             outputs.append(out[0].transpose(1, 0, 2))
         row += extend_len

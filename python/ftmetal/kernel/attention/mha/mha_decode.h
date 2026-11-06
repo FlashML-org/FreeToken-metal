@@ -2,6 +2,7 @@
 // pass are encoded together, with the partials in a temporary (see mha_decode.metal).
 #pragma once
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -19,7 +20,9 @@ void init_mha_decode_library(const std::string& source);
 // page_table [B, max_pages] int32; seq_lens [B] int32. The caller picks the grid's
 // split-KV partition count, the partition rule (see PartitionRule) that gives each
 // request its share of the grid, the threadgroups that share one kv head's query heads
-// (num_head_groups, dividing G) and simdgroups per threadgroup. Returns [B, Hq, D].
+// (num_head_groups, dividing G) and simdgroups per threadgroup. sinks [Hq] in q's dtype, when
+// given, are each query head's learned logit in the softmax's denominator, unscaled. Returns
+// [B, Hq, D].
 mx::array flash_decode(
     const mx::array& q,
     const mx::array& k_cache,
@@ -35,6 +38,7 @@ mx::array flash_decode(
     int num_head_groups,
     int num_simdgroups,
     float scale,
+    const std::optional<mx::array>& sinks = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // The caller's partition count for a max_seqlen_k; the kernels apply it on the GPU to
@@ -58,6 +62,7 @@ struct FlashDecodeConfig {
   int num_head_groups;
   int num_simdgroups;
   float scale;
+  bool has_sinks;
 };
 
 class FlashDecode : public mx::Primitive {

@@ -79,12 +79,15 @@ def flash_decode(
     max_seqlen_k: int,
     page_size: int,
     scale: float,
+    sinks: mx.array | None = None,
 ) -> mx.array:
     """Attention of one query per request over its first seq_lens[b] paged keys.
 
     q [B, Hq, D]; k_cache / v_cache [num_pages * page_size, Hkv, D] in q's dtype;
     page_table [B, max_pages] int32 page ids; seq_lens [B] int32, each >= 1.
-    max_seqlen_k bounds seq_lens and only sizes the partitioning. Returns [B, Hq, D].
+    max_seqlen_k bounds seq_lens and only sizes the partitioning. sinks [Hq] in q's dtype, when
+    given, add each query head's learned logit to the softmax's denominator, unscaled. Returns
+    [B, Hq, D].
     """
     batch_size, num_heads, head_dim = q.shape
     num_kv_heads = k_cache.shape[1]
@@ -114,6 +117,7 @@ def flash_decode(
         num_head_groups,
         num_simdgroups,
         scale,
+        sinks,
     )
 
 

@@ -12,7 +12,8 @@
 // simdgroup 0 writes the partition's unnormalized [GH, D] accumulator and its (max,
 // sum) in the log2 domain.
 // mha_decode_merge, grid (32 * G, HKV, B): one simdgroup per (request, query head) merges
-// the request's partials by log-sum-exp.
+// the request's partials by log-sum-exp. With SINKS each query head's learned logit (buffer 5,
+// [HKV * G], unscaled) joins the softmax's denominator only.
 #include <metal_stdlib>
 using namespace metal;
 
@@ -27,6 +28,7 @@ using namespace metal;
 #define MIN_PARTITION_TOKENS {{MIN_PARTITION_TOKENS}}
 #define MAX_PARTITIONS {{MAX_PARTITIONS}}
 #define MIN_THREADGROUPS {{MIN_THREADGROUPS}}
+#define SINKS {{SINKS}}
 #define LPD (D / 32)
 #define VW (LPD % 4 == 0 ? 4 : 2)
 #define NV (LPD / VW)
@@ -191,13 +193,18 @@ inline uint request_partitions(uint seq_len, uint batch_size, uint grid_partitio
 }
 
 // Buffers: 0 part_acc, 1 part_ml (as above), 2 seq_lens, 3 out [B, HKV * G, D],
-// 4 the grid's partition count P.
+// 4 the grid's partition count P, 5 sinks [HKV * G] (SINKS only).
+#if SINKS
+#define SINKS_ARG , device const T* sinks [[buffer(5)]]
+#else
+#define SINKS_ARG
+#endif
 [[kernel]] void mha_decode_merge(
     device const float* part_acc [[buffer(0)]],
     device const float* part_ml [[buffer(1)]],
     device const int* seq_lens [[buffer(2)]],
     device T* out [[buffer(3)]],
-    constant const int& grid_partitions [[buffer(4)]],
+    constant const int& grid_partitions [[buffer(4)]] SINKS_ARG,
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint3 tptg [[threadgroups_per_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
@@ -211,6 +218,10 @@ inline uint request_partitions(uint seq_len, uint batch_size, uint grid_partitio
   float m_max = -INFINITY;
   for (uint p = 0; p < num_partitions; ++p)
     m_max = max(m_max, part_ml[((head_row * grid_partitions + p) * G + g) * 2]);
+#if SINKS
+  const float sink = static_cast<float>(sinks[kv_head * G + g]) * M_LOG2E_F;
+  m_max = max(m_max, sink);
+#endif
   float l_sum = 0.0f;
   float o[LPD];
   for (int i = 0; i < LPD; ++i) o[i] = 0.0f;
@@ -223,6 +234,9 @@ inline uint request_partitions(uint seq_len, uint batch_size, uint grid_partitio
     const size_t acc_off = ((head_row * grid_partitions + p) * G + g) * D + lane_off;
     for (int i = 0; i < LPD; ++i) o[i] += part_acc[acc_off + i] * weight;
   }
+#if SINKS
+  l_sum += fast::exp2(sink - m_max);
+#endif
   const float inv = (l_sum > 0.0f) ? (1.0f / l_sum) : 0.0f;
   const size_t out_off = (head_row * G + g) * D + lane_off;
   for (int i = 0; i < LPD; ++i) out[out_off + i] = static_cast<T>(o[i] * inv);

@@ -3,7 +3,8 @@
 The reference is AffineMoEMethod.apply_slots' tail over the same inputs: mx.gather_qmm of act at the
 slots through the down bank (on scales and biases, or the pair-code rows' expanded ones), then
 (y.squeeze(-2) * weights[..., None]).sum(axis=-2), then layers/activation.py's
-sigmoid_gated_add(routed, shared, gate) when the shared expert is given. Every output must be equal
+sigmoid_gated_add(routed, shared, gate) when the shared expert is given, or routed + shared when
+it has no gate. Every output must be equal
 bit for bit: the products rounded to the dtype, the sum in MLX's column-reduction order
 (min(8, top_k) partial sums from +0, then summed in turn; a copy for top_k 1), the gated add in
 fp32 with MLX's sigmoid. Shapes: Qwen3.6's down (hidden 2048, width 512, group 64, top 8) at 1 and
@@ -49,6 +50,7 @@ class Case:
     # None: plain scales and biases.
     code_bits: int | None = None
     has_shared: bool = True
+    has_gate: bool = True
     weights: Weights = "random"
     num_slots: int = 16
 
@@ -58,7 +60,8 @@ class Case:
         return (
             f"T{self.tokens}-k{self.top_k}-H{self.hidden_size}-I{self.intermediate_size}"
             f"-g{self.group_size}-b{self.bits}-{dtype}-{scales}"
-            f"-{'shared' if self.has_shared else 'routed'}-w{self.weights}"
+            f"-{'routed' if not self.has_shared else 'gated' if self.has_gate else 'plain'}"
+            f"-w{self.weights}"
         )
 
 
@@ -71,6 +74,11 @@ CASES = [
     Case(1, 10, 2560, 640, group_size=32, code_bits=13),
     Case(22, 10, 2560, 640, group_size=32),
     Case(3, 10, 2560, 640, group_size=32, dtype=mx.float32, code_bits=16),
+    # Flint: its shared expert has no gate; plain, pair codes, the gathered rows' combine.
+    Case(1, 6, 2048, 512, has_gate=False),
+    Case(22, 6, 2048, 512, code_bits=13, has_gate=False),
+    Case(3, 6, 2048, 512, dtype=mx.float32, has_gate=False),
+    Case(2, 8, 256, 704, group_size=32, code_bits=13, has_gate=False),
     # tests/tiny_model.py.
     Case(5, 2, 64, 96, group_size=32, dtype=mx.float32, num_slots=4),
     Case(4, 4, 64, 256, group_size=32, code_bits=13, num_slots=6),
@@ -145,8 +153,10 @@ def test_matches_apply_slots_tail(case: Case) -> None:
         mode="affine",
     )
     expected = (y.squeeze(-2) * weights[..., None]).sum(axis=-2)
-    if case.has_shared:
+    if case.has_shared and case.has_gate:
         expected = sigmoid_gated_add(expected, shared, gate)
+    elif case.has_shared:
+        expected = expected + shared
     got = affine_down_combine(
         act,
         w,
@@ -156,7 +166,7 @@ def test_matches_apply_slots_tail(case: Case) -> None:
         group_size=case.group_size,
         bits=case.bits,
         shared=shared if case.has_shared else None,
-        shared_gate=gate if case.has_shared else None,
+        shared_gate=gate if case.has_shared and case.has_gate else None,
     )
     assert got.shape == expected.shape and got.dtype == expected.dtype
     # Bit patterns, so that +0 and -0 differ.

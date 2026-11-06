@@ -49,6 +49,7 @@ mx::array make_flash_prefill(
     const std::optional<mx::array>& block_ends,
     int qsa_block_size,
     const std::vector<mx::array>& qsa_lists,
+    const std::optional<mx::array>& sinks,
     mx::StreamOrDevice s) {
   if (q.ndim() != 3 || k_cache.ndim() != 3 || v_cache.ndim() != 3 || page_table.ndim() != 2 ||
       tiles.ndim() != 2 || tiles.shape(1) != 4) {
@@ -107,6 +108,9 @@ mx::array make_flash_prefill(
                      block_ends->dtype() != mx::int32)) {
     throw std::invalid_argument("ftmetal mha_prefill: block_ends must be int32 [num_tokens]");
   }
+  if (sinks && (sinks->ndim() != 1 || sinks->shape(0) != num_heads || sinks->dtype() != q.dtype())) {
+    throw std::invalid_argument("ftmetal mha_prefill: sinks must be [Hq] in q's dtype");
+  }
   auto stream = mx::to_stream(s);
   FlashPrefillConfig config{
       head_dim,
@@ -123,13 +127,17 @@ mx::array make_flash_prefill(
       mpp,
       scale,
       block_ends.has_value(),
-      qsa_block_size};
+      qsa_block_size,
+      sinks.has_value()};
   auto inputs = paged_attention_inputs(q, k_cache, v_cache, page_table, tiles, stream);
   if (block_ends) {
     inputs.push_back(mx::contiguous(*block_ends, false, stream));
   }
   for (const auto& list : qsa_lists) {
     inputs.push_back(mx::contiguous(list, false, stream));
+  }
+  if (sinks) {
+    inputs.push_back(mx::contiguous(*sinks, false, stream));
   }
   return mx::array(
       q.shape(), q.dtype(), std::make_shared<FlashPrefill>(stream, config), std::move(inputs));
@@ -154,10 +162,12 @@ mx::array flash_prefill(
     bool mpp,
     float scale,
     const std::optional<mx::array>& block_ends,
+    const std::optional<mx::array>& sinks,
     mx::StreamOrDevice s) {
   return make_flash_prefill(
       q, k_cache, v_cache, page_table, tiles, page_size, num_row_groups, head_split, block_k,
-      kv_shared, num_passes, num_partitions, sliding_window, mpp, scale, block_ends, 0, {}, s);
+      kv_shared, num_passes, num_partitions, sliding_window, mpp, scale, block_ends, 0, {}, sinks,
+      s);
 }
 
 mx::array flash_prefill_qsa(
@@ -191,7 +201,7 @@ mx::array flash_prefill_qsa(
   return make_flash_prefill(
       q, k_cache, v_cache, page_table, tiles, page_size, num_row_groups, head_split, block_k,
       kv_shared, num_passes, num_partitions, 0, mpp, scale, std::nullopt, qsa_block_size,
-      {qsa_blocks, qsa_counts, qsa_bits}, s);
+      {qsa_blocks, qsa_counts, qsa_bits}, std::nullopt, s);
 }
 
 bool FlashPrefill::is_equivalent(const mx::Primitive& other) const {
@@ -226,7 +236,8 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
       std::to_string(c.kv_shared) + "_" + std::to_string(c.num_passes) + "_" +
       std::to_string(c.sliding_window) + (c.mpp ? "_mpp" : "_simdgroup") +
       (c.has_block_ends ? "_blocks" : "") +
-      (c.qsa_block_size > 0 ? "_qsa" + std::to_string(c.qsa_block_size) : "");
+      (c.qsa_block_size > 0 ? "_qsa" + std::to_string(c.qsa_block_size) : "") +
+      (c.has_sinks ? "_sinks" : "");
 
   auto s = stream();
   auto& d = mx::metal::device(s.device);
@@ -246,6 +257,7 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
     replace_all(source, "{{MMA}}", c.mpp ? "MMA_MPP" : "MMA_SIMDGROUP");
     replace_all(source, "{{BLOCKS}}", c.has_block_ends ? "1" : "0");
     replace_all(source, "{{QSA}}", std::to_string(c.qsa_block_size));
+    replace_all(source, "{{SINKS}}", c.has_sinks ? "1" : "0");
     return source;
   });
 
@@ -275,6 +287,9 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
     encoder.set_bytes(max_pages, 7);
     encoder.set_bytes(scale_log2e, 8);
     set_mask_inputs();
+    if (c.has_sinks) {
+      encoder.set_input_array(inputs.back(), 15);
+    }
     encoder.dispatch_threadgroups(MTL::Size(num_tiles, c.num_kv_heads, 1), tile_group);
     return;
   }
@@ -300,6 +315,9 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
   encoder.set_input_array(inputs[4], 2);
   encoder.set_output_array(out, 3);
   encoder.set_bytes(c.num_partitions, 4);
+  if (c.has_sinks) {
+    encoder.set_input_array(inputs.back(), 5);
+  }
   encoder.dispatch_threadgroups(
       MTL::Size(rows, c.num_kv_heads, num_tiles), MTL::Size(SIMD_WIDTH, 1, 1));
 }

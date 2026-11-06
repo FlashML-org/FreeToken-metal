@@ -4,7 +4,7 @@
 // one token, simdgroup j its pair j's down rows at the pair's slot (affine_slot_qmv.h's impl MLX's
 // gather_qmv picks), each rounded to the dtype and times the pair's routing weight in the dtype, as
 // (y * weights[..., None]) does; the pairs' products are summed as (...).sum(axis=-2) sums them
-// (routed_sum); {{OUTPUT}} is the sum or its sigmoid_gated_add.
+// (routed_sum); {{OUTPUT}} is the sum, its sigmoid_gated_add or its plain add of the shared rows.
 threadgroup T products[TOP_K * ROWS];
 const int token = threadgroup_position_in_grid.z;
 const int out_row = threadgroup_position_in_grid.x * ROWS;

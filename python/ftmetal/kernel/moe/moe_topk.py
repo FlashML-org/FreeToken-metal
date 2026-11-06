@@ -1,6 +1,7 @@
-"""Fused MoE router: softmax over the experts, top-k selection and renormalization.
+"""Fused MoE router: softmax over the experts or each logit's sigmoid, top-k selection and
+renormalization.
 
-One simdgroup per token row on mx.fast.metal_kernel; replaces the softmax,
+One simdgroup per token row on mx.fast.metal_kernel; replaces the softmax or sigmoid,
 argpartition, take_along_axis, sum and divide dispatches of the ops path (kernel/ref.py). The
 selection runs on per-lane registers (PR #3's kernel/router.py router_topk_registers): no
 threadgroup memory or barrier on its serial path.
@@ -27,8 +28,11 @@ KERNEL = metal_kernel(
 )
 
 
-def moe_topk(gates: mx.array, top_k: int, norm_topk_prob: bool) -> tuple[mx.array, mx.array]:
-    """gates [T, E] logits -> (expert ids int32 [T, top_k], weights [T, top_k] in gates' dtype)."""
+def moe_topk(
+    gates: mx.array, top_k: int, norm_topk_prob: bool, sigmoid: bool = False
+) -> tuple[mx.array, mx.array]:
+    """gates [T, E] logits -> (expert ids int32 [T, top_k], weights [T, top_k] in gates' dtype);
+    scored by each logit's fp32 sigmoid, else the row's fp32 softmax."""
     num_rows, num_experts = gates.shape
     assert 1 <= top_k <= num_experts, (top_k, num_experts)
     ids, scores = KERNEL(
@@ -38,6 +42,7 @@ def moe_topk(gates: mx.array, top_k: int, norm_topk_prob: bool) -> tuple[mx.arra
             ("E", num_experts),
             ("K", top_k),
             ("NORM", norm_topk_prob),
+            ("SIGMOID", sigmoid),
         ],
         grid=(SIMD_WIDTH * num_rows, 1, 1),
         threadgroup=(SIMD_WIDTH, 1, 1),

@@ -5,8 +5,9 @@ No FreeToken donor. After affine_swiglu_pending: each pair's act row through the
 resolved slot, as mx.gather_qmm computes it (affine_slot_qmv.h, on the impl MLX's gather_qmv
 picks), then (y.squeeze(-2) * weights[..., None]).sum(axis=-2) in the dtype, its products and
 partial sums rounded and ordered as MLX's multiply and column reduction round and order them,
-then, given the shared expert's output and gate logit, layers/activation.py's sigmoid_gated_add.
-The output equals that sequence of ops' bit for bit. One threadgroup per output rows computes every
+then, given the shared expert's output and gate logit, layers/activation.py's sigmoid_gated_add,
+or, given its output alone, their sum in the dtype. The output equals that sequence of ops' bit for
+bit. One threadgroup per output rows computes every
 pair's rows and combines them, except on pair codes off the fast step whose last part-block
 QMV_HALF_REM does not split (kernel/_ext.py's switch off, or a tail over half a block): there
 affine_gather_qmv_pair_codes gathers the rows and affine_down_combine_gathered combines them.
@@ -15,6 +16,7 @@ affine_gather_qmv_pair_codes gathers the rows and affine_down_combine_gathered c
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import mlx.core as mx
 
@@ -60,47 +62,52 @@ PAIR_CODE_SCALES = (
     "PairCodeScales<T, CODE_BITS, decltype(pairs)>{"
     "(const device uint32_t*)(codes + size_t(slot) * CODE_ROW_BYTES), pairs}"
 )
-GATED_ADD = "sigmoid_gated_add(total, shared[size_t(token) * N + row], shared_gate[token])"
+# What the routed sum adds of a shared expert.
+SharedAdd = Literal["none", "plain", "gated"]
+# Each one's output expression, kernel name suffix and extra inputs.
+SHARED_ADDS: dict[SharedAdd, tuple[str, str, tuple[str, ...]]] = {
+    "none": ("total", "", ()),
+    "plain": ("total + shared[size_t(token) * N + row]", "_shared_plain", ("shared",)),
+    "gated": (
+        "sigmoid_gated_add(total, shared[size_t(token) * N + row], shared_gate[token])",
+        "_shared",
+        ("shared", "shared_gate"),
+    ),
+}
 
 
-def combine_kernel(is_pair_codes: bool, has_shared: bool) -> MetalKernel:
-    """The kernel over one scale source, with or without the gated add."""
+def combine_kernel(is_pair_codes: bool, shared_add: SharedAdd) -> MetalKernel:
+    """The kernel over one scale source and one way to add the shared expert."""
+    output, suffix, shared_names = SHARED_ADDS[shared_add]
     scale_names = ["codes", "pairs"] if is_pair_codes else ["scales", "biases"]
     source = SOURCE.replace("{{SCALES}}", PAIR_CODE_SCALES if is_pair_codes else AFFINE_SCALES)
-    source = source.replace("{{OUTPUT}}", GATED_ADD if has_shared else "total")
+    source = source.replace("{{OUTPUT}}", output)
     name = "affine_down_combine" + ("_pair_codes" if is_pair_codes else "")
     return metal_kernel(
-        name=name + ("_shared" if has_shared else ""),
-        input_names=[
-            "act",
-            "w",
-            *scale_names,
-            "slots",
-            "weights",
-            *(["shared", "shared_gate"] if has_shared else []),
-        ],
+        name=name + suffix,
+        input_names=["act", "w", *scale_names, "slots", "weights", *shared_names],
         output_names=["out"],
         source=source,
         header=HEADER,
     )
 
 
-# (pair codes, shared expert) -> kernel.
+# (pair codes, shared add) -> kernel.
 KERNELS = {
-    (is_pair_codes, has_shared): combine_kernel(is_pair_codes, has_shared)
+    (is_pair_codes, shared_add): combine_kernel(is_pair_codes, shared_add)
     for is_pair_codes in (False, True)
-    for has_shared in (False, True)
+    for shared_add in SHARED_ADDS
 }
-# shared expert -> affine_down_combine_gathered.
+# shared add -> affine_down_combine_gathered.
 GATHERED_KERNELS = {
-    has_shared: metal_kernel(
-        name="affine_down_combine_gathered" + ("_shared" if has_shared else ""),
-        input_names=["y", "weights", *(["shared", "shared_gate"] if has_shared else [])],
+    shared_add: metal_kernel(
+        name="affine_down_combine_gathered" + suffix,
+        input_names=["y", "weights", *shared_names],
         output_names=["out"],
-        source=GATHERED_SOURCE.replace("{{OUTPUT}}", GATED_ADD if has_shared else "total"),
+        source=GATHERED_SOURCE.replace("{{OUTPUT}}", output),
         header=HEADER,
     )
-    for has_shared in (False, True)
+    for shared_add, (output, suffix, shared_names) in SHARED_ADDS.items()
 }
 
 
@@ -118,8 +125,8 @@ def affine_down_combine(
 ) -> mx.array:
     """The routed experts' output [T, H] in act's dtype: act [T, top_k, 1, I] through the down
     bank w [S, H, I * bits / 32] uint32 and its scales at slots int32 [T, top_k], summed by
-    weights [T, top_k] in act's dtype; plus shared [T, H] gated by sigmoid(shared_gate [T, 1])
-    when given (both in act's dtype)."""
+    weights [T, top_k] in act's dtype; plus shared [T, H] when given, gated by
+    sigmoid(shared_gate [T, 1]) when that is given too (both in act's dtype)."""
     tokens, top_k, _, intermediate_size = act.shape
     num_slots, hidden_size, words = w.shape
     assert act.dtype in (mx.float32, mx.float16, mx.bfloat16), act.dtype
@@ -155,14 +162,18 @@ def affine_down_combine(
         assert scales.scales.shape == scales.biases.shape == group_shape
         assert scales.scales.dtype == scales.biases.dtype == act.dtype, scales.scales.dtype
         scale_inputs = [scales.scales, scales.biases]
+    shared_add: SharedAdd
+    shared_inputs: list[mx.array]
     if shared is None:
         assert shared_gate is None, "a shared gate without a shared expert"
-        shared_inputs: list[mx.array] = []
+        shared_add, shared_inputs = "none", []
     else:
-        assert shared_gate is not None, "a shared expert without its gate"
-        assert shared.shape == (tokens, hidden_size) and shared_gate.shape == (tokens, 1)
-        assert shared.dtype == shared_gate.dtype == act.dtype, (shared.dtype, shared_gate.dtype)
-        shared_inputs = [shared, shared_gate]
+        assert shared.shape == (tokens, hidden_size) and shared.dtype == act.dtype, shared.shape
+        if shared_gate is None:
+            shared_add, shared_inputs = "plain", [shared]
+        else:
+            assert shared_gate.shape == (tokens, 1) and shared_gate.dtype == act.dtype
+            shared_add, shared_inputs = "gated", [shared, shared_gate]
     if (
         isinstance(scales, PairCodeScales)
         and not is_fast
@@ -182,7 +193,7 @@ def affine_down_combine(
             bits=bits,
             code_bits=scales.code_bits,
         )
-        (out,) = GATHERED_KERNELS[shared is not None](
+        (out,) = GATHERED_KERNELS[shared_add](
             inputs=[y, weights, *shared_inputs],
             template=[("T", act.dtype), ("N", hidden_size), ("TOP_K", top_k)],
             grid=(tokens * hidden_size, 1, 1),
@@ -191,7 +202,7 @@ def affine_down_combine(
             output_dtypes=[act.dtype],
         )
         return out
-    kernel = KERNELS[(isinstance(scales, PairCodeScales), shared is not None)]
+    kernel = KERNELS[(isinstance(scales, PairCodeScales), shared_add)]
     (out,) = kernel(
         inputs=[act, w, *scale_inputs, slots, weights, *shared_inputs],
         template=template,

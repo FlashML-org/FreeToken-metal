@@ -29,7 +29,8 @@ void init_mha_prefill_library(const std::string& source);
 // at position p to keys (p - W, p]; positions count from the page table row's first key.
 // block_ends [num_tokens] int32, when given, lets each query also see the keys before its
 // own entry (the end of its image span in row positions, 0 for text), the window still
-// applying. Returns [num_tokens, Hq, D].
+// applying. sinks [Hq] in q's dtype, when given, are each query head's learned logit in the
+// softmax's denominator, unscaled. Returns [num_tokens, Hq, D].
 mx::array flash_prefill(
     const mx::array& q,
     const mx::array& k_cache,
@@ -47,6 +48,7 @@ mx::array flash_prefill(
     bool mpp,
     float scale,
     const std::optional<mx::array>& block_ends = std::nullopt,
+    const std::optional<mx::array>& sinks = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // flash_prefill's QSA mode, without window or block ends: each tile streams only the keys of
@@ -92,6 +94,7 @@ struct FlashPrefillConfig {
   bool has_block_ends;
   // 0: every key up to the query is a candidate; else flash_prefill_qsa's block size.
   int qsa_block_size;
+  bool has_sinks;
 
   bool operator==(const FlashPrefillConfig&) const = default;
 };

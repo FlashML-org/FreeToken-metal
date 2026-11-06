@@ -358,6 +358,7 @@ def flash_decode(
     num_head_groups: int,
     num_simdgroups: int,
     scale: float,
+    sinks: mx.array | None = None,
     *,
     stream: Stream = None,
 ) -> mx.array: ...
@@ -378,6 +379,7 @@ def flash_prefill(
     mpp: bool,
     scale: float,
     block_ends: mx.array | None = None,
+    sinks: mx.array | None = None,
     *,
     stream: Stream = None,
 ) -> mx.array: ...
