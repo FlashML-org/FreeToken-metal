@@ -55,7 +55,7 @@ from ftmetal.layers.quantization.config import FP_BLOCK_SHAPES
 from ftmetal.layers.quantization.moe import AffineMoEMethod, SharedExpertForward
 from ftmetal.layers.quantization.moe_pending import PendingOutputs
 from ftmetal.models.config import MoeStrategy
-from ftmetal.moe.offload_cache import IssuedLookup
+from ftmetal.moe.offload_cache import IssuedLookup, OffloadMoeCache, ResidentFirst
 from ftmetal.moe.pack import PACK_FILE
 from ftmetal.moe.slot_pools import MoePoolGrouping, PrefillBufferPlacement
 from ftmetal.scheduler.scheduler import Scheduler
@@ -580,6 +580,58 @@ def test_split_lookup_logits_equal_the_waiting_lookups(
         assert mx.array_equal(got, expected).item(), f"forward {forward}"
     # The later decode steps read experts: the split path waited for some.
     assert misses > misses_at_third_decode
+
+
+# Overlap prefills whose layers find some routed experts in slots and read the others: affine,
+# chunked, NVFP4, ModelOpt's per-expert output scales, a victim cache's copies, a pack's pair
+# codes.
+RESIDENT_FIRST_CASES = [
+    case
+    for case in CASES
+    if case.name
+    in (
+        "overlap-prefill",
+        "chunked-overlap-prefill",
+        "nvfp4",
+        "modelopt",
+        "victim-cache",
+        "pair-codes-packed",
+    )
+]
+
+
+@pytest.mark.parametrize("case", RESIDENT_FIRST_CASES, ids=lambda case: case.name)
+def test_resident_first_logits_equal_one_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: Case
+) -> None:
+    """An overlap prefill layer's MoE run as its experts in slots first, during the reads, then
+    the others (OffloadMoeCache.resident_first), gives every forward's logits bit for bit as one
+    pass after the reads; the split ran."""
+    monkeypatch.setenv("FTMETAL_MOE_PREFILL_OVERLAP_MIN_TOKENS", str(case.overlap_min_tokens))
+    write_checkpoint(tmp_path, case)
+    if case.is_packed:
+        assert run_pack(["--model", str(tmp_path)]) == 0
+    rng = np.random.default_rng(len(case.name))
+    prompts = [[int(t) for t in rng.integers(1, 120, size=n)] for n in case.prompt_lens]
+    splits = 0
+    resident_first = OffloadMoeCache.resident_first
+
+    def counting(
+        cache: OffloadMoeCache, layer_id: int
+    ) -> tuple[ResidentFirst, dict[str, mx.array]] | None:
+        nonlocal splits
+        first = resident_first(cache, layer_id)
+        splits += first is not None
+        return first
+
+    monkeypatch.setattr(OffloadMoeCache, "resident_first", counting)
+    two_pass, _, _ = serve_logits(tmp_path, case, prompts)
+    assert splits > 0
+    monkeypatch.setenv("FTMETAL_MOE_RESIDENT_FIRST_TOKENS", "0")
+    one_pass, _, _ = serve_logits(tmp_path, case, prompts)
+    assert len(two_pass) == len(one_pass)
+    for forward, (got, expected) in enumerate(zip(two_pass, one_pass, strict=True)):
+        assert mx.array_equal(got, expected).item(), f"forward {forward}"
 
 
 @pytest.mark.parametrize("fallback", ["stale", "ignored"])

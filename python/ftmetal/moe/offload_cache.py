@@ -1,10 +1,9 @@
-"""OffloadMoeCache: a slot cache of routed experts read on demand from the checkpoint.
-
-Port of FreeToken moe/offload_cache.py (OffloadMoeCache). Divergences: memory is unified, so
-there are no host banks: one raw byte buffer per bank role holds the cache's expert rows (each
-pool's in its layers' layout), filled straight from the checkpoint files by _C.ExpertService (in
-C++: a token-granular LRU per pool of slots, the IO threads, the two prefill buffers), laid out
-by moe/slot_pools.py (FreeToken's slot pool design, its pools of one slot width placed smallest
+"""OffloadMoeCache: a slot cache of routed experts read on demand from the checkpoint. Port of
+FreeToken moe/offload_cache.py (OffloadMoeCache). Divergences: memory is unified, so there are
+no host banks: one raw byte buffer per bank role holds the cache's expert rows (each pool's in
+its layers' layout), filled straight from the checkpoint files by _C.ExpertService (in C++: a
+token-granular LRU per pool of slots, the IO threads, the two prefill buffers), laid out by
+moe/slot_pools.py (FreeToken's slot pool design, its pools of one slot width placed smallest
 first, not in layer order; the layers' layouts share their banks); slot_of and last_use are
 shared arrays the C++ side writes in place; ensure_experts takes the forward's step and returns
 the slots; prefetch_prefill_layer returns where each of the layer's experts lies (resident
@@ -18,25 +17,29 @@ so the layer's resident pairs and shared expert run during the read. Each forwar
 like an attention backend's metadata: a decode, or a prefill below prefill_overlap_min_tokens,
 looks its experts up (a copy-miss prefill: its misses join the LRU, where FreeToken's prefill
 streams whole layers); a longer prefill reads each layer's absent experts into a prefill buffer
-one layer ahead, ordered by the host. No slot a step reads may be rewritten within the step,
-since the GPU caches may keep its old row: a decode's rows are capped so that each pool holds
-its layers' experts of the whole decode at once (FreeToken caps per layer), one step as a graph
-replay must, and a copy-miss prefill whose experts may not all fit the pools at once runs as
-several steps, each its own command buffer. Below the slots, a victim cache in pageable host
-memory outside the GPU budget (victim_cache_bytes, 0: none; FreeToken has none) keeps the
-experts that leave their slots, purgeable under memory pressure: a later miss, or an overlap
-prefill's absent expert, is copied from it instead of read from the checkpoint. Only where a
-slot's bytes come from changes; the lookups and slot_of never see it.
+ahead of its routing, the most often routed first, drops the reads its routing does not need
+once that is on the host, and starts the next layer's then (PR #3's route-drop). No slot a step
+reads may be rewritten within the step, since the GPU caches may keep its old row: a decode's
+rows are capped so that each pool holds its layers' experts of the whole decode at once
+(FreeToken caps per layer), one step as a graph replay must, and a copy-miss prefill whose
+experts may not all fit the pools at once runs as several steps, each its own command buffer.
+Below the slots, a victim cache in pageable host memory outside the GPU budget
+(victim_cache_bytes, 0: none; FreeToken has none) keeps the experts that leave their slots,
+purgeable under memory pressure: a later miss, or an overlap prefill's absent expert, is copied
+from it instead of read from the checkpoint. Only where a slot's bytes come from changes; the
+lookups and slot_of never see it.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Literal, NamedTuple
 
 import mlx.core as mx
 import numpy as np
 
 from ftmetal.core import Batch
+from ftmetal.env import read_env
 from ftmetal.kernel._ext import _C
 from ftmetal.kernel.moe.moe_lookup import moe_lookup, moe_lookup_issue
 from ftmetal.moe.slot_pools import MoeCachePolicy, SlotLayout, VictimMemoryKind, initial_experts
@@ -67,6 +70,30 @@ VICTIM_MEMORY = {
     "purgeable": _C.VictimMemory.PURGEABLE,
     "reserved": _C.VictimMemory.ANONYMOUS,
 }
+# An overlap prefill reads each layer's absent experts ahead of its routing, the most often
+# routed first: each layer's routed rate, decayed by this at each of its prefill routings (PR #3's
+# 0.75), orders them, so that the reads its routing then drops (route_prefill_layer) are the
+# queue's tail.
+PREFILL_ROUTED_DECAY = 0.75
+# With a prediction of its routing (the next layer's router on this layer's MoE input:
+# set_routers), a layer reads ahead only its absent predicted experts, the predicted at least this
+# many (PR #3's 48); the rest wait for its routing, so that the reads it drops never begin.
+PREFILL_READS_AHEAD = 48
+# An overlap prefill of fewer tokens computes each layer's routed experts that lie in slots while
+# its absent ones are read (FTMETAL_MOE_RESIDENT_FIRST_TOKENS, 0: never; PR #3's 3072): less GPU
+# work is left after the reads, so the next layer's routing lands sooner and drops more of its
+# reads. A longer one's MoE outlasts its reads anyway. Only when each pair runs changes.
+RESIDENT_FIRST_TOKENS = 3072
+
+
+class ResidentFirst(NamedTuple):
+    """An overlap prefill layer's MoE in two passes (MoEMethod.apply_sorted_first): the experts
+    in order, its routed ones in slots first (num_experts of them, num_rows of its pairs)."""
+
+    order: np.ndarray
+    num_experts: int
+    num_rows: int
+
 
 # What a forward does with the routed experts: looks them up (a decode, or a short prefill:
 # copy-miss) or reads each layer's absent ones into a prefill buffer ahead of it (a long
@@ -234,10 +261,23 @@ class OffloadMoeCache:
         self.step_starts: list[int] = []
         self.step = 0
         self.moe_step = mx.zeros((2,), dtype=mx.int32)
-        # An overlap prefill's expert byte offsets of each prefetched layer, and the MoE output
-        # of the layer before, which must land before the next layer is read into its buffer.
+        # An overlap prefill's expert byte offsets of each prefetched layer, the MoE output of
+        # the layer before, which must land before the next layer is read into its buffer, and
+        # each layer's routed rate float64 [num_layers, num_experts], its read-ahead order.
         self.prefill_expert_bytes: dict[int, dict[str, mx.array]] = {}
         self.prefill_previous_output: mx.array | None = None
+        self.prefill_routed_rate = np.zeros((num_layers, num_experts))
+        # The overlap prefill's tokens, each prefetched layer's slot map and the layers whose
+        # routing splits their MoE (resident_first).
+        self.prefill_tokens = 0
+        self.resident_first_tokens = int(
+            read_env("MOE_RESIDENT_FIRST_TOKENS") or RESIDENT_FIRST_TOKENS
+        )
+        self.prefill_slot_maps: dict[int, np.ndarray] = {}
+        self.prefill_resident_first: dict[int, ResidentFirst] = {}
+        # Each layer's router, predicting its routing from an input (set_routers); none: the
+        # read-ahead goes by routed rate alone.
+        self.routers: dict[int, Callable[[mx.array], mx.array]] = {}
 
     @property
     def nbytes(self) -> int:
@@ -271,6 +311,7 @@ class OffloadMoeCache:
             or (max_tokens is not None and batch.num_tokens > max_tokens)
         ):
             self.mode = "overlap"
+            self.prefill_tokens = batch.num_tokens
         else:
             self.begin_lookups("copy_miss", batch.num_tokens)
 
@@ -347,37 +388,75 @@ class OffloadMoeCache:
         too, runs after them."""
         self.mailbox = mailbox
 
+    def set_routers(self, routers: dict[int, Callable[[mx.array], mx.array]]) -> None:
+        """Each MoE layer's router: its routing int32 [T, top_k] of an input, which predicts it
+        from the layer before's MoE input during an overlap prefill."""
+        self.routers = routers
+
     def begin_prefill_forward(self) -> None:
         """Layer 0 of an overlap prefill: wait for the GPU (the forward before may still read
-        the prefill buffers' slots), take the buffers back and start reading layers 0 and 1."""
+        the prefill buffers' slots), take the buffers back and start reading layer 0."""
         mx.synchronize()
         self.begin_prefill()
         self.prefill_previous_output = None
-        self.prefill_expert_bytes = {
-            layer_id: self.prefetch_prefill_layer(layer_id)
-            for layer_id in range(min(2, self.num_layers))
-        }
+        self.prefill_slot_maps = {}
+        self.prefill_resident_first = {}
+        self.prefill_expert_bytes = {0: self.prefetch_prefill_layer(0)}
 
-    def expert_bytes(self, layer_id: int) -> dict[str, mx.array]:
-        """An overlap prefill layer's experts per projection, once its prefill buffer is read:
-        int64 [num_experts, banks], each expert's byte offsets into the projection's banks
-        (weight, then any scales and biases)."""
-        self.wait_prefill_layer(layer_id)
-        return self.prefill_expert_bytes.pop(layer_id)
+    def predict_prefill_routing(self, layer_id: int, hidden_states: mx.array) -> mx.array | None:
+        """The next layer's routing as its router predicts it from this overlap prefill layer's
+        MoE input hidden_states (lazy), or None without a router or a next layer."""
+        router = self.routers.get(layer_id + 1)
+        return None if router is None else router(hidden_states)
+
+    def route_prefill_layer(
+        self, layer_id: int, topk_ids: mx.array, predicted: mx.array | None = None
+    ) -> None:
+        """An overlap prefill layer's routing topk_ids int32 [T, top_k], once its router ran:
+        drop the reads of its unrouted experts not yet begun and start its routed ones not read
+        ahead, then start reading the next layer (predicted: its routing as predicted) into the
+        prefill buffer of the layer before, whose MoE output has landed (a layer's routing
+        depends on it, so the wait is free)."""
+        ids = np.array(topk_ids)
+        routed = np.unique(ids)
+        self.service.route_prefill_layer(layer_id, routed.tolist())
+        resident = routed[self.prefill_slot_maps.pop(layer_id)[routed] >= 0]
+        if self.prefill_tokens < self.resident_first_tokens and 0 < resident.size < routed.size:
+            order = np.concatenate([resident, np.setdiff1d(np.arange(self.num_experts), resident)])
+            num_rows = int(np.isin(ids, resident).sum())
+            self.prefill_resident_first[layer_id] = ResidentFirst(order, resident.size, num_rows)
+        rate = self.prefill_routed_rate[layer_id]
+        rate *= PREFILL_ROUTED_DECAY
+        rate[routed] += 1 - PREFILL_ROUTED_DECAY
+        next_layer = layer_id + 1
+        if next_layer < self.num_layers and next_layer not in self.prefill_expert_bytes:
+            if self.prefill_previous_output is not None:
+                mx.eval(self.prefill_previous_output)
+            counts = (
+                None
+                if predicted is None
+                else np.bincount(np.array(predicted).ravel(), minlength=self.num_experts)
+            )
+            self.prefill_expert_bytes[next_layer] = self.prefetch_prefill_layer(next_layer, counts)
 
     def end_prefill_layer(self, layer_id: int, output: mx.array) -> None:
-        """After an overlap prefill layer's MoE output is submitted: wait for the layer
-        before's, whose prefill buffer the next layer is read into, then start that read."""
-        next_layer = layer_id + 1
-        if next_layer == self.num_layers:
-            self.prefill_previous_output = None
-        elif next_layer in self.prefill_expert_bytes:
-            self.prefill_previous_output = output
-        else:
-            assert self.prefill_previous_output is not None, "layer 0 prefetches layer 1"
-            mx.eval(self.prefill_previous_output)
-            self.prefill_expert_bytes[next_layer] = self.prefetch_prefill_layer(next_layer)
-            self.prefill_previous_output = output
+        """An overlap prefill layer's MoE output, submitted: the next layer's routing reads the
+        layer after it into this layer's prefill buffer once it lands (the last layer's is not
+        kept)."""
+        self.prefill_previous_output = output if layer_id + 1 < self.num_layers else None
+
+    def resident_first(self, layer_id: int) -> tuple[ResidentFirst, dict[str, mx.array]] | None:
+        """After route_prefill_layer: how an overlap prefill layer splits its MoE to compute its
+        experts in slots first, with its expert_bytes ahead of its reads, or None."""
+        first = self.prefill_resident_first.pop(layer_id, None)
+        return None if first is None else (first, self.prefill_expert_bytes[layer_id])
+
+    def expert_bytes(self, layer_id: int) -> dict[str, mx.array]:
+        """An overlap prefill layer's experts per projection, once its routed experts are in its
+        prefill buffer: int64 [num_experts, banks], each expert's byte offsets into the
+        projection's banks (weight, then any scales and biases)."""
+        self.wait_prefill_layer(layer_id)
+        return self.prefill_expert_bytes.pop(layer_id)
 
     def fill_initial(self) -> None:
         """Fill every pool with its layers' most routed experts (the lowest-numbered without a
@@ -392,10 +471,26 @@ class OffloadMoeCache:
     def begin_prefill(self) -> None:
         self.service.begin_prefill()
 
-    def prefetch_prefill_layer(self, layer_id: int) -> dict[str, mx.array]:
-        """Start reading the layer's absent experts into its prefill buffer; returns each
-        expert's byte offsets per projection (expert_bytes), in bank order."""
-        slot_map = np.array(self.service.prefetch_prefill_layer(layer_id), dtype=np.int64)
+    def prefetch_prefill_layer(
+        self, layer_id: int, predicted: np.ndarray | None = None
+    ) -> dict[str, mx.array]:
+        """Start reading the layer's absent experts into its prefill buffer: with predicted (how
+        often its predicted routing names each expert, int64 [num_experts]) the predicted ones,
+        the most often named first, else all, the most often routed first; returns each expert's
+        byte offsets per projection (expert_bytes), in bank order."""
+        rate = self.prefill_routed_rate[layer_id]
+        if predicted is None:
+            order, reads_ahead = np.argsort(-rate, kind="stable"), -1
+        else:
+            # The predicted experts lead the order: its head that many long, at least
+            # PREFILL_READS_AHEAD, is read ahead (the absent of it).
+            order = np.lexsort((-rate, -predicted))
+            reads_ahead = max(PREFILL_READS_AHEAD, int(np.count_nonzero(predicted)))
+        slot_map = np.array(
+            self.service.prefetch_prefill_layer(layer_id, order.tolist(), reads_ahead),
+            dtype=np.int64,
+        )
+        self.prefill_slot_maps[layer_id] = slot_map
         offsets, rows = self.destinations[layer_id, :, 0], self.destinations[layer_id, :, 1]
         buffer = (layer_id % 2) * self.buffer_bytes
         slots = slot_map[:, None]

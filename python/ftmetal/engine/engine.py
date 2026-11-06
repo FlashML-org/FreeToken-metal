@@ -57,6 +57,7 @@ from ftmetal.kvcache import create_pools, pool_arrays, pool_costs
 from ftmetal.kvcache.base import PoolCost
 from ftmetal.layers.moe import OffloadMoELayer
 from ftmetal.layers.quantization.config import BankSpec
+from ftmetal.layers.shared_expert_moe import offload_routers
 from ftmetal.mm.config import ENCODER_SECTIONS
 from ftmetal.mm.encoder_cache import EncoderCache
 from ftmetal.mm.processor import MMProcessor, get_mm_processor
@@ -492,6 +493,7 @@ class Engine:
                 cache_policy=config.moe_cache_policy,
                 ssd_keepalive_us=config.moe_ssd_keepalive_us,
             )
+            self.moe_offload_cache.set_routers(offload_routers(self.model))
             pool_slots = [pool.num_slots for pool in slot_layout.pools]
             logger.info(
                 f"MoE offload: {config.moe_pool} pools x{len(pool_slots)} of {min(pool_slots)}-"

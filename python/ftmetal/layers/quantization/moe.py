@@ -22,9 +22,10 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Literal, Protocol
+from typing import Literal, NamedTuple, Protocol
 
 import mlx.core as mx
+import numpy as np
 from mlx.utils import tree_unflatten
 
 from ftmetal.kernel.moe.affine.affine_gather_qmv_pair_codes import affine_gather_qmv_pair_codes
@@ -97,6 +98,20 @@ class ExpertProjection(Protocol):
     """One bank projection (a key of ExpertSchemes.projections) of x for a forward's experts."""
 
     def __call__(self, projection: str, x: mx.array, /) -> mx.array: ...
+
+
+class SortedSplit(NamedTuple):
+    """apply_sorted in two passes (apply_sorted_first, apply_sorted_rest): the pairs sorted
+    with the experts of order's head first, the head's glu output (the first num_rows sorted
+    pairs), and what the rest needs."""
+
+    alignment: ExpertAlignment
+    sorted_x: mx.array
+    # int32 [E]: the experts in the sort's order, the head's num_experts first.
+    order: mx.array
+    num_experts: int
+    num_rows: int
+    head: mx.array
 
 
 class SharedExpertForward(Protocol):
@@ -246,6 +261,74 @@ class MoEMethod(ABC):
             return self.scale_parts(projection, banks, y, expert_ids)
 
         return self.sorted_forward(banks, x, topk_weights, topk_ids, alignment, project)
+
+    def apply_sorted_first(
+        self,
+        banks: Mapping[str, mx.array],
+        x: mx.array,
+        topk_ids: mx.array,
+        order: np.ndarray,
+        num_experts: int,
+        num_rows: int,
+        expert_bytes: Mapping[str, mx.array],
+    ) -> SortedSplit:
+        """apply_sorted's first pass: the pairs of the experts order[:num_experts] (the
+        routing's first num_rows pairs once sorted in order, every expert once in it) through
+        glu, for apply_sorted_rest to finish. Only where each pair is computed changes: every
+        pair's row is the same kernel's over the same expert, the combine the same."""
+        assert x.dtype == self.cfg.dtype, f"x is {x.dtype}, the banks {self.cfg.dtype}"
+        rank = np.empty(self.cfg.num_experts, dtype=np.int32)
+        rank[order] = np.arange(self.cfg.num_experts, dtype=np.int32)
+        alignment = moe_align(mx.take(mx.array(rank), topk_ids), self.cfg.num_experts)
+        sorted_x = mx.expand_dims(x, -2)[alignment.sorted_token_indices]
+        split = SortedSplit(
+            alignment, sorted_x, mx.array(order.astype(np.int32)), num_experts, num_rows, sorted_x
+        )
+        head = self.glu(
+            sorted_x[:num_rows], self.part_projection(banks, split, expert_bytes, is_head=True)
+        )
+        return split._replace(head=head)
+
+    def apply_sorted_rest(
+        self,
+        banks: Mapping[str, mx.array],
+        split: SortedSplit,
+        topk_weights: mx.array,
+        topk_ids: mx.array,
+        expert_bytes: Mapping[str, mx.array],
+    ) -> mx.array:
+        """apply_sorted's second pass after apply_sorted_first: the other pairs through glu,
+        then every pair combined by its routing weight."""
+        rest = self.glu(
+            split.sorted_x[split.num_rows :],
+            self.part_projection(banks, split, expert_bytes, is_head=False),
+        )
+        weights = self.routing_weights(banks, topk_weights, topk_ids)
+        out = mx.concatenate([split.head, rest])
+        return moe_combine(out, split.alignment.pair_positions, weights)
+
+    def part_projection(
+        self,
+        banks: Mapping[str, mx.array],
+        split: SortedSplit,
+        expert_bytes: Mapping[str, mx.array],
+        is_head: bool,
+    ) -> ExpertProjection:
+        """The sorted projection of the split's head experts' pairs, or its other ones."""
+        num_experts, num_rows = split.num_experts, split.num_rows
+        experts = slice(0, num_experts) if is_head else slice(num_experts, self.cfg.num_experts)
+        rows = slice(0, num_rows) if is_head else slice(num_rows, None)
+        offsets = split.alignment.expert_offsets[experts.start : experts.stop + 1]
+        offsets = offsets if is_head else offsets - num_rows
+        part_experts = split.order[experts]
+        expert_ids = mx.take(split.order, split.alignment.sorted_expert_ids[rows])
+
+        def project(projection: str, h: mx.array) -> mx.array:
+            part_bytes = mx.take(expert_bytes[projection], part_experts, axis=0)
+            y = self.gather_sorted(projection, banks, h, offsets, part_bytes)
+            return self.scale_parts(projection, banks, y, expert_ids)
+
+        return project
 
     def sorted_forward(
         self,

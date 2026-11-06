@@ -69,9 +69,11 @@ Step = tuple[tuple[int, tuple[int, ...]], ...]
 
 @dataclass(frozen=True)
 class Prefill:
-    """An overlapped prefill of these layers, in order: two prefetched ahead."""
+    """An overlapped prefill of these layers, in order: two prefetched ahead; with routed, each
+    layer's routed experts, the reads of the others dropped where they have not begun."""
 
     layers: tuple[int, ...]
+    routed: tuple[tuple[int, ...], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -127,14 +129,16 @@ class Case:
         per_expert = "-per-expert" if self.is_per_expert else ""
         victims = f"-V{self.victim_cache_entries}" if self.victim_cache_entries else ""
         packed = "-coded" if self.has_pair_codes else "-packed" if self.is_packed else ""
+        routed = any(isinstance(e, Prefill) and e.routed is not None for e in self.script)
         spares = "" if self.deferred_store_spares is None else f"-D{self.deferred_store_spares}"
         memory = "-reserved" if self.victim_memory == "reserved" else ""
         policy = "-lrfu" if self.cache_policy == "lrfu" else ""
         keepalive = f"-K{self.ssd_keepalive_us}" if self.ssd_keepalive_us else ""
+        routed_suffix = "-routed" if routed else ""
         return (
             f"{self.naming}-L{self.num_layers}-E{self.num_experts}-H{self.hidden_size}"
             f"-I{self.intermediate_size}-S{self.cache_size}-{self.grouping}{overlap}-{scheme}"
-            f"{per_expert}{victims}{packed}{spares}{memory}{policy}{keepalive}"
+            f"{per_expert}{victims}{packed}{spares}{memory}{policy}{keepalive}{routed_suffix}"
         )
 
 
@@ -430,6 +434,25 @@ CASES += [
     replace(CASES[3], is_packed=True, has_pair_codes=True),
 ]
 
+# Route-drop: each prefill layer routes some of its experts, the reads of the others that have
+# not begun are dropped (a pack's records only); with a victim cache's copies too.
+ROUTED_SCRIPT = (
+    ((0, (0, 1)), (1, (2,)), (2, (0, 3)), (3, (1,))),
+    Prefill((0, 1, 2, 3), routed=((0,), (1, 2), (), (3,))),
+    ((0, (2, 3)), (1, (0, 1)), (2, (1,)), (3, (0, 2))),
+    Prefill((1, 2), routed=((0, 1, 2, 3), (2,))),
+    ((1, (3,)), (2, (0, 1))),
+)
+ROUTED_CASE = Case(
+    4, 4, 128, 64, 12, True, script=ROUTED_SCRIPT, grouping="unified", victim_cache_entries=4
+)
+CASES += [
+    ROUTED_CASE,
+    replace(ROUTED_CASE, is_packed=True),
+    replace(ROUTED_CASE, is_packed=True, has_pair_codes=True),
+    replace(ROUTED_CASE, victim_cache_entries=0, is_packed=True),
+]
+
 
 def decode_steps(seed: int, num_steps: int) -> tuple[Step, ...]:
     """num_steps decode steps of 4 layers, each 2 of its 4 experts."""
@@ -596,6 +619,9 @@ def test_rows_match_checkpoint(tmp_path: Path, case: Case) -> None:
                 cache.prefetch_prefill_layer(layer_id)
             for i, layer_id in enumerate(entry.layers):
                 expert_bytes = cache.prefetch_prefill_layer(layer_id)
+                routed = range(cache.num_experts) if entry.routed is None else entry.routed[i]
+                if entry.routed is not None:
+                    cache.service.route_prefill_layer(layer_id, list(routed))
                 cache.wait_prefill_layer(layer_id)
                 offsets = np.concatenate([np.array(v) for v in expert_bytes.values()], axis=1)
                 buffer_row = 0
@@ -611,10 +637,10 @@ def test_rows_match_checkpoint(tmp_path: Path, case: Case) -> None:
                         buffer_row += 1
                     assert (offsets[expert] == expected_offsets).all(), (layer_id, expert)
                 buffered += buffer_row
+                # A dropped expert's row is never filled: the routed and the resident ones are.
+                wanted = set(routed) | {e for (layer, e) in resident if layer == layer_id}
                 check_rows(
-                    cache,
-                    expected,
-                    {(layer_id, expert): offsets[expert] for expert in range(cache.num_experts)},
+                    cache, expected, {(layer_id, expert): offsets[expert] for expert in wanted}
                 )
                 if i + 2 < len(entry.layers):
                     cache.prefetch_prefill_layer(entry.layers[i + 2])
@@ -638,7 +664,18 @@ def test_rows_match_checkpoint(tmp_path: Path, case: Case) -> None:
             stride = int(part.locations[1, 1] - part.locations[0, 1])
             assert stats.bytes_read[layer_id] == stats.experts_read[layer_id] * stride, layer_id
     copied = sum(stats.victim_hits) + sum(stats.victim_buffer_hits)
-    assert sum(stats.experts_read) + copied == sum(stats.misses) + buffered
+    dropped = sum(stats.experts_dropped)
+    assert sum(stats.experts_read) + copied + dropped == sum(stats.misses) + buffered
+    # Only the experts a prefill routes elsewhere are dropped; without records only the victim
+    # cache's copies.
+    unrouted = sum(
+        len(set(range(case.num_experts)) - set(routed))
+        for entry in case.script
+        if isinstance(entry, Prefill) and entry.routed is not None
+        for routed in entry.routed
+    )
+    assert dropped <= unrouted
+    assert case.is_packed or case.victim_cache_entries > 0 or dropped == 0
     assert (copied > 0) == (case.victim_cache_entries > 0)
     assert (sum(stats.deferred_stores) > 0) == bool(case.deferred_store_spares)
 
@@ -750,6 +787,42 @@ def test_begin_prefill_stores_the_experts_it_drops(tmp_path: Path) -> None:
     stats = cache.stats()
     assert (stats.experts_read[2], stats.victim_hits[2], sum(stats.victim_stores)) == (1, 1, 8)
     assert cache.service.victim_cache_ids() == [0, 1, 8, 9, 16, 24, 25]
+
+
+# (victim cache entries, the routed experts of layer 0): with every slot under the buffers, the
+# layer's experts are all absent; its reads paused, routing drops every unrouted one exactly, the
+# victim cache's copies (of the experts begin_prefill stored) as its record reads.
+ROUTE_DROP_CASES: list[tuple[int, tuple[int, ...]]] = [
+    (0, (1, 6)),
+    (0, tuple(range(8))),
+    (0, ()),
+    (16, (0, 5, 7)),
+]
+
+
+@pytest.mark.parametrize(("victim_entries", "routed"), ROUTE_DROP_CASES)
+def test_routing_drops_the_unrouted_reads(
+    tmp_path: Path, victim_entries: int, routed: tuple[int, ...]
+) -> None:
+    case = Case(4, 8, 128, 64, 16, True, victim_cache_entries=victim_entries, is_packed=True)
+    cache, reference, source = build(tmp_path / "checkpoint", case)
+    expected = expected_rows(cache, reference, source.layer_prefixes)
+    cache.fill_initial()
+    cache.begin_prefill()
+    assert resident_rows(cache) == {}
+    cache.service.pause_reads(True)
+    expert_bytes = cache.prefetch_prefill_layer(0)
+    dropped = cache.service.route_prefill_layer(0, list(routed))
+    cache.service.pause_reads(False)
+    cache.wait_prefill_layer(0)
+    assert dropped == cache.num_experts - len(routed)
+    offsets = np.concatenate([np.array(v) for v in expert_bytes.values()], axis=1)
+    check_rows(cache, expected, {(0, expert): offsets[expert] for expert in routed})
+    stats = cache.stats()
+    assert stats.experts_dropped[0] == dropped
+    assert stats.experts_read[0] + stats.victim_buffer_hits[0] == len(routed)
+    # The dropped copies' entries are back in the victim cache, unpinned: begin_prefill again.
+    cache.begin_prefill()
 
 
 def test_overlap_prefill_copies_cached_experts(tmp_path: Path) -> None:

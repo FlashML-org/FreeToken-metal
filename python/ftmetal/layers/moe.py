@@ -129,8 +129,9 @@ class OffloadMoELayer(MoELayer):
         resident = dict(tree_flatten(self.parameters()))
         method = self.quant_method
         if cache.mode == "overlap":
-            routed = self.prefill_forward(cache, resident, hidden_states, topk_weights, topk_ids)
-            return add_shared_expert(routed, hidden_states, shared_expert)
+            return self.prefill_forward(
+                cache, resident, hidden_states, topk_weights, topk_ids, shared_expert
+            )
         elif (
             cache.mode == "decode"
             and cache.split_lookup
@@ -157,20 +158,49 @@ class OffloadMoELayer(MoELayer):
         hidden_states: mx.array,
         topk_weights: mx.array,
         topk_ids: mx.array,
+        shared_expert: SharedExpertForward | None,
     ) -> mx.array:
-        """An overlap prefill layer: the layer's input runs while its prefill buffer is read,
-        its MoE runs as a command buffer of its own once the buffer is in."""
+        """An overlap prefill layer: the layer's input, its shared expert and the next layer's
+        predicted routing run while its prefill buffer is read; once its routing is on the host
+        the unrouted reads are dropped and the next layer's start; its MoE runs as a command
+        buffer of its own once its routed experts are in, a short prefill's experts in slots
+        first, during the reads (OffloadMoeCache.resident_first)."""
         if self.moe_layer_id == 0:
             cache.begin_prefill_forward()
+        # One evaluation signals once all its arrays are done: the routing alone first, so the
+        # host has it before the prediction and the shared expert run.
         mx.async_eval(hidden_states, topk_weights, topk_ids)
-        expert_bytes = cache.expert_bytes(self.moe_layer_id)
+        predicted = cache.predict_prefill_routing(self.moe_layer_id, hidden_states)
+        if predicted is not None:
+            mx.async_eval(predicted)
+        shared = None if shared_expert is None else shared_expert(hidden_states)
+        if shared is not None:
+            mx.async_eval(*shared)
+        cache.route_prefill_layer(self.moe_layer_id, topk_ids, predicted)
         banks = {**cache.banks, **cache.layer_pairs(self.moe_layer_id), **resident}
-        out = self.quant_method.apply_sorted(
-            banks, hidden_states, topk_weights, topk_ids, expert_bytes
-        )
+        method = self.quant_method
+        first = cache.resident_first(self.moe_layer_id)
+        if first is None:
+            expert_bytes = cache.expert_bytes(self.moe_layer_id)
+            out = method.apply_sorted(banks, hidden_states, topk_weights, topk_ids, expert_bytes)
+        else:
+            # The experts in slots run during the reads, the others once they are in.
+            plan, ahead_bytes = first
+            split = method.apply_sorted_first(
+                banks,
+                hidden_states,
+                topk_ids,
+                plan.order,
+                plan.num_experts,
+                plan.num_rows,
+                ahead_bytes,
+            )
+            mx.async_eval(split.head)
+            expert_bytes = cache.expert_bytes(self.moe_layer_id)
+            out = method.apply_sorted_rest(banks, split, topk_weights, topk_ids, expert_bytes)
         mx.async_eval(out)
         cache.end_prefill_layer(self.moe_layer_id, out)
-        return out
+        return out if shared is None else sigmoid_gated_add(out, *shared)
 
 
 __all__ = ["MoELayer", "OffloadMoELayer"]

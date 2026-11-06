@@ -396,6 +396,8 @@ NB_MODULE(_C, m) {
       .def_ro("victim_stores", &ftmetal::ExpertServiceStats::victim_stores)
       .def_ro("victim_drops", &ftmetal::ExpertServiceStats::victim_drops)
       .def_ro("deferred_stores", &ftmetal::ExpertServiceStats::deferred_stores)
+      .def_ro("experts_dropped", &ftmetal::ExpertServiceStats::experts_dropped)
+      .def_ro("experts_wasted", &ftmetal::ExpertServiceStats::experts_wasted)
       .def_ro("victim_copy_ns", &ftmetal::ExpertServiceStats::victim_copy_ns)
       .def_ro("victim_entries", &ftmetal::ExpertServiceStats::victim_entries)
       .def_ro("victim_bytes", &ftmetal::ExpertServiceStats::victim_bytes)
@@ -536,8 +538,20 @@ NB_MODULE(_C, m) {
           "prefetch_prefill_layer",
           &ftmetal::ExpertService::prefetch_prefill_layer,
           "layer_id"_a,
+          "order"_a = std::vector<int32_t>(),
+          "reads_ahead"_a = -1,
           nb::call_guard<nb::gil_scoped_release>(),
-          "Start reading the layer's absent experts into its prefill buffer; returns its slot map.")
+          "Start reading the layer's absent experts into its prefill buffer, in order (every "
+          "expert once; empty: expert order), only those among its first reads_ahead "
+          "(negative: all) before its routing; returns its slot map.")
+      .def(
+          "route_prefill_layer",
+          &ftmetal::ExpertService::route_prefill_layer,
+          "layer_id"_a,
+          "routed"_a,
+          nb::call_guard<nb::gil_scoped_release>(),
+          "Drop the layer's prefill buffer loads of the experts not in routed that have not "
+          "begun and queue the routed ones not queued yet; returns how many it dropped.")
       .def(
           "wait_prefill_layer",
           &ftmetal::ExpertService::wait_prefill_layer,
@@ -567,6 +581,12 @@ NB_MODULE(_C, m) {
           &ftmetal::ExpertService::purge_victim_cache,
           nb::call_guard<nb::gil_scoped_release>(),
           "For tests: discard the victim cache's bytes as memory pressure would.")
+      .def(
+          "pause_reads",
+          &ftmetal::ExpertService::pause_reads,
+          "is_paused"_a,
+          nb::call_guard<nb::gil_scoped_release>(),
+          "For tests: while paused, the IO threads take no new reads.")
       .def(
           "victim_cache_ids",
           &ftmetal::ExpertService::victim_cache_ids,

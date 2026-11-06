@@ -85,6 +85,10 @@ struct ExpertServiceStats {
   // Victim hits that took a spare slot, their evicted resident's store deferred past the
   // answer (pool_spares); victim_stores counts the store once it is done.
   std::vector<int64_t> deferred_stores;
+  // A prefill layer's absent experts it never read or copied: unrouted, their reads dropped
+  // before they began (route_prefill_layer); and those read or copied though unrouted.
+  std::vector<int64_t> experts_dropped;
+  std::vector<int64_t> experts_wasted;
   // Time spent copying to and from its entries, over every thread; its entries and bytes.
   int64_t victim_copy_ns = 0;
   int64_t victim_entries = 0;
@@ -130,7 +134,8 @@ struct RecordLayout {
 // one run of the batch's experts, expert e of the run at base + e * expert_bytes, or for
 // segment -1 the records of a run of experts of a record layer; or, with entry set, a copy
 // between that victim cache entry and the batch layer's row at index (a slot, or a row of the
-// batch's buffer), into the entry when is_store.
+// batch's buffer), into the entry when is_store. A load of exactly one expert (a record, or a
+// victim cache copy into a row) names it: route_prefill_layer may drop it before it begins.
 struct ReadTask {
   ReadBatch* batch = nullptr;
   int segment = 0;
@@ -141,6 +146,7 @@ struct ReadTask {
   uint8_t* entry = nullptr;
   int32_t index = 0;
   bool is_store = false;
+  int32_t expert = -1;
 };
 
 // The prefill buffer of the layers of one parity: the layer it holds or is reading.
@@ -151,6 +157,10 @@ struct PrefillBuffer {
   std::unique_ptr<ReadBatch> batch = std::make_unique<ReadBatch>();
   // The victim cache entries being copied into it, pinned until it is waited.
   std::vector<int32_t> entries;
+  // Read ahead in order: each absent expert's victim cache entry (NO_ENTRY: a record read),
+  // and the absent experts not queued yet, which its routing queues or drops.
+  std::vector<int32_t> entry_of_expert;
+  std::vector<int32_t> unqueued;
 };
 
 class ExpertService {
@@ -213,8 +223,20 @@ class ExpertService {
   void reset_scores();
 
   // Start reading the layer's non-resident experts into prefill buffer layer_id % 2; returns its
-  // slot map (SlotLru::prefill_slot_map).
-  std::vector<int32_t> prefetch_prefill_layer(int layer_id);
+  // slot map (SlotLru::prefill_slot_map). With an order (every expert once) and records, the
+  // absent experts among order's first reads_ahead (negative: all), in order, one load each,
+  // the victim cache's copies first; the others wait for the layer's routing. Without either,
+  // every absent expert, record runs merged.
+  std::vector<int32_t> prefetch_prefill_layer(
+      int layer_id,
+      const std::vector<int32_t>& order = {},
+      int reads_ahead = -1);
+
+  // The layer's routing is known, before its buffer is waited: drop its buffer's loads of the
+  // experts not in routed that have not begun (one-expert loads: records and victim cache
+  // copies; without records, only the copies) and queue the routed ones not queued yet;
+  // returns how many it dropped.
+  int64_t route_prefill_layer(int layer_id, const std::vector<int32_t>& routed);
 
   // Wait for the layer's prefill buffer reads.
   void wait_prefill_layer(int layer_id);
@@ -235,6 +257,9 @@ class ExpertService {
   // For tests: discard the victim cache's bytes as memory pressure would, and the flat ids it
   // holds.
   void purge_victim_cache();
+
+  // For tests: while paused, the IO threads take no new reads (those begun finish).
+  void pause_reads(bool is_paused);
   std::vector<int32_t> victim_cache_ids();
 
  private:
@@ -255,6 +280,17 @@ class ExpertService {
       int buffer = -1,
       std::vector<ReadTask> copies = {});
   void finish_buffer(PrefillBuffer& buffer, int64_t wait_ns);
+  // Reset the batch for loads (expert, slot or row) of the layer into buffer (-1: slots).
+  void begin_batch(
+      ReadBatch& batch,
+      int layer_id,
+      const std::vector<ExpertLoad>& loads,
+      int buffer);
+  // Fill the rows of the batch's experts' segments the checkpoint does not store.
+  void fill_rows(const ReadBatch& batch);
+  void enqueue(ReadBatch& batch, std::vector<ReadTask> tasks);
+  // Queue the buffer's loads of these experts in order, its victim cache copies first.
+  void queue_prefill_experts(PrefillBuffer& buffer, const std::vector<int32_t>& experts);
   void work(int thread_index);
   void read(const ReadTask& task, uint8_t* staging);
   // Fill the segment's bytes of the expert, which the checkpoint does not store.
@@ -267,11 +303,12 @@ class ExpertService {
   // is_store.
   void copy_entry(uint8_t* entry, int layer_id, int buffer, int32_t index, bool is_store);
   // The loads of the layer the victim cache does not hold; each one it holds is pinned and
-  // added to hits as (entry, slot or row).
+  // added to hits as (entry, slot or row), its expert to hit_experts when given.
   std::vector<ExpertLoad> split_victim_hits(
       int layer_id,
       const std::vector<ExpertLoad>& loads,
-      std::vector<std::pair<int32_t, int32_t>>& hits);
+      std::vector<std::pair<int32_t, int32_t>>& hits,
+      std::vector<int32_t>* hit_experts = nullptr);
   // A victim hit that evicts a resident takes a spare slot of its pool, and the evicted expert
   // is stored once the request is answered: the GPU waits for one copy, not two. A pool holds
   // at most its pool_spares slots, spares and deferred stores together, and none after a step
@@ -319,6 +356,7 @@ class ExpertService {
   std::condition_variable queue_ready_;
   std::deque<ReadTask> queue_;
   bool is_stopping_ = false;
+  bool is_paused_ = false;
   std::vector<std::unique_ptr<uint8_t, void (*)(void*)>> staging_;
   std::vector<std::thread> threads_;
 

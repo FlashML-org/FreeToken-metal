@@ -14,7 +14,10 @@ its experts' columns in place.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import mlx.core as mx
+import mlx.nn as nn
 
 from ftmetal.kernel.moe.moe_topk import moe_topk
 from ftmetal.layers.activation import silu_and_mul
@@ -113,6 +116,15 @@ class SharedExpertMoE(BaseOP):
             self.pop("gate")
             self.pop("shared_expert_gate")
 
+    def predict_routing(self, hidden_states: mx.array) -> mx.array:
+        """The experts this block's router picks for hidden_states, int32 [T, top_k]: an offload
+        prefill's prediction of this layer's routing from the layer before's MoE input."""
+        if "gates" not in self:
+            logits = project(self.gate, hidden_states)
+        else:
+            logits = rows_forward(self.gates, hidden_states, 0, self.num_experts)
+        return moe_topk(logits, self.top_k, self.norm_topk_prob)[0]
+
     def forward(self, hidden_states: mx.array) -> mx.array:
         num_experts = self.num_experts
         shared_gate: mx.array | None = None
@@ -139,4 +151,14 @@ class SharedExpertMoE(BaseOP):
         return self.experts.forward(hidden_states, topk_weights, topk_ids, gated_shared_expert)
 
 
-__all__ = ["GATE_UP_PARTS", "SharedExpert", "SharedExpertMoE"]
+def offload_routers(model: nn.Module) -> dict[int, Callable[[mx.array], mx.array]]:
+    """Each offloaded MoE layer's router (SharedExpertMoE.predict_routing), by its index among
+    the model's MoE layers: OffloadMoeCache.set_routers' input."""
+    return {
+        block.experts.moe_layer_id: block.predict_routing
+        for _, block in model.named_modules()
+        if isinstance(block, SharedExpertMoE) and isinstance(block.experts, OffloadMoELayer)
+    }
+
+
+__all__ = ["GATE_UP_PARTS", "SharedExpert", "SharedExpertMoE", "offload_routers"]

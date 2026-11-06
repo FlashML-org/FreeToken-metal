@@ -244,6 +244,8 @@ ExpertService::ExpertService(
   stats_.victim_stores.assign(num_layers, 0);
   stats_.victim_drops.assign(num_layers, 0);
   stats_.deferred_stores.assign(num_layers, 0);
+  stats_.experts_dropped.assign(num_layers, 0);
+  stats_.experts_wasted.assign(num_layers, 0);
   size_t num_pools = pool_bounds.size() - 1;
   if (!pool_spares.empty() && pool_spares.size() != num_pools) {
     throw std::invalid_argument("ExpertService: pool_spares must hold one count per pool");
@@ -452,19 +454,15 @@ void ExpertService::submit(
     const std::vector<ExpertLoad>& loads,
     int buffer,
     std::vector<ReadTask> copies) {
-  batch.layer_id = layer_id;
-  batch.buffer = buffer;
-  batch.experts_read = static_cast<int64_t>(loads.size());
-  batch.index_of_expert.assign(num_experts_, -1);
-  for (const auto& [expert, index] : loads) {
-    batch.index_of_expert[expert] = index;
-  }
-  batch.bytes_read.store(0, std::memory_order_relaxed);
-  batch.error.clear();
-  batch.held_fills.clear();
+  begin_batch(batch, layer_id, loads, buffer);
   bool is_held = batch.is_held.load(std::memory_order_relaxed);
   const RecordLayout& record = records_[layer_id];
+  // The victim cache's copies first: they take no device time.
   std::vector<ReadTask> tasks;
+  for (ReadTask& copy : copies) {
+    copy.batch = &batch;
+    tasks.push_back(copy);
+  }
   for (int s = 0; s < segments_per_layer_; ++s) {
     int64_t segment_index = layer_id * segments_per_layer_ + s;
     const ExpertSegment& segment = segments_[segment_index];
@@ -519,23 +517,93 @@ void ExpertService::submit(
       }
       int64_t begin = record.first + first * record.stride;
       int64_t end = begin + (last - 1 - first) * record.stride + record.bytes;
-      tasks.push_back({&batch, -1, record.file_index, record.first, begin, end});
+      tasks.push_back(
+          {.batch = &batch,
+           .segment = -1,
+           .file_index = record.file_index,
+           .base = record.first,
+           .begin = begin,
+           .end = end,
+           .expert = last - first == 1 ? first : -1});
       first = last;
     }
   }
-  for (ReadTask& copy : copies) {
-    copy.batch = &batch;
-    tasks.push_back(copy);
+  enqueue(batch, std::move(tasks));
+}
+
+void ExpertService::begin_batch(
+    ReadBatch& batch,
+    int layer_id,
+    const std::vector<ExpertLoad>& loads,
+    int buffer) {
+  batch.layer_id = layer_id;
+  batch.buffer = buffer;
+  batch.experts_read = static_cast<int64_t>(loads.size());
+  batch.index_of_expert.assign(num_experts_, -1);
+  for (const auto& [expert, index] : loads) {
+    batch.index_of_expert[expert] = index;
   }
-  batch.remaining.store(static_cast<int64_t>(tasks.size()), std::memory_order_release);
+  batch.bytes_read.store(0, std::memory_order_relaxed);
+  batch.remaining.store(0, std::memory_order_relaxed);
+  batch.error.clear();
+  batch.held_fills.clear();
+}
+
+void ExpertService::fill_rows(const ReadBatch& batch) {
+  for (int s = 0; s < segments_per_layer_; ++s) {
+    int64_t segment_index = batch.layer_id * segments_per_layer_ + s;
+    const ExpertLocation* locations = &locations_[segment_index * num_experts_];
+    for (int32_t expert = 0; expert < num_experts_; ++expert) {
+      if (batch.index_of_expert[expert] >= 0 && locations[expert].file_index == FILL_FILE) {
+        fill(batch, segment_index, expert);
+      }
+    }
+  }
+}
+
+void ExpertService::enqueue(ReadBatch& batch, std::vector<ReadTask> tasks) {
   if (tasks.empty()) {
     return;
   }
+  // Counted before any can finish.
+  batch.remaining.fetch_add(static_cast<int64_t>(tasks.size()), std::memory_order_release);
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
     queue_.insert(queue_.end(), tasks.begin(), tasks.end());
   }
   queue_ready_.notify_all();
+}
+
+void ExpertService::queue_prefill_experts(
+    PrefillBuffer& buffer,
+    const std::vector<int32_t>& experts) {
+  ReadBatch& batch = *buffer.batch;
+  const RecordLayout& record = records_[batch.layer_id];
+  std::vector<ReadTask> tasks;
+  for (int32_t expert : experts) {
+    int32_t entry = buffer.entry_of_expert[expert];
+    if (entry != NO_ENTRY) {
+      tasks.push_back(
+          {.batch = &batch,
+           .entry = victims_->data(entry),
+           .index = batch.index_of_expert[expert],
+           .expert = expert});
+    }
+  }
+  for (int32_t expert : experts) {
+    if (buffer.entry_of_expert[expert] == NO_ENTRY) {
+      int64_t begin = record.first + expert * record.stride;
+      tasks.push_back(
+          {.batch = &batch,
+           .segment = -1,
+           .file_index = record.file_index,
+           .base = record.first,
+           .begin = begin,
+           .end = begin + record.bytes,
+           .expert = expert});
+    }
+  }
+  enqueue(batch, std::move(tasks));
 }
 
 void ExpertService::work(int thread_index) {
@@ -546,7 +614,7 @@ void ExpertService::work(int thread_index) {
     ReadTask task;
     {
       std::unique_lock<std::mutex> lock(queue_mutex_);
-      queue_ready_.wait(lock, [this] { return is_stopping_ || !queue_.empty(); });
+      queue_ready_.wait(lock, [this] { return is_stopping_ || (!is_paused_ && !queue_.empty()); });
       if (is_stopping_) {
         return;
       }
@@ -720,7 +788,8 @@ void ExpertService::release_spares() {
 std::vector<ExpertLoad> ExpertService::split_victim_hits(
     int layer_id,
     const std::vector<ExpertLoad>& loads,
-    std::vector<std::pair<int32_t, int32_t>>& hits) {
+    std::vector<std::pair<int32_t, int32_t>>& hits,
+    std::vector<int32_t>* hit_experts) {
   std::vector<ExpertLoad> reads;
   for (const auto& [expert, index] : loads) {
     bool is_purged = false;
@@ -730,6 +799,9 @@ std::vector<ExpertLoad> ExpertService::split_victim_hits(
       reads.emplace_back(expert, index);
     } else {
       hits.emplace_back(entry, index);
+      if (hit_experts != nullptr) {
+        hit_experts->push_back(expert);
+      }
     }
   }
   return reads;
@@ -1005,10 +1077,27 @@ void ExpertService::begin_prefill() {
   }
 }
 
-std::vector<int32_t> ExpertService::prefetch_prefill_layer(int layer_id) {
+std::vector<int32_t> ExpertService::prefetch_prefill_layer(
+    int layer_id,
+    const std::vector<int32_t>& order,
+    int reads_ahead) {
   std::lock_guard<std::mutex> lock(call_mutex_);
   check_healthy();
   check_layer(layer_id, "prefetch_prefill_layer");
+  if (!order.empty()) {
+    std::vector<uint8_t> seen(num_experts_, 0);
+    for (int32_t expert : order) {
+      if (expert < 0 || expert >= num_experts_ || seen[expert]) {
+        throw std::invalid_argument(
+            "ExpertService.prefetch_prefill_layer: the order must name every expert once");
+      }
+      seen[expert] = 1;
+    }
+    if (order.size() != static_cast<size_t>(num_experts_)) {
+      throw std::invalid_argument(
+          "ExpertService.prefetch_prefill_layer: the order must name every expert once");
+    }
+  }
   PrefillBuffer& buffer = buffers_[layer_id % 2];
   if (buffer.layer_id == layer_id) {
     return buffer.slot_map;
@@ -1022,26 +1111,113 @@ std::vector<int32_t> ExpertService::prefetch_prefill_layer(int layer_id) {
   buffer.layer_id = layer_id;
   buffer.slot_map = std::move(assignment.slots);
   buffer.is_waited = false;
-  if (!victims_) {
-    submit(*buffer.batch, layer_id, assignment.loads, layer_id % 2);
-  } else {
-    // A cached expert is copied in and stays cached, pinned until the buffer is waited.
-    try {
-      std::vector<std::pair<int32_t, int32_t>> hits;
-      std::vector<ExpertLoad> reads = split_victim_hits(layer_id, assignment.loads, hits);
+  buffer.unqueued.clear();
+  // A cached expert is copied in and stays cached, pinned until the buffer is waited.
+  try {
+    std::vector<std::pair<int32_t, int32_t>> hits;
+    std::vector<int32_t> hit_experts;
+    std::vector<ExpertLoad> reads = victims_
+        ? split_victim_hits(layer_id, assignment.loads, hits, &hit_experts)
+        : assignment.loads;
+    buffer.entry_of_expert.assign(num_experts_, NO_ENTRY);
+    for (size_t j = 0; j < hits.size(); ++j) {
+      buffer.entry_of_expert[hit_experts[j]] = hits[j].first;
+      buffer.entries.push_back(hits[j].first);
+    }
+    if (order.empty() || records_[layer_id].stride == 0) {
       std::vector<ReadTask> copies;
-      for (const auto& [entry, row] : hits) {
-        copies.push_back({.entry = victims_->data(entry), .index = row});
-        buffer.entries.push_back(entry);
+      for (size_t j = 0; j < hits.size(); ++j) {
+        const auto& [entry, row] = hits[j];
+        copies.push_back(
+            {.entry = victims_->data(entry), .index = row, .expert = hit_experts[j]});
       }
       submit(*buffer.batch, layer_id, reads, layer_id % 2, std::move(copies));
-    } catch (const std::exception& error) {
-      // The pool already maps the layer's experts to buffer rows nothing will fill.
-      fail(MailboxError::Io, std::string("ExpertService: victim cache: ") + error.what());
-      throw;
+      return buffer.slot_map;
     }
+    // In order: every absent expert has its row; the first reads_ahead are queued.
+    ReadBatch& batch = *buffer.batch;
+    begin_batch(batch, layer_id, assignment.loads, layer_id % 2);
+    batch.experts_read = static_cast<int64_t>(reads.size());
+    fill_rows(batch);
+    size_t head = reads_ahead < 0 ? order.size()
+                                  : std::min(order.size(), static_cast<size_t>(reads_ahead));
+    std::vector<int32_t> ahead;
+    for (size_t j = 0; j < order.size(); ++j) {
+      if (buffer.slot_map[order[j]] < 0) {
+        (j < head ? ahead : buffer.unqueued).push_back(order[j]);
+      }
+    }
+    queue_prefill_experts(buffer, ahead);
+  } catch (const std::exception& error) {
+    // The pool already maps the layer's experts to buffer rows nothing will fill.
+    fail(MailboxError::Io, std::string("ExpertService: victim cache: ") + error.what());
+    throw;
   }
   return buffer.slot_map;
+}
+
+int64_t ExpertService::route_prefill_layer(int layer_id, const std::vector<int32_t>& routed) {
+  std::lock_guard<std::mutex> lock(call_mutex_);
+  check_healthy();
+  check_layer(layer_id, "route_prefill_layer");
+  PrefillBuffer& buffer = buffers_[layer_id % 2];
+  if (buffer.layer_id != layer_id || buffer.is_waited) {
+    throw std::logic_error(
+        "ExpertService.route_prefill_layer: layer " + std::to_string(layer_id) +
+        " is not prefetched, or already waited");
+  }
+  std::vector<uint8_t> is_routed(num_experts_, 0);
+  for (int32_t expert : routed) {
+    if (expert < 0 || expert >= num_experts_) {
+      throw std::out_of_range(
+          "ExpertService.route_prefill_layer: expert " + std::to_string(expert) +
+          " is out of range");
+    }
+    is_routed[expert] = 1;
+  }
+  ReadBatch& batch = *buffer.batch;
+  // The queued loads of unrouted experts that have not begun.
+  std::vector<int32_t> dropped;
+  int64_t dropped_tasks = 0;
+  {
+    std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+    auto kept_end = std::remove_if(queue_.begin(), queue_.end(), [&](const ReadTask& task) {
+      if (task.batch != &batch || task.expert < 0 || is_routed[task.expert]) {
+        return false;
+      }
+      dropped.push_back(task.expert);
+      return true;
+    });
+    dropped_tasks = static_cast<int64_t>(queue_.end() - kept_end);
+    queue_.erase(kept_end, queue_.end());
+  }
+  batch.remaining.fetch_sub(dropped_tasks, std::memory_order_release);
+  // The unqueued: the routed ones now, the others never.
+  std::vector<int32_t> late;
+  for (int32_t expert : buffer.unqueued) {
+    (is_routed[expert] ? late : dropped).push_back(expert);
+  }
+  buffer.unqueued.clear();
+  queue_prefill_experts(buffer, late);
+  // Dropped copies give their entries back; dropped reads are no reads.
+  for (int32_t expert : dropped) {
+    int32_t entry = buffer.entry_of_expert[expert];
+    if (entry != NO_ENTRY) {
+      victims_->unpin(entry);
+      buffer.entries.erase(std::find(buffer.entries.begin(), buffer.entries.end(), entry));
+      buffer.entry_of_expert[expert] = NO_ENTRY;
+    } else {
+      batch.experts_read -= 1;
+    }
+  }
+  int64_t unrouted = 0;
+  for (int32_t expert = 0; expert < num_experts_; ++expert) {
+    unrouted += buffer.slot_map[expert] < 0 && !is_routed[expert];
+  }
+  int64_t num_dropped = static_cast<int64_t>(dropped.size());
+  stats_.experts_dropped[layer_id] += num_dropped;
+  stats_.experts_wasted[layer_id] += unrouted - num_dropped;
+  return num_dropped;
 }
 
 void ExpertService::wait_prefill_layer(int layer_id) {
@@ -1093,6 +1269,14 @@ void ExpertService::purge_victim_cache() {
   if (victims_) {
     victims_->purge();
   }
+}
+
+void ExpertService::pause_reads(bool is_paused) {
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    is_paused_ = is_paused;
+  }
+  queue_ready_.notify_all();
 }
 
 std::vector<int32_t> ExpertService::victim_cache_ids() {
