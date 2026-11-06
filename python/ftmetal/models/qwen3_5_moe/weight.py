@@ -19,9 +19,9 @@ from ftmetal.layers.shared_expert_moe import GATE_UP_PARTS
 from ftmetal.models.config import ModelConfig
 from ftmetal.models.loader import (
     ExpertBytes,
-    ExpertSlices,
     FuseRule,
     WeightRules,
+    stack_expert_banks,
     stacked_slices,
 )
 
@@ -85,13 +85,8 @@ def mlx_layout(
             out[key] = tensor + 1
         else:
             out[key] = tensor
-    for bank, by_expert in experts.items():
-        names, tensors = zip(*(by_expert[expert_id] for expert_id in range(len(by_expert))))
-        out[bank] = mx.stack(tensors)
-        expert_bytes[bank] = ExpertSlices(
-            names=names, offsets=(0,) * len(names), nbytes=tensors[0].nbytes
-        )
-    return out, expert_bytes
+    banks, slices = stack_expert_banks(experts)
+    return out | banks, expert_bytes | slices
 
 
 def weight_rules(model_config: ModelConfig) -> WeightRules:

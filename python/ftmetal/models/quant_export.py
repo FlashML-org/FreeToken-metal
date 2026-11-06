@@ -16,6 +16,7 @@ import mlx.core as mx
 
 from ftmetal.layers.quantization.config import FpBlockScheme, QuantScheme
 from ftmetal.models.loader import (
+    UNUSED_SCALE_SUFFIXES,
     ExpertBytes,
     ExpertFill,
     config_dict,
@@ -40,7 +41,6 @@ COMPRESSED_TENSORS_UNSERVED_FIELDS = {
     "transform_config": "rotated weights",
     "sparsity_config": "sparse weights",
 }
-UNUSED_SCALE_SUFFIXES = (".input_scale", ".input_global_scale", ".k_scale", ".v_scale")
 
 
 def output_scale(module: str, scale: mx.array, weight: mx.array) -> mx.array:

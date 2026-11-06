@@ -37,6 +37,10 @@ class FuseRule:
     parts: tuple[str, ...]
 
 
+# Scales of an export that nothing reads: activations and the KV cache's.
+UNUSED_SCALE_SUFFIXES = (".input_scale", ".input_global_scale", ".k_scale", ".v_scale")
+
+
 @dataclass(frozen=True, kw_only=True)
 class ExpertSlices:
     """Where each expert of a stacked expert tensor of the MLX layout lies in the checkpoint:
@@ -55,6 +59,28 @@ class ExpertFill:
 
 
 ExpertBytes = ExpertSlices | ExpertFill
+
+
+def stack_expert_banks(
+    experts: dict[str, dict[int, tuple[str, mx.array]]],
+) -> tuple[dict[str, mx.array], dict[str, ExpertSlices]]:
+    """Banks a checkpoint stores one tensor per expert, by bank and expert id: (checkpoint name,
+    tensor). Each stacked in expert order, with where each expert lies in the checkpoint. Scales
+    nothing reads are left out first: an export that omits a few experts' is still whole."""
+    banks: dict[str, mx.array] = {}
+    slices: dict[str, ExpertSlices] = {}
+    for bank, by_expert in experts.items():
+        if bank.endswith(UNUSED_SCALE_SUFFIXES):
+            continue
+        missing = sorted(set(range(max(by_expert) + 1)) - by_expert.keys())
+        if missing:
+            raise ValueError(f"{bank}: the checkpoint has no tensor for experts {missing[:8]}")
+        names, tensors = zip(*(by_expert[expert_id] for expert_id in range(len(by_expert))))
+        banks[bank] = mx.stack(list(tensors))
+        slices[bank] = ExpertSlices(
+            names=names, offsets=(0,) * len(names), nbytes=tensors[0].nbytes
+        )
+    return banks, slices
 
 
 def stacked_slices(name: str, tensor: mx.array, part: int = 0, num_parts: int = 1) -> ExpertSlices:
@@ -356,6 +382,7 @@ def load_weights(
 
 
 __all__ = [
+    "UNUSED_SCALE_SUFFIXES",
     "CheckpointBytes",
     "ExpertBytes",
     "ExpertFill",
@@ -380,6 +407,7 @@ __all__ = [
     "load_weights",
     "mixed_fuses",
     "read_model_config",
+    "stack_expert_banks",
     "stacked_slices",
     "weight_files",
 ]
