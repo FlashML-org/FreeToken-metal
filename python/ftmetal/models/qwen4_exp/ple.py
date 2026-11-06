@@ -36,7 +36,6 @@ from ftmetal.kernel.kvcache.pool_rows import scatter_rows
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.gdn import DepthwiseConv1d
 from ftmetal.layers.linear import Linear
-from ftmetal.layers.projection import project
 from ftmetal.layers.quantization.config import QuantScheme
 from ftmetal.mm import restore_placeholder
 from ftmetal.models.loader import weight_files
@@ -367,8 +366,8 @@ class Qwen4ExpPLE(BaseOP):
             embeddings = self.host_embeddings(batch, metadata)
         else:
             embeddings = self.step_embeddings(hyper, ticket)
-        keys = self.norm_key.forward(project(self.key_proj, embeddings)).reshape(streams)
-        values = project(self.value_proj, embeddings)
+        keys = self.norm_key.forward(self.key_proj.forward(embeddings)).reshape(streams)
+        values = self.value_proj.forward(embeddings)
         queries = self.norm_query.forward(hyper).reshape(streams)
         scores = mx.sum(
             keys.astype(mx.float32) * queries.astype(mx.float32), axis=-1, keepdims=True

@@ -7,9 +7,8 @@ kernel/moe/moe_topk Metal kernel (fp32 softmax, top-k, renorm in one launch) and
 experts are the resident MoELayer, or OffloadMoELayer under the offload strategy (FreeToken's
 make_moe_layer choice, made here), whose forward adds the gated shared expert, so that an offload
 decode runs it while its absent experts are read. Once loaded, an affine router gate and shared
-expert gate of one scheme are one projection of their rows (fuse_gates): a decode token computes
-both in one GEMV (the shared gate's one row alone would take a whole launch), the router reading
-its experts' columns in place.
+expert gate of one scheme are one LinearMerged of their rows (fuse_gates): a decode token computes
+both in one GEMV (the shared gate's one row alone would take a whole launch).
 """
 
 from __future__ import annotations
@@ -24,7 +23,6 @@ from ftmetal.layers.activation import silu_and_mul
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
 from ftmetal.layers.moe import MoELayer, OffloadMoELayer
-from ftmetal.layers.projection import fuse_rows, project, qmv_scheme, rows_forward
 from ftmetal.layers.quantization.config import QuantScheme
 from ftmetal.layers.quantization.moe import ExpertSchemes
 from ftmetal.models.config import ModelConfig
@@ -54,7 +52,7 @@ class SharedExpert(BaseOP):
         self.down_proj = Linear(intermediate_size, hidden_size, scheme=down_scheme, dtype=dtype)
 
     def forward(self, x: mx.array) -> mx.array:
-        return project(self.down_proj, silu_and_mul(project(self.gate_up_proj, x)))
+        return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
 
 
 class SharedExpertMoE(BaseOP):
@@ -109,8 +107,8 @@ class SharedExpertMoE(BaseOP):
 
     def fuse_gates(self) -> None:
         """Replace the router gate and the shared expert gate, when both are affine in one scheme,
-        by one projection of their rows (fuse_rows)."""
-        fused = fuse_rows([self.gate, self.shared_expert_gate])
+        by one LinearMerged of their rows (LinearMerged.fuse_rows)."""
+        fused = LinearMerged.fuse_rows([self.gate, self.shared_expert_gate])
         if fused is not None:
             self.gates = fused
             self.pop("gate")
@@ -120,32 +118,22 @@ class SharedExpertMoE(BaseOP):
         """The experts this block's router picks for hidden_states, int32 [T, top_k]: an offload
         prefill's prediction of this layer's routing from the layer before's MoE input."""
         if "gates" not in self:
-            logits = project(self.gate, hidden_states)
+            logits = self.gate.forward(hidden_states)
         else:
-            logits = rows_forward(self.gates, hidden_states, 0, self.num_experts)
+            logits = self.gates.forward_split(hidden_states)[0]
         return moe_topk(logits, self.top_k, self.norm_topk_prob)[0]
 
     def forward(self, hidden_states: mx.array) -> mx.array:
-        num_experts = self.num_experts
         shared_gate: mx.array | None = None
         if "gates" not in self:
-            topk_ids, topk_weights = moe_topk(
-                project(self.gate, hidden_states), self.top_k, self.norm_topk_prob
-            )
-        elif qmv_scheme(self.gates, hidden_states) is not None:
-            logits = project(self.gates, hidden_states)
-            topk_ids, topk_weights = moe_topk(
-                logits, self.top_k, self.norm_topk_prob, num_experts=num_experts
-            )
-            shared_gate = logits[:, num_experts : num_experts + 1]
+            router_logits = self.gate.forward(hidden_states)
         else:
-            router_logits = rows_forward(self.gates, hidden_states, 0, num_experts)
-            topk_ids, topk_weights = moe_topk(router_logits, self.top_k, self.norm_topk_prob)
-            shared_gate = rows_forward(self.gates, hidden_states, num_experts, num_experts + 1)
+            router_logits, shared_gate = self.gates.forward_split(hidden_states)
+        topk_ids, topk_weights = moe_topk(router_logits, self.top_k, self.norm_topk_prob)
 
         def gated_shared_expert(x: mx.array) -> tuple[mx.array, mx.array]:
             """The shared expert's output and its gate logit, which the experts add gated."""
-            gate = project(self.shared_expert_gate, x) if shared_gate is None else shared_gate
+            gate = self.shared_expert_gate.forward(x) if shared_gate is None else shared_gate
             return self.shared_expert.forward(x), gate
 
         return self.experts.forward(hidden_states, topk_weights, topk_ids, gated_shared_expert)

@@ -26,7 +26,6 @@ from ftmetal.kvcache.linear_state_pool import LinearStatePool
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
 from ftmetal.layers.norm import GatedRMSNorm
-from ftmetal.layers.projection import project, project_split
 from ftmetal.layers.quantization.config import QuantScheme
 from ftmetal.models.config import LinearGatedDeltaGroupConfig
 
@@ -133,8 +132,8 @@ class GatedDeltaNet(BaseOP):
         assert pool is not None and isinstance(metadata, LinearAttnMetadata)
         li = pool.local_index(self.layer_id)
         num_tokens = hidden_states.shape[0]
-        conv_in, z = project_split(self.in_proj_qkvz, hidden_states)
-        b, a = project_split(self.in_proj_ba, hidden_states)
+        conv_in, z = self.in_proj_qkvz.forward_split(hidden_states)
+        b, a = self.in_proj_ba.forward_split(hidden_states)
         slots = metadata.cache_indices
         kernel = self.conv_kernel_size
 
@@ -200,7 +199,7 @@ class GatedDeltaNet(BaseOP):
 
         z = z.reshape(num_tokens, self.num_v_heads, self.head_v_dim)
         out = self.norm.forward(core_out, z).reshape(num_tokens, self.value_dim)
-        return project(self.out_proj, out)
+        return self.out_proj.forward(out)
 
 
 class DepthwiseConv1d(BaseOP):

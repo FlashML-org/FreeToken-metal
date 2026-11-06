@@ -14,12 +14,12 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
+from ftmetal.kernel.gemm.affine.affine_qmv_rows import qmv_rows
 from ftmetal.kernel.hc.hc_mix import hc_mix
 from ftmetal.kernel.hc.hc_up_mix import hc_up_mix, supports_hc_up_mix
 from ftmetal.kernel.norm.offset_rms_norm import hc_norm, offset_rms_norm
 from ftmetal.layers.base import BaseOP
-from ftmetal.layers.linear import Linear
-from ftmetal.layers.projection import fuse_rows, project, qmv_scheme, rows_forward
+from ftmetal.layers.linear import Linear, LinearMerged
 from ftmetal.layers.quantization.config import QuantScheme
 from ftmetal.layers.quantization.linear import AffineLinearMethod
 
@@ -87,7 +87,7 @@ class HyperConnection(BaseOP):
     def fuse_down_inject(self) -> None:
         """Replace the down and inject projections, when both are affine in one scheme, by one
         of their rows, then zero rows up to a whole qmv_rows tile."""
-        fused = fuse_rows([self.input_mix_weight_down, self.block_inject_weight])
+        fused = LinearMerged.fuse_rows([self.input_mix_weight_down, self.block_inject_weight])
         if fused is None:
             return
         self.down_inject = fused
@@ -99,15 +99,26 @@ class HyperConnection(BaseOP):
         lowrank, hc_count = self.lowrank, self.hc_count
         if "down_inject" in self:
             fused = self.down_inject
-            if qmv_scheme(fused, normed) is not None:
-                projected = project(fused, normed, hc_epilogue=(lowrank, hc_count))
+            method = fused.quant_method
+            if isinstance(method, AffineLinearMethod) and method.uses_qmv_rows(fused, normed):
+                # The decode token's down rows activated as qmv_rows stores them.
+                scheme = method.scheme
+                projected = qmv_rows(
+                    normed,
+                    fused["weight"],
+                    fused["scales"],
+                    fused["biases"],
+                    group_size=scheme.group_size,
+                    bits=scheme.bits,
+                    hc_epilogue=(lowrank, hc_count),
+                )
                 return projected[:, :lowrank], projected[:, lowrank : lowrank + hc_count]
-            down = rows_forward(fused, normed, 0, lowrank)
-            logits = rows_forward(fused, normed, lowrank, lowrank + hc_count)
+            else:
+                down, logits = fused.forward_split(normed)
         else:
-            down = project(self.input_mix_weight_down, normed)
+            down = self.input_mix_weight_down.forward(normed)
             if "block_inject_weight" in self:
-                logits = project(self.block_inject_weight, normed)
+                logits = self.block_inject_weight.forward(normed)
             else:
                 logits = None
         activated = nn.silu(down.astype(mx.float32) / hc_count).astype(normed.dtype)
@@ -138,7 +149,7 @@ class HyperConnection(BaseOP):
                     group_size=scheme.group_size,
                     bits=scheme.bits,
                 )
-        return hc_mix(project(up, activated), normed, self.hc_count)
+        return hc_mix(up.forward(activated), normed, self.hc_count)
 
     def norm(self, hyper: mx.array, pending: PendingBranch | None) -> tuple[mx.array, mx.array]:
         """(normed streams, streams): hyper with the pending branch injected."""

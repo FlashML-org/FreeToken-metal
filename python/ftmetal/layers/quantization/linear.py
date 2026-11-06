@@ -6,7 +6,9 @@ registry, and a method has no kernel table or finalize step, MLX's op being each
 kernel; MLX affine and float block modes take the place of FreeToken's fp8 / fp4 / GGUF kinds;
 apply reads the arrays
 by role from a mapping (the layer itself) rather than the layer's attributes, and the layer adds
-its bias after apply, MLX's quantized matmul taking none.
+its bias after apply, MLX's quantized matmul taking none. The affine method runs one token as
+qmv_rows (kernel/gemm/affine/affine_qmv_rows: MLX's qmv_fast at one output row per simdgroup, the
+same values) where it takes the shape (FTMETAL_QMV_ROWS), else MLX's quantized matmul.
 """
 
 from __future__ import annotations
@@ -14,12 +16,27 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
-from functools import partial
+from functools import cache, partial
 
 import mlx.core as mx
 
+from ftmetal.env import read_env
+from ftmetal.kernel.gemm.affine.affine_qmv_rows import qmv_rows, supports_qmv_rows
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.quantization.config import AffineScheme, FpBlockScheme, QuantScheme
+
+
+@cache
+def qmv_rows_min_rows() -> int | None:
+    """FTMETAL_QMV_ROWS: from how many output rows an affine linear runs one token as qmv_rows;
+    1 (default) wherever it takes the shape, 0 never (None)."""
+    value = read_env("QMV_ROWS") or "1"
+    if not value.isdigit():
+        raise ValueError(f"FTMETAL_QMV_ROWS must be a whole number, got {value!r}")
+    elif value == "0":
+        return None
+    else:
+        return int(value)
 
 
 @partial(mx.compile, shapeless=True)
@@ -72,11 +89,46 @@ class AffineLinearMethod(LinearMethod):
             setattr(layer, role, mx.zeros(spec.shape, dtype=spec.dtype))
 
     def apply(self, weights: Mapping[str, mx.array], x: mx.array) -> mx.array:
+        if self.uses_qmv_rows(weights, x):
+            return qmv_rows(
+                x,
+                weights["weight"],
+                weights["scales"],
+                weights["biases"],
+                group_size=self.scheme.group_size,
+                bits=self.scheme.bits,
+            )
+        else:
+            return self.matmul(x, weights["weight"], weights["scales"], weights["biases"])
+
+    def uses_qmv_rows(self, weights: Mapping[str, mx.array], x: mx.array) -> bool:
+        """Whether apply runs x as qmv_rows: one token of a shape it takes, from
+        qmv_rows_min_rows() output rows."""
+        weight = weights["weight"]
+        min_rows = qmv_rows_min_rows()
+        return (
+            min_rows is not None
+            and weight.shape[0] >= min_rows
+            and supports_qmv_rows(
+                x, weight, weights["scales"], self.scheme.group_size, self.scheme.bits
+            )
+        )
+
+    def apply_rows(
+        self, weights: Mapping[str, mx.array], x: mx.array, start: int, stop: int
+    ) -> mx.array:
+        """x through the output rows start..stop alone (MLX's quantized matmul)."""
+        rows = slice(start, stop)
+        return self.matmul(
+            x, weights["weight"][rows], weights["scales"][rows], weights["biases"][rows]
+        )
+
+    def matmul(self, x: mx.array, w: mx.array, scales: mx.array, biases: mx.array) -> mx.array:
         return mx.quantized_matmul(
             x,
-            weights["weight"],
-            weights["scales"],
-            weights["biases"],
+            w,
+            scales,
+            biases,
             transpose=True,
             group_size=self.scheme.group_size,
             bits=self.scheme.bits,

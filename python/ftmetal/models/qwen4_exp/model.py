@@ -9,9 +9,8 @@ from the checkpoint's quantization map at construction; a sublayer's output is i
 the streams by the next hyper-connection as it norms them (a pending branch), the last
 layer's by the final mixer, after the last rows are selected; once the weights load
 (FinishesLoading) the PLE tables are opened from the checkpoint files and each
-hyper-connection's down and inject projections fused; a decode token's projections run on
-kernel/gemm/affine/affine_qmv_rows; the PLE layers' row service is armed before each decode step
-and checked once its tokens land (ServesStepLookups).
+hyper-connection's down and inject projections fused; the PLE layers' row service is armed
+before each decode step and checked once its tokens land (ServesStepLookups).
 """
 
 from __future__ import annotations
@@ -26,7 +25,6 @@ from ftmetal.layers.base import BaseOP
 from ftmetal.layers.embedding import Embedding
 from ftmetal.layers.gdn import IN_PROJ_BA_PARTS, IN_PROJ_QKVZ_PARTS, GatedDeltaNet
 from ftmetal.layers.linear import Linear
-from ftmetal.layers.projection import project
 from ftmetal.layers.quantization.config import QuantScheme
 from ftmetal.layers.quantization.moe import ExpertSchemes
 from ftmetal.layers.shared_expert_moe import GATE_UP_PARTS, SharedExpertMoE
@@ -271,7 +269,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         if self.config.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(hidden)
         else:
-            return project(self.lm_head, hidden)
+            return self.lm_head.forward(hidden)
 
     def encode(self, item: MMItem) -> mx.array:
         """[item.num_tokens, out_hidden_size] soft tokens of one image."""

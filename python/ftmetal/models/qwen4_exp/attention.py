@@ -19,7 +19,6 @@ from ftmetal.kernel.norm.offset_rms_norm import offset_rms_norm_rope, supports_o
 from ftmetal.layers.activation import sigmoid_gate
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
-from ftmetal.layers.projection import project, project_split
 from ftmetal.layers.quantization.config import QuantScheme
 from ftmetal.layers.rotary import MRotaryEmbedding, RotaryEmbedding
 from ftmetal.models.config import QSAAttentionGroupConfig, RotaryConfig
@@ -90,7 +89,7 @@ class QSAIndexer(BaseOP):
 
     def forward(self, x: mx.array, positions: mx.array) -> QSAIndexInputs:
         num_tokens = x.shape[0]
-        projected = project(self.index_qk_proj, x).reshape(
+        projected = self.index_qk_proj.forward(x).reshape(
             num_tokens, self.num_heads + 1, self.head_dim
         )
         queries = norm_rope(
@@ -138,7 +137,7 @@ class Qwen4ExpAttention(BaseOP):
 
     def forward(self, x: mx.array, batch: Batch) -> mx.array:
         num_tokens = x.shape[0]
-        qg, k, v = project_split(self.qkv_proj, x)
+        qg, k, v = self.qkv_proj.forward_split(x)
         qg = qg.reshape(num_tokens, self.num_q, 2 * self.head_dim)
         q, gate = mx.split(qg, 2, axis=-1)
         gate = gate.reshape(num_tokens, self.qo_attn_dim)
@@ -153,7 +152,7 @@ class Qwen4ExpAttention(BaseOP):
         assert isinstance(backend, QSAAttnBackend)
         o = backend.qsa_forward(q, k, v, index, self.layer_id, batch)
         o = sigmoid_gate(o.reshape(num_tokens, self.qo_attn_dim), gate)
-        return project(self.o_proj, o)
+        return self.o_proj.forward(o)
 
 
 __all__ = ["QSAIndexer", "Qwen4ExpAttention"]

@@ -1,12 +1,11 @@
 // One simdgroup per row, the probabilities in registers: lane l holds experts l, l + 32, ...
 // (PER of them). Each lane keeps its best expert (ties to its lowest); a pick takes the simdgroup's
 // best (ties to the lowest expert) and only the winning lane rescans its own, so the serial
-// selection reads no threadgroup memory and takes no barrier. The logits of row r are gates[r * GS
-// + e], e < E.
+// selection reads no threadgroup memory and takes no barrier.
 constexpr int PER = (E + 31) / 32;
 const uint row = thread_position_in_grid.x / 32;
 const int lane = thread_index_in_simdgroup;
-auto logits = gates + row * GS;
+auto logits = gates + row * E;
 
 float probs[PER];
 float row_max = -INFINITY;

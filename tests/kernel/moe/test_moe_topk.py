@@ -58,26 +58,3 @@ def test_moe_topk_matches_ops_path(
         for a, b in zip(got, want):
             assert abs(a - b) <= tolerance * max(1.0, abs(b))
     assert ids.dtype == mx.int32 and weights.dtype == dtype
-
-
-@pytest.mark.parametrize(
-    ("num_experts", "stride", "top_k", "dtype", "num_rows"),
-    [
-        (512, 520, 10, mx.bfloat16, 4),
-        (256, 264, 8, mx.bfloat16, 6),
-        (16, 24, 4, mx.float32, 7),
-    ],
-    ids=["E512-in-S520", "E256-in-S264", "E16-in-S24"],
-)
-def test_moe_topk_reads_a_wider_row_in_place(
-    num_experts: int, stride: int, top_k: int, dtype: mx.Dtype, num_rows: int
-) -> None:
-    mx.random.seed(num_experts + stride + num_rows)
-    wide = (3.0 * mx.random.normal((num_rows, stride))).astype(dtype)
-    # Equal logits on two experts: the tie goes to the lower index either way.
-    wide[:, 3] = wide[:, 1]
-    expected_ids, expected_weights = moe_topk(mx.contiguous(wide[:, :num_experts]), top_k, True)
-    ids, weights = moe_topk(wide, top_k, True, num_experts=num_experts)
-    assert mx.array_equal(ids, expected_ids).item()
-    bits = mx.uint16 if dtype == mx.bfloat16 else mx.uint32
-    assert mx.array_equal(weights.view(bits), expected_weights.view(bits)).item()
