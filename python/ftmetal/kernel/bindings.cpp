@@ -11,8 +11,8 @@
 #include "attention/mha/mha_prefill.h"
 #include "embedding/ple_lookup.h"
 #include "kvcache/pool_rows.h"
-#include "moe/affine/affine_swiglu_pending.h"
-#include "moe/affine/affine_swiglu_pending_shared.h"
+#include "moe/affine/affine_glu_pending.h"
+#include "moe/affine/affine_glu_pending_shared.h"
 #include "moe/gather_sorted.h"
 #include "moe/moe_lookup.h"
 #include "sample/sample_tokens.h"
@@ -39,10 +39,7 @@ NB_MODULE(_C, m) {
       "unquantized_source"_a);
   m.def("init_sample_tokens_library", &ftmetal::init_sample_tokens_library, "source"_a);
   m.def("init_moe_lookup_library", &ftmetal::init_moe_lookup_library, "source"_a);
-  m.def(
-      "init_affine_swiglu_pending_library",
-      &ftmetal::init_affine_swiglu_pending_library,
-      "source"_a);
+  m.def("init_affine_glu_pending_library", &ftmetal::init_affine_glu_pending_library, "source"_a);
   m.def("init_ple_lookup_library", &ftmetal::init_ple_lookup_library, "source"_a);
 
   m.def(
@@ -306,8 +303,8 @@ NB_MODULE(_C, m) {
       "moe_lookup for a decode without the wait: the absent experts posted, their pairs' slots negative; returns (slots, issued, mailbox, last_use, hit_stats).");
 
   m.def(
-      "affine_swiglu_pending",
-      &ftmetal::affine_swiglu_pending,
+      "affine_glu_pending",
+      &ftmetal::affine_glu_pending,
       "x"_a,
       "w"_a,
       "scales_or_codes"_a,
@@ -325,9 +322,10 @@ NB_MODULE(_C, m) {
       "bits"_a,
       "code_bits"_a,
       "is_fast"_a,
+      "activation"_a,
       nb::kw_only(),
       "stream"_a = nb::none(),
-      "silu_and_mul of a MoE layer's routed gate_up rows, the pending pairs' computed once the CPU answered moe_lookup_issue's request; returns (act, slots, mailbox).");
+      "activation(gate) * up of a MoE layer's routed gate_up rows, the pending pairs' computed once the CPU answered moe_lookup_issue's request; returns (act, slots, mailbox).");
 
   nb::class_<ftmetal::SlotLru>(m, "SlotLru")
       .def(

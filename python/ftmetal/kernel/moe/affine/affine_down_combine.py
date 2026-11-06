@@ -1,7 +1,7 @@
 """affine_down_combine: the offload decode's down projection of one MoE layer's routed pairs, their
 routing-weighted sum and the shared expert's gated add, in one launch.
 
-No FreeToken donor. After affine_swiglu_pending: each pair's act row through the down bank at its
+No FreeToken donor. After affine_glu_pending: each pair's act row through the down bank at its
 resolved slot, as mx.gather_qmm computes it (affine_slot_qmv.h, on the impl MLX's gather_qmv
 picks), then (y.squeeze(-2) * weights[..., None]).sum(axis=-2) in the dtype, its products and
 partial sums rounded and ordered as MLX's multiply and column reduction round and order them,
@@ -29,7 +29,7 @@ from ftmetal.kernel.moe.affine.affine_gather_qmv_pair_codes import (
     SIMD_WIDTH,
     affine_gather_qmv_pair_codes,
 )
-from ftmetal.kernel.moe.affine.affine_swiglu_pending import ExpertScales, PairCodeScales
+from ftmetal.kernel.moe.affine.affine_glu_pending import ExpertScales, PairCodeScales
 
 # Output rows per threadgroup; its simdgroups are the token's top_k pairs.
 ROWS_PER_THREADGROUP = 4

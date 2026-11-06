@@ -7,7 +7,7 @@
 // watchdog answers a stuck request FAILED the same way; a shutdown sets the shutdown word, then
 // Acknowledged = Sequence, then State SHUTDOWN. moe_lookup and ple_wait wait in one threadgroup and
 // return State to IDLE (SHUTDOWN after a shutdown) themselves. moe_lookup_issue posts and returns;
-// the waiters of its request (affine_swiglu_pending's threadgroups, any number) each spin until
+// the waiters of its request (affine_glu_pending's threadgroups, any number) each spin until
 // Acknowledged equals the issued sequence, or the shutdown word is set, and take the request as
 // answered when State then reads DONE. Nobody returns State to IDLE after an issued request: it
 // holds the answer until the next post, and no post may run before every waiter finished: the

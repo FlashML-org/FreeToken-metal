@@ -103,7 +103,7 @@ MoeForwardMode = Literal["decode", "copy_miss", "overlap"]
 
 class IssuedLookup(NamedTuple):
     """A decode layer's lookup posted without its wait (moe_lookup_issue), for the kernels that
-    wait for it (affine_swiglu_pending)."""
+    wait for it (affine_glu_pending)."""
 
     # int32 [T, top_k]: each pair's slot in the layer's pool, negative where it is pending.
     slots: mx.array

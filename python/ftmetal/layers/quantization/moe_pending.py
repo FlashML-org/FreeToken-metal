@@ -1,13 +1,13 @@
 """An affine offload decode on its issued lookup: the resident pairs' gate_up and the shared expert
-run while the CPU reads the absent experts, which affine_swiglu_pending waits for in the kernel.
+run while the CPU reads the absent experts, which affine_glu_pending waits for in the kernel.
 
 No FreeToken donor. A decode layer whose lookup moe_lookup_issue posted without its wait (an
 OffloadMoeCache under split_lookup) runs four kernels where AffineMoEMethod.apply_slots and the
 shared expert's add run six or more: the resident gate_up pass (affine_gather_qmv, or
-affine_gather_qmv_pair_codes with skip_pending), the shared expert, affine_swiglu_pending (the
-absent pairs' gate_up once read, silu_and_mul for all) and affine_down_combine (down, the routing
-weighted sum and the shared expert's add, gated when it has a gate). The output equals the other
-path's bit for bit.
+affine_gather_qmv_pair_codes with skip_pending), the shared expert, affine_glu_pending (the
+absent pairs' gate_up once read, the gated activation, silu or gelu_tanh, for all) and
+affine_down_combine (down, the routing weighted sum and the shared expert's add, gated when it has
+a gate). The output equals the other path's bit for bit.
 """
 
 from __future__ import annotations
@@ -28,12 +28,12 @@ from ftmetal.kernel.moe.affine.affine_gather_qmv_pair_codes import (
     GROUP_SIZES,
     affine_gather_qmv_pair_codes,
 )
-from ftmetal.kernel.moe.affine.affine_swiglu_pending import (
+from ftmetal.kernel.moe.affine.affine_glu_pending import (
     ACT_ROWS_PER_SIMDGROUP,
     AffineScales,
     ExpertScales,
     PairCodeScales,
-    affine_swiglu_pending,
+    affine_glu_pending,
 )
 from ftmetal.layers.quantization.config import AffineScheme
 from ftmetal.layers.quantization.moe import AffineMoEMethod, SharedExpertForward
@@ -50,13 +50,12 @@ class PendingOutputs(NamedTuple):
 
 
 def supports_pending(method: AffineMoEMethod, x: mx.array, topk_weights: mx.array) -> bool:
-    """Whether apply_pending runs this forward: silu over one gate_up projection and down, both
-    affine in the kernels' bits and group sizes, at shapes they take, the routing weights in x's
-    dtype, the banks'."""
+    """Whether apply_pending runs this forward: one gate_up projection and down, both affine in
+    the kernels' bits and group sizes, at shapes they take, the routing weights in x's dtype, the
+    banks'."""
     cfg = method.cfg
     return (
-        cfg.activation == "silu"
-        and list(method.projections) == ["gate_up_proj", "down_proj"]
+        list(method.projections) == ["gate_up_proj", "down_proj"]
         and all(
             isinstance(scheme, AffineScheme)
             and scheme.bits in GATHER_QMV_FAST_INPUT_STEP
@@ -127,7 +126,7 @@ def apply_pending(
             after = shared
         else:
             (after,) = mx.depends([shared], [shared_gate])
-    act, slots, mailbox = affine_swiglu_pending(
+    act, slots, mailbox = affine_glu_pending(
         h,
         gate_up_weight,
         gate_up_scales,
@@ -142,6 +141,7 @@ def apply_pending(
         num_experts=method.cfg.num_experts,
         group_size=gate_up_scheme.group_size,
         bits=gate_up_scheme.bits,
+        activation=method.cfg.activation,
     )
     out = affine_down_combine(
         act,

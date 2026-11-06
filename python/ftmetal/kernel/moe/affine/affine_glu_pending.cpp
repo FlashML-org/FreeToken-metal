@@ -1,11 +1,12 @@
-#include "moe/affine/affine_swiglu_pending.h"
+#include "moe/affine/affine_glu_pending.h"
 
+#include <map>
 #include <stdexcept>
 
 #include "common/mailbox.h"
 #include "common/metal_primitive.h"
+#include "moe/affine/affine_glu_pending_shared.h"
 #include "moe/affine/affine_pair_codes_shared.h"
-#include "moe/affine/affine_swiglu_pending_shared.h"
 #include "mlx/allocator.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/utils.h"
@@ -14,9 +15,14 @@ namespace ftmetal {
 
 namespace {
 
-std::string affine_swiglu_pending_source;
+std::string affine_glu_pending_source;
 const int SIMD_WIDTH = 32;
-const std::string OP_NAME = "affine_swiglu_pending";
+const std::string OP_NAME = "affine_glu_pending";
+// Each activation's functor in the Metal source, its Act template argument.
+const std::map<std::string, std::string> ACT_FUNCTORS = {
+    {"silu", "Silu"},
+    {"gelu_tanh", "GeluTanh"},
+};
 
 void check(bool condition, const std::string& expected) {
   if (!condition) {
@@ -26,11 +32,11 @@ void check(bool condition, const std::string& expected) {
 
 } // namespace
 
-void init_affine_swiglu_pending_library(const std::string& source) {
-  affine_swiglu_pending_source = source;
+void init_affine_glu_pending_library(const std::string& source) {
+  affine_glu_pending_source = source;
 }
 
-std::vector<mx::array> affine_swiglu_pending(
+std::vector<mx::array> affine_glu_pending(
     const mx::array& x,
     const mx::array& w,
     const mx::array& scales_or_codes,
@@ -48,7 +54,9 @@ std::vector<mx::array> affine_swiglu_pending(
     int bits,
     int code_bits,
     bool is_fast,
+    const std::string& activation,
     mx::StreamOrDevice s) {
+  check(ACT_FUNCTORS.count(activation) == 1, "activation must be silu or gelu_tanh");
   check_affine_quantization(OP_NAME, group_size, bits);
   check(
       code_bits >= 0 && code_bits <= MAX_PAIR_CODE_BITS,
@@ -109,10 +117,10 @@ std::vector<mx::array> affine_swiglu_pending(
   return mx::array::make_arrays(
       {{num_rows, top_k, 1, intermediate_size}, {num_rows, top_k}, mailbox.shape()},
       {x.dtype(), mx::int32, mx::uint32},
-      std::make_shared<AffineSwigluPending>(
+      std::make_shared<AffineGluPending>(
           stream,
-          AffineSwigluPendingConfig{
-              layer_id, slot_base, num_experts, group_size, bits, code_bits, is_fast}),
+          AffineGluPendingConfig{
+              layer_id, slot_base, num_experts, group_size, bits, code_bits, is_fast, activation}),
       {mx::contiguous(x, false, stream),
        w,
        scales_or_codes,
@@ -125,16 +133,16 @@ std::vector<mx::array> affine_swiglu_pending(
        after});
 }
 
-bool AffineSwigluPending::is_equivalent(const mx::Primitive& other) const {
-  auto* pending = dynamic_cast<const AffineSwigluPending*>(&other);
+bool AffineGluPending::is_equivalent(const mx::Primitive& other) const {
+  auto* pending = dynamic_cast<const AffineGluPending*>(&other);
   return pending != nullptr && pending->config_ == config_;
 }
 
-void AffineSwigluPending::eval_cpu(const std::vector<mx::array>&, std::vector<mx::array>&) {
-  throw std::runtime_error("ftmetal affine_swiglu_pending: GPU only");
+void AffineGluPending::eval_cpu(const std::vector<mx::array>&, std::vector<mx::array>&) {
+  throw std::runtime_error("ftmetal affine_glu_pending: GPU only");
 }
 
-void AffineSwigluPending::eval_gpu(
+void AffineGluPending::eval_gpu(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
   // inputs: x, w, scale rows, bias rows, gate_up_resident, slots, issued, slot_of, mailbox and
@@ -142,7 +150,7 @@ void AffineSwigluPending::eval_gpu(
   for (int i : {1, 2, 3, 7, 8}) {
     if (!inputs[i].flags().row_contiguous) {
       throw std::runtime_error(
-          "ftmetal affine_swiglu_pending: the banks, slot_of and the mailbox must be row "
+          "ftmetal affine_glu_pending: the banks, slot_of and the mailbox must be row "
           "contiguous");
     }
   }
@@ -160,31 +168,32 @@ void AffineSwigluPending::eval_gpu(
   int top_k = inputs[5].shape(1);
   int intermediate_size = w.shape(1) / 2;
   std::string type = metal_type(x.dtype(), OP_NAME);
-  std::string library_name = "ftmetal_affine_swiglu_pending_" + type + "_gs_" +
+  std::string library_name = "ftmetal_affine_glu_pending_" + type + "_gs_" +
       std::to_string(c.group_size) + "_b_" + std::to_string(c.bits) + "_c_" +
-      std::to_string(c.code_bits) + (c.is_fast ? "_fast" : "");
+      std::to_string(c.code_bits) + (c.is_fast ? "_fast" : "") + "_" + c.activation;
 
   auto s = stream();
   auto& d = mx::metal::device(s.device);
   auto* library = d.get_library(library_name, [&]() {
-    std::string templated = affine_swiglu_pending_source;
+    std::string templated = affine_glu_pending_source;
     replace_all(templated, "{{T}}", type);
     replace_all(templated, "{{GROUP_SIZE}}", std::to_string(c.group_size));
     replace_all(templated, "{{BITS}}", std::to_string(c.bits));
     replace_all(templated, "{{CODE_BITS}}", std::to_string(c.code_bits));
     replace_all(templated, "{{FAST}}", c.is_fast ? "true" : "false");
+    replace_all(templated, "{{ACT}}", ACT_FUNCTORS.at(c.activation));
     return templated;
   });
 
   auto& encoder = mx::metal::get_command_encoder(s);
-  encoder.set_compute_pipeline_state(d.get_kernel("affine_swiglu_pending", library));
+  encoder.set_compute_pipeline_state(d.get_kernel("affine_glu_pending", library));
   for (int i = 0; i < 8; ++i) {
     encoder.set_input_array(inputs[i], i);
   }
   encoder.set_output_array(outputs[2], 8);
   encoder.set_output_array(act, 9);
   encoder.set_output_array(resolved_slots, 10);
-  SwigluPendingParams params{
+  GluPendingParams params{
       hidden_size,
       intermediate_size,
       top_k,
@@ -193,13 +202,13 @@ void AffineSwigluPending::eval_gpu(
       c.slot_base,
       c.code_bits == 0 ? 0 : static_cast<int>(inputs[2].shape(1))};
   encoder.set_bytes(params, 11);
-  int act_rows_per_threadgroup = SWIGLU_PENDING_SIMDGROUPS * ACT_ROWS_PER_SIMDGROUP;
+  int act_rows_per_threadgroup = GLU_PENDING_SIMDGROUPS * ACT_ROWS_PER_SIMDGROUP;
   encoder.dispatch_threadgroups(
       MTL::Size(
           1,
           (intermediate_size + act_rows_per_threadgroup - 1) / act_rows_per_threadgroup,
           num_rows * top_k),
-      MTL::Size(SIMD_WIDTH, SWIGLU_PENDING_SIMDGROUPS, 1));
+      MTL::Size(SIMD_WIDTH, GLU_PENDING_SIMDGROUPS, 1));
 }
 
 } // namespace ftmetal

@@ -4,7 +4,7 @@ No FreeToken donor. The offload decode's resident pass (moe_lookup_issue's slots
 affine_gather_qmv_fast and affine_gather_qmv (quantized.h) over each pair's slot, on the impl MLX's
 gather_qmv picks for the shape (affine_slot_qmv.h), so every row equals mx.gather_qmm's (unsorted,
 one row per pair) bit for bit, while a pair whose slot is negative, its expert absent, is left
-unwritten for affine_swiglu_pending.
+unwritten for affine_glu_pending.
 """
 
 from __future__ import annotations

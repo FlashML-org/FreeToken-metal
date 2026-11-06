@@ -38,7 +38,7 @@ nanobind_add_module(
   ${CMAKE_CURRENT_LIST_DIR}/attention/mha/mha_prefill.cpp
   ${CMAKE_CURRENT_LIST_DIR}/embedding/ple_lookup.cpp
   ${CMAKE_CURRENT_LIST_DIR}/kvcache/pool_rows.cpp
-  ${CMAKE_CURRENT_LIST_DIR}/moe/affine/affine_swiglu_pending.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/moe/affine/affine_glu_pending.cpp
   ${CMAKE_CURRENT_LIST_DIR}/moe/gather_sorted.cpp
   ${CMAKE_CURRENT_LIST_DIR}/moe/moe_lookup.cpp
   ${CMAKE_CURRENT_LIST_DIR}/sample/sample_tokens.cpp

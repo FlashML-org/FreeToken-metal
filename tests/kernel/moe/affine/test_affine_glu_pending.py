@@ -1,27 +1,27 @@
-"""affine_swiglu_pending against the offload decode's ops with a waiting lookup, exactly, and its
+"""affine_glu_pending against the offload decode's ops with a waiting lookup, exactly, and its
 wait on the mailbox (common/mailbox.h).
 
 First the kernel alone, after moe_lookup_issue and the resident gate_up pass over a pool of random
 affine experts (plain, or pair codes of 13 and 16 bits), with the CPU's answer written into the
 mailbox and slot_of by the test, before the kernel runs or while its threadgroups wait: the resolved
 slots must be moe_lookup's for the same request (an answered miss its new slot, a padding pair and
-an unanswered miss the first pair's, or the pool's first slot) and act must equal silu_and_mul of
-mx.gather_qmm's gate_up rows at them, bit for bit. Requests are answered DONE, answered FAILED,
-released by the shutdown word, refused by it before the post, given up on past the mailbox's spin
-limit (after which the next lookup posts nothing), or not needed (no expert absent, no real row).
-Shapes: Qwen3.6's and Qwen3.8-Flash-Next's gate_up (whose hidden 2560 is K) at 1 and 22 rows, the
-test models', bits 2-6 and 8, each dtype.
+an unanswered miss the first pair's, or the pool's first slot) and act must equal silu_and_mul (or
+gelu_tanh_and_mul) of mx.gather_qmm's gate_up rows at them, bit for bit. Requests are answered DONE,
+answered FAILED, released by the shutdown word, refused by it before the post, given up on past the
+mailbox's spin limit (after which the next lookup posts nothing), or not needed (no expert absent,
+no real row). Shapes: Qwen3.6's and Qwen3.8-Flash-Next's gate_up (whose hidden 2560 is K) at 1 and
+22 rows, Gemma4 26B-A4B's under gelu_tanh, the test models', bits 2-6 and 8, each dtype.
 
 Then the four kernels of a decode MoE layer (moe_lookup_issue, the resident pass,
-affine_swiglu_pending, affine_down_combine with the shared expert's gated add) on an offload cache
+affine_glu_pending, affine_down_combine with the shared expert's gated add) on an offload cache
 whose C++ coordinator answers: a chain of layers per step, each layer's ids depending on the layer
 before, must give the outputs, slots, slot_of and last_use of a twin cache running the waiting
 lookup's path (moe_lookup, AffineMoEMethod.apply_slots, sigmoid_gated_add), eagerly and as a
-replayed command graph, in plain and pair-code rows. Last the wait's edges on a cache: a coordinator
-in the test that reads the misses into their slots while the waiters spin, a request the watchdog
-fails, a shutdown releasing the waiters, a failed read; the unanswered fall back as moe_lookup's do.
-And apply_pending's order: a probe in the shared expert's place must run while the request is
-posted and unanswered, after the issue and before the waiters.
+replayed command graph, in plain and pair-code rows, and under gelu_tanh with no shared expert. Last
+the wait's edges on a cache: a coordinator in the test that reads the misses into their slots while
+the waiters spin, a request the watchdog fails, a shutdown releasing the waiters, a failed read; the
+unanswered fall back as moe_lookup's do. And apply_pending's order: a probe in the shared expert's
+place must run while the request is posted and unanswered, after the issue and before the waiters.
 """
 
 from __future__ import annotations
@@ -43,15 +43,15 @@ from ftmetal.kernel._ext import _C
 from ftmetal.kernel.custom import metal_kernel
 from ftmetal.kernel.moe.affine.affine_gather_qmv import affine_gather_qmv
 from ftmetal.kernel.moe.affine.affine_gather_qmv_pair_codes import affine_gather_qmv_pair_codes
-from ftmetal.kernel.moe.affine.affine_swiglu_pending import (
+from ftmetal.kernel.moe.affine.affine_glu_pending import (
     AffineScales,
     ExpertScales,
     PairCodeScales,
-    affine_swiglu_pending,
+    affine_glu_pending,
 )
 from ftmetal.kernel.moe.moe_lookup import moe_lookup_issue
 from ftmetal.kernel.ref import pair_code_bank_ref
-from ftmetal.layers.activation import sigmoid_gated_add, silu_and_mul
+from ftmetal.layers.activation import gelu_tanh_and_mul, sigmoid_gated_add, silu_and_mul
 from ftmetal.layers.quantization.config import AffineScheme
 from ftmetal.layers.quantization.moe import AffineMoEMethod, MoEConfig, moe_method
 from ftmetal.layers.quantization.moe_pending import apply_pending, supports_pending
@@ -116,6 +116,7 @@ class Case:
     is_first_absent: bool = False
     answer: Answer = "done"
     is_late: bool = False
+    activation: Literal["silu", "gelu_tanh"] = "silu"
 
     def __str__(self) -> str:
         dtype = {mx.bfloat16: "bf16", mx.float16: "fp16", mx.float32: "fp32"}[self.dtype]
@@ -125,7 +126,7 @@ class Case:
             f"T{self.tokens}r{real}-k{self.top_k}-H{self.hidden_size}-I{self.intermediate_size}"
             f"-g{self.group_size}-b{self.bits}-{dtype}-{scales}-E{self.num_experts}"
             f"-a{self.num_absent}{'f' if self.is_first_absent else ''}-{self.answer}"
-            f"{'-late' if self.is_late else ''}"
+            f"{'-late' if self.is_late else ''}-{self.activation}"
         )
 
 
@@ -140,9 +141,27 @@ CASES = [
     Case(1, 10, 2560, 640, group_size=32, num_experts=512, code_bits=13),
     Case(22, 10, 2560, 640, group_size=32, num_experts=512, num_real_rows=20, is_late=True),
     Case(2, 10, 2560, 640, group_size=32, dtype=mx.float32, num_experts=512, code_bits=16),
+    # Gemma4 26B-A4B (hidden 2816, width 704, top 8, 128 experts) under gelu_tanh: one decode row,
+    # the decode cap answered while the kernel waits, pair codes, and the fast impl in fp16.
+    Case(1, 8, 2816, 704, num_experts=128, activation="gelu_tanh"),
+    Case(
+        22,
+        8,
+        2816,
+        704,
+        num_experts=128,
+        num_real_rows=19,
+        is_late=True,
+        code_bits=13,
+        activation="gelu_tanh",
+    ),
+    Case(3, 8, 2048, 512, dtype=mx.float16, is_first_absent=True, activation="gelu_tanh"),
+    # fp32 shows what bf16 and fp16 round away: an fma in the activation differs by an ulp.
+    Case(4, 8, 512, 256, group_size=32, dtype=mx.float32, num_experts=16, activation="gelu_tanh"),
     # tests/tiny_model.py and tests/offload_harness.py.
     Case(5, 2, 64, 96, group_size=32, dtype=mx.float32, num_experts=8, num_absent=2),
     Case(4, 4, 64, 256, group_size=32, num_experts=8, num_absent=2, code_bits=13),
+    Case(5, 2, 64, 32, group_size=32, dtype=mx.float32, num_experts=8, activation="gelu_tanh"),
     Case(3, 2, 128, 64, num_experts=32, num_real_rows=2, is_first_absent=True),
     Case(9, 2, 192, 128, bits=8, dtype=mx.float16, num_experts=32, is_late=True),
     Case(2, 2, 2048, 2048, num_experts=32, num_absent=2),
@@ -165,6 +184,16 @@ CASES = [
     Case(3, 8, 2048, 512, num_real_rows=2, num_absent=0),
     Case(4, 8, 2048, 512, num_real_rows=0, num_absent=0),
 ]
+
+
+def test_unknown_activation_is_refused() -> None:
+    x = mx.zeros((1, 1, 1, 64), dtype=mx.float32)
+    w = mx.zeros((1, 8, 8), dtype=mx.uint32)
+    ints = mx.zeros((1, 1), dtype=mx.int32)
+    with pytest.raises(ValueError, match="activation must be silu or gelu_tanh"):
+        _C.affine_glu_pending(
+            x, w, x, x, x, ints, ints, ints, x, x, 0, 0, 8, 64, 4, 0, False, "relu"
+        )
 
 
 def gate_up_bank(
@@ -214,7 +243,7 @@ def resident_gate_up(
 
 
 @pytest.mark.parametrize("case", CASES, ids=str)
-def test_matches_lookup_and_silu_and_mul(case: Case) -> None:
+def test_matches_lookup_and_the_activation(case: Case) -> None:
     rng = np.random.default_rng(case.hidden_size * 13 + case.tokens * 7 + case.num_absent)
     num_real_rows = case.tokens if case.num_real_rows is None else case.num_real_rows
     # Rows draw their experts from a few candidates, so that the pool stays small.
@@ -284,7 +313,7 @@ def test_matches_lookup_and_silu_and_mul(case: Case) -> None:
     gate_up = resident_gate_up(
         x, w, scale_source, lookup.slots, group_size=case.group_size, bits=case.bits
     )
-    act, resolved_slots, waited_mailbox = affine_swiglu_pending(
+    act, resolved_slots, waited_mailbox = affine_glu_pending(
         x,
         w,
         scale_source,
@@ -299,6 +328,7 @@ def test_matches_lookup_and_silu_and_mul(case: Case) -> None:
         num_experts=case.num_experts,
         group_size=case.group_size,
         bits=case.bits,
+        activation=case.activation,
     )
     if case.is_late:
         cpu = threading.Thread(target=answer)
@@ -330,7 +360,8 @@ def test_matches_lookup_and_silu_and_mul(case: Case) -> None:
         dtype=np.int32,
     )
     assert np.array(resolved_slots).tolist() == expected_slots.tolist()
-    expected = silu_and_mul(
+    act_and_mul = silu_and_mul if case.activation == "silu" else gelu_tanh_and_mul
+    expected = act_and_mul(
         mx.gather_qmm(
             x,
             w,
@@ -374,13 +405,16 @@ class ChainCase:
     num_experts: int = 32
     is_pair_codes: bool = False
     is_replayed: bool = False
+    activation: Literal["silu", "gelu_tanh"] = "silu"
+    has_shared_expert: bool = True
 
     def __str__(self) -> str:
         return (
             f"H{self.hidden_size}-I{self.intermediate_size}-b{self.bits}-g{self.group_size}"
             f"-k{self.top_k}-E{self.num_experts}"
             f"-{'pair_codes' if self.is_pair_codes else 'plain'}"
-            f"-{'replay' if self.is_replayed else 'eager'}"
+            f"-{'replay' if self.is_replayed else 'eager'}-{self.activation}"
+            f"{'' if self.has_shared_expert else '-no_shared'}"
         )
 
 
@@ -401,6 +435,10 @@ CHAIN_CASES = [
     ChainCase(is_pair_codes=True, is_replayed=True),
     QWEN38_CHAIN,
     replace(QWEN38_CHAIN, is_replayed=True),
+    # Gemma4's: gelu_tanh, no shared expert (its dense MLP runs beside the MoE).
+    ChainCase(activation="gelu_tanh", has_shared_expert=False),
+    ChainCase(activation="gelu_tanh", has_shared_expert=False, is_replayed=True),
+    ChainCase(activation="gelu_tanh", is_pair_codes=True),
 ]
 
 
@@ -437,9 +475,10 @@ def split_layer(
     x: mx.array,
     inputs: LayerInputs,
     moe_step: mx.array,
+    has_shared_expert: bool = True,
 ) -> tuple[mx.array, mx.array]:
     """The layer's output [T, H] and slots as OffloadMoELayer runs a split decode layer: the
-    issued lookup, then apply_pending with the shared expert's output and gate logit."""
+    issued lookup, then apply_pending with the shared expert's output and gate logit, if any."""
     assert supports_pending(method, x, inputs.weights)
     cache.moe_step = moe_step
     lookup = cache.issue_lookup(layer_id, inputs.topk_ids)
@@ -449,7 +488,7 @@ def split_layer(
         x,
         inputs.weights,
         lookup,
-        lambda _: (inputs.shared, inputs.shared_gate),
+        (lambda _: (inputs.shared, inputs.shared_gate)) if has_shared_expert else None,
     )
     cache.end_issued_lookup(outputs.mailbox)
     return outputs.out, outputs.slots
@@ -461,20 +500,26 @@ def reference_layer(
     x: mx.array,
     inputs: LayerInputs,
     slots: mx.array,
+    has_shared_expert: bool = True,
 ) -> mx.array:
-    """The waiting lookup's decode layer at the slots: apply_slots, then the shared expert's add."""
+    """The waiting lookup's decode layer at the slots: apply_slots, then the shared expert's add,
+    if any."""
     routed = method.apply_slots(banks, x, inputs.weights, inputs.topk_ids, slots)
+    if not has_shared_expert:
+        return routed
     return sigmoid_gated_add(routed, inputs.shared, inputs.shared_gate)
 
 
-def affine_method(spec: CheckpointSpec, top_k: int) -> AffineMoEMethod:
+def affine_method(
+    spec: CheckpointSpec, top_k: int, activation: Literal["silu", "gelu_tanh"] = "silu"
+) -> AffineMoEMethod:
     cfg = MoEConfig(
         num_experts=spec.num_experts,
         top_k=top_k,
         hidden=spec.hidden_size,
         intermediate=spec.intermediate_size,
         schemes=spec.expert_schemes,
-        activation="silu",
+        activation=activation,
         dtype=mx.bfloat16,
         strategy="offload",
     )
@@ -530,14 +575,16 @@ def test_chain_matches_the_waiting_lookup(tmp_path: Path, case: ChainCase) -> No
         cache.fill_initial()
     has_codes = "gate_up_proj.codes" in split.layer_banks(0)
     assert has_codes == case.is_pair_codes, "the pack's rows hold no pair codes"
-    method = affine_method(spec, case.top_k)
+    method = affine_method(spec, case.top_k, case.activation)
 
     def split_chain(x: mx.array, layers: list[LayerInputs], moe_step: mx.array) -> mx.array:
         """The split path's summary: each layer's output bits, then its slots, as int32."""
         out = None
         summary = []
         for layer_id, inputs in enumerate(layers):
-            out, slots = split_layer(split, method, layer_id, x, inputs.after(out), moe_step)
+            out, slots = split_layer(
+                split, method, layer_id, x, inputs.after(out), moe_step, case.has_shared_expert
+            )
             summary += [out.view(mx.uint16).astype(mx.int32).reshape(-1), slots.reshape(-1)]
             x = out
         return mx.concatenate(summary)
@@ -572,7 +619,8 @@ def test_chain_matches_the_waiting_lookup(tmp_path: Path, case: ChainCase) -> No
         layer_x = x
         for layer_id, inputs in enumerate(layers):
             slots, _ = waiting.lookup(layer_id, inputs.topk_ids, moe_step, _C.MoeLookupKind.DECODE)
-            out = reference_layer(method, waiting.layer_banks(layer_id), layer_x, inputs, slots)
+            banks = waiting.layer_banks(layer_id)
+            out = reference_layer(method, banks, layer_x, inputs, slots, case.has_shared_expert)
             expected += [out.view(mx.uint16).astype(mx.int32).reshape(-1), slots.reshape(-1)]
             layer_x = out
         expected_summary = mx.concatenate(expected)

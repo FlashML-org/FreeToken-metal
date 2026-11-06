@@ -6,7 +6,7 @@ the mailbox and waits in the kernel until the CPU has read them into victim slot
 CPU gone silent past the spin limit), so a forward with lookups needs no host synchronization and
 replays as a command graph. A probe posts no experts and only checks that the CPU answers. A decode
 may instead issue its lookup: moe_lookup_issue posts the absent experts and returns, and the kernels
-after it (affine_swiglu_pending) wait for the answer only where they need the absent experts' rows.
+after it (affine_glu_pending) wait for the answer only where they need the absent experts' rows.
 """
 
 from __future__ import annotations

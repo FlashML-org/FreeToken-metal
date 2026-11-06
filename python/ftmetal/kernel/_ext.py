@@ -72,8 +72,8 @@ _C.init_gather_sorted_libraries(
 )
 _C.init_sample_tokens_library(metal_source(KERNEL_DIR / "sample" / "sample_tokens.metal"))
 _C.init_moe_lookup_library(metal_source(KERNEL_DIR / "moe" / "moe_lookup.metal"))
-_C.init_affine_swiglu_pending_library(
-    metal_source(KERNEL_DIR / "moe" / "affine" / "affine_swiglu_pending.metal")
+_C.init_affine_glu_pending_library(
+    metal_source(KERNEL_DIR / "moe" / "affine" / "affine_glu_pending.metal")
 )
 _C.init_ple_lookup_library(metal_source(KERNEL_DIR / "embedding" / "ple_lookup.metal"))
 

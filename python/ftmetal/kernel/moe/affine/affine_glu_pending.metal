@@ -1,18 +1,19 @@
-// AffineSwigluPending (see affine_swiglu_pending.h): threadgroup z is one (token, expert) pair,
-// each simdgroup ACT_ROWS_PER_SIMDGROUP rows of its act. A pair moe_lookup_issue resolved takes its
-// gate and up rows from gate_up_resident, in its first threadgroup; a pending one waits (thread 0
-// on the mailbox, common/mailbox_wait.h), resolves its slot as moe_lookup would have and
-// computes its gate and up rows at it. act is silu_and_mul's: the rows in the dtype, then
-// silu(gate) * up in fp32 with MLX's sigmoid, cast back. Memory the CPU shares is accessed volatile
-// coherent(system) after a system-scope fence; the bank rows of pending slots, which nothing reads
-// before the answer, are read after it. The {{...}} tokens are substituted per configuration before
-// compilation, and each #include is inlined (_ext.py). Buffers: 0 x, 1 w, 2 scales or codes, 3
-// biases or pairs, 4 gate_up_resident, 5 slots, 6 issued, 7 slot_of, 8 mailbox, 9 act, 10 resolved
-// slots, 11 params.
+// AffineGluPending (see affine_glu_pending.h): threadgroup z is one (token, expert) pair, each
+// simdgroup ACT_ROWS_PER_SIMDGROUP rows of its act. A pair moe_lookup_issue resolved takes its gate
+// and up rows from gate_up_resident, in its first threadgroup; a pending one waits (thread 0 on the
+// mailbox, common/mailbox_wait.h), resolves its slot as moe_lookup would have and computes its gate
+// and up rows at it. act is the Act template argument's, silu_and_mul's or gelu_tanh_and_mul's: the
+// rows in the dtype, then Act(gate) * up in fp32 as MLX computes it, cast back. Memory the CPU
+// shares is accessed volatile coherent(system) after a system-scope fence; the bank rows of pending
+// slots, which nothing reads before the answer, are read after it. The {{...}} tokens are
+// substituted per configuration before compilation, and each #include is inlined (_ext.py).
+// Buffers: 0 x, 1 w, 2 scales or codes, 3 biases or pairs, 4 gate_up_resident, 5 slots, 6 issued, 7
+// slot_of, 8 mailbox, 9 act, 10 resolved slots, 11 params.
 // Adapted from MLX v0.32.3 (Copyright © 2023-2024 Apple Inc., MIT License): the pending pairs'
 // gate_up rows are those of affine_gather_qmv_fast (2087-2147) and affine_gather_qmv (2149-2209)
 // in mlx/backend/metal/kernels/quantized.h, on affine_slot_qmv.h's impls, a simdgroup computing
-// its act rows' gate and up rows together.
+// its act rows' gate and up rows together; act_mul's gelu_tanh is nn.gelu_approx in
+// python/mlx/nn/layers/activations.py (186).
 #pragma METAL internals : enable
 #ifndef __METAL_MEMORY_SCOPE_SYSTEM__
 #define __METAL_MEMORY_SCOPE_SYSTEM__ 3
@@ -28,8 +29,8 @@ constexpr constant metal::thread_scope thread_scope_system =
 #include "mlx/backend/metal/kernels/utils.h"
 #include "common/mailbox_wait.h"
 #include "common/norm.h"
+#include "moe/affine/affine_glu_pending_shared.h"
 #include "moe/affine/affine_slot_qmv.h"
-#include "moe/affine/affine_swiglu_pending_shared.h"
 
 // MLX's steel headers disable the internals that coherent(system) needs.
 #pragma METAL internals : enable
@@ -39,16 +40,32 @@ using namespace metal;
 constant constexpr int ISSUED_SEQUENCE = int(IssuedWord::Sequence);
 constant constexpr int ISSUED_NUM_MISSES = int(IssuedWord::NumMisses);
 
-// layers/activation.py's silu_mul of one gate and up value.
-template <typename T>
-inline T silu_mul(T gate, T up) {
-  const float gate_value = static_cast<float>(gate);
-  const float silu = gate_value * precise_sigmoid(gate_value);
-  return static_cast<T>(silu * static_cast<float>(up));
+// The activations layers/activation.py serves, of a gate value in fp32. Each op rounds as in MLX's
+// compiled kernels, which contract none into an fma.
+struct Silu {
+  float operator()(float gate) thread {
+#pragma clang fp contract(off)
+    return gate * precise_sigmoid(gate);
+  }
+};
+
+// nn.gelu_approx's terms in its order, on MLX's ops and constants.
+struct GeluTanh {
+  float operator()(float gate) thread {
+#pragma clang fp contract(off)
+    const float inner = 0.7978846f * (gate + 0.044715f * metal::pow(gate, 3.0f));
+    return 0.5f * gate * (1.0f + metal::precise::tanh(inner));
+  }
+};
+
+// layers/activation.py's silu_mul or gelu_tanh_mul of one gate and up value.
+template <typename Act, typename T>
+inline T act_mul(T gate, T up) {
+  return static_cast<T>(Act()(static_cast<float>(gate)) * static_cast<float>(up));
 }
 
-template <typename T, int GROUP_SIZE, int BITS, int CODE_BITS, bool FAST>
-[[kernel]] void affine_swiglu_pending(
+template <typename T, int GROUP_SIZE, int BITS, int CODE_BITS, bool FAST, typename Act>
+[[kernel]] void affine_glu_pending(
     const device T* x [[buffer(0)]],
     const device uint32_t* w [[buffer(1)]],
     const device uint8_t* scales_or_codes [[buffer(2)]],
@@ -60,19 +77,18 @@ template <typename T, int GROUP_SIZE, int BITS, int CODE_BITS, bool FAST>
     volatile coherent(system) device uint* mailbox [[buffer(8)]],
     device T* act [[buffer(9)]],
     device int* resolved_slots [[buffer(10)]],
-    constant const SwigluPendingParams& params [[buffer(11)]],
+    constant const GluPendingParams& params [[buffer(11)]],
     uint3 threadgroup_id [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint simdgroup [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
   constexpr int ROWS = ACT_ROWS_PER_SIMDGROUP;
-  constexpr int THREADS = SIMD_SIZE * SWIGLU_PENDING_SIMDGROUPS;
+  constexpr int THREADS = SIMD_SIZE * GLU_PENDING_SIMDGROUPS;
   threadgroup bool is_answered;
 
   const int pair = threadgroup_id.z;
   const int intermediate_size = params.intermediate_size;
-  const int act_row =
-      (int(threadgroup_id.y) * SWIGLU_PENDING_SIMDGROUPS + int(simdgroup)) * ROWS;
+  const int act_row = (int(threadgroup_id.y) * GLU_PENDING_SIMDGROUPS + int(simdgroup)) * ROWS;
   const bool is_slot_writer = threadgroup_id.y == 0 && thread_index == 0;
   device T* pair_act = act + size_t(pair) * intermediate_size;
   const int issued_slot = slots[pair];
@@ -84,7 +100,7 @@ template <typename T, int GROUP_SIZE, int BITS, int CODE_BITS, bool FAST>
       }
       const device T* gate_up = gate_up_resident + size_t(pair) * 2 * intermediate_size;
       for (int row = thread_index; row < intermediate_size; row += THREADS) {
-        pair_act[row] = silu_mul(gate_up[row], gate_up[intermediate_size + row]);
+        pair_act[row] = act_mul<Act>(gate_up[row], gate_up[intermediate_size + row]);
       }
     }
     return;
@@ -150,16 +166,17 @@ template <typename T, int GROUP_SIZE, int BITS, int CODE_BITS, bool FAST>
   if (lane == 0) {
     for (int r = 0; r < ROWS; r++) {
       pair_act[act_row + r] =
-          silu_mul(static_cast<T>(result[r]), static_cast<T>(result[ROWS + r]));
+          act_mul<Act>(static_cast<T>(result[r]), static_cast<T>(result[ROWS + r]));
     }
   }
 }
 
 instantiate_kernel(
-    "affine_swiglu_pending",
-    affine_swiglu_pending,
+    "affine_glu_pending",
+    affine_glu_pending,
     {{T}},
     {{GROUP_SIZE}},
     {{BITS}},
     {{CODE_BITS}},
-    {{FAST}})
+    {{FAST}},
+    {{ACT}})

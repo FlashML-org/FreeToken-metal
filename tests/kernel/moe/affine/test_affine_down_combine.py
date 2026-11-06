@@ -27,7 +27,7 @@ import numpy as np
 import pytest
 
 from ftmetal.kernel.moe.affine.affine_down_combine import affine_down_combine
-from ftmetal.kernel.moe.affine.affine_swiglu_pending import (
+from ftmetal.kernel.moe.affine.affine_glu_pending import (
     AffineScales,
     ExpertScales,
     PairCodeScales,
@@ -105,6 +105,8 @@ CASES = [
     Case(3, 1, 64, 96, group_size=32, code_bits=13, num_slots=4),
     Case(2, 4, 64, 96, group_size=32, code_bits=13, weights="negative_zero", num_slots=4),
     Case(2, 8, 256, 704, group_size=32, code_bits=13),
+    # A packed Gemma4 26B's: a tail of 192 (gathered), no shared expert.
+    Case(2, 8, 2816, 704, code_bits=13, has_shared=False),
 ]
 
 

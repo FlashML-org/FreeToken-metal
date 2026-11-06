@@ -1,25 +1,26 @@
 """GPU time of one offload decode MoE layer's routed experts: the waiting lookup's kernels against
 the split lookup's four.
 
-uv run python tools/bench_affine_swiglu_pending.py [--models qwen3.6,qwen3.8] [--tokens 1,8,22]
+uv run python tools/bench_affine_glu_pending.py [--models qwen3.6,qwen3.8] [--tokens 1,8,22]
 [--pending 0,2] [--scales plain,pair_codes] [--slots 128]
 
 waiting: moe_lookup, the gate_up gather (mx.gather_qmm, or affine_gather_qmv_pair_codes on pair-code
-rows), silu_and_mul, the down gather, (y * weights).sum(-2) and sigmoid_gated_add with the shared
-expert's output. split: moe_lookup_issue, the resident gate_up pass (affine_gather_qmv or
-affine_gather_qmv_pair_codes with skip_pending), affine_swiglu_pending and affine_down_combine.
-Every expert is resident but --pending of them per layer, which the split path leaves to
-affine_swiglu_pending; the mailbox's shutdown word is set, so nothing is posted, no CPU answers and
-both paths give the absent experts' pairs moe_lookup's fallback slot without a wait: the time is the
-kernels' alone, the SSD read the split overlaps is not in it. The routed experts of Qwen3.6-35B-A3B
-(hidden 2048, width 512, group 64, top 8, 256 experts) and Qwen3.8-Flash-Next (hidden 2560, width
-640, group 32, top 10, 512 experts), affine 4-bit bf16, over a pool of --slots slots of random
-weights (and random 13-bit codes into 8192-pair tables). Each call routes every token to top_k
-distinct random experts, a new draw per call, and calls chain as layers do: each call's ids wait on
-the call before's output (one fused kernel, whose own time is measured alone and taken off). A run
-builds the graph of its --calls calls first and times its evaluation alone, as a replayed decode
-step pays only that. GPU: the best of --repeats runs in microseconds per call; exact: the waiting
-lookup's and the split path's outputs equal bit for bit.
+rows), the activation, the down gather, (y * weights).sum(-2) and sigmoid_gated_add with the shared
+expert's output, where the model has one. split: moe_lookup_issue, the resident gate_up pass
+(affine_gather_qmv or affine_gather_qmv_pair_codes with skip_pending), affine_glu_pending and
+affine_down_combine. Every expert is resident but --pending of them per layer, which the split path
+leaves to affine_glu_pending; the mailbox's shutdown word is set, so nothing is posted, no CPU
+answers and both paths give the absent experts' pairs moe_lookup's fallback slot without a wait: the
+time is the kernels' alone, the SSD read the split overlaps is not in it. The routed experts of
+Qwen3.6-35B-A3B (hidden 2048, width 512, group 64, top 8, 256 experts), Qwen3.8-Flash-Next (hidden
+2560, width 640, group 32, top 10, 512 experts) and Gemma4 26B-A4B (hidden 2816, width 704, group
+64, top 8, 128 experts, gelu_tanh, no shared expert), affine 4-bit bf16, over a pool of --slots
+slots of random weights (and random 13-bit codes into 8192-pair tables). Each call routes every
+token to top_k distinct random experts, a new draw per call, and calls chain as layers do: each
+call's ids wait on the call before's output (one fused kernel, whose own time is measured alone and
+taken off). A run builds the graph of its --calls calls first and times its evaluation alone, as a
+replayed decode step pays only that. GPU: the best of --repeats runs in microseconds per call;
+exact: the waiting lookup's and the split path's outputs equal bit for bit.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from typing import NamedTuple, Protocol
+from typing import Literal, NamedTuple, Protocol
 
 import mlx.core as mx
 import numpy as np
@@ -36,15 +37,15 @@ from ftmetal.kernel._ext import _C
 from ftmetal.kernel.moe.affine.affine_down_combine import affine_down_combine
 from ftmetal.kernel.moe.affine.affine_gather_qmv import affine_gather_qmv
 from ftmetal.kernel.moe.affine.affine_gather_qmv_pair_codes import affine_gather_qmv_pair_codes
-from ftmetal.kernel.moe.affine.affine_swiglu_pending import (
+from ftmetal.kernel.moe.affine.affine_glu_pending import (
     AffineScales,
     ExpertScales,
     PairCodeScales,
-    affine_swiglu_pending,
+    affine_glu_pending,
 )
 from ftmetal.kernel.moe.moe_lookup import moe_lookup, moe_lookup_issue
 from ftmetal.kernel.ref import pair_code_bank_ref
-from ftmetal.layers.activation import sigmoid_gated_add, silu_and_mul
+from ftmetal.layers.activation import gelu_tanh_and_mul, sigmoid_gated_add, silu_and_mul
 
 DTYPE = mx.bfloat16
 BITS = 4
@@ -57,11 +58,14 @@ class ExpertShapes(NamedTuple):
     group_size: int
     top_k: int
     num_experts: int
+    activation: Literal["silu", "gelu_tanh"] = "silu"
+    has_shared_expert: bool = True
 
 
 MODELS = {
     "qwen3.6": ExpertShapes(2048, 512, 64, 8, 256),
     "qwen3.8": ExpertShapes(2560, 640, 32, 10, 512),
+    "gemma4-26b": ExpertShapes(2816, 704, 64, 8, 128, "gelu_tanh", False),
 }
 
 
@@ -182,10 +186,11 @@ def waiting_call(shapes: ExpertShapes) -> LayerCall:
             kind=_C.MoeLookupKind.DECODE,
         )
         x = mx.expand_dims(x, (-2, -3))
-        act = silu_and_mul(gather(shapes, layer.gate_up, x, slots, False))
+        act_and_mul = silu_and_mul if shapes.activation == "silu" else gelu_tanh_and_mul
+        act = act_and_mul(gather(shapes, layer.gate_up, x, slots, False))
         y = gather(shapes, layer.down, act, slots, False)
         routed = (y.squeeze(-2) * weights[..., None]).sum(axis=-2)
-        return sigmoid_gated_add(routed, shared, gate)
+        return sigmoid_gated_add(routed, shared, gate) if shapes.has_shared_expert else routed
 
     return call
 
@@ -212,7 +217,7 @@ def split_call(shapes: ExpertShapes) -> LayerCall:
         )
         x = mx.expand_dims(x, (-2, -3))
         gate_up = gather(shapes, layer.gate_up, x, lookup.slots, True)
-        act, slots, _ = affine_swiglu_pending(
+        act, slots, _ = affine_glu_pending(
             x,
             layer.gate_up.weight,
             layer.gate_up.scales,
@@ -221,12 +226,13 @@ def split_call(shapes: ExpertShapes) -> LayerCall:
             lookup.issued,
             layer.slot_of,
             lookup.mailbox,
-            shared,
+            shared if shapes.has_shared_expert else gate_up,
             layer_id=0,
             slot_base=0,
             num_experts=shapes.num_experts,
             group_size=shapes.group_size,
             bits=BITS,
+            activation=shapes.activation,
         )
         return affine_down_combine(
             act,
@@ -236,8 +242,8 @@ def split_call(shapes: ExpertShapes) -> LayerCall:
             weights,
             group_size=shapes.group_size,
             bits=BITS,
-            shared=shared,
-            shared_gate=gate,
+            shared=shared if shapes.has_shared_expert else None,
+            shared_gate=gate if shapes.has_shared_expert else None,
         )
 
     return call
@@ -362,7 +368,7 @@ def bench_model(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--models", default="qwen3.6,qwen3.8")
+    parser.add_argument("--models", default="qwen3.6,qwen3.8,gemma4-26b")
     parser.add_argument("--tokens", default="1,8,22")
     parser.add_argument("--pending", default="0,2")
     parser.add_argument("--scales", default="plain,pair_codes")
@@ -376,7 +382,7 @@ def main() -> int:
     mx.random.seed(0)
     print(
         f"affine {BITS}-bit bf16, {args.slots} slots; GPU microseconds per chained MoE layer "
-        "(routed experts and the shared expert's gated add)"
+        "(routed experts and any shared expert's gated add)"
     )
     print(
         "| model | scales | T | top_k | pending | waiting us | split us | split / waiting | exact |"
