@@ -24,7 +24,7 @@ from ftmetal.layers.norm import RMSNorm
 from ftmetal.layers.quantization.moe import ExpertSchemes
 from ftmetal.mm.item import MMItem
 from ftmetal.models.blocks import BaseLLMModel, embed_input_ids, select_last_rows
-from ftmetal.models.config import ModelConfig
+from ftmetal.models.config import ModelConfig, scheme_of, schemes_of
 from ftmetal.models.gemma4.attention import Gemma4Attention
 from ftmetal.models.gemma4.moe import Gemma4GatedMLP, Gemma4Router
 from ftmetal.models.gemma4.vision import (
@@ -38,8 +38,6 @@ from ftmetal.models.gemma4.weight import (
     QKV_PARTS,
     checkpoint_prefix,
     k_eq_v_layer_ids,
-    scheme_of,
-    schemes_of,
 )
 
 

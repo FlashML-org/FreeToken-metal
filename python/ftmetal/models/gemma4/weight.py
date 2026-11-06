@@ -11,7 +11,6 @@ built.
 
 from __future__ import annotations
 
-from ftmetal.layers.quantization.config import QuantScheme
 from ftmetal.models.config import FullAttentionGroupConfig, ModelConfig
 from ftmetal.models.loader import FuseRule, WeightRules
 
@@ -37,22 +36,6 @@ def checkpoint_prefix(model_config: ModelConfig) -> str:
     if CONDITIONAL_GENERATION in model_config.architectures:
         return LANGUAGE_MODEL_PREFIX
     return ""
-
-
-def scheme_of(config: ModelConfig, checkpoint_module: str) -> QuantScheme | None:
-    if config.quant is None:
-        return None
-    return config.quant.scheme_for(checkpoint_module)
-
-
-def schemes_of(
-    config: ModelConfig, parent_module: str, parts: tuple[str, ...]
-) -> list[QuantScheme | None]:
-    """The scheme of each part (a checkpoint module name under parent_module) of a fused
-    module; they fuse only when all agree."""
-    if config.quant is None:
-        return [None] * len(parts)
-    return config.quant.schemes_for([f"{parent_module}.{part}" for part in parts])
 
 
 def k_eq_v_layer_ids(model_config: ModelConfig) -> tuple[int, ...]:
@@ -98,7 +81,5 @@ __all__ = [
     "QK_PARTS",
     "checkpoint_prefix",
     "k_eq_v_layer_ids",
-    "scheme_of",
-    "schemes_of",
     "weight_rules",
 ]

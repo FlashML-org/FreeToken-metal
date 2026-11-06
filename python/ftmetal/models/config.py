@@ -18,7 +18,7 @@ from typing import ClassVar, Literal
 import mlx.core as mx
 
 from ftmetal.attention.metadata import AttnType
-from ftmetal.layers.quantization.config import QuantConfig
+from ftmetal.layers.quantization.config import QuantConfig, QuantScheme
 from ftmetal.layers.rotary import MRopeLayout
 
 
@@ -373,6 +373,22 @@ class ModelConfig:
         return tuple(specs)
 
 
+def scheme_of(config: ModelConfig, checkpoint_module: str) -> QuantScheme | None:
+    """The scheme of a module by its checkpoint path; None means bf16."""
+    return None if config.quant is None else config.quant.scheme_for(checkpoint_module)
+
+
+def schemes_of(
+    config: ModelConfig, parent_module: str, parts: tuple[str, ...]
+) -> list[QuantScheme | None]:
+    """The scheme of each part (a checkpoint module name under parent_module) of a fused
+    module; they fuse only when all agree."""
+    if config.quant is None:
+        return [None] * len(parts)
+    else:
+        return config.quant.schemes_for([f"{parent_module}.{part}" for part in parts])
+
+
 __all__ = [
     "AttentionGroupConfig",
     "BaseAttentionGroupConfig",
@@ -388,4 +404,6 @@ __all__ = [
     "SlotStateSpec",
     "mrope_layout_from_rope_params",
     "mrope_section_from_rope_params",
+    "scheme_of",
+    "schemes_of",
 ]

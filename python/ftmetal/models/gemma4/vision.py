@@ -18,9 +18,9 @@ import numpy as np
 from ftmetal.layers.base import BaseOP
 from ftmetal.layers.linear import Linear, LinearMerged
 from ftmetal.layers.norm import RMSNorm
-from ftmetal.models.config import ModelConfig
+from ftmetal.models.config import ModelConfig, scheme_of, schemes_of
 from ftmetal.models.gemma4.moe import Gemma4GatedMLP
-from ftmetal.models.gemma4.weight import GATE_UP_PARTS, QKV_PARTS, scheme_of, schemes_of
+from ftmetal.models.gemma4.weight import GATE_UP_PARTS, QKV_PARTS
 from ftmetal.models.loader import (
     config_bool,
     config_dict,
