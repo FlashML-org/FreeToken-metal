@@ -59,9 +59,10 @@ MAX_STEP = 2**31 - 1
 # A pool's spare slots for deferred victim stores (ExpertService): a decode lookup's victim hit
 # that evicts a resident takes a spare, and the evicted expert is stored once the lookup is
 # answered, so the GPU waits for one copy instead of two (PR #3's 4). Only in pools far larger
-# than one step's experts: the scheduler's cap on a step's rows counts every slot of a pool.
+# than one step's experts: the scheduler's cap on a step's rows counts every slot of a pool. 1024:
+# four steps of Gemma4 26B's 240 experts, whose whole model is 3840.
 DEFERRED_STORE_SPARES = 4
-DEFERRED_STORE_MIN_POOL_SLOTS = 4096
+DEFERRED_STORE_MIN_POOL_SLOTS = 1024
 # --moe-cache-policy lrfu's half-life in steps (PR #3's): an expert a conversation keeps coming
 # back to outlasts one-off ones; longer ones lost long replies there, whose new working set they
 # evicted while earlier turns' frequent experts held their slots.
