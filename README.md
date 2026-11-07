@@ -2,10 +2,22 @@
 
 LLM serving engine for one Apple Silicon Mac: Python + MLX + Metal.
 
-## Setup
+## Install
 
 ```bash
-uv sync                                  # creates .venv, builds the C++ extensions
+./install.sh                             # builds this checkout into ~/.ftmetal/venv, links ~/.local/bin/ftm
+ftm serve --model /path/to/model
+```
+
+Needs macOS 14 or later on Apple Silicon and the Xcode Command Line Tools. The script keeps its own
+pinned uv in `~/.ftmetal/bin` (linked into `~/.local/bin` if there is no uv yet), uses Python 3.13,
+downloading it if missing, and leaves out the dev group. The install is a copy of the sources: rerun
+it after any change.
+
+## Development
+
+```bash
+uv sync                                  # creates .venv with the dev group, builds the C++ extensions
 uv sync --reinstall-package ftmetal      # after editing a .cpp or .h (not for .metal)
 uv run pytest tests/ -q
 uv run ruff check python tests tools && uv run ruff format --check python tests tools

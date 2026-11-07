@@ -9,13 +9,15 @@ Python is managed with [uv](https://docs.astral.sh/uv/), always:
   (`uv run pytest tests/`, `uv run ruff check`, `uv run ftm serve ...`). Never
   call a bare `python`, `pip` or a system or global interpreter, and never point
   the repository at a virtual environment that lives outside it.
-- Add or change dependencies with `uv add` / `uv remove` so `pyproject.toml` and
-  `uv.lock` stay the source of truth; never `pip install` into the environment by
-  hand, and never edit the lock file directly.
-- `mlx` is pinned in `pyproject.toml`; do not bump it as a side effect of another
-  change.
+- Add or change dependencies with `uv add` / `uv remove` so `pyproject.toml` stays
+  the source of truth; never `pip install` into the environment by hand. `uv.lock` is
+  local to each checkout and git-ignored.
+- `mlx`, `mlx-lm`, `openai`, the Hugging Face packages and the build requirements are
+  pinned in `pyproject.toml`; do not bump them as a side effect of another change.
 - Do not create a second virtual environment, install into another project's
-  environment, or hardcode an interpreter path anywhere in the repository.
+  environment, or hardcode an interpreter path anywhere in the repository. The one
+  environment outside it is `~/.ftmetal/venv`, where `install.sh` installs the engine
+  to run it, without the dev group; development stays in `.venv/`.
 
 ## Coding style guidelines
 

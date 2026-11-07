@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=75", "cmake>=3.27", "nanobind==3.0.1", "mlx==0.32.3"]
+requires = ["setuptools==84.2.1", "cmake==4.4.4", "nanobind==3.0.1", "mlx==0.32.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,17 +8,21 @@ version = "0.0.1"
 description = "LLM serving engine for Apple Silicon on MLX and Metal"
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.13"
+requires-python = ">=3.13,<3.14"
 dependencies = [
     "mlx==0.32.3",
     "numpy>=2.0,<3",
     "fastapi>=0.115,<1",
     "uvicorn>=0.30,<1",
     "pydantic>=2.9,<3",
-    "tokenizers>=0.21,<1",
+    "tokenizers==0.23.2",
+    # Brought in by tokenizers, not imported; pinned because they move fast.
+    "huggingface-hub==1.32.0",
+    "hf-xet==1.6.0",
     "jinja2>=3.1,<4",
     "partial-json-parser>=0.2,<1",
-    "openai>=2.0,<3",
+    # responses_api.py imports openai.types.responses, which changes between releases.
+    "openai==2.54.0",
     "pillow>=11.0,<13",
 ]
 
@@ -29,7 +33,10 @@ ftm = "ftmetal.cli:main"
 dev = [
     "pytest>=8",
     "ruff>=0.12",
-    "mlx-lm>=0.31",
+    # The parity reference of tests/models, and the Hugging Face packages it brings in.
+    "mlx-lm==0.31.3",
+    "transformers==5.17.0",
+    "safetensors==0.8.0",
 ]
 
 [tool.setuptools]
