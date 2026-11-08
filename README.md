@@ -37,9 +37,27 @@ uv run ftm serve --model /path/to/Qwen3.6-35B-A3B-MLX      # OpenAI API on 127.0
 uv run ftm serve --model /path/to/model --port 8000 --max-running-requests 8 --max-seq-len 65536
 uv run ftm shell                                            # chat with the running server
 uv run ftm shell --server http://127.0.0.1:8000             # or FTMETAL_HOST=http://...
+uv run ftm launch claude                                    # a coding agent on the running server
 uv run ftm pack --model /path/to/Qwen3.6-35B-A3B-MLX       # expert pack for MoE offload
 uv run ftm --version
 ```
+
+`ftm launch <agent>` (`claude`, `codex`, `opencode`, `openclaw`, `hermes`, `pi` or `dsh`) points a
+coding agent at the running server and starts it, the way `ollama launch` does for Ollama. It reads
+the model, the longest context a request may hold and whether thinking can be switched off from
+`/v1/models`, offers to install the agent if it is missing (`-y` approves every prompt; Enter means
+yes), and writes the agent's configuration where the agent reads it (its home variables, such as
+`CODEX_HOME` or `HERMES_HOME`, and profiles count), keeping the last five backups of any file it
+changes and every setting it does not own (Hermes's `config.yaml` keeps its comments outside the
+`model` section). A config file it cannot parse, such as an OpenClaw `openclaw.json` in JSON5, stops
+the launch with the file untouched. `--server URL` picks the server (a host without a scheme means
+port 1919, a URL its scheme's port, and a path is a prefix the server sits under), `--dry-run`
+prints the plan and changes nothing, `--config` configures the agent and asks before starting it,
+`--install-only` needs no server, `--restore` removes what a launch wrote for Codex, and arguments
+after `--` go to the agent. With a proxy in the environment the agent is told to reach the server
+directly (`NO_PROXY`). OpenClaw is onboarded on its first launch (after its security notice), its
+gateway is started when it is down, and it works in its own workspace, not the current directory;
+OpenClaw and Hermes offer to connect a messaging app before an interactive session.
 
 `ftm serve` exposes FreeToken's routes: the OpenAI `POST /v1/chat/completions` (streamed
 or not; `reasoning_content` carries the reasoning, the `<think>` block on Qwen3.6 and Flint and

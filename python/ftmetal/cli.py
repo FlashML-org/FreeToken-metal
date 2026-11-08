@@ -1,8 +1,9 @@
-"""ftm: serve a model over the OpenAI API, chat with a running server, or pack a model's
-routed experts for MoE offload.
+"""ftm: serve a model over the OpenAI API, chat with a running server, start a coding agent
+against it, or pack a model's routed experts for MoE offload.
 
     ftm serve --model <checkpoint dir> [--host H] [--port P] [...]
     ftm shell [--server URL]
+    ftm launch <agent> [--server URL] [...] [-- <agent args>]
     ftm pack --model <checkpoint dir>
     ftm --version
 
@@ -29,6 +30,7 @@ from pydantic import BaseModel
 from ftmetal.engine.config import EngineConfig
 from ftmetal.engine.engine import offload_layers
 from ftmetal.env import read_env
+from ftmetal.launch.run import run_launch
 from ftmetal.models.register import create_model, model_weight_rules, read_checkpoint
 from ftmetal.moe.pack import write_pack
 from ftmetal.moe.slot_pools import bank_layouts
@@ -279,11 +281,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     elif command == "shell":
         return run_shell(rest)
+    elif command == "launch":
+        return run_launch(rest, DEFAULT_SERVER_URL)
     elif command == "pack":
         logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
         return run_pack(rest)
     else:
-        print(f"unknown command {command!r}; expected serve, shell or pack", file=sys.stderr)
+        print(
+            f"unknown command {command!r}; expected serve, shell, launch or pack", file=sys.stderr
+        )
         return 2
 
 
