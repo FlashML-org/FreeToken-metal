@@ -12,18 +12,20 @@ import queue
 import struct
 import threading
 import time
+from importlib.metadata import version
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import JsonValue
 
-from ftmetal import __version__
+from ftmetal.cli import main as ftm_main
 from ftmetal.env import ENV_PREFIXES
 from ftmetal.mm.config import ENCODER_KINDS, EncoderKind, MultimodalConfig
 from ftmetal.server.access_log_filter import PollingAccessLogFilter
 from ftmetal.server.api_server import FrontendManager, create_app
 from ftmetal.server.control_api import MoeCacheGeometry, cache_geometry
+from ftmetal.version import __version__
 from scripted_server import (
     WAIT_SECONDS,
     ScriptedScheduler,
@@ -56,6 +58,15 @@ def write_model_config(model_dir: Path, tensor_names: tuple[str, ...] = ()) -> N
     header = json.dumps(entries).encode()
     data = bytes(4 * len(tensor_names))
     (model_dir / "model.safetensors").write_bytes(struct.pack("<Q", len(header)) + header + data)
+
+
+@pytest.mark.parametrize("flag", ["--version", "-V"])
+def test_version_is_the_installed_package_version(
+    flag: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert ftm_main([flag]) == 0
+    assert capsys.readouterr().out == f"ftmetal version {__version__}\n"
+    assert version("ftmetal") == __version__
 
 
 def test_health_follows_the_engine_lifecycle(

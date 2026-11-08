@@ -4,6 +4,7 @@ routed experts for MoE offload.
     ftm serve --model <checkpoint dir> [--host H] [--port P] [...]
     ftm shell [--server URL]
     ftm pack --model <checkpoint dir>
+    ftm --version
 
 The shell is an ordinary client of POST /v1/chat/completions, so it gets the prompt
 rendering, sampling defaults and reasoning split every other client gets. The pack
@@ -40,6 +41,7 @@ from ftmetal.server.api_models import (
 )
 from ftmetal.server.api_server import run_api_server
 from ftmetal.server.args import parse_args
+from ftmetal.version import __version__
 
 DEFAULT_SERVER_URL = "http://127.0.0.1:1919"
 # A turn's first token waits for the prefill of the whole conversation.
@@ -268,7 +270,10 @@ def main(argv: list[str] | None = None) -> int:
         print(__doc__)
         return 0 if args else 2
     command, rest = args[0], args[1:]
-    if command == "serve":
+    if command in ("-V", "--version"):
+        print(f"ftmetal version {__version__}")
+        return 0
+    elif command == "serve":
         logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
         run_api_server(parse_args(rest, prog="ftm serve"))
         return 0

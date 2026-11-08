@@ -38,6 +38,7 @@ uv run ftm serve --model /path/to/model --port 8000 --max-running-requests 8 --m
 uv run ftm shell                                            # chat with the running server
 uv run ftm shell --server http://127.0.0.1:8000             # or FTMETAL_HOST=http://...
 uv run ftm pack --model /path/to/Qwen3.6-35B-A3B-MLX       # expert pack for MoE offload
+uv run ftm --version
 ```
 
 `ftm serve` exposes FreeToken's routes: the OpenAI `POST /v1/chat/completions` (streamed

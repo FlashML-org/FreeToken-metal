@@ -47,7 +47,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from jinja2 import TemplateError
 from pydantic import BaseModel, JsonValue
 
-from ftmetal import __version__
 from ftmetal.core import SamplingParams
 from ftmetal.effort import ThinkingProfile
 from ftmetal.message.backend import (
@@ -86,6 +85,7 @@ from ftmetal.tokenizer import (
     load_eos_token_ids,
     load_sampling_defaults,
 )
+from ftmetal.version import __version__
 
 logger = logging.getLogger(__name__)
 

@@ -4,7 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ftmetal"
-version = "0.0.1"
+# Single source of truth: python/ftmetal/version.py (read via the attr directive below).
+dynamic = ["version"]
 description = "LLM serving engine for Apple Silicon on MLX and Metal"
 readme = "README.md"
 license = "Apache-2.0"
@@ -48,6 +49,9 @@ dev = [
 
 [tool.setuptools]
 package-dir = { "" = "python" }
+
+[tool.setuptools.dynamic]
+version = { attr = "ftmetal.version.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["python"]
