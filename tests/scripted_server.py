@@ -67,6 +67,10 @@ class ScriptedScheduler(Scheduler):
         self.aborted: list[int] = []
         ScriptedScheduler.instances.append(self)
 
+    @property
+    def max_seq_len(self) -> int:
+        return self.max_prompt_tokens
+
     def add_request(
         self,
         uid: int,

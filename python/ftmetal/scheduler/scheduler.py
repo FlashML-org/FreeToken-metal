@@ -156,6 +156,11 @@ class Scheduler:
         # marks the request; process_last_data frees it once the forward has landed.
         self.inflight_data: ForwardData | None = None
 
+    @property
+    def max_seq_len(self) -> int:
+        """The longest prompt plus output a request may hold."""
+        return self.engine.max_seq_len
+
     def add_request(
         self,
         uid: int,

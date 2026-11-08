@@ -145,15 +145,14 @@ def register_openai_routes(
     async def v1_models():
         state = get_state()
         model_id = _served_model_name(state)
-        ctx = _model_context_length(state)
         efforts, default_effort = await _effort_fields(state)
         return ModelList(
             data=[
                 ModelCard(
                     id=model_id,
                     root=state.config.model_path,
-                    max_model_len=ctx,
-                    context_length=ctx,
+                    max_model_len=state.max_seq_len,
+                    context_length=state.max_seq_len,
                     supported_reasoning_efforts=efforts,
                     default_reasoning_effort=default_effort,
                     input_modalities=["text", *sorted(state.config.served_modalities)],
@@ -761,13 +760,3 @@ async def _effort_fields(state: Any) -> tuple[list[str] | None, str | None]:
 
 def _served_model_name(state: Any) -> str:
     return getattr(state.config, "served_model_name", None) or state.config.model_path
-
-
-def _model_context_length(state: Any) -> int | None:
-    """The model ceiling, not `min(ceiling, KV budget)`: a rebuild moves the latter, and agents
-    read this once at startup."""
-    try:  # never 500 a metadata route: max_seq_len walks into the HF config on some builds
-        value = int(state.config.max_seq_len)
-    except Exception:  # noqa: BLE001
-        return None
-    return value if value > 0 else None

@@ -13,12 +13,13 @@ run, "stopping" once prepare-stop closed admission and "failed" once a thread ha
 died, which is also the fatal error /health reports (no supervisor, loading gate or cache
 rebuild, so no /v1/cache/rebuild, and /v1/cache/status lives in control_api with the
 request-ring middleware; of FreeToken's readiness meta the scheduler thread's start reports
-the MoE offload cache's geometry alone); the stats tracker and the request ring are the
-FrontendManager's; both TokenizeManagers probe their chat template's thinking and effort
-controls before serving (FreeToken probes on first use, and warms the frontend's on the
-first cache poll); closing a request's reply stream before its terminal reply also aborts
-it, and an abort is sent once; abort_user (prepare-stop's) also hands a consumer still
-reading a terminal "request aborted" error, where FreeToken leaves that client waiting;
+the MoE offload cache's geometry and the longest request alone); the stats tracker and the
+request ring are the FrontendManager's; both TokenizeManagers probe their chat template's
+thinking and effort controls before serving (FreeToken probes on first use, and warms the
+frontend's on the first cache poll); closing a request's reply stream before its terminal
+reply also aborts it, and an abort is sent once; abort_user (prepare-stop's) also hands a
+consumer still reading a terminal "request aborted" error, where FreeToken leaves that client
+waiting;
 /generate leaves its 503 to new_user and reports a failed request as an {"error": ...}
 event before [DONE]; a stop string matched by the detokenizer aborts the request; the
 decode state of an aborted request is dropped when the tokenizer worker relays the abort,
@@ -123,6 +124,8 @@ class FrontendManager:
     # The engine's MoE offload cache, reported once the scheduler thread has built it; None
     # while experts are resident.
     moe_cache: MoeCacheGeometry | None = None
+    # The longest prompt plus output a request may hold, reported with moe_cache.
+    max_seq_len: int | None = None
 
     @property
     def fatal_error(self) -> str | None:
@@ -320,15 +323,23 @@ def run_tokenizer(
             frontend.post(BatchFrontendMsg(data=replies))
 
 
+@dataclass(frozen=True, kw_only=True)
+class StartedEngine:
+    """What the scheduler thread reports once the engine is built."""
+
+    max_seq_len: int
+    moe_cache: MoeCacheGeometry | None
+
+
 def run_scheduler(
     config: ServerArgs,
     eos_token_ids: set[int],
     recv_backend: queue.Queue[BaseBackendMsg],
     send_tokenizer: queue.Queue[BaseTokenizerMsg | None],
-    started: Future[MoeCacheGeometry | None],
+    started: Future[StartedEngine],
 ) -> None:
     """The scheduler thread, the only MLX caller: admits and aborts, runs the overlap loop.
-    started gets the MoE offload cache's geometry once the engine is built."""
+    started gets what the frontend reports about the engine once it is built."""
     try:
         scheduler = Scheduler(config, eos_token_ids)
     except Exception as exc:
@@ -337,16 +348,15 @@ def run_scheduler(
         return
     cache = scheduler.moe_offload_cache
     if cache is None:
-        started.set_result(None)
+        moe_cache = None
     else:
-        started.set_result(
-            MoeCacheGeometry(
-                num_experts=cache.num_experts,
-                num_moe_layers=cache.num_layers,
-                moe_cache_size=cache.cache_size,
-                moe_cache_policy=config.moe_cache_policy,
-            )
+        moe_cache = MoeCacheGeometry(
+            num_experts=cache.num_experts,
+            num_moe_layers=cache.num_layers,
+            moe_cache_size=cache.cache_size,
+            moe_cache_policy=config.moe_cache_policy,
         )
+    started.set_result(StartedEngine(max_seq_len=scheduler.max_seq_len, moe_cache=moe_cache))
 
     try:
         scheduler.run_forever(recv_backend, send_tokenizer)
@@ -369,7 +379,7 @@ def create_app(config: ServerArgs) -> FastAPI:
     frontend = FrontendManager(
         config=config, send_tokenizer=recv_tokenizer, mm_processor=mm_processor
     )
-    engine_started: Future[MoeCacheGeometry | None] = Future()
+    engine_started: Future[StartedEngine] = Future()
     engine_thread = threading.Thread(
         target=run_scheduler,
         args=(config, eos_token_ids, recv_backend, recv_tokenizer, engine_started),
@@ -391,7 +401,9 @@ def create_app(config: ServerArgs) -> FastAPI:
         # Both TokenizeManagers probe their template once, before the first request.
         await asyncio.to_thread(tokenize_manager.thinking_profile)
         frontend.thinking_profile = await asyncio.to_thread(frontend.warm_frontend_tokenizer)
-        frontend.moe_cache = await asyncio.wrap_future(engine_started)
+        started_engine = await asyncio.wrap_future(engine_started)
+        frontend.moe_cache = started_engine.moe_cache
+        frontend.max_seq_len = started_engine.max_seq_len
         frontend.loop = asyncio.get_running_loop()
         tokenizer_thread.start()
         frontend.backend_threads = [engine_thread, tokenizer_thread]

@@ -140,8 +140,9 @@ class ModelCard(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "ftmetal"
     root: str
-    # The model's own limit, not the KV budget in force. Two spellings of the same number:
-    # `max_model_len` is vLLM/SGLang's, `context_length` what most other clients look for.
+    # The longest prompt plus output a request may hold: the model's own limit, or what the KV
+    # pool holds when that is less. Two spellings of the same number: `max_model_len` is
+    # vLLM/SGLang's, `context_length` what most other clients look for.
     max_model_len: int | None = None
     context_length: int | None = None
     # The checkpoint's probed effort vocabulary (freetoken.tokenizer.effort); None

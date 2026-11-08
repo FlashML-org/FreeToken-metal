@@ -357,7 +357,9 @@ def test_max_tokens_finishes_with_length(client: TestClient) -> None:
     assert completion["usage"]["completion_tokens"] == 3
 
 
-def test_models_lists_the_served_model(client: TestClient, tiny_model_dir: Path) -> None:
+def test_models_lists_the_served_model(
+    client: TestClient, tiny_model_dir: Path, scripted: type[ScriptedScheduler]
+) -> None:
     models = client.get("/v1/models").json()
     assert models["object"] == "list"
     [card] = models["data"]
@@ -366,8 +368,8 @@ def test_models_lists_the_served_model(client: TestClient, tiny_model_dir: Path)
         str(tiny_model_dir),
         "ftmetal",
     )
-    # The tiny checkpoint has no config.json, so its context length is unknown.
-    assert card["max_model_len"] is None and card["context_length"] is None
+    # The scheduler's limit, past which a prompt is refused.
+    assert card["max_model_len"] == card["context_length"] == scripted.max_prompt_tokens
     assert client.get("/v1").json() == {"status": "ok"}
 
 
