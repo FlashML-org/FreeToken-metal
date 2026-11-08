@@ -9,7 +9,7 @@ LLM serving engine for one Apple Silicon Mac: Python + MLX + Metal.
 ftm serve --model /path/to/model
 ```
 
-Needs macOS 14 or later on Apple Silicon and the Xcode Command Line Tools. The script keeps its own
+Needs macOS 26 or later on Apple Silicon and the Xcode Command Line Tools. The script keeps its own
 pinned uv in `~/.ftmetal/bin` (linked into `~/.local/bin` if there is no uv yet), uses Python 3.13,
 downloading it if missing, and leaves out the dev group. The install is a copy of the sources: rerun
 it after any change.
