@@ -146,6 +146,7 @@ def register_openai_routes(
         state = get_state()
         model_id = _served_model_name(state)
         efforts, default_effort = await _effort_fields(state)
+        toggleable, default_thinking = await _thinking_switch_fields(state)
         return ModelList(
             data=[
                 ModelCard(
@@ -155,6 +156,8 @@ def register_openai_routes(
                     context_length=state.max_seq_len,
                     supported_reasoning_efforts=efforts,
                     default_reasoning_effort=default_effort,
+                    thinking_toggleable=toggleable,
+                    default_thinking=default_thinking,
                     input_modalities=["text", *sorted(state.config.served_modalities)],
                 )
             ]
@@ -756,6 +759,23 @@ async def _effort_fields(state: Any) -> tuple[list[str] | None, str | None]:
         return None, None
     ordered = sorted(served, key=lambda name: -EFFORT_SCALE.get(name, 0.0))
     return ordered, profile.default
+
+
+async def _thinking_switch_fields(state: Any) -> tuple[bool | None, bool | None]:
+    """Whether the template turns thinking off and on, and whether it is on by default, for
+    /v1/models; (None, None) when there is no frontend tokenizer or the probe fails."""
+    build = getattr(state, "frontend_tokenizer", None)
+    if build is None:
+        return None, None
+    try:
+        manager = await asyncio.to_thread(build)
+        profile = await asyncio.to_thread(manager.thinking_profile)
+    except Exception:  # noqa: BLE001 -- metadata only; the generation path reports real faults
+        return None, None
+    if profile.toggleable:
+        return True, profile.default_state != "off"
+    else:
+        return False, None
 
 
 def _served_model_name(state: Any) -> str:

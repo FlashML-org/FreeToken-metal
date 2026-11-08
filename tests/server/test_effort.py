@@ -271,6 +271,31 @@ def test_models_list_the_served_efforts(
     )
 
 
+# (chat template, thinking_toggleable, default_thinking)
+MODEL_THINKING_SWITCH_CASES: list[tuple[str, bool, bool | None]] = [
+    (THINKING_PROBE_CASES[0][0], True, True),
+    (THINKING_PROBE_CASES[1][0], True, False),
+    (THINKING_PROBE_CASES[2][0], False, None),
+    (THINKING_PROBE_CASES[3][0], True, True),
+]
+
+
+@pytest.mark.parametrize(
+    ("template", "toggleable", "default_thinking"), MODEL_THINKING_SWITCH_CASES
+)
+def test_models_report_the_thinking_switch(
+    tiny_model_dir: Path,
+    scripted: type[ScriptedScheduler],
+    template: str,
+    toggleable: bool,
+    default_thinking: bool | None,
+) -> None:
+    (tiny_model_dir / "chat_template.jinja").write_text(template)
+    with TestClient(create_app(tiny_server_args(tiny_model_dir))) as client:
+        [card] = client.get("/v1/models").json()["data"]
+    assert (card["thinking_toggleable"], card["default_thinking"]) == (toggleable, default_thinking)
+
+
 @pytest.mark.skipif(MODEL_PATH is None, reason="FTMETAL_TEST_MODEL_PATH is not set")
 def test_real_template_takes_effort_as_the_thinking_switch() -> None:
     """Qwen3.6 and Gemma4 read enable_thinking and no effort."""

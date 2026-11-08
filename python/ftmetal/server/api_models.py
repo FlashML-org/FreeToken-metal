@@ -149,6 +149,10 @@ class ModelCard(BaseModel):
     # (not []) when the model has no effort knob or the probe could not run.
     supported_reasoning_efforts: list[str] | None = None
     default_reasoning_effort: str | None = None
+    # Whether a request can turn thinking off (reasoning_effort "none") and on, and, when it can,
+    # whether thinking is on for a request that does not say; None when the probe could not run.
+    thinking_toggleable: bool | None = None
+    default_thinking: bool | None = None
     # What a request may carry: "text", and "image" when a vision tower is served.
     input_modalities: list[str] = Field(default_factory=lambda: ["text"])
 

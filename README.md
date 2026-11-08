@@ -47,7 +47,8 @@ the thought channel on Gemma4, and `tools` come back as `tool_calls`;
 `chat_template_kwargs: {"enable_thinking": false}` or `thinking: {"type": "disabled"}`
 turns thinking off, and so does `reasoning_effort: "none"`; any other effort turns it on and
 reaches a chat template that grades effort as the nearest level it accepts, which `/v1/models`
-lists), `POST /v1/completions` and `GET /v1/models`; the Anthropic
+lists along with `thinking_toggleable` and `default_thinking`), `POST /v1/completions` and
+`GET /v1/models`; the Anthropic
 `POST /v1/messages` (thinking, text and tool_use blocks) and `/v1/messages/count_tokens`;
 the OpenAI Responses `POST /v1/responses` (stateless: `GET /v1/responses/{id}` and its
 `/cancel` answer 404); and `POST /generate` (a raw text prompt, no chat template, streamed
