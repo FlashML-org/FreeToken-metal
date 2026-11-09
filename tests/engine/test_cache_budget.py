@@ -43,8 +43,12 @@ from ftmetal.engine.cache_budget import (
     solve_num_pages,
     victim_cache_bytes,
 )
-from ftmetal.engine.config import EngineConfig, MoeStrategyChoice
-from ftmetal.engine.engine import offload_layers, resolve_moe_strategy
+from ftmetal.engine.config import (
+    DEFAULT_RESERVED_CONTEXT_TOKENS,
+    EngineConfig,
+    MoeStrategyChoice,
+)
+from ftmetal.engine.engine import Engine, offload_layers, resolve_moe_strategy
 from ftmetal.kvcache import pool_costs
 from ftmetal.kvcache.base import PoolCost
 from ftmetal.models.config import MoeStrategy
@@ -202,9 +206,168 @@ def test_qwen3_6_budget_reproduces_pages_and_slots(
     report = plan_budget(budget, WEIGHTS_BYTES, activations, 0, costs)
     assert report.lines() == case.lines
     caplog.set_level(logging.INFO)
-    num_pages = solve_num_pages(report, config.page_size, config.num_page_override)
+    num_pages = solve_num_pages(
+        report,
+        config.page_size,
+        config.num_page_override,
+        num_token_override=None,
+        context_tokens=DEFAULT_RESERVED_CONTEXT_TOKENS,
+        is_context_requested=False,
+    )
     assert num_pages == case.num_pages
     assert caplog.messages == [case.pages_line]
+
+
+# (the tokens the budget gives the KV pools, the context, whether a flag asked for it,
+# --num-pages, the refusal, the warning)
+CONTEXT_FIT_CASES: list[tuple[int, int, bool, int | None, str, str]] = [
+    (65536, 65536, True, None, "", ""),
+    (65535, 65536, True, None, "a context of 65536 tokens does not fit the memory budget", ""),
+    (65535, 65536, False, None, "", "less than the default context of 65536"),
+    # --num-pages sizes the pools by hand, whatever the budget or the context.
+    (65535, 65536, True, 1024, "", ""),
+]
+
+
+@pytest.mark.parametrize(
+    ("tokens", "context", "requested", "pages", "error", "warning"), CONTEXT_FIT_CASES
+)
+def test_context_is_held_or_refused(
+    caplog: pytest.LogCaptureFixture,
+    tokens: int,
+    context: int,
+    requested: bool,
+    pages: int | None,
+    error: str,
+    warning: str,
+) -> None:
+    report = plan_budget(tokens * 1024, 0, 0, 0, {AttnType.FULL: PoolCost(1024, 0)})
+    if error:
+        with pytest.raises(ValueError, match=error):
+            solve_num_pages(
+                report,
+                1,
+                pages,
+                num_token_override=None,
+                context_tokens=context,
+                is_context_requested=requested,
+            )
+    else:
+        with caplog.at_level(logging.WARNING):
+            num_pages = solve_num_pages(
+                report,
+                1,
+                pages,
+                num_token_override=None,
+                context_tokens=context,
+                is_context_requested=requested,
+            )
+        assert num_pages == (tokens if pages is None else pages)
+        assert warning in caplog.text and (warning != "") == bool(caplog.records)
+
+
+# (the tokens the budget gives the KV pools, --num-token, --page-size, the pages, the refusal)
+NUM_TOKEN_CASES: list[tuple[int, int, int, int, str]] = [
+    # What was asked for, not all the budget gives.
+    (65536, 8192, 1, 8192, ""),
+    (65536, 65536, 1, 65536, ""),
+    # Tokens, rounded up to whole pages.
+    (65536, 8193, 4, 2049, ""),
+    (65535, 65536, 1, 0, "a context of 65536 tokens does not fit the memory budget"),
+]
+
+
+@pytest.mark.parametrize(("budget", "num_tokens", "page_size", "pages", "error"), NUM_TOKEN_CASES)
+def test_num_token_sets_the_kv_capacity(
+    budget: int, num_tokens: int, page_size: int, pages: int, error: str
+) -> None:
+    costs = {AttnType.FULL: PoolCost(1024 * page_size, 0)}
+    report = plan_budget(budget * 1024, 0, 0, 0, costs)
+    if error:
+        with pytest.raises(ValueError, match=error):
+            solve_num_pages(
+                report,
+                page_size,
+                None,
+                num_token_override=num_tokens,
+                context_tokens=num_tokens,
+                is_context_requested=True,
+            )
+    else:
+        assert (
+            solve_num_pages(
+                report,
+                page_size,
+                None,
+                num_token_override=num_tokens,
+                context_tokens=num_tokens,
+                is_context_requested=True,
+            )
+            == pages
+        )
+
+
+@pytest.mark.parametrize(("max_seq_len", "num_tokens"), [(1 << 40, None), (None, 1 << 40)])
+def test_engine_refuses_a_context_the_budget_cannot_hold(
+    tmp_path: Path, max_seq_len: int | None, num_tokens: int | None
+) -> None:
+    save_checkpoint(build_reference(seed=0), tmp_path, quantization=None)
+    config = EngineConfig(
+        model_path=str(tmp_path),
+        dtype=mx.float32,
+        attention_backend="mlx",
+        max_seq_len_override=max_seq_len,
+        num_token_override=num_tokens,
+        max_extend_tokens_override=128,
+        command_graph=False,
+    )
+    with pytest.raises(ValueError, match="does not fit the memory budget"):
+        Engine(config)
+
+
+# (the checkpoint's context window, --max-seq-len, --num-token, --num-pages, --page-size, the
+# tokens kept before the experts)
+RESERVED_CONTEXT_CASES: list[tuple[int, int | None, int | None, int | None, int, int]] = [
+    (262144, None, None, None, 1, 65536),
+    # The default counts tokens, whatever the page size.
+    (262144, None, None, None, 4, 65536),
+    (4096, None, None, None, 1, 4096),
+    (262144, 8192, None, None, 1, 8192),
+    (262144, 131072, None, None, 1, 131072),
+    (262144, None, 32768, None, 1, 32768),
+    # --num-token is what the pools get, whatever --max-seq-len caps a request at.
+    (262144, 8192, 32768, None, 1, 32768),
+    # --num-pages sizes the pools by hand: the experts get what it leaves.
+    (262144, 131072, None, 1024, 1, 1024),
+    (262144, None, None, 1024, 4, 4096),
+]
+
+
+@pytest.mark.parametrize(
+    ("window", "max_seq_len", "num_tokens", "pages", "page_size", "expected"),
+    RESERVED_CONTEXT_CASES,
+)
+def test_reserved_context_is_counted_in_tokens(
+    tmp_path: Path,
+    window: int,
+    max_seq_len: int | None,
+    num_tokens: int | None,
+    pages: int | None,
+    page_size: int,
+    expected: int,
+) -> None:
+    save_checkpoint(build_reference(seed=0), tmp_path, quantization=None)
+    checkpoint_config = json.loads((tmp_path / "config.json").read_text())
+    checkpoint_config["text_config"] = {**TINY_TEXT_CONFIG, "max_position_embeddings": window}
+    (tmp_path / "config.json").write_text(json.dumps(checkpoint_config))
+    config = EngineConfig(
+        model_path=str(tmp_path),
+        page_size=page_size,
+        max_seq_len_override=max_seq_len,
+        num_token_override=num_tokens,
+        num_page_override=pages,
+    )
+    assert config.reserved_context_tokens == expected
 
 
 def test_graph_reserve_comes_off_the_paged_pools() -> None:
@@ -414,23 +577,23 @@ class OffloadBudgetCase(NamedTuple):
 
 
 OFFLOAD_BUDGET_CASES = [
-    # A 24 GB Mac's budget: the experts do not fit resident; cache-auto gives the KV pools
-    # 8192 tokens and the experts the rest.
+    # A 24 GB Mac's budget: the experts do not fit resident; cache-auto keeps the KV pools
+    # 65536 tokens and gives the experts the rest.
     OffloadBudgetCase(
         0.43,
         0,
         None,
         True,
         "offload",
-        6342,
+        5678,
         [
             "budget         16.10 GiB",
             "weights         1.28 GiB",
-            "experts        10.51 GiB",
+            "experts         9.42 GiB",
             "gdn slots       1.51 GiB",
             "activations     2.62 GiB",
             "graphs          0.01 GiB",
-            "kv pages        0.16 GiB",
+            "kv pages        1.25 GiB",
         ],
     ),
     OffloadBudgetCase(
@@ -552,7 +715,7 @@ def offload_budget(
     costs = pool_costs(model_config.kv_cache_group_specs(), config)
     budget = memory_budget_bytes(WORKING_SET_BYTES, config.memory_ratio)
     graphs = graph_reserve_bytes(config.max_running_req)
-    reserve_pages = kv_reserve_pages(config.kv_reserve_tokens, config.page_size)
+    reserve_pages = kv_reserve_pages(DEFAULT_RESERVED_CONTEXT_TOKENS, config.page_size)
     resident = BudgetReport(
         budget=budget,
         weights=NON_EXPERT_BYTES + EXPERT_BYTES,
@@ -617,9 +780,11 @@ REFUSED_OFFLOAD_CASES: list[tuple[dict[str, float | int | bool | None], str]] = 
     ({"moe_cache_size": 200, "moe_prefill_overlap": False}, "give at least 320 slots$"),
     ({"memory_ratio": 0.15, "moe_prefill_overlap": False}, "does not fit the memory budget"),
     ({"moe_cache_size": 512, "moe_cache_rate": 0.5}, "moe_cache_size and moe_cache_rate are"),
-    ({"moe_cache_rate": 0.5, "moe_cache_auto": True}, "moe_cache_rate and moe_cache_auto are"),
+    ({"num_token_override": 8192, "num_page_override": 1024}, "num_token_override and num_page_"),
+    ({"num_token_override": 0}, "num_token_override must be positive"),
     ({"moe_cache_rate": 1.5}, r"moe_cache_rate must be in \[0, 1\]"),
     ({"memory_ratio": 0.0}, r"memory_ratio must be in \(0, 1\]"),
+    ({"max_seq_len_override": 0}, "max_seq_len_override must be positive"),
     ({"moe_victim_cache_gib": -1.0}, "moe_victim_cache_gib must be auto or a finite"),
     ({"moe_victim_cache_gib": float("nan")}, "moe_victim_cache_gib must be auto or a finite"),
 ]
@@ -659,17 +824,16 @@ def test_victim_cache_bytes(
 
 # (--moe-strategy, EngineConfig flags, budget, the checkpoint's quantization mode or None for
 # bf16, the strategy resolved) on a tiny checkpoint: its weights take a few MiB beside an
-# activation reserve of two 0.75 GiB steps, and 8192 tokens of KV take 8 MiB. auto resolves
-# alike whatever the experts' format.
+# activation reserve of two 0.75 GiB steps, and its 512-token context of KV 0.5 MiB. auto
+# resolves alike whatever the experts' format.
 STRATEGY_CASES: list[
     tuple[MoeStrategyChoice, dict[str, float | bool], int, str | None, MoeStrategy]
 ] = [
     ("auto", {}, 2 * GIB, "affine", "fused"),
     ("auto", {}, 1 * GIB, "affine", "offload"),
-    ("auto", {"kv_reserve_tokens": 1 << 20}, 2 * GIB, None, "offload"),
-    ("auto", {"kv_reserve_tokens": 1 << 20}, 2 * GIB, "mxfp4", "offload"),
+    ("auto", {"max_seq_len_override": 1 << 20}, 2 * GIB, None, "offload"),
+    ("auto", {"max_seq_len_override": 1 << 20}, 2 * GIB, "mxfp4", "offload"),
     ("auto", {"moe_cache_rate": 0.5}, 2 * GIB, None, "offload"),
-    ("auto", {"moe_cache_auto": True}, 2 * GIB, None, "offload"),
     ("fused", {"moe_cache_rate": 0.5}, 1 * GIB, "affine", "fused"),
     ("offload", {}, 2 * GIB, None, "offload"),
 ]
@@ -737,7 +901,7 @@ def test_auto_keeps_experts_resident_without_offload(
     }
     (tmp_path / "config.json").write_text(json.dumps(checkpoint_config))
     # Its window pool alone takes 3.3 GiB beside the 1.5 GiB activation reserve.
-    flags: dict[str, float | bool] = {"kv_reserve_tokens": 1 << 20}
+    flags: dict[str, float | bool] = {"max_seq_len_override": 1 << 20}
     assert resolve_tiny_strategy(tmp_path, "auto", flags, 8 * GIB) == "offload"
     architecture = "Gemma4ForConditionalGeneration"
     no_offload = dataclasses.replace(MODEL_REGISTRY[architecture], has_offload=False)

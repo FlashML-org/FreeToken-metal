@@ -6,9 +6,11 @@ served_modalities reads the encoders from mm.processor.active_encoders (no activ
 property) and is empty for a checkpoint without config.json; model_config drops the unbuilt
 encoder sections from the raw config dictionary; the MoE strategies are auto, fused and
 offload (no host-bank kinds), and no deprecated moe_backend field (only the flag);
-memory_ratio defaults to None, the working set less a headroom; the three cache size fields
+memory_ratio defaults to None, the working set less a headroom; the two cache size fields
 are checked exclusive here, not only as flags; moe_victim_cache_gib sizes the offload's host
-victim cache, which FreeToken does not have.
+victim cache, which FreeToken does not have; no kv_reserve_tokens and no moe_cache_auto:
+what the KV pools keep before the experts is the context (reserved_context_tokens), and an
+offload without a cache size gives the experts the rest.
 """
 
 from __future__ import annotations
@@ -46,6 +48,9 @@ MoeStrategyChoice = Literal["auto", "fused", "offload"]
 # four rows, where the expert-sorted tile kernel beats the per-row matvec in every expert
 # format (1.5-2.8x at Qwen3.6's shapes on the M4 Pro).
 DEFAULT_MOE_PREFILL_OVERLAP_MIN_TOKENS = 128
+# The tokens the KV pools keep before an offload cache takes the rest, without --num-token or
+# --max-seq-len.
+DEFAULT_RESERVED_CONTEXT_TOKENS = 65536
 
 
 def command_graph_from_env() -> bool:
@@ -123,6 +128,8 @@ class EngineConfig:
     attention_backend: str = "metal"
     max_seq_len_override: int | None = None
     num_page_override: int | None = None
+    # The KV pools' capacity in tokens, rounded up to whole pages; None: sized from the budget.
+    num_token_override: int | None = None
     # Prefill token budget per batch, longer prompts chunked; None: the model's.
     max_extend_tokens_override: int | None = None
     # Decode steps between status log lines.
@@ -140,14 +147,11 @@ class EngineConfig:
     # config.
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
     moe_strategy: MoeStrategyChoice = "auto"
-    # The offload cache's size in expert slots, or as a fraction of every expert, or auto (the
-    # KV pools get kv_reserve_tokens first, the experts the rest); at most one is set, and an
-    # offload with none is auto. 0 and None: not set.
+    # The offload cache's size in expert slots, or as a fraction of every expert; at most one
+    # is set. 0 and None: not set, the KV pools keep reserved_context_tokens first and the
+    # experts get the rest.
     moe_cache_size: int = 0
     moe_cache_rate: float | None = None
-    moe_cache_auto: bool = False
-    # KV tokens auto keeps before the experts: auto's fused fit check and cache sizing.
-    kv_reserve_tokens: int = 8192
     moe_cache_policy: MoeCachePolicy = "lru"
     # How the offload cache groups the MoE layers into pools of slots, and splits its slots
     # among them: evenly per layer, or by a hot-expert table (moe_pool_profile, else the model
@@ -178,17 +182,12 @@ class EngineConfig:
     memory_ratio: float | None = None
 
     def __post_init__(self) -> None:
-        cache_flags = [
-            flag
-            for flag, is_set in (
-                ("moe_cache_size", self.moe_cache_size != 0),
-                ("moe_cache_rate", self.moe_cache_rate is not None),
-                ("moe_cache_auto", self.moe_cache_auto),
+        if self.moe_cache_size != 0 and self.moe_cache_rate is not None:
+            raise ValueError("moe_cache_size and moe_cache_rate are exclusive: set at most one")
+        if self.num_token_override is not None and self.num_page_override is not None:
+            raise ValueError(
+                "num_token_override and num_page_override are exclusive: set at most one"
             )
-            if is_set
-        ]
-        if len(cache_flags) > 1:
-            raise ValueError(f"{' and '.join(cache_flags)} are exclusive: set at most one")
         if self.moe_cache_policy not in get_args(MoeCachePolicy):
             raise ValueError(f"moe_cache_policy must be lru or lrfu, got {self.moe_cache_policy!r}")
         if self.moe_victim_memory not in get_args(VictimMemoryKind):
@@ -199,10 +198,12 @@ class EngineConfig:
             raise ValueError(f"moe_cache_size must not be negative, got {self.moe_cache_size}")
         if self.moe_cache_rate is not None and not 0 <= self.moe_cache_rate <= 1:
             raise ValueError(f"moe_cache_rate must be in [0, 1], got {self.moe_cache_rate}")
-        if self.kv_reserve_tokens < 0:
+        if self.max_seq_len_override is not None and self.max_seq_len_override <= 0:
             raise ValueError(
-                f"kv_reserve_tokens must not be negative, got {self.kv_reserve_tokens}"
+                f"max_seq_len_override must be positive, got {self.max_seq_len_override}"
             )
+        if self.num_token_override is not None and self.num_token_override <= 0:
+            raise ValueError(f"num_token_override must be positive, got {self.num_token_override}")
         if self.memory_ratio is not None and not 0 < self.memory_ratio <= 1:
             raise ValueError(f"memory_ratio must be in (0, 1], got {self.memory_ratio}")
         if self.moe_victim_cache_gib != "auto" and not (
@@ -261,6 +262,19 @@ class EngineConfig:
         return self.model_config.rotary_config.max_position
 
     @property
+    def reserved_context_tokens(self) -> int:
+        """The KV tokens kept before the experts, for auto's resident check and cache sizing:
+        what --num-pages allocates, else --num-token, else --max-seq-len, else the default."""
+        if self.num_page_override is not None:
+            return self.num_page_override * self.page_size
+        elif self.num_token_override is not None:
+            return self.num_token_override
+        elif self.max_seq_len_override is not None:
+            return self.max_seq_len_override
+        else:
+            return min(DEFAULT_RESERVED_CONTEXT_TOKENS, self.max_seq_len)
+
+    @property
     def max_extend_tokens(self) -> int:
         if self.max_extend_tokens_override is not None:
             return self.max_extend_tokens_override
@@ -273,6 +287,7 @@ class EngineConfig:
 
 __all__ = [
     "DEFAULT_MOE_PREFILL_OVERLAP_MIN_TOKENS",
+    "DEFAULT_RESERVED_CONTEXT_TOKENS",
     "CacheTypeChoice",
     "EngineConfig",
     "MoeStrategyChoice",

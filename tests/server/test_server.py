@@ -957,44 +957,56 @@ def test_multimodal_flags_are_validated_at_startup(
     assert error in capsys.readouterr().err
 
 
-# (flags, (--moe-strategy, --moe-cache-size, --moe-cache-rate, --moe-cache-auto,
-# --kv-reserve-tokens, prefill overlap, --memory-ratio) as the server args hold them, the
-# warning logged)
-MOE_FLAG_CASES: list[
-    tuple[list[str], tuple[str, int, float | None, bool, int, bool, float | None], str]
-] = [
-    ([], ("auto", 0, None, False, 8192, True, None), ""),
-    # An offload without a size flag sizes its cache automatically.
-    (["--moe-strategy", "offload"], ("offload", 0, None, True, 8192, True, None), ""),
+# (flags, --num-token as the server args hold it)
+NUM_TOKEN_FLAG_CASES: list[tuple[list[str], int | None]] = [
+    ([], None),
+    (["--num-token", "8192"], 8192),
+    (["--context-length", "8192"], 8192),
+]
+
+
+@pytest.mark.parametrize(("flags", "expected"), NUM_TOKEN_FLAG_CASES)
+def test_num_token_flag_reaches_the_server_args(
+    tiny_model_dir: Path, flags: list[str], expected: int | None
+) -> None:
+    args = parse_args(["--model", str(tiny_model_dir), *flags], prog="ftm serve")
+    assert args.num_token_override == expected
+
+
+# (flags, (--moe-strategy, --moe-cache-size, --moe-cache-rate, prefill overlap,
+# --memory-ratio) as the server args hold them, the warning logged)
+MOE_FLAG_CASES: list[tuple[list[str], tuple[str, int, float | None, bool, float | None], str]] = [
+    ([], ("auto", 0, None, True, None), ""),
+    (["--moe-strategy", "offload"], ("offload", 0, None, True, None), ""),
     (
         ["--moe-strategy", "offload", "--moe-cache-rate", "0.7"],
-        ("offload", 0, 0.7, False, 8192, True, None),
+        ("offload", 0, 0.7, True, None),
         "",
     ),
     # A rate of 0 sets nothing.
     (
         ["--moe-strategy", "offload", "--moe-cache-rate", "0"],
-        ("offload", 0, None, True, 8192, True, None),
+        ("offload", 0, None, True, None),
         "",
     ),
     (
         ["--moe-backend", "offload", "--moe-cache-size", "600"],
-        ("offload", 600, None, False, 8192, True, None),
+        ("offload", 600, None, True, None),
         "--moe-backend is deprecated; use --moe-strategy",
     ),
     (
-        ["--moe-cache-auto", "--kv-reserve-tokens", "4096", "--memory-ratio", "0.43"],
-        ("auto", 0, None, True, 4096, True, 0.43),
+        ["--memory-ratio", "0.43"],
+        ("auto", 0, None, True, 0.43),
         "",
     ),
     (
         ["--disable-moe-prefill-overlap", "--moe-cache-policy", "lru"],
-        ("auto", 0, None, False, 8192, False, None),
+        ("auto", 0, None, False, None),
         "",
     ),
     (
         ["--expert-load", "serial"],
-        ("auto", 0, None, False, 8192, True, None),
+        ("auto", 0, None, True, None),
         "--expert-load is ignored",
     ),
 ]
@@ -1005,7 +1017,7 @@ def test_moe_flags_reach_the_server_args(
     tiny_model_dir: Path,
     caplog: pytest.LogCaptureFixture,
     flags: list[str],
-    fields: tuple[str, int, float | None, bool, int, bool, float | None],
+    fields: tuple[str, int, float | None, bool, float | None],
     warning: str,
 ) -> None:
     with caplog.at_level(logging.WARNING):
@@ -1014,8 +1026,6 @@ def test_moe_flags_reach_the_server_args(
         args.moe_strategy,
         args.moe_cache_size,
         args.moe_cache_rate,
-        args.moe_cache_auto,
-        args.kv_reserve_tokens,
         args.moe_prefill_overlap,
         args.memory_ratio,
     ) == fields
@@ -1028,11 +1038,13 @@ REFUSED_MOE_FLAG_CASES: list[tuple[list[str], str]] = [
     (["--moe-strategy", "cpu"], "--moe-strategy cpu computes experts on the CPU"),
     (["--moe-backend", "hybrid"], "--moe-strategy hybrid computes experts on the CPU"),
     (["--moe-cache-size", "600", "--moe-cache-rate", "0.5"], "not allowed with argument"),
-    (["--moe-cache-rate", "0.5", "--moe-cache-auto"], "not allowed with argument"),
+    (["--moe-cache-auto"], "unrecognized arguments: --moe-cache-auto"),
+    (["--num-token", "8192", "--num-pages", "1024"], "--num-token and --num-pages are exclusive"),
     (["--moe-cache-rate", "1.5"], "expected a number in [0, 1]"),
     (["--moe-cache-size", "-1"], "expected a non-negative integer"),
     (["--memory-ratio", "0"], "expected a number in (0, 1]"),
     (["--moe-cache-policy", "lfu"], "invalid choice: 'lfu'"),
+    (["--kv-reserve-tokens", "4096"], "unrecognized arguments: --kv-reserve-tokens"),
     (["--moe-victim-cache-gib", "-1"], "expected auto or a non-negative number"),
     (["--moe-victim-cache-gib", "inf"], "expected auto or a non-negative number"),
     (["--moe-victim-memory", "anonymous"], "invalid choice"),

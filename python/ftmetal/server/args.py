@@ -12,7 +12,10 @@ transformers) and is module-level. MoE: --moe-strategy takes auto, fused and off
 refuses FreeToken's cpu and hybrid (no host banks on unified memory); --expert-load is
 accepted and ignored; --memory-ratio defaults to unset (the working set less a headroom);
 no --moe-cpu-threads, --moe-cpu-layers, --moe-hybrid-max-fetch or --moe-prefill-hit-d2d;
---moe-victim-cache-gib is this engine's own.
+--moe-victim-cache-gib is this engine's own; no --kv-reserve-tokens and no --moe-cache-auto:
+an offload without a cache size and auto's resident check keep the context, --num-token
+(FreeToken's --num-tokens, also --context-length), --max-seq-len or 64K tokens, before the
+experts.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ from typing import Literal, get_args
 from ftmetal.attention import SUPPORTED_ATTENTION_BACKENDS
 from ftmetal.engine.cache_budget import GIB, VICTIM_CACHE_HOST_RESERVE_BYTES
 from ftmetal.engine.config import (
+    DEFAULT_RESERVED_CONTEXT_TOKENS,
     CacheTypeChoice,
     EngineConfig,
     MoeStrategyChoice,
@@ -301,13 +305,27 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         help="requests decoded together",
     )
     parser.add_argument(
+        "--num-token",
+        "--context-length",
+        dest="num_token_override",
+        type=positive_int,
+        metavar="N",
+        default=ServerArgs.num_token_override,
+        help="KV capacity in tokens, shared by the running requests and the prefix cache, "
+        "which also caps a request: a MoE cache gets what this leaves, and a start the "
+        "memory budget cannot give it stops (default: what memory holds, keeping "
+        f"{DEFAULT_RESERVED_CONTEXT_TOKENS} tokens before the MoE cache)",
+    )
+    parser.add_argument(
         "--max-seq-len",
         "--max-seq-len-override",
         dest="max_seq_len_override",
         type=positive_int,
         metavar="N",
         default=ServerArgs.max_seq_len_override,
-        help="context length, prompt plus output (default: the model's)",
+        help="longest request, prompt plus output: an automatically sized MoE cache leaves the "
+        "KV pools this much, and a start the memory budget cannot give it stops (default: the "
+        "model's as memory holds it)",
     )
     parser.add_argument(
         "--max-output-tokens",
@@ -326,15 +344,17 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         help="prefill tokens per batch, longer prompts chunked (default: the model's, 2048 "
         "for most)",
     )
-    parser.add_argument(
+    advanced_group = parser.add_argument_group("advanced")
+    advanced_group.add_argument(
         "--num-pages",
         dest="num_page_override",
         type=positive_int,
         metavar="N",
         default=ServerArgs.num_page_override,
-        help="KV pages to allocate (default: sized from the memory budget)",
+        help="KV pages to allocate, unchecked against the memory budget; exclusive with "
+        "--num-token (default: sized from the memory budget)",
     )
-    parser.add_argument(
+    advanced_group.add_argument(
         "--page-size",
         type=positive_int,
         default=ServerArgs.page_size,
@@ -386,8 +406,9 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         default=ServerArgs.moe_strategy,
         help="how a MoE model's routed experts are served: fused keeps them resident, offload "
         "reads them from the checkpoint into a slot cache, auto (default) keeps them resident "
-        "when they fit the memory budget beside --kv-reserve-tokens of KV and offloads "
-        "otherwise; cpu and hybrid are not supported on macOS",
+        "when they fit the memory budget beside the context (--num-token or --max-seq-len, else "
+        f"{DEFAULT_RESERVED_CONTEXT_TOKENS} tokens) and offloads otherwise; cpu and hybrid "
+        "are not supported on macOS",
     )
     parser.add_argument(
         "--moe-backend",
@@ -405,7 +426,8 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         metavar="N",
         default=ServerArgs.moe_cache_size,
         help="expert slots of the MoE offload cache (with prefill overlap at least twice the "
-        "experts of a layer, else once)",
+        "experts of a layer, else once); without this or --moe-cache-rate the cache gets what "
+        "the KV pools leave",
     )
     moe_cache_group.add_argument(
         "--moe-cache-rate",
@@ -413,21 +435,6 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         metavar="R",
         default=ServerArgs.moe_cache_rate,
         help="the MoE offload cache's slots as a fraction of all routed experts",
-    )
-    moe_cache_group.add_argument(
-        "--moe-cache-auto",
-        action="store_true",
-        help="size the MoE offload cache from the memory budget, experts first: the KV pools "
-        "get --kv-reserve-tokens, the experts the rest (the default of an offload without a "
-        "size flag)",
-    )
-    parser.add_argument(
-        "--kv-reserve-tokens",
-        type=non_negative_int,
-        metavar="N",
-        default=ServerArgs.kv_reserve_tokens,
-        help="KV tokens kept before the experts by --moe-cache-auto and by auto's "
-        f"resident check (default {ServerArgs.kv_reserve_tokens})",
     )
     parser.add_argument(
         "--moe-cache-policy",
@@ -598,6 +605,8 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         )
     disabled_encoders: set[EncoderKind] = set(ENCODER_KINDS) if namespace.text_model_only else set()
     disabled_encoders.update(namespace.mm_disable)
+    if namespace.num_token_override is not None and namespace.num_page_override is not None:
+        parser.error("--num-token and --num-pages are exclusive: set at most one")
     if namespace.moe_strategy in HOST_MOE_STRATEGIES:
         parser.error(
             f"--moe-strategy {namespace.moe_strategy} computes experts on the CPU from host "
@@ -608,12 +617,6 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
             "--expert-load is ignored: the experts are read from the checkpoint into the "
             "offload cache"
         )
-    # FreeToken: an offload without a size flag sizes its cache automatically.
-    moe_cache_auto = namespace.moe_cache_auto or (
-        namespace.moe_strategy == "offload"
-        and namespace.moe_cache_size == 0
-        and not namespace.moe_cache_rate
-    )
     return ServerArgs(
         model_path=model_path,
         served_model_name=(
@@ -630,6 +633,7 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         max_output_tokens=namespace.max_output_tokens,
         max_extend_tokens_override=namespace.max_extend_tokens_override,
         num_page_override=namespace.num_page_override,
+        num_token_override=namespace.num_token_override,
         page_size=namespace.page_size,
         cache_type=namespace.cache_type,
         swa_windows=namespace.swa_windows,
@@ -640,8 +644,6 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         moe_strategy=namespace.moe_strategy,
         moe_cache_size=namespace.moe_cache_size,
         moe_cache_rate=namespace.moe_cache_rate if namespace.moe_cache_rate else None,
-        moe_cache_auto=moe_cache_auto,
-        kv_reserve_tokens=namespace.kv_reserve_tokens,
         moe_cache_policy=namespace.moe_cache_policy,
         moe_pool=namespace.moe_pool,
         moe_pool_slots=namespace.moe_pool_slots[0],

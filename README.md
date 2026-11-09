@@ -34,7 +34,7 @@ against the pinned `mlx` wheel; the Metal kernels under `python/ftmetal/kernel/`
 
 ```bash
 uv run ftm serve --model /path/to/Qwen3.6-35B-A3B-MLX      # OpenAI API on 127.0.0.1:1919
-uv run ftm serve --model /path/to/model --port 8000 --max-running-requests 8 --max-seq-len 65536
+uv run ftm serve --model /path/to/model --port 8000 --max-running-requests 8 --num-token 65536
 uv run ftm shell                                            # chat with the running server
 uv run ftm shell --server http://127.0.0.1:8000             # or FTMETAL_HOST=http://...
 uv run ftm launch claude                                    # a coding agent on the running server
@@ -85,15 +85,16 @@ reply. Environment knobs are read as `FTMETAL_<NAME>`, falling back to
 A MoE checkpoint whose experts do not fit the memory budget, in any format its family loads
 (bf16, MLX affine or float modes, the Hugging Face layout, an NVFP4 or FP8 export), serves
 them from an offload cache that reads them from the checkpoint on demand
-(`--moe-strategy auto|fused|offload`, FreeToken's flags): `--moe-cache-size`,
-`--moe-cache-rate` or `--moe-cache-auto` size it (auto, the default, gives the KV pools
-`--kv-reserve-tokens` first and the experts the rest), `--disable-moe-prefill-overlap`
+(`--moe-strategy auto|fused|offload`, FreeToken's flags): `--moe-cache-size` or
+`--moe-cache-rate` size it (without them the KV pools keep the context first, `--num-token`,
+also `--context-length`, or 64K tokens, and the experts get the rest; a `--num-token` the
+budget cannot hold stops the start), `--disable-moe-prefill-overlap`
 stops long prefills from reading each layer's experts ahead, and `--memory-ratio` sets the
 budget as a fraction of Metal's recommended working set, which also emulates a smaller Mac.
 `ftm pack --model DIR` writes `DIR/experts.packed`, each routed expert as one record (an
 affine checkpoint's scales and biases as codes into a per-layer table of their pairs), which
 the offload cache then reads instead of the checkpoint: one read per expert, and smaller
-affine slots, which `--moe-cache-auto` turns into more of them. A pack the checkpoint has
+affine slots, which a cache sized from the budget turns into more of them. A pack the checkpoint has
 changed under is passed over with a warning; `FTMETAL_MOE_PACK=0` ignores it.
 
 ```bash

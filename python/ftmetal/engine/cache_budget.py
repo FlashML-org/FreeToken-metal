@@ -6,11 +6,13 @@ it; every pool prices its own spec as (bytes per page, fixed bytes), the fixed c
 off first and the paged pools share the rest (FreeToken's engine adds the GDN state pool to
 the KV family's fixed cost by hand); the lines are the ones this engine has (weights, the
 offload cache's experts, one per pool, activations, the vision encoder's activations, the
-decode graphs' arena); --moe-cache-auto (plan_cache_budget) gives the KV pools
-kv_reserve_tokens first and the experts the rest, out of what the other lines leave; the
-auto strategy keeps the experts resident when they fit beside that KV reserve (FreeToken's
-auto always offloads a MoE model off unified memory); the offload's victim cache lies outside
-the budget, in the host memory beyond the working set (victim_cache_bytes).
+decode graphs' arena); an offload without a cache size keeps the KV pools the context first
+(--num-token, --max-seq-len or 64K tokens, not FreeToken's --kv-reserve-tokens) and gives
+the experts the rest, out of what the other lines leave (no --moe-cache-auto); the auto
+strategy keeps the experts resident when they fit beside that context (FreeToken's auto
+always offloads a MoE model off unified memory); a --num-token or --max-seq-len the budget
+cannot hold is refused at startup; the offload's victim cache lies outside the budget, in
+the host memory beyond the working set (victim_cache_bytes).
 """
 
 from __future__ import annotations
@@ -175,8 +177,8 @@ class BudgetReport:
         ]
 
 
-def kv_reserve_pages(kv_reserve_tokens: int, page_size: int) -> int:
-    return -(-kv_reserve_tokens // page_size)
+def kv_reserve_pages(reserved_context_tokens: int, page_size: int) -> int:
+    return -(-reserved_context_tokens // page_size)
 
 
 def choose_moe_strategy(resident: BudgetReport, reserve_pages: int) -> MoeStrategy:
@@ -203,9 +205,9 @@ def resolve_moe_cache_size(
     buffer_placement: PrefillBufferPlacement,
 ) -> int:
     """The offload cache's slots: requested when set (at least one token's experts per layer,
-    and the two prefill buffers with prefill overlap: min_cache_size), else --moe-cache-auto:
-    what the paged pools of report (which has no experts line) leave past reserve_pages, from
-    that floor to every expert."""
+    and the two prefill buffers with prefill overlap: min_cache_size), else what the paged
+    pools of report (which has no experts line) leave past reserve_pages, from that floor to
+    every expert."""
     floor = min_cache_size(
         num_layers,
         num_experts,
@@ -272,14 +274,42 @@ def victim_cache_bytes(
         return int(requested_gib * GIB)
 
 
-def solve_num_pages(report: BudgetReport, page_size: int, num_page_override: int | None) -> int:
-    """Usable pages the paged pools get: their share of the budget unless overridden."""
-    if num_page_override is None:
-        num_pages = report.paged_bytes // report.bytes_per_page
-    else:
+def solve_num_pages(
+    report: BudgetReport,
+    page_size: int,
+    num_page_override: int | None,
+    *,
+    num_token_override: int | None,
+    context_tokens: int,
+    is_context_requested: bool,
+) -> int:
+    """Usable pages the paged pools get: --num-pages as given, --num-token in whole pages, else
+    their share of the budget. A budget short of the context refuses a requested one and warns
+    about the default."""
+    budget_pages = report.paged_bytes // report.bytes_per_page
+    if num_page_override is not None:
         num_pages = num_page_override
+    elif num_token_override is not None:
+        num_pages = min(budget_pages, kv_reserve_pages(num_token_override, page_size))
+    else:
+        num_pages = budget_pages
+    num_tokens = num_pages * page_size
+    is_short_of_context = num_page_override is None and num_tokens < context_tokens
     if num_pages <= 1:
-        raise RuntimeError("not enough memory for the KV cache; lower --max-seq-len")
+        raise RuntimeError(
+            "not enough memory for the KV cache; raise --memory-ratio, lower "
+            "--max-prefill-length or shrink the MoE cache"
+        )
+    elif is_short_of_context and is_context_requested:
+        raise ValueError(
+            f"a context of {context_tokens} tokens does not fit the memory budget: the KV pools "
+            f"get {num_tokens} tokens beside the weights and any MoE cache"
+        )
+    elif is_short_of_context:
+        logger.warning(
+            f"the memory budget gives the KV pools {num_tokens} tokens, less than the default "
+            f"context of {context_tokens}"
+        )
     logger.info(
         f"KV cache: {num_pages} pages x {page_size} tokens, "
         f"{num_pages * report.bytes_per_page / GIB:.2f} GiB"

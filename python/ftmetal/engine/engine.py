@@ -118,13 +118,12 @@ def resolve_moe_strategy(
 ) -> MoeStrategy:
     """FreeToken's MoE strategy resolution: an explicit strategy stands; auto offloads when a
     cache size flag is given, else keeps the experts resident when the checkpoint's weights
-    leave the paged pools kv_reserve_tokens (choose_moe_strategy) or, when they leave them any
+    leave the paged pools the reserved context (choose_moe_strategy) or, when they leave them any
     pages, the model family has no offload cache; when they leave none, raises before any
     weight is read. state: the lazily mapped checkpoint the model loads from."""
     model_config = config.model_config
     has_cache_flag = (
         config.moe_cache_size_flag(model_config.num_moe_layers * model_config.num_experts) > 0
-        or config.moe_cache_auto
     )
     if not model_config.is_moe and config.moe_strategy == "offload":
         raise ValueError(f"--moe-strategy offload: {config.model_path} routes no experts")
@@ -155,19 +154,19 @@ def resolve_moe_strategy(
             encoder=encoder,
         )
         strategy = choose_moe_strategy(
-            resident, kv_reserve_pages(config.kv_reserve_tokens, config.page_size)
+            resident, kv_reserve_pages(config.reserved_context_tokens, config.page_size)
         )
         if strategy == "offload" and not get_model_spec(config.architecture).has_offload:
             # Refused here, before any weight is read, when they leave the paged pools nothing.
             plan_budget(budget, resident.weights, resident.activations, graphs, costs, encoder)
             logger.warning(
                 f"{config.architecture} has no MoE offload: its experts stay resident, beside "
-                "less KV than kv_reserve_tokens"
+                "less KV than the reserved context"
             )
             strategy = "fused"
         logger.info(
             f"Auto-selected MoE strategy: {strategy} ({weights.experts / GIB:.2f} GiB of "
-            f"experts beside {config.kv_reserve_tokens} tokens of KV; "
+            f"experts beside {config.reserved_context_tokens} tokens of KV; "
             f"{resident.paged_bytes / GIB:.2f} GiB left for the KV pools if resident)"
         )
         return strategy
@@ -397,7 +396,7 @@ class Engine:
                     costs=costs,
                     encoder=encoder_reserve,
                 ),
-                reserve_pages=kv_reserve_pages(config.kv_reserve_tokens, config.page_size),
+                reserve_pages=kv_reserve_pages(config.reserved_context_tokens, config.page_size),
                 # The widest row of each bank: the banks hold at most this much per slot.
                 slot_bytes=sum(
                     max(layout[role].nbytes for layout in layouts) for role in layouts[0]
@@ -447,7 +446,16 @@ class Engine:
         )
         for line in report.lines():
             logger.info(line)
-        self.num_pages = solve_num_pages(report, config.page_size, config.num_page_override)
+        self.num_pages = solve_num_pages(
+            report,
+            config.page_size,
+            config.num_page_override,
+            num_token_override=config.num_token_override,
+            context_tokens=config.reserved_context_tokens,
+            is_context_requested=(
+                config.num_token_override is not None or config.max_seq_len_override is not None
+            ),
+        )
         self.pools = create_pools(specs, config, self.num_pages)
 
         num_tokens = self.num_pages * config.page_size
