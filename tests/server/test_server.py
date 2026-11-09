@@ -870,13 +870,18 @@ def test_swa_windows_flag_takes_a_window_count(tiny_model_dir: Path) -> None:
             parse_args([*flags, "--swa-windows", value], prog="ftm serve")
 
 
-def test_gdn_snapshots_flag_takes_a_snapshot_count(tiny_model_dir: Path) -> None:
+def test_linear_state_checkpoints_flag_takes_a_checkpoint_count(tiny_model_dir: Path) -> None:
     flags = ["--model", str(tiny_model_dir)]
-    assert parse_args(flags, prog="ftm serve").gdn_snapshots is None
-    assert parse_args([*flags, "--gdn-snapshots", "12"], prog="ftm serve").gdn_snapshots == 12
+    assert parse_args(flags, prog="ftm serve").linear_state_checkpoints is None
+    assert (
+        parse_args(
+            [*flags, "--linear-state-checkpoints", "12"], prog="ftm serve"
+        ).linear_state_checkpoints
+        == 12
+    )
     for value in ("0", "1.5"):
         with pytest.raises(SystemExit):
-            parse_args([*flags, "--gdn-snapshots", value], prog="ftm serve")
+            parse_args([*flags, "--linear-state-checkpoints", value], prog="ftm serve")
 
 
 def test_multimodal_flags_reach_the_server_args(tiny_model_dir: Path) -> None:

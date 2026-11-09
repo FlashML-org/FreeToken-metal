@@ -107,12 +107,13 @@ class SlotCase(NamedTuple):
     label: str
     cache_type: Literal["naive", "radix"]
     max_running_req: int
-    gdn_snapshots: int | None
+    linear_state_checkpoints: int | None
     num_slots: int
 
 
 # Radix (the hybrid radix cache): 4 slots per running request (live, ping-pong pair, locked
-# snapshot), the snapshot cache of gdn_snapshots slots, 8 by default, and the padding slot.
+# snapshot), the snapshot cache of linear_state_checkpoints slots, 8 by default, and the
+# padding slot.
 # Naive: one live slot per running request and the padding slot.
 SLOT_CASES = [
     SlotCase("radix, the default snapshot cache", "radix", 2, None, 4 * 2 + 8 + 1),
@@ -124,14 +125,16 @@ SLOT_CASES = [
 
 
 def slot_config(
-    cache_type: Literal["naive", "radix"], max_running_req: int, gdn_snapshots: int | None
+    cache_type: Literal["naive", "radix"],
+    max_running_req: int,
+    linear_state_checkpoints: int | None,
 ) -> EngineConfig:
     return EngineConfig(
         model_path="unused",
         dtype=mx.float16,
         page_size=4,
         max_running_req=max_running_req,
-        gdn_snapshots=gdn_snapshots,
+        linear_state_checkpoints=linear_state_checkpoints,
         cache_type=cache_type,
     )
 
@@ -140,7 +143,7 @@ def test_kv_cost_prices_what_from_spec_allocates() -> None:
     specs = parse_config(TINY_TEXT_CONFIG).kv_cache_group_specs()
     num_pages = 10
     for case in SLOT_CASES:
-        config = slot_config(case.cache_type, case.max_running_req, case.gdn_snapshots)
+        config = slot_config(case.cache_type, case.max_running_req, case.linear_state_checkpoints)
         costs = pool_costs(specs, config)
         pools = create_pools(specs, config, num_pages)
         linear_pool = pools[AttnType.LINEAR]
@@ -160,5 +163,5 @@ def test_kv_cost_prices_what_from_spec_allocates() -> None:
 
 def test_fewer_snapshots_than_one_conversation_are_refused() -> None:
     specs = parse_config(TINY_TEXT_CONFIG).kv_cache_group_specs()
-    with pytest.raises(ValueError, match="--gdn-snapshots 2 or more"):
+    with pytest.raises(ValueError, match="--linear-state-checkpoints 2 or more"):
         pool_costs(specs, slot_config("radix", 2, 1))

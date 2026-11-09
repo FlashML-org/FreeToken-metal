@@ -43,7 +43,7 @@ def make_scheduler(
     num_pages: int = 64,
     max_running_req: int = 2,
     max_extend_tokens: int = 512,
-    gdn_snapshots: int | None = None,
+    linear_state_checkpoints: int | None = None,
     cache_type: CacheTypeChoice = "radix",
 ) -> Scheduler:
     config = EngineConfig(
@@ -53,7 +53,7 @@ def make_scheduler(
         page_size=page_size,
         num_page_override=num_pages,
         max_extend_tokens_override=max_extend_tokens,
-        gdn_snapshots=gdn_snapshots,
+        linear_state_checkpoints=linear_state_checkpoints,
         cache_type=cache_type,
     )
     return Scheduler(config, eos_token_ids={127})
@@ -207,7 +207,9 @@ def test_eviction_under_small_budgets_keeps_outputs(tmp_path: Path) -> None:
     save_checkpoint(model, tmp_path, quantization=None)
     prompts = [random_tokens(270 + i, 150) for i in range(6)]
     expected = [reference_greedy(model, prompt, STEPS)[1] for prompt in prompts]
-    scheduler = make_scheduler(tmp_path, num_pages=16, max_running_req=1, gdn_snapshots=4)
+    scheduler = make_scheduler(
+        tmp_path, num_pages=16, max_running_req=1, linear_state_checkpoints=4
+    )
     pool = scheduler.engine.ctx.linear_state_pool
     assert pool is not None and pool.num_slots == 9
     for uid, prompt in enumerate(prompts):
@@ -257,10 +259,10 @@ def test_too_few_snapshots_fail_at_startup_and_naive_ignores_the_count(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     save_checkpoint(build_reference(seed=29), tmp_path, quantization=None)
-    with pytest.raises(ValueError, match="--gdn-snapshots 2 or more"):
-        make_scheduler(tmp_path, gdn_snapshots=1)
+    with pytest.raises(ValueError, match="--linear-state-checkpoints 2 or more"):
+        make_scheduler(tmp_path, linear_state_checkpoints=1)
     with caplog.at_level(logging.WARNING, logger="ftmetal.scheduler.scheduler"):
-        scheduler = make_scheduler(tmp_path, gdn_snapshots=1, cache_type="naive")
-    assert "--gdn-snapshots" in caplog.text
+        scheduler = make_scheduler(tmp_path, linear_state_checkpoints=1, cache_type="naive")
+    assert "--linear-state-checkpoints" in caplog.text
     pool = scheduler.engine.ctx.linear_state_pool
     assert pool is not None and pool.num_slots == 2 + 1  # a live slot per running request

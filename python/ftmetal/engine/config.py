@@ -128,9 +128,9 @@ class EngineConfig:
     # Decode steps between status log lines.
     decode_log_interval: int = 40
     cache_type: CacheTypeChoice = "radix"
-    # GDN snapshot cache of the hybrid radix cache, in slots on top of the running requests'
-    # own, at least one conversation's two; None: kvcache.linear_state_pool's default.
-    gdn_snapshots: int | None = None
+    # Linear state checkpoint cache of the hybrid radix cache, in slots on top of the running
+    # requests' own, at least one conversation's two; None: kvcache.linear_state_pool's default.
+    linear_state_checkpoints: int | None = None
     # Window pool of the SWA radix cache, in sliding windows, at least what the running
     # requests and a prefill hold; None: kvcache.swa_pool's default, that floor and 8 more.
     swa_windows: int | None = None

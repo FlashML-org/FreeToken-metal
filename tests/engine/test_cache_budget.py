@@ -93,7 +93,7 @@ GDN_SLOT_BYTES = 64_880_640
 class BudgetCase(NamedTuple):
     page_size: int
     max_running_req: int
-    gdn_snapshots: int | None
+    linear_state_checkpoints: int | None
     max_extend_tokens: int
     num_page_override: int | None
     num_pages: int
@@ -107,7 +107,7 @@ CASES = [
     BudgetCase(
         page_size=1,
         max_running_req=4,
-        gdn_snapshots=None,
+        linear_state_checkpoints=None,
         max_extend_tokens=2048,
         num_page_override=None,
         num_pages=507478,
@@ -124,7 +124,7 @@ CASES = [
     BudgetCase(
         page_size=32,
         max_running_req=8,
-        gdn_snapshots=16,
+        linear_state_checkpoints=16,
         max_extend_tokens=2048,
         num_page_override=None,
         num_pages=13482,
@@ -141,7 +141,7 @@ CASES = [
     BudgetCase(
         page_size=16,
         max_running_req=2,
-        gdn_snapshots=4,
+        linear_state_checkpoints=4,
         max_extend_tokens=1024,
         num_page_override=1000,
         num_pages=1000,
@@ -160,7 +160,7 @@ CASES = [
     BudgetCase(
         page_size=1,
         max_running_req=4,
-        gdn_snapshots=None,
+        linear_state_checkpoints=None,
         max_extend_tokens=2048,
         num_page_override=None,
         num_pages=570838,
@@ -187,7 +187,7 @@ def test_qwen3_6_budget_reproduces_pages_and_slots(
         model_path="unused",
         page_size=case.page_size,
         max_running_req=case.max_running_req,
-        gdn_snapshots=case.gdn_snapshots,
+        linear_state_checkpoints=case.linear_state_checkpoints,
         max_extend_tokens_override=case.max_extend_tokens,
         num_page_override=case.num_page_override,
         cache_type=case.cache_type,

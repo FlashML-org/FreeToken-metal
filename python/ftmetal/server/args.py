@@ -33,7 +33,10 @@ from ftmetal.engine.config import (
     MoeStrategyChoice,
     command_graph_from_env,
 )
-from ftmetal.kvcache.linear_state_pool import CONVERSATION_SNAPSHOTS, DEFAULT_GDN_SNAPSHOTS
+from ftmetal.kvcache.linear_state_pool import (
+    CONVERSATION_SNAPSHOTS,
+    DEFAULT_LINEAR_STATE_CHECKPOINTS,
+)
 from ftmetal.mm.config import ENCODER_KINDS, EncoderKind, MultimodalConfig
 from ftmetal.moe.slot_pools import MoeCachePolicy, MoePoolGrouping, MoePoolSlots, VictimMemoryKind
 from ftmetal.tokenizer import read_json_object
@@ -353,13 +356,13 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         "(default: the fewest that hold the running requests and a prefill, and 8 more)",
     )
     parser.add_argument(
-        "--gdn-snapshots",
+        "--linear-state-checkpoints",
         type=positive_int,
         metavar="N",
-        default=ServerArgs.gdn_snapshots,
-        help=f"GDN state snapshots the radix cache keeps on a model with linear attention, "
+        default=ServerArgs.linear_state_checkpoints,
+        help=f"state checkpoints the radix cache keeps on a model with linear attention, "
         f"{CONVERSATION_SNAPSHOTS} per cached conversation, at least {CONVERSATION_SNAPSHOTS} "
-        f"(default: {DEFAULT_GDN_SNAPSHOTS})",
+        f"(default: {DEFAULT_LINEAR_STATE_CHECKPOINTS})",
     )
     parser.add_argument(
         "--attention-backend",
@@ -630,7 +633,7 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         page_size=namespace.page_size,
         cache_type=namespace.cache_type,
         swa_windows=namespace.swa_windows,
-        gdn_snapshots=namespace.gdn_snapshots,
+        linear_state_checkpoints=namespace.linear_state_checkpoints,
         attention_backend=namespace.attention_backend,
         command_graph=not namespace.disable_command_graph and command_graph_from_env(),
         memory_ratio=namespace.memory_ratio,
