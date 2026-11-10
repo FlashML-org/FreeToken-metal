@@ -99,7 +99,9 @@ class Scheduler:
                 f"{cache_type} cache"
             )
         if cache_type == "hybrid_radix":
-            num_checkpoints = linear_state_checkpoint_slots(config.linear_state_checkpoints)
+            num_checkpoints = linear_state_checkpoint_slots(
+                config.linear_state_checkpoints, config.max_running_req
+            )
             logger.info(f"linear state checkpoint cache: {num_checkpoints} slots")
         elif config.linear_state_checkpoints is not None:
             logger.warning(

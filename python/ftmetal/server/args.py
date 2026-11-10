@@ -39,7 +39,7 @@ from ftmetal.engine.config import (
 )
 from ftmetal.kvcache.linear_state_pool import (
     CONVERSATION_SNAPSHOTS,
-    DEFAULT_LINEAR_STATE_CHECKPOINTS,
+    MIN_DEFAULT_LINEAR_STATE_CHECKPOINTS,
 )
 from ftmetal.mm.config import ENCODER_KINDS, EncoderKind, MultimodalConfig
 from ftmetal.moe.slot_pools import MoeCachePolicy, MoePoolGrouping, MoePoolSlots, VictimMemoryKind
@@ -382,7 +382,8 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         default=ServerArgs.linear_state_checkpoints,
         help=f"state checkpoints the radix cache keeps on a model with linear attention, "
         f"{CONVERSATION_SNAPSHOTS} per cached conversation, at least {CONVERSATION_SNAPSHOTS} "
-        f"(default: {DEFAULT_LINEAR_STATE_CHECKPOINTS})",
+        f"(default: {CONVERSATION_SNAPSHOTS} per running request, at least "
+        f"{MIN_DEFAULT_LINEAR_STATE_CHECKPOINTS})",
     )
     parser.add_argument(
         "--attention-backend",

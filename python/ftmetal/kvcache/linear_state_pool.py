@@ -11,8 +11,8 @@ for the hybrid radix cache is a whole slot, written into a request's ping-pong s
 deepest stride boundary inside its chunk and at most its prompt's reuse_len. The pool is
 built from the LINEAR group's spec and prices itself (FreeToken's engine adds
 state_pool_bytes to the KV family's fixed cost instead). The hybrid radix cache's snapshot
-cache is linear_state_checkpoints slots on top of the running requests' (FreeToken's is max(4,
-linear_state_cache_ratio x max_running_req)). Naive holds only each running request's live
+cache is linear_state_checkpoints slots on top of the running requests', by default FreeToken's
+max(4, 2 x max_running_req). Naive holds only each running request's live
 slot and the padding slot, FreeToken's naive size; the live slot is a free-list slot the
 request takes at admission and returns at its finish or abort (SGLang's
 HybridReqToTokenPool), where FreeToken's naive keys it by table_idx.
@@ -37,15 +37,18 @@ TRACK_SLOTS = 2
 LOCKED_SNAPSHOT_SLOTS = 1
 # Snapshots a finished conversation leaves in the tree: its prompt's track and its live state.
 CONVERSATION_SNAPSHOTS = 2
-# The hybrid radix cache's default snapshot cache, about four conversations. 8 is arbitrary.
-DEFAULT_LINEAR_STATE_CHECKPOINTS = 8
+# The fewest snapshots the hybrid radix cache keeps by default, two conversations.
+MIN_DEFAULT_LINEAR_STATE_CHECKPOINTS = 4
 
 
-def linear_state_checkpoint_slots(linear_state_checkpoints: int | None) -> int:
-    """The hybrid radix cache's snapshot cache: linear_state_checkpoints, by default
-    DEFAULT_LINEAR_STATE_CHECKPOINTS; fewer than one conversation's snapshots are refused."""
+def linear_state_checkpoint_slots(
+    linear_state_checkpoints: int | None, max_running_req: int
+) -> int:
+    """The hybrid radix cache's snapshot cache: linear_state_checkpoints, by default one
+    conversation's snapshots per running request, at least MIN_DEFAULT_LINEAR_STATE_CHECKPOINTS;
+    fewer than one conversation's snapshots are refused."""
     if linear_state_checkpoints is None:
-        return DEFAULT_LINEAR_STATE_CHECKPOINTS
+        return max(MIN_DEFAULT_LINEAR_STATE_CHECKPOINTS, CONVERSATION_SNAPSHOTS * max_running_req)
     elif linear_state_checkpoints < CONVERSATION_SNAPSHOTS:
         raise ValueError(
             f"--linear-state-checkpoints {linear_state_checkpoints} holds fewer than the "
@@ -66,7 +69,9 @@ def linear_pool_num_slots(config: PoolConfig) -> int:
         return LIVE_SLOTS * max_running_req + 1
     else:
         slots_per_req = LIVE_SLOTS + TRACK_SLOTS + LOCKED_SNAPSHOT_SLOTS
-        snapshot_cache = linear_state_checkpoint_slots(config.linear_state_checkpoints)
+        snapshot_cache = linear_state_checkpoint_slots(
+            config.linear_state_checkpoints, max_running_req
+        )
         return slots_per_req * max_running_req + snapshot_cache + 1
 
 
@@ -165,7 +170,7 @@ class LinearStatePool(BasePool):
 
 __all__ = [
     "CONVERSATION_SNAPSHOTS",
-    "DEFAULT_LINEAR_STATE_CHECKPOINTS",
+    "MIN_DEFAULT_LINEAR_STATE_CHECKPOINTS",
     "LIVE_SLOTS",
     "LOCKED_SNAPSHOT_SLOTS",
     "PADDING_SLOT",

@@ -112,11 +112,12 @@ class SlotCase(NamedTuple):
 
 
 # Radix (the hybrid radix cache): 4 slots per running request (live, ping-pong pair, locked
-# snapshot), the snapshot cache of linear_state_checkpoints slots, 8 by default, and the
-# padding slot.
+# snapshot), the snapshot cache of linear_state_checkpoints slots, by default 2 per running
+# request and at least 4, and the padding slot.
 # Naive: one live slot per running request and the padding slot.
 SLOT_CASES = [
-    SlotCase("radix, the default snapshot cache", "radix", 2, None, 4 * 2 + 8 + 1),
+    SlotCase("radix, the default snapshot cache at one request", "radix", 1, None, 4 * 1 + 4 + 1),
+    SlotCase("radix, the default snapshot cache grows", "radix", 8, None, 4 * 8 + 16 + 1),
     SlotCase("radix, one conversation's snapshots", "radix", 4, 2, 4 * 4 + 2 + 1),
     SlotCase("radix, a snapshot cache past the default", "radix", 8, 32, 4 * 8 + 32 + 1),
     SlotCase("naive", "naive", 2, None, 2 + 1),
