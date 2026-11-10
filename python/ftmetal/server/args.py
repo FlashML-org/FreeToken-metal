@@ -302,7 +302,7 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         type=positive_int,
         metavar="N",
         default=ServerArgs.max_running_req,
-        help="requests decoded together",
+        help="requests decoded together; any more wait in the queue (default: %(default)s)",
     )
     parser.add_argument(
         "--num-token",

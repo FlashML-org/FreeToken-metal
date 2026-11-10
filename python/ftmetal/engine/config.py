@@ -6,7 +6,8 @@ served_modalities reads the encoders from mm.processor.active_encoders (no activ
 property) and is empty for a checkpoint without config.json; model_config drops the unbuilt
 encoder sections from the raw config dictionary; the MoE strategies are auto, fused and
 offload (no host-bank kinds), and no deprecated moe_backend field (only the flag);
-memory_ratio defaults to None, the working set less a headroom; the two cache size fields
+max_running_req defaults to 1, not 4 (one user's Mac: its slots and live state go to the
+caches); memory_ratio defaults to None, the working set less a headroom; the two cache size fields
 are checked exclusive here, not only as flags; moe_victim_cache_gib sizes the offload's host
 victim cache, which FreeToken does not have; no kv_reserve_tokens and no moe_cache_auto:
 what the KV pools keep before the experts is the context (reserved_context_tokens), and an
@@ -121,7 +122,7 @@ def moe_prefill_overlap_min_tokens_from_env() -> int:
 class EngineConfig:
     model_path: str
     dtype: mx.Dtype = mx.bfloat16
-    max_running_req: int = 4
+    max_running_req: int = 1
     page_size: int = 1
     # Name in attention.SUPPORTED_ATTENTION_BACKENDS: metal runs the paged flash-prefill and
     # flash-decode kernels, mlx runs MLX SDPA over gathered pages.

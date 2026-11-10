@@ -763,6 +763,7 @@ def offload_budget(
 def test_qwen3_6_offload_budget(case: OffloadBudgetCase) -> None:
     config = EngineConfig(
         model_path="unused",
+        max_running_req=4,
         max_extend_tokens_override=2048,
         memory_ratio=case.memory_ratio,
         moe_cache_size=case.moe_cache_size,
@@ -908,7 +909,7 @@ def test_auto_keeps_experts_resident_without_offload(
     monkeypatch.setitem(MODEL_REGISTRY, architecture, no_offload)
     assert resolve_tiny_strategy(tmp_path, "auto", flags, 8 * GIB) == "fused"
     with pytest.raises(RuntimeError, match="model does not fit the memory budget"):
-        resolve_tiny_strategy(tmp_path, "auto", {}, 4 * GIB)
+        resolve_tiny_strategy(tmp_path, "auto", {"max_running_req": 4}, 4 * GIB)
 
 
 def test_dense_model_refuses_moe_offload(tmp_path: Path) -> None:
