@@ -1047,6 +1047,7 @@ def test_real_checkpoint_rows() -> None:
         prefill_overlap=False,
         prefill_overlap_min_tokens=128,
         victim_cache_bytes=0,
+        cache_policy="lru",
         pairs=None,
         split_lookup=False,
     )

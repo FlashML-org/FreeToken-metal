@@ -128,7 +128,7 @@ class OffloadMoeCache:
         pairs: list[mx.array] | None,
         split_lookup: bool,
         victim_memory: VictimMemoryKind = "purgeable",
-        cache_policy: MoeCachePolicy = "lru",
+        cache_policy: MoeCachePolicy,
         ssd_keepalive_us: int = 0,
         deferred_store_spares: list[int] | None = None,
         stall_timeout_s: float = STALL_TIMEOUT_S,

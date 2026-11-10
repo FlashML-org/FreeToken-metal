@@ -7,11 +7,12 @@ property) and is empty for a checkpoint without config.json; model_config drops 
 encoder sections from the raw config dictionary; the MoE strategies are auto, fused and
 offload (no host-bank kinds), and no deprecated moe_backend field (only the flag);
 max_running_req defaults to 1, not 4 (one user's Mac: its slots and live state go to the
-caches); memory_ratio defaults to None, the working set less a headroom; the two cache size fields
-are checked exclusive here, not only as flags; moe_victim_cache_gib sizes the offload's host
-victim cache, which FreeToken does not have; no kv_reserve_tokens and no moe_cache_auto:
-what the KV pools keep before the experts is the context (reserved_context_tokens), and an
-offload without a cache size gives the experts the rest.
+caches); moe_cache_policy defaults to lrfu, not lru; memory_ratio defaults to None, the
+working set less a headroom; the two cache size fields are checked exclusive here, not only as
+flags; moe_victim_cache_gib sizes the offload's host victim cache, which FreeToken does not
+have; no kv_reserve_tokens and no moe_cache_auto: what the KV pools keep before the experts is
+the context (reserved_context_tokens), and an offload without a cache size gives the experts
+the rest.
 """
 
 from __future__ import annotations
@@ -153,7 +154,7 @@ class EngineConfig:
     # experts get the rest.
     moe_cache_size: int = 0
     moe_cache_rate: float | None = None
-    moe_cache_policy: MoeCachePolicy = "lru"
+    moe_cache_policy: MoeCachePolicy = "lrfu"
     # How the offload cache groups the MoE layers into pools of slots, and splits its slots
     # among them: evenly per layer, or by a hot-expert table (moe_pool_profile, else the model
     # directory's, else the one shipped for the model).

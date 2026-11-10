@@ -441,9 +441,9 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         "--moe-cache-policy",
         choices=list(get_args(MoeCachePolicy)),
         default=ServerArgs.moe_cache_policy,
-        help="the MoE offload cache's eviction policy: lru (default) evicts the least recently "
-        "used expert, lrfu the one with the lowest use count decayed by a 20-step half-life (an "
-        "expert the decode keeps coming back to outlasts one-off ones)",
+        help="the MoE offload cache's eviction policy: lrfu (default) evicts the expert with the "
+        "lowest use count decayed by a 20-step half-life (an expert the decode keeps coming back "
+        "to outlasts one-off ones), lru the least recently used one",
     )
     parser.add_argument(
         "--moe-pool",

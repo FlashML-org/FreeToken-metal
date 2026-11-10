@@ -1000,7 +1000,7 @@ MOE_FLAG_CASES: list[tuple[list[str], tuple[str, int, float | None, bool, float 
         "",
     ),
     (
-        ["--disable-moe-prefill-overlap", "--moe-cache-policy", "lru"],
+        ["--disable-moe-prefill-overlap", "--moe-cache-policy", "lrfu"],
         ("auto", 0, None, False, None),
         "",
     ),
@@ -1029,7 +1029,7 @@ def test_moe_flags_reach_the_server_args(
         args.moe_prefill_overlap,
         args.memory_ratio,
     ) == fields
-    assert args.moe_cache_policy == "lru"
+    assert args.moe_cache_policy == "lrfu"
     assert warning in caplog.text
 
 
@@ -1069,9 +1069,9 @@ def test_victim_cache_flag_reaches_the_server_args(
 
 # (flags, --moe-victim-memory and --moe-cache-policy as the server args hold them)
 OFFLOAD_POLICY_FLAG_CASES: list[tuple[list[str], str, str]] = [
-    ([], "purgeable", "lru"),
-    (["--moe-victim-memory", "reserved"], "reserved", "lru"),
-    (["--moe-cache-policy", "lrfu"], "purgeable", "lrfu"),
+    ([], "purgeable", "lrfu"),
+    (["--moe-victim-memory", "reserved"], "reserved", "lrfu"),
+    (["--moe-cache-policy", "lru"], "purgeable", "lru"),
 ]
 
 
