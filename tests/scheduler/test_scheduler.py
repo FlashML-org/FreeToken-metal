@@ -7,6 +7,8 @@ held evictable by the prefix cache.
 
 from __future__ import annotations
 
+import queue
+import threading
 from pathlib import Path
 
 import mlx.core as mx
@@ -15,6 +17,20 @@ import pytest
 
 from ftmetal.core import SamplingParams
 from ftmetal.engine.config import EngineConfig
+from ftmetal.message.backend import (
+    BaseBackendMsg,
+    BatchBackendMsg,
+    ExitMsg,
+    FlushCacheBackendMsg,
+    UserMsg,
+)
+from ftmetal.message.tokenizer import (
+    BaseTokenizerMsg,
+    BatchTokenizerMsg,
+    DetokenizeMsg,
+    FlushCacheResultMsg,
+    FlushStatus,
+)
 from ftmetal.scheduler.scheduler import Scheduler, TokenEvent
 from tiny_model import build_reference, reference_greedy, save_checkpoint
 
@@ -243,3 +259,54 @@ def test_timings_count_the_prompt_and_every_committed_token(
         assert min(last["queue_ms"], last["prompt_ms"], last["predicted_ms"]) >= 0
         generated = np.array([event.token for event in events], dtype=np.int32)
         prompt = np.concatenate([prompt, generated, prompt[:5]])
+
+
+# (a request queued with the flush, the flush's timeout, its status)
+FLUSH_CASES: list[tuple[bool, float, FlushStatus]] = [
+    (False, 0.0, "ok"),
+    (True, 0.0, "busy"),
+    # Waits for the request to finish.
+    (True, 60.0, "ok"),
+]
+
+
+@pytest.mark.parametrize(("with_request", "timeout_s", "status"), FLUSH_CASES)
+def test_flush_empties_the_prefix_cache_once_idle(
+    tmp_path: Path, with_request: bool, timeout_s: float, status: FlushStatus
+) -> None:
+    save_checkpoint(build_reference(seed=10), tmp_path, quantization=None)
+    scheduler = make_scheduler(tmp_path, max_running_req=1, num_pages=64)
+    # Past a 64-token boundary: the hybrid tree keeps a snapshot there.
+    prompt = np.random.default_rng(10).integers(1, 120, size=130).astype(np.int32)
+    params = SamplingParams(max_tokens=3, ignore_eos=True)
+    scheduler.add_request(0, prompt, params)
+    scheduler.run_until_idle()
+    assert scheduler.cache_manager.evictable_size > 0
+    recv_backend: queue.Queue[BaseBackendMsg] = queue.Queue()
+    send_tokenizer: queue.Queue[BaseTokenizerMsg | None] = queue.Queue()
+    thread = threading.Thread(
+        target=scheduler.run_forever, args=(recv_backend, send_tokenizer), daemon=True
+    )
+    thread.start()
+    request = UserMsg(
+        uid=1, input_ids=prompt[::-1].copy(), sampling_params=params, reuse_len=len(prompt)
+    )
+    flush = FlushCacheBackendMsg(request_id="flush", timeout_s=timeout_s)
+    recv_backend.put(BatchBackendMsg(data=[request, flush] if with_request else [flush]))
+    results: list[FlushCacheResultMsg] = []
+    is_request_done = not with_request
+    try:
+        while not (results and is_request_done):
+            batch = send_tokenizer.get(timeout=60)
+            assert isinstance(batch, BatchTokenizerMsg)
+            results += [msg for msg in batch.data if isinstance(msg, FlushCacheResultMsg)]
+            is_request_done |= any(
+                isinstance(msg, DetokenizeMsg) and msg.finished for msg in batch.data
+            )
+    finally:
+        recv_backend.put(ExitMsg())
+        thread.join(timeout=60)
+    assert [(result.request_id, result.status) for result in results] == [("flush", status)]
+    if status == "ok":
+        assert scheduler.cache_manager.evictable_size == 0
+    assert_all_freed(scheduler)

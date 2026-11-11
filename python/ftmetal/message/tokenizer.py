@@ -18,6 +18,9 @@ from pydantic import JsonValue
 from ftmetal.core import SamplingParams
 
 FinishReason = Literal["stop", "length"]
+# A /v1/cache/flush outcome: done, refused (scheduler busy or another flush waiting), the
+# idle wait timed out, or the engine failed.
+FlushStatus = Literal["ok", "busy", "timeout", "failed"]
 
 
 @dataclass(kw_only=True)
@@ -89,6 +92,23 @@ class ErrorReplyMsg(BaseTokenizerMsg):
     code: str | None = None
 
 
+@dataclass(kw_only=True)
+class FlushCacheMsg(BaseTokenizerMsg):
+    """API server -> tokenizer worker, passed on as a FlushCacheBackendMsg."""
+
+    request_id: str
+    timeout_s: float = 0.0
+
+
+@dataclass(kw_only=True)
+class FlushCacheResultMsg(BaseTokenizerMsg):
+    """Scheduler -> tokenizer worker, passed on as a FlushCacheReply."""
+
+    request_id: str
+    status: FlushStatus
+    error: str | None = None
+
+
 __all__ = [
     "AbortMsg",
     "BaseTokenizerMsg",
@@ -96,6 +116,9 @@ __all__ = [
     "DetokenizeMsg",
     "ErrorReplyMsg",
     "FinishReason",
+    "FlushCacheMsg",
+    "FlushCacheResultMsg",
+    "FlushStatus",
     "PromptAdmittedMsg",
     "TokenizeMsg",
 ]

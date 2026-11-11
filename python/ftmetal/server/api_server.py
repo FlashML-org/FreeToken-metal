@@ -2,8 +2,9 @@
 tokenizer worker and the scheduler.
 
 Port of FreeToken server/api_server.py (FrontendManager, app, lifespan, install_cors,
-run_api_server, /generate), with the message loops of tokenizer/server.py (tokenize_worker)
-and of scheduler/scheduler.py (run_forever and its message handling). Divergences: one
+run_api_server, /generate, /v1/cache/flush), with the message loops of
+tokenizer/server.py (tokenize_worker) and of scheduler/scheduler.py (run_forever and its
+message handling). Divergences: one
 process; the tokenizer worker and the scheduler are threads fed by queue.Queue instead of
 processes over ZMQ, and the scheduler thread is the only MLX caller; replies reach the event
 loop through call_soon_threadsafe and wait per request on an asyncio.Queue; one image
@@ -12,7 +13,8 @@ before the server accepts requests, so maintenance_state is "serving" while both
 run, "stopping" once prepare-stop closed admission and "failed" once a thread has
 died, which is also the fatal error /health reports (no supervisor, loading gate or cache
 rebuild, so no /v1/cache/rebuild, and /v1/cache/status lives in control_api with the
-request-ring middleware; of FreeToken's readiness meta the scheduler thread's start reports
+request-ring middleware; a cache flush the scheduler thread cannot answer any more fails
+when it dies; of FreeToken's readiness meta the scheduler thread's start reports
 the MoE offload cache's geometry and the longest request alone); the stats tracker and the
 request ring are the FrontendManager's; both TokenizeManagers probe their chat template's
 thinking and effort controls before serving (FreeToken probes on first use, and warms the
@@ -42,7 +44,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from jinja2 import TemplateError
@@ -55,14 +57,22 @@ from ftmetal.message.backend import (
     BaseBackendMsg,
     BatchBackendMsg,
     ExitMsg,
+    FlushCacheBackendMsg,
 )
-from ftmetal.message.frontend import BaseFrontendMsg, BatchFrontendMsg, UserReply
+from ftmetal.message.frontend import (
+    BaseFrontendMsg,
+    BatchFrontendMsg,
+    FlushCacheReply,
+    UserReply,
+)
 from ftmetal.message.tokenizer import (
     AbortMsg,
     BaseTokenizerMsg,
     BatchTokenizerMsg,
     DetokenizeMsg,
     ErrorReplyMsg,
+    FlushCacheMsg,
+    FlushCacheResultMsg,
     PromptAdmittedMsg,
     TokenizeMsg,
 )
@@ -89,6 +99,9 @@ from ftmetal.tokenizer import (
 from ftmetal.version import __version__
 
 logger = logging.getLogger(__name__)
+
+# How often a /v1/cache/flush waiter checks that the backend threads are still alive.
+FLUSH_LIVENESS_POLL_S = 0.5
 
 
 @dataclass(kw_only=True)
@@ -126,6 +139,8 @@ class FrontendManager:
     moe_cache: MoeCacheGeometry | None = None
     # The longest prompt plus output a request may hold, reported with moe_cache.
     max_seq_len: int | None = None
+    # /v1/cache/flush waiters by request id; the scheduler owns the deadline.
+    flush_futures: dict[str, asyncio.Future[FlushCacheReply]] = field(default_factory=dict)
 
     @property
     def fatal_error(self) -> str | None:
@@ -176,6 +191,11 @@ class FrontendManager:
     def deliver(self, msg: BaseFrontendMsg) -> None:
         replies = msg.data if isinstance(msg, BatchFrontendMsg) else [msg]
         for reply in replies:
+            if isinstance(reply, FlushCacheReply):
+                waiter = self.flush_futures.pop(reply.request_id, None)
+                if waiter is not None and not waiter.done():
+                    waiter.set_result(reply)
+                continue
             assert isinstance(reply, UserReply)
             # Accounting follows the engine's work even after a client left.
             self.stats.observe(reply)
@@ -315,6 +335,14 @@ def run_tokenizer(
             elif isinstance(msg, AbortMsg):
                 detokenize_manager.discard(msg.uid)
                 backend_msgs.append(AbortBackendMsg(uid=msg.uid))
+            elif isinstance(msg, FlushCacheMsg):
+                backend_msgs.append(
+                    FlushCacheBackendMsg(request_id=msg.request_id, timeout_s=msg.timeout_s)
+                )
+            elif isinstance(msg, FlushCacheResultMsg):
+                replies.append(
+                    FlushCacheReply(request_id=msg.request_id, status=msg.status, error=msg.error)
+                )
             else:
                 raise NotImplementedError(f"unexpected tokenizer message {msg!r}")
         if backend_msgs:
@@ -366,6 +394,13 @@ def run_scheduler(
         failed: list[BaseTokenizerMsg] = [
             ErrorReplyMsg(uid=uid, error="the engine failed") for uid in sorted(scheduler.live_uids)
         ]
+        if scheduler.pending_flush is not None:
+            request_id = scheduler.pending_flush[0].request_id
+            failed.append(
+                FlushCacheResultMsg(
+                    request_id=request_id, status="failed", error="the engine failed"
+                )
+            )
         send_tokenizer.put(BatchTokenizerMsg(data=failed))
 
 
@@ -457,6 +492,41 @@ def create_app(config: ServerArgs) -> FastAPI:
             frontend.stream_with_cancellation(frontend.stream_generate(uid), request, uid),
             media_type="text/event-stream",
         )
+
+    @app.api_route("/v1/cache/flush", methods=["GET", "POST"])
+    async def cache_flush(timeout: float = Query(0.0, ge=0.0)) -> JSONResponse:
+        """Drop every prefix-cache entry once the scheduler is idle, waiting up to timeout
+        seconds for it."""
+        state = frontend.maintenance_state
+        if state == "failed":
+            return JSONResponse(
+                {"status": "failed", "error": "server latched in maintenance; restart required"},
+                status_code=503,
+            )
+        elif state == "stopping":
+            return JSONResponse(
+                {"status": "busy", "error": "engine stop is in progress"}, status_code=409
+            )
+        request_id = str(uuid.uuid4())
+        waiter: asyncio.Future[FlushCacheReply] = asyncio.get_running_loop().create_future()
+        frontend.flush_futures[request_id] = waiter
+        try:
+            await frontend.send_one(FlushCacheMsg(request_id=request_id, timeout_s=timeout))
+            # A backend thread that dies before reading the flush never answers it.
+            while not waiter.done() and frontend.fatal_error is None:
+                await asyncio.wait({waiter}, timeout=FLUSH_LIVENESS_POLL_S)
+        finally:
+            frontend.flush_futures.pop(request_id, None)
+        if waiter.done():
+            reply = waiter.result()
+        else:
+            reply = FlushCacheReply(
+                request_id=request_id, status="failed", error=frontend.fatal_error
+            )
+        body = {"status": reply.status}
+        if reply.error is not None:
+            body["error"] = reply.error
+        return JSONResponse(body, status_code={"ok": 200, "timeout": 504}.get(reply.status, 503))
 
     return app
 

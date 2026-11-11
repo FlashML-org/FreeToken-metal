@@ -74,7 +74,8 @@ the OpenAI Responses `POST /v1/responses` (stateless: `GET /v1/responses/{id}` a
 `/cancel` answer 404); and `POST /generate` (a raw text prompt, no chat template, streamed
 as `{"text": ...}` events and sampled greedily). The control plane is FreeToken's too:
 `GET /health`, `GET /v1/stats` (throughput, request counters, token totals, pool usage),
-`GET /v1/requests?since=<cursor>` (recent requests), `GET /v1/cache/status` and, from
+`GET /v1/requests?since=<cursor>` (recent requests), `GET /v1/cache/status`,
+`POST /v1/cache/flush?timeout=<s>` (drop the prefix cache once the engine is idle) and, from
 loopback only, `POST /v1/admin/prepare-stop` (close admission, drain, abort the rest, seal
 the token totals); `FTMETAL_API_LOG_DIR` logs every request body as JSON lines, and
 `--cors-origins` sets the CORS allow-list. Any API key is accepted. `presence_penalty` and

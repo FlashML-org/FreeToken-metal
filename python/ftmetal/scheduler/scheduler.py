@@ -11,7 +11,7 @@ sampled tokens. The multimodal gather plan, the image block ends and the mrope p
 are built in numpy by scheduler/mm.py. A drained step's tokens are used only once the
 engine's offload cache passes its health check (a failed expert read leaves stand-in
 experts behind). A request with stop strings carries its timings on every event, as the
-detokenizer may end it on any token.
+detokenizer may end it on any token. A cache flush waits for the idle point in run_forever.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from ftmetal.message.backend import (
     BaseBackendMsg,
     BatchBackendMsg,
     ExitMsg,
+    FlushCacheBackendMsg,
     UserMsg,
 )
 from ftmetal.message.tokenizer import (
@@ -43,6 +44,7 @@ from ftmetal.message.tokenizer import (
     BatchTokenizerMsg,
     DetokenizeMsg,
     ErrorReplyMsg,
+    FlushCacheResultMsg,
     PromptAdmittedMsg,
 )
 from ftmetal.mm.item import MMItem
@@ -161,6 +163,8 @@ class Scheduler:
         # The launched-but-not-drained batch (overlap). An abort of one of its requests only
         # marks the request; process_last_data frees it once the forward has landed.
         self.inflight_data: ForwardData | None = None
+        # A /v1/cache/flush waiting for the idle point, with its time.monotonic() deadline.
+        self.pending_flush: tuple[FlushCacheBackendMsg, float] | None = None
 
     @property
     def max_seq_len(self) -> int:
@@ -279,7 +283,8 @@ class Scheduler:
         self.live_uids.clear()
         data: ForwardData | None = None
         while True:
-            is_idle = data is None and not self.runnable
+            # A waiting flush runs (or times out) on the next pass, so it must not block.
+            is_idle = data is None and not self.runnable and self.pending_flush is None
             pending = [recv_backend.get()] if is_idle else []
             while not recv_backend.empty():
                 pending.append(recv_backend.get_nowait())
@@ -315,9 +320,24 @@ class Scheduler:
                     self.abort_request(msg.uid)
                     self.live_uids.discard(msg.uid)
                     abort_acks.append(ErrorReplyMsg(uid=msg.uid, error="request aborted"))
+                elif isinstance(msg, FlushCacheBackendMsg):
+                    if self.pending_flush is None:
+                        self.pending_flush = (msg, time.monotonic() + msg.timeout_s)
+                    else:
+                        replies.append(
+                            FlushCacheResultMsg(
+                                request_id=msg.request_id,
+                                status="busy",
+                                error="another cache flush is already waiting",
+                            )
+                        )
                 else:
                     raise NotImplementedError(f"unexpected backend message {msg!r}")
 
+            if self.pending_flush is not None:
+                flush_result = self.check_pending_flush(data)
+                if flush_result is not None:
+                    replies.append(flush_result)
             data = self.overlap_loop(data)
             replies.extend(self.prompt_admissions)
             self.prompt_admissions = []
@@ -351,6 +371,31 @@ class Scheduler:
                 self.status_reporter.report_idle(
                     moe_experts=None if cache is None else cache.hit_counts()
                 )
+
+    def check_pending_flush(self, data: ForwardData | None) -> FlushCacheResultMsg | None:
+        """Run the pending flush if the scheduler is idle, fail it past its deadline, or leave
+        it waiting (None)."""
+        assert self.pending_flush is not None
+        msg, deadline = self.pending_flush
+        if data is None and not self.runnable:
+            freed = self.cache_manager.flush()
+            self.cache_manager.check_integrity()
+            # Cleared only now: a flush that raises stays pending for the failure reply.
+            self.pending_flush = None
+            logger.info(f"cache flushed: {freed} prefix-cache tokens freed")
+            return FlushCacheResultMsg(request_id=msg.request_id, status="ok")
+        elif time.monotonic() >= deadline:
+            self.pending_flush = None
+            error = (
+                f"scheduler is not idle: {len(self.prefill_manager.pending_list)} queued, "
+                f"{len(self.decode_manager.running_reqs)} running"
+                + (", last batch still in flight" if data is not None else "")
+            )
+            logger.warning(f"cache not flushed, {error}")
+            status = "timeout" if msg.timeout_s > 0 else "busy"
+            return FlushCacheResultMsg(request_id=msg.request_id, status=status, error=error)
+        else:
+            return None
 
     def send_result(self, events: list[TokenEvent]) -> None:
         self.results.extend(events)

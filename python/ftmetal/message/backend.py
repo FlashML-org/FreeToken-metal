@@ -53,4 +53,20 @@ class AbortBackendMsg(BaseBackendMsg):
     uid: int
 
 
-__all__ = ["AbortBackendMsg", "BaseBackendMsg", "BatchBackendMsg", "ExitMsg", "UserMsg"]
+@dataclass(kw_only=True)
+class FlushCacheBackendMsg(BaseBackendMsg):
+    """Drop every unlocked prefix-cache entry once the scheduler is idle, waiting up to
+    timeout_s for it."""
+
+    request_id: str
+    timeout_s: float = 0.0
+
+
+__all__ = [
+    "AbortBackendMsg",
+    "BaseBackendMsg",
+    "BatchBackendMsg",
+    "ExitMsg",
+    "FlushCacheBackendMsg",
+    "UserMsg",
+]

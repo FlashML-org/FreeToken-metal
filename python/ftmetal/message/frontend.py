@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ftmetal.message.tokenizer import FinishReason
+from ftmetal.message.tokenizer import FinishReason, FlushStatus
 
 
 @dataclass(kw_only=True)
@@ -49,4 +49,13 @@ class UserReply(BaseFrontendMsg):
     timings: dict[str, float | int] | None = None
 
 
-__all__ = ["BaseFrontendMsg", "BatchFrontendMsg", "UserReply"]
+@dataclass(kw_only=True)
+class FlushCacheReply(BaseFrontendMsg):
+    """The result of a /v1/cache/flush request."""
+
+    request_id: str
+    status: FlushStatus
+    error: str | None = None
+
+
+__all__ = ["BaseFrontendMsg", "BatchFrontendMsg", "FlushCacheReply", "UserReply"]

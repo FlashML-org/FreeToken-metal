@@ -246,27 +246,8 @@ class CacheManager:
         if needed_pages == 0:
             return
         short_tokens = (needed_pages - len(self.free_slots)) * self.page_size
-        if short_tokens > 0 and self.is_hybrid:
-            # Evicting KV leaves drops their snapshots too: return both currencies.
-            cache, pool = self.hybrid_parts()
-            evicted = cache.evict_full(short_tokens)
-            self.free_slots = np.concatenate(
-                [self.free_slots, evicted.kv_indices[:: self.page_size]]
-            )
-            pool.free(evicted.mamba_slots)
-        elif short_tokens > 0 and self.is_swa:
-            # Evicting KV leaves frees their live window slots too.
-            cache, pool = self.swa_parts()
-            evicted = cache.evict_full(short_tokens)
-            self.free_slots = np.concatenate(
-                [self.free_slots, evicted.kv_indices[:: self.page_size]]
-            )
-            pool.free_swa(evicted.swa_indices)
-        elif short_tokens > 0 and self.cache_type == "radix":
-            # Clamped to what is evictable: a shortfall left after it raises below.
-            cache = self.radix_cache()
-            evicted_slots = cache.evict(min(short_tokens, cache.evictable_size))
-            self.free_slots = np.concatenate([self.free_slots, evicted_slots[:: self.page_size]])
+        if short_tokens > 0:
+            self.evict(short_tokens)
         if needed_pages > len(self.free_slots):
             raise RuntimeError("KV pages exhausted")
         pages = self.free_slots[:needed_pages]
@@ -286,6 +267,34 @@ class CacheManager:
             start, stop = first_page * self.page_size, last_page * self.page_size
             self.page_table[table_idx, start:stop] = slots
             offset += count
+
+    def evict(self, num_tokens: int) -> None:
+        """Evict num_tokens of the prefix cache's unlocked KV into the free list (a shortfall
+        left raises in the caller)."""
+        if self.is_hybrid:
+            # Evicting KV leaves drops their snapshots too: return both currencies.
+            cache, pool = self.hybrid_parts()
+            evicted = cache.evict_full(num_tokens)
+            kv_indices = evicted.kv_indices
+            pool.free(evicted.mamba_slots)
+        elif self.is_swa:
+            # Evicting KV leaves frees their live window slots too.
+            cache, pool = self.swa_parts()
+            evicted = cache.evict_full(num_tokens)
+            kv_indices = evicted.kv_indices
+            pool.free_swa(evicted.swa_indices)
+        elif self.cache_type == "radix":
+            cache = self.radix_cache()
+            kv_indices = cache.evict(min(num_tokens, cache.evictable_size))
+        else:
+            kv_indices = EMPTY_IDS
+        self.free_slots = np.concatenate([self.free_slots, kv_indices[:: self.page_size]])
+
+    def flush(self) -> int:
+        """Evict every unlocked prefix-cache entry; returns the tokens freed."""
+        evictable = self.evictable_size
+        self.evict(evictable)
+        return evictable - self.evictable_size
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
         """Commit a request's prefix to the prefix cache and, on finish, free what it owns."""

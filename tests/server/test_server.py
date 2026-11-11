@@ -29,9 +29,15 @@ from tokenizers import Tokenizer
 from ftmetal.core import SamplingParams
 from ftmetal.env import ENV_PREFIXES
 from ftmetal.message.frontend import BatchFrontendMsg, UserReply
-from ftmetal.message.tokenizer import AbortMsg, BaseTokenizerMsg, FinishReason
+from ftmetal.message.tokenizer import (
+    AbortMsg,
+    BaseTokenizerMsg,
+    FinishReason,
+    FlushCacheResultMsg,
+)
 from ftmetal.mm import MM_PAD_SHIFT_VALUE
 from ftmetal.mm.config import ENCODER_KINDS, EncoderKind, Modality, MultimodalConfig
+from ftmetal.scheduler.scheduler import ForwardData
 from ftmetal.server.api_server import FrontendManager, create_app
 from ftmetal.server.args import (
     ServerArgs,
@@ -679,6 +685,45 @@ def test_stream_reports_ride_every_chunk_when_asked(
     if has_usage:
         usages = [chunk["usage"]["completion_tokens"] for chunk in content_chunks[1:]]
         assert usages == sorted(usages) and usages[-1] <= SCRIPT_TOKENS
+
+
+def test_cache_flush_reaches_the_scheduler(
+    client: TestClient, scripted: type[ScriptedScheduler]
+) -> None:
+    assert client.post("/v1/cache/flush").json() == {"status": "ok"}
+    assert client.get("/v1/cache/flush?timeout=2").json() == {"status": "ok"}
+    assert scripted.instances[0].flushes == 2
+    assert client.post("/v1/cache/flush?timeout=-1").status_code == 422
+
+
+def unanswered_flush_failure(
+    self: ScriptedScheduler, data: ForwardData | None
+) -> FlushCacheResultMsg | None:
+    self.pending_flush = None
+    raise RuntimeError("scripted flush failure")
+
+
+# (whether the dying scheduler still holds the flush, the reply's error)
+FLUSH_FAILURE_CASES: list[tuple[bool, str]] = [
+    (True, "the engine failed"),
+    (False, "backend thread ftmetal-scheduler exited (restart required)"),
+]
+
+
+@pytest.mark.parametrize(("holds_flush", "error"), FLUSH_FAILURE_CASES)
+def test_a_flush_the_engine_dies_on_fails(
+    client: TestClient,
+    scripted: type[ScriptedScheduler],
+    monkeypatch: pytest.MonkeyPatch,
+    holds_flush: bool,
+    error: str,
+) -> None:
+    monkeypatch.setattr(scripted, "fails", True)
+    if not holds_flush:
+        monkeypatch.setattr(scripted, "check_pending_flush", unanswered_flush_failure)
+    reply = client.post("/v1/cache/flush")
+    assert reply.status_code == 503
+    assert reply.json() == {"status": "failed", "error": error}
 
 
 def test_image_reaches_the_scheduler_as_its_expanded_span(

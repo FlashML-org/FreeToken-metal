@@ -24,7 +24,7 @@ from tokenizers import Tokenizer
 
 from ftmetal.core import SamplingParams
 from ftmetal.engine.config import EngineConfig
-from ftmetal.message.tokenizer import PromptAdmittedMsg
+from ftmetal.message.tokenizer import FlushCacheResultMsg, PromptAdmittedMsg
 from ftmetal.mm.item import MMItem
 from ftmetal.scheduler.scheduler import ForwardData, Scheduler, TokenEvent
 from ftmetal.scheduler.status import SchedulerStatusReporter
@@ -44,7 +44,7 @@ class ScriptedScheduler(Scheduler):
     max_prompt_tokens: ClassVar[int] = 4096
     # The prefix-cache hit every admitted prompt reports.
     cached_tokens: ClassVar[int] = 0
-    # Whether a step raises, which kills the scheduler thread.
+    # Whether a step or a cache flush raises, which kills the scheduler thread.
     fails: ClassVar[bool] = False
     # The pools each step reports: used KV pages are the requests admitted so far, used GDN
     # slots the running ones; no GDN pool when its total is 0.
@@ -65,6 +65,9 @@ class ScriptedScheduler(Scheduler):
         self.admitted: dict[int, tuple[list[int], SamplingParams]] = {}
         self.reuse_lens: dict[int, int | None] = {}
         self.aborted: list[int] = []
+        self.pending_flush = None
+        # Cache flushes run; the real one is the scheduler's own test.
+        self.flushes = 0
         # uid -> tokens sampled so far
         self.generated: dict[int, int] = {}
         ScriptedScheduler.instances.append(self)
@@ -117,6 +120,15 @@ class ScriptedScheduler(Scheduler):
 
     def swa_token_usage(self) -> tuple[int, int] | None:
         return None
+
+    def check_pending_flush(self, data: ForwardData | None) -> FlushCacheResultMsg | None:
+        assert self.pending_flush is not None
+        if self.fails:
+            raise RuntimeError("scripted flush failure")
+        request_id = self.pending_flush[0].request_id
+        self.pending_flush = None
+        self.flushes += 1
+        return FlushCacheResultMsg(request_id=request_id, status="ok")
 
     def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
         time.sleep(self.step_seconds)
