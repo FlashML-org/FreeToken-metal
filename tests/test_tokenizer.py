@@ -417,6 +417,17 @@ def test_checkpoint_eos_and_sampling_defaults(tiny_model_dir: Path) -> None:
     assert load_sampling_defaults(str(tiny_model_dir)).is_greedy
 
 
+def test_stop_ids_come_from_config_json_without_generation_config(tiny_model_dir: Path) -> None:
+    manager = TokenizeManager(str(tiny_model_dir))
+    eos = manager.tokenizer.token_to_id("<|im_end|>")
+    assert eos is not None
+    end_of_text = 7
+    (tiny_model_dir / "config.json").write_text(json.dumps({"eos_token_id": [eos, end_of_text]}))
+    assert load_eos_token_ids(str(tiny_model_dir), manager.tokenizer) == {eos}
+    (tiny_model_dir / "generation_config.json").unlink()
+    assert load_eos_token_ids(str(tiny_model_dir), manager.tokenizer) == {eos, end_of_text}
+
+
 @pytest.mark.skipif(MODEL_PATH is None, reason="FTMETAL_TEST_MODEL_PATH is not set")
 def test_real_tokenizer_matches_transformers() -> None:
     assert MODEL_PATH is not None

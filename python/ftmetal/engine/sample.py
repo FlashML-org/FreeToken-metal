@@ -72,7 +72,9 @@ class Sampler:
         if all(p.is_greedy for p in params):
             return BatchSamplingArgs(temperatures=None, penalized_rows=penalized_rows)
         temperatures = [max(0.0 if p.is_greedy else p.temperature, MIN_TEMPERATURE) for p in params]
-        top_ks = [p.top_k if p.top_k >= 1 else self.vocab_size for p in params]
+        top_ks = [
+            min(p.top_k, self.vocab_size) if p.top_k >= 1 else self.vocab_size for p in params
+        ]
         top_ps = [min(max(p.top_p, MIN_TOP_P), 1.0) for p in params]
         args = BatchSamplingArgs(
             temperatures=mx.array(temperatures, dtype=mx.float32), penalized_rows=penalized_rows

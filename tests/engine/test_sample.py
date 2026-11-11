@@ -64,6 +64,15 @@ def test_mixed_batch_samples_only_from_allowed_tokens(use_kernel: bool) -> None:
         assert sampler.sample(logits, args).tolist() == [1, 1, 1]
 
 
+@pytest.mark.parametrize("use_kernel", [True, False])
+def test_top_k_past_the_vocabulary_keeps_every_token(use_kernel: bool) -> None:
+    mx.random.seed(0)
+    sampler = Sampler(vocab_size=4, use_kernel=use_kernel)
+    args = sampler.prepare(batch_of([SamplingParams(temperature=1.0, top_k=2**40)] * 64))
+    tokens = sampler.sample(mx.zeros((64, 4)), args).tolist()
+    assert isinstance(tokens, list) and set(tokens) == {0, 1, 2, 3}
+
+
 def test_env_selects_the_mlx_ops(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in ("FTMETAL_SAMPLE_KERNEL", "FREETOKEN_SAMPLE_KERNEL"):
         monkeypatch.delenv(name, raising=False)

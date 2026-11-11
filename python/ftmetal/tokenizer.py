@@ -62,6 +62,7 @@ TOKENIZER_FILE = "tokenizer.json"
 TOKENIZER_CONFIG_FILE = "tokenizer_config.json"
 CHAT_TEMPLATE_FILE = "chat_template.jinja"
 GENERATION_CONFIG_FILE = "generation_config.json"
+MODEL_CONFIG_FILE = "config.json"
 # The tokenizer_config.json entries apply_chat_template hands the template (Gemma's opens
 # with bos_token).
 TEMPLATE_SPECIAL_TOKENS = ("bos_token", "eos_token", "pad_token", "unk_token")
@@ -84,14 +85,22 @@ def read_json_object(path: Path) -> dict[str, object]:
 
 
 def load_eos_token_ids(model_path: str, tokenizer: Tokenizer) -> set[int]:
-    """generation_config.json's eos_token_id (an id or a list) plus the tokenizer's eos token."""
+    """generation_config.json's eos_token_id (an id or a list) plus the tokenizer's eos token.
+
+    A checkpoint without generation_config.json can still list its stop ids in config.json.
+    """
     eos_token_ids: set[int] = set()
-    generation_eos = read_json_object(Path(model_path) / GENERATION_CONFIG_FILE).get("eos_token_id")
-    if isinstance(generation_eos, int):
-        eos_token_ids.add(generation_eos)
-    elif isinstance(generation_eos, list):
-        eos_token_ids.update(token for token in generation_eos if isinstance(token, int))
-    eos_token = read_json_object(Path(model_path) / TOKENIZER_CONFIG_FILE).get("eos_token")
+    model_dir = Path(model_path)
+    if (model_dir / GENERATION_CONFIG_FILE).is_file():
+        stop_ids_file = model_dir / GENERATION_CONFIG_FILE
+    else:
+        stop_ids_file = model_dir / MODEL_CONFIG_FILE
+    checkpoint_eos = read_json_object(stop_ids_file).get("eos_token_id")
+    if isinstance(checkpoint_eos, int):
+        eos_token_ids.add(checkpoint_eos)
+    elif isinstance(checkpoint_eos, list):
+        eos_token_ids.update(token for token in checkpoint_eos if isinstance(token, int))
+    eos_token = read_json_object(model_dir / TOKENIZER_CONFIG_FILE).get("eos_token")
     eos_token_id = tokenizer.token_to_id(eos_token) if isinstance(eos_token, str) else None
     if eos_token_id is not None:
         eos_token_ids.add(eos_token_id)
