@@ -14,7 +14,7 @@ from pydantic import JsonValue
 # Used when the server reports no context length. Guessing low only costs earlier compaction.
 FALLBACK_CONTEXT_WINDOW = 128_000
 MAX_OUTPUT_TOKENS_CAP = 32_768
-# The server accepts any key, and some agents refuse an empty one.
+# Sent to a server without --api-key, which accepts any key; some agents refuse an empty one.
 PLACEHOLDER_API_KEY = "ftmetal"
 # The variable that carries it for agents that read their key from one.
 API_KEY_ENV = "FTMETAL_API_KEY"
@@ -61,6 +61,8 @@ class LaunchContext:
     assume_yes: bool
     # None only for a dry run of an agent that is not installed.
     agent_binary: str | None
+    # The server's --api-key; None when it takes any key.
+    api_key: str | None = None
 
 
 class PreLaunch(Protocol):
@@ -82,6 +84,10 @@ class CommandSpec:
 
 class AgentPreparer(Protocol):
     def __call__(self, context: LaunchContext) -> CommandSpec: ...
+
+
+def agent_api_key(context: LaunchContext) -> str:
+    return context.api_key or PLACEHOLDER_API_KEY
 
 
 def context_window(context: LaunchContext) -> int:
@@ -172,6 +178,7 @@ __all__ = [
     "PreLaunch",
     "ServedModel",
     "ServerURL",
+    "agent_api_key",
     "command_output",
     "command_version",
     "confirm",

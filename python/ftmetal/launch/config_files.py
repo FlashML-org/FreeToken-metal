@@ -20,7 +20,8 @@ OWNER_ONLY_MODE = 0o600
 BACKUPS_KEPT = 5
 
 
-def write_text_with_backup(path: Path, text: str) -> None:
+def write_text_with_backup(path: Path, text: str, *, private: bool = False) -> None:
+    """private: the file holds a secret, so it is written owner-only whatever its old mode."""
     # Written through a symlink, so a dotfile manager's link stays a link.
     target = path.resolve()
     content = text.encode("utf-8")
@@ -51,7 +52,8 @@ def write_text_with_backup(path: Path, text: str) -> None:
                 stream.write(content)
                 stream.flush()
                 os.fsync(stream.fileno())
-            if original is not None:
+            # mkstemp creates it owner-only.
+            if original is not None and not private:
                 shutil.copymode(target, temporary)
             os.replace(temporary, target)
         finally:
@@ -60,11 +62,16 @@ def write_text_with_backup(path: Path, text: str) -> None:
         raise RuntimeError(f"cannot write {path}: {exc}") from exc
 
 
-def write_json_with_backup(path: Path, value: dict[str, JsonValue]) -> None:
-    write_text_with_backup(path, json.dumps(value, indent=2, ensure_ascii=False) + "\n")
+def write_json_with_backup(
+    path: Path, value: dict[str, JsonValue], *, private: bool = False
+) -> None:
+    text = json.dumps(value, indent=2, ensure_ascii=False) + "\n"
+    write_text_with_backup(path, text, private=private)
 
 
-def write_yaml_with_backup(path: Path, value: dict[str, JsonValue], keys: tuple[str, ...]) -> None:
+def write_yaml_with_backup(
+    path: Path, value: dict[str, JsonValue], keys: tuple[str, ...], *, private: bool = False
+) -> None:
     """Rewrites only the top-level keys blocks in the file's text, so every other line, comments
     included, stays as it was; a whole new dump when that text would not load back as value."""
     text = read_config_text(path)
@@ -90,7 +97,7 @@ def write_yaml_with_backup(path: Path, value: dict[str, JsonValue], keys: tuple[
     except yaml.YAMLError:
         is_faithful = False
     written = patched if is_faithful else yaml.safe_dump(value, sort_keys=False, allow_unicode=True)
-    write_text_with_backup(path, written)
+    write_text_with_backup(path, written, private=private)
 
 
 def read_config_text(path: Path) -> str:

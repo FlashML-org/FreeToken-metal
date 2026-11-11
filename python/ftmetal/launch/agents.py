@@ -33,6 +33,7 @@ from ftmetal.launch.context import (
     AgentPreparer,
     CommandSpec,
     LaunchContext,
+    agent_api_key,
     command_version,
     context_window,
     input_modalities,
@@ -99,7 +100,7 @@ def prepare_claude(context: LaunchContext) -> CommandSpec:
             ),
             "ANTHROPIC_BASE_URL": context.server.origin,
             "ANTHROPIC_API_KEY": "",
-            "ANTHROPIC_AUTH_TOKEN": PLACEHOLDER_API_KEY,
+            "ANTHROPIC_AUTH_TOKEN": agent_api_key(context),
             "ANTHROPIC_MODEL": model_id,
             "ANTHROPIC_DEFAULT_OPUS_MODEL": model_id,
             "ANTHROPIC_DEFAULT_SONNET_MODEL": model_id,
@@ -171,13 +172,16 @@ def prepare_opencode(context: LaunchContext) -> CommandSpec:
             "none": {"reasoningEffort": "none"},
             **{level: {"disabled": True} for level in ("low", "medium", "high")},
         }
+    options: dict[str, JsonValue] = {"baseURL": context.server.openai_base_url}
+    if context.api_key is not None:
+        options["apiKey"] = context.api_key
     config: dict[str, JsonValue] = {
         "$schema": "https://opencode.ai/config.json",
         "provider": {
             PROVIDER_ID: {
                 "npm": "@ai-sdk/openai-compatible",
                 "name": PROVIDER_NAME,
-                "options": {"baseURL": context.server.openai_base_url},
+                "options": options,
                 "models": {model_id: model_entry},
             },
         },
@@ -225,7 +229,10 @@ def prepare_pi(context: LaunchContext) -> CommandSpec:
         provider["baseUrl"] = context.server.openai_base_url
         # The model's compat settings are for this API.
         provider["api"] = "openai-completions"
-        provider.setdefault("apiKey", PLACEHOLDER_API_KEY)
+        if context.api_key is not None:
+            provider["apiKey"] = context.api_key
+        else:
+            provider.setdefault("apiKey", PLACEHOLDER_API_KEY)
         existing_models = provider.get("models")
         # Entries a launch wrote are replaced; the user's own are kept, one for this model too.
         user_models = [
@@ -237,7 +244,7 @@ def prepare_pi(context: LaunchContext) -> CommandSpec:
             isinstance(entry, dict) and entry.get("id") == model_id for entry in user_models
         )
         provider["models"] = user_models if has_user_entry else [*user_models, model_entry]
-        write_json_with_backup(models_path, config)
+        write_json_with_backup(models_path, config, private=context.api_key is not None)
     extra_args = context.extra_args
     has_model_args = False
     i = 0
@@ -320,7 +327,7 @@ def prepare_dsh(context: LaunchContext) -> CommandSpec:
         profile, app_args = "web", extra_args
     return CommandSpec(
         argv=["dsh", "--profile", profile, "--patch", str(patch_path), *app_args],
-        env={API_KEY_ENV: PLACEHOLDER_API_KEY, "DSH_TELEMETRY_DISABLED": "1"},
+        env={API_KEY_ENV: agent_api_key(context), "DSH_TELEMETRY_DISABLED": "1"},
         unset_env=CLOUD_PROVIDER_API_KEY_ENV,
     )
 

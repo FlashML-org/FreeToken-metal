@@ -2,7 +2,7 @@
 against it, or pack a model's routed experts for MoE offload.
 
     ftm serve --model <checkpoint dir> [--host H] [--port P] [...]
-    ftm shell [--server URL]
+    ftm shell [--server URL] [--api-key KEY]
     ftm launch <agent> [--server URL] [...] [-- <agent args>]
     ftm pack --model <checkpoint dir>
     ftm --version
@@ -99,17 +99,26 @@ def open_connection(server_url: str) -> http.client.HTTPConnection:
     return http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=CHAT_READ_TIMEOUT)
 
 
-def served_model_id(server_url: str) -> str:
+def auth_headers(api_key: str | None) -> dict[str, str]:
+    return {"Authorization": f"Bearer {api_key}"} if api_key is not None else {}
+
+
+def served_model_id(server_url: str, api_key: str | None) -> str:
     connection = open_connection(server_url)
     try:
-        connection.request("GET", "/v1/models")
-        models = ModelList.model_validate_json(connection.getresponse().read())
+        connection.request("GET", "/v1/models", headers=auth_headers(api_key))
+        response = connection.getresponse()
+        if response.status != 200:
+            raise ShellError(f"HTTP {response.status}: {response.read().decode()}")
+        models = ModelList.model_validate_json(response.read())
     finally:
         connection.close()
     return models.data[0].id
 
 
-def stream_chat(server_url: str, request: ChatCompletionRequest) -> Iterator[ChatCompletionChunk]:
+def stream_chat(
+    server_url: str, request: ChatCompletionRequest, api_key: str | None
+) -> Iterator[ChatCompletionChunk]:
     """The chunks of one streamed completion; closing early disconnects, which aborts it."""
     connection = open_connection(server_url)
     try:
@@ -117,7 +126,7 @@ def stream_chat(server_url: str, request: ChatCompletionRequest) -> Iterator[Cha
             "POST",
             "/v1/chat/completions",
             body=request.model_dump_json(exclude_none=True),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **auth_headers(api_key)},
         )
         response = connection.getresponse()
         if response.status != 200:
@@ -136,7 +145,9 @@ def stream_chat(server_url: str, request: ChatCompletionRequest) -> Iterator[Cha
         connection.close()
 
 
-def run_turn(server_url: str, request: ChatCompletionRequest, style: bool) -> str | None:
+def run_turn(
+    server_url: str, request: ChatCompletionRequest, api_key: str | None, style: bool
+) -> str | None:
     """Stream one reply to the terminal; returns the content shown, None if the turn failed."""
     dim, reset = (DIM, RESET) if style else ("", "")
     content: list[str] = []
@@ -144,7 +155,7 @@ def run_turn(server_url: str, request: ChatCompletionRequest, style: bool) -> st
     started = time.perf_counter()
     first_token_at: float | None = None
     try:
-        for chunk in stream_chat(server_url, request):
+        for chunk in stream_chat(server_url, request, api_key):
             if chunk.usage is not None:
                 decode_seconds = time.perf_counter() - (first_token_at or started)
                 rate = chunk.usage.completion_tokens / max(decode_seconds, 1e-9)
@@ -188,9 +199,15 @@ def run_shell(argv: list[str]) -> int:
         default=read_env("HOST") or DEFAULT_SERVER_URL,
         help=f"server URL (default: $FTMETAL_HOST, else {DEFAULT_SERVER_URL})",
     )
-    server_url = parser.parse_args(argv).server
+    parser.add_argument(
+        "--api-key",
+        default=read_env("API_KEY"),
+        help="API key of a server started with --api-key (default: $FTMETAL_API_KEY)",
+    )
+    args = parser.parse_args(argv)
+    server_url, api_key = args.server, args.api_key or None
     try:
-        model_id = served_model_id(server_url)
+        model_id = served_model_id(server_url, api_key)
     except (ShellError, OSError) as exc:
         print(f"cannot reach {server_url}: {exc}", file=sys.stderr)
         return 1
@@ -229,7 +246,7 @@ def run_shell(argv: list[str]) -> int:
                 stream_options=StreamOptions(include_usage=True),
                 chat_template_kwargs={"enable_thinking": thinking},
             )
-            answer = run_turn(server_url, request, style=sys.stdout.isatty())
+            answer = run_turn(server_url, request, api_key, style=sys.stdout.isatty())
             # The reasoning is never sent back: the template drops it from past turns.
             if answer is not None:
                 history = [*messages, Message(role="assistant", content=answer)]

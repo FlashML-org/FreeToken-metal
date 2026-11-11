@@ -19,9 +19,9 @@ from ftmetal.launch.config_files import (
 from ftmetal.launch.context import (
     API_KEY_ENV,
     CLOUD_PROVIDER_API_KEY_ENV,
-    PLACEHOLDER_API_KEY,
     CommandSpec,
     LaunchContext,
+    agent_api_key,
     command_version,
     context_window,
     input_modalities,
@@ -173,7 +173,7 @@ def prepare_codex(context: LaunchContext) -> CommandSpec:
             model_id,
             *extra_args,
         ],
-        env={API_KEY_ENV: PLACEHOLDER_API_KEY},
+        env={API_KEY_ENV: agent_api_key(context)},
         unset_env=CODEX_CLEAR_ENV,
     )
 

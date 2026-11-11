@@ -20,9 +20,9 @@ from ftmetal.launch.config_files import (
     write_yaml_with_backup,
 )
 from ftmetal.launch.context import (
-    PLACEHOLDER_API_KEY,
     CommandSpec,
     LaunchContext,
+    agent_api_key,
     confirm,
     context_window,
     is_interactive,
@@ -116,7 +116,7 @@ def prepare_hermes(context: LaunchContext) -> CommandSpec:
         model_section["default"] = context.model.model_id
         model_section["provider"] = "custom"
         model_section["base_url"] = context.server.openai_base_url
-        model_section["api_key"] = PLACEHOLDER_API_KEY
+        model_section["api_key"] = agent_api_key(context)
         # Else Hermes takes a window it cached for this URL, stale once the server restarts
         # with another.
         model_section["context_length"] = window
@@ -126,7 +126,7 @@ def prepare_hermes(context: LaunchContext) -> CommandSpec:
                 f"context and this server holds {window}.",
                 file=sys.stderr,
             )
-        write_yaml_with_backup(config_path, config, ("model",))
+        write_yaml_with_backup(config_path, config, ("model",), private=context.api_key is not None)
 
     def offer_messaging(environment: dict[str, str]) -> subprocess.Popen[bytes] | None:
         binary_path = context.agent_binary

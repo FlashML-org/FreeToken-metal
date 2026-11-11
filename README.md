@@ -78,7 +78,9 @@ as `{"text": ...}` events and sampled greedily). The control plane is FreeToken'
 `POST /v1/cache/flush?timeout=<s>` (drop the prefix cache once the engine is idle) and, from
 loopback only, `POST /v1/admin/prepare-stop` (close admission, drain, abort the rest, seal
 the token totals); `FTMETAL_API_LOG_DIR` logs every request body as JSON lines, and
-`--cors-origins` sets the CORS allow-list. Any API key is accepted. `presence_penalty` and
+`--cors-origins` sets the CORS allow-list. Any API key is accepted unless `--api-key` (or
+`FTMETAL_API_KEY`) sets one, which every route but `/health` then requires as a bearer token
+or `x-api-key`; `ftm launch` and `ftm shell` take it the same way. `presence_penalty` and
 `frequency_penalty` apply. The reasoning and tool-call parsers follow the model family
 (`--reasoning-parser`, `--tool-call-parser` override them); `--enable-cache-report` adds the
 prefix-cache hit to each `usage`, and `--enable-timings-report` a per-request `timings` object

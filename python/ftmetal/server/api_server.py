@@ -2,7 +2,7 @@
 tokenizer worker and the scheduler.
 
 Port of FreeToken server/api_server.py (FrontendManager, app, lifespan, install_cors,
-run_api_server, /generate, /v1/cache/flush), with the message loops of
+install_api_key, run_api_server, /generate, /v1/cache/flush), with the message loops of
 tokenizer/server.py (tokenize_worker) and of scheduler/scheduler.py (run_forever and its
 message handling). Divergences: one
 process; the tokenizer worker and the scheduler are threads fed by queue.Queue instead of
@@ -31,6 +31,8 @@ so tokens that race it are not counted.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import queue
@@ -49,6 +51,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from jinja2 import TemplateError
 from pydantic import BaseModel, JsonValue
+from starlette.datastructures import Headers
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from ftmetal.core import SamplingParams
 from ftmetal.effort import ThinkingProfile
@@ -404,6 +408,33 @@ def run_scheduler(
         send_tokenizer.put(BatchTokenizerMsg(data=failed))
 
 
+class ApiKeyMiddleware:
+    """Refuses every request but /health without the key, as a bearer token or x-api-key."""
+
+    def __init__(self, app: ASGIApp, api_key: str) -> None:
+        self.app = app
+        self.digest = hashlib.sha256(api_key.encode()).digest()
+
+    def matches(self, value: str | None) -> bool:
+        # Digests compare in a time that does not depend on the key's length.
+        return value is not None and hmac.compare_digest(
+            hashlib.sha256(value.encode()).digest(), self.digest
+        )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] not in ("http", "websocket") or scope["path"] == "/health":
+            await self.app(scope, receive, send)
+            return
+        headers = Headers(scope=scope)
+        scheme, _, token = headers.get("authorization", "").partition(" ")
+        if (scheme.lower() == "bearer" and self.matches(token)) or self.matches(
+            headers.get("x-api-key")
+        ):
+            await self.app(scope, receive, send)
+        else:
+            await JSONResponse({"error": "Unauthorized"}, status_code=401)(scope, receive, send)
+
+
 def create_app(config: ServerArgs) -> FastAPI:
     mm_processor = get_mm_processor(config.model_path, config.mm)
     tokenize_manager = TokenizeManager(config.model_path, mm_processor)
@@ -464,6 +495,10 @@ def create_app(config: ServerArgs) -> FastAPI:
     register_control_routes(app, lambda: frontend, lambda: model_sampling)
     register_accounting_routes(app, lambda: frontend)
 
+    if config.api_key is not None:
+        # Added before CORS, which wraps it: preflights pass and 401s carry the CORS headers.
+        app.add_middleware(ApiKeyMiddleware, api_key=config.api_key)
+        logger.info("API key required on every route except /health")
     # CORS headers for browser and webview clients; an empty allow-list sends none.
     cors_origins = [origin.strip() for origin in config.cors_origins.split(",") if origin.strip()]
     if cors_origins:
@@ -536,6 +571,7 @@ def run_api_server(config: ServerArgs) -> None:
 
 
 __all__ = [
+    "ApiKeyMiddleware",
     "FrontendManager",
     "GenerateRequest",
     "create_app",

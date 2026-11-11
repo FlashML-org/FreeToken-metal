@@ -15,7 +15,7 @@ no --moe-cpu-threads, --moe-cpu-layers, --moe-hybrid-max-fetch or --moe-prefill-
 --moe-victim-cache-gib is this engine's own; no --kv-reserve-tokens and no --moe-cache-auto:
 an offload without a cache size and auto's resident check keep the context, --num-token
 (FreeToken's --num-tokens, also --context-length), --max-seq-len or 64K tokens, before the
-experts.
+experts. --api-key defaults to FTMETAL_API_KEY (FREETOKEN_API_KEY as the fallback).
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ import argparse
 import logging
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, get_args
 
@@ -37,6 +37,7 @@ from ftmetal.engine.config import (
     MoeStrategyChoice,
     command_graph_from_env,
 )
+from ftmetal.env import read_env
 from ftmetal.kvcache.linear_state_pool import (
     CONVERSATION_SNAPSHOTS,
     MIN_DEFAULT_LINEAR_STATE_CHECKPOINTS,
@@ -89,6 +90,8 @@ REASONING_PARSER_CHOICES = (
 class ServerArgs(EngineConfig):
     server_host: str = "127.0.0.1"
     server_port: int = 1919
+    # Required on every route but /health when set; kept out of repr, which the log prints.
+    api_key: str | None = field(default=None, repr=False)
     # Model id /v1/models reports; parse_args defaults it to the checkpoint directory name.
     served_model_name: str | None = None
     # Tool-call format the chat routes parse out of the completion.
@@ -312,6 +315,14 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         type=positive_int,
         default=ServerArgs.server_port,
         metavar="PORT",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=ServerArgs.api_key,
+        metavar="KEY",
+        help="require this key on every route but /health, sent as 'Authorization: Bearer "
+        "<key>' or 'x-api-key: <key>' (default: $FTMETAL_API_KEY; unset serves without "
+        "authentication)",
     )
     parser.add_argument(
         "--max-running-requests",
@@ -609,6 +620,9 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         "local desktop-app origins); '' disables it, '*' allows any origin",
     )
     namespace = parser.parse_args(argv)
+    # An empty key is usually an unset shell variable: refuse it rather than serve open.
+    if namespace.api_key == "":
+        parser.error("--api-key is empty; omit it to serve without authentication")
     model_path = os.path.expanduser(namespace.model_path)
     if not os.path.isdir(model_path):
         parser.error(f"--model {model_path} is not a directory")
@@ -662,6 +676,7 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         enable_cache_report=namespace.enable_cache_report,
         enable_timings_report=namespace.enable_timings_report,
         anthropic_inline_system=namespace.anthropic_inline_system,
+        api_key=namespace.api_key or read_env("API_KEY"),
         cors_origins=namespace.cors_origins,
         server_host=namespace.server_host,
         server_port=namespace.server_port,

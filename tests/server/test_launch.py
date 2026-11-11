@@ -3,6 +3,7 @@ os.execve caught, so every written file and the started command can be read back
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import os
@@ -105,11 +106,14 @@ class Sandbox:
 
 @pytest.fixture
 def sandbox(
+    request: pytest.FixtureRequest,
     tmp_path: Path,
     tiny_model_dir: Path,
     scripted: type[ScriptedScheduler],
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[Sandbox]:
+    """The server takes the API key the test parametrizes it with, else any."""
+    api_key: str | None = getattr(request, "param", None)
     home = tmp_path / "home"
     home.mkdir()
     bin_dir = tmp_path / "bin"
@@ -117,12 +121,16 @@ def sandbox(
         make_executable(bin_dir / agent)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("PATH", str(bin_dir))
-    for name in (*(prefix + "HOST" for prefix in ENV_PREFIXES), *AGENT_ENV):
+    for name in (
+        *(prefix + variable for prefix in ENV_PREFIXES for variable in ("HOST", "API_KEY")),
+        *AGENT_ENV,
+    ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(launch_install, "SYSTEM_BIN_DIRS", (tmp_path / "system-bin",))
     monkeypatch.setattr(os, "execve", fake_execve)
+    args = dataclasses.replace(tiny_server_args(tiny_model_dir), api_key=api_key)
     with (
-        running_server(create_app(tiny_server_args(tiny_model_dir))) as port,
+        running_server(create_app(args)) as port,
         socket.create_server(("127.0.0.1", 0)) as gateway,
     ):
         # OpenClaw's gateway is up unless a test says otherwise.
@@ -403,6 +411,44 @@ def test_dry_run_changes_nothing(
     assert f"Model: {MODEL_ID}" in output and f"Command: {agent}" in output
 
 
+# (agent, where the started agent finds the server's key: an environment variable, or a file
+# in home and the path to the key in it, which must then be owner-only)
+API_KEY_CASES: list[tuple[str, str, list[str | int]]] = [
+    ("claude", "ANTHROPIC_AUTH_TOKEN", []),
+    ("codex", "FTMETAL_API_KEY", []),
+    ("dsh", "FTMETAL_API_KEY", []),
+    ("opencode", "OPENCODE_CONFIG_CONTENT", ["provider", "ftmetal", "options", "apiKey"]),
+    ("openclaw", OPENCLAW_CONFIG, ["models", "providers", "ftmetal", "apiKey"]),
+    ("hermes", HERMES_CONFIG, ["model", "api_key"]),
+    ("pi", PI_MODELS, ["providers", "ftmetal", "apiKey"]),
+]
+
+
+@pytest.mark.parametrize("sandbox", ["secret"], indirect=True)
+@pytest.mark.parametrize(("agent", "location", "path"), API_KEY_CASES)
+def test_agent_gets_the_servers_api_key(
+    sandbox: Sandbox,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    agent: str,
+    location: str,
+    path: list[str | int],
+) -> None:
+    assert sandbox.launch(agent, "-y") == 1
+    assert "needs a valid API key" in capsys.readouterr().err
+    assert sandbox.launch(agent, "--api-key", "secret", "--dry-run") == 0
+    assert "secret" not in capsys.readouterr().out
+    monkeypatch.setenv("FTMETAL_API_KEY", "secret")
+    started = sandbox.start(agent, "-y")
+    if location not in sandbox.files():
+        value = started.env[location]
+        assert (json_path(json.loads(value), path) if path else value) == "secret"
+    else:
+        file = sandbox.home / location
+        assert json_path(yaml.safe_load(file.read_text()), path) == "secret"
+        assert stat.S_IMODE(file.stat().st_mode) == 0o600
+
+
 # (agent, arguments, whether the agent starts once --config has configured it).
 CONFIG_ONLY_CASES: list[tuple[str, list[str], bool]] = [
     ("claude", ["-y"], True),
@@ -472,7 +518,7 @@ def test_agent_names_and_aliases(sandbox: Sandbox, name: str, agent: str) -> Non
 def test_ctrl_c_ends_the_launch_quietly(
     sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    def interrupted(server: ServerURL) -> ServedModel:
+    def interrupted(server: ServerURL, api_key: str | None) -> ServedModel:
         raise KeyboardInterrupt
 
     monkeypatch.setattr(launch_run, "discover_served_model", interrupted)

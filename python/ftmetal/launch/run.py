@@ -1,10 +1,10 @@
 """ftm launch: read the running server's model, install the agent if missing, write its config
 and become it.
 
-Port of FreeToken launch.py. Divergences: /v1/models alone describes the model; no --api-key;
-proxies are ignored when asking the server, and the agent is told to skip them for it; the
-process execs the agent, since on macOS nothing needs a parent left around it, unless the agent
-needs a helper process that must stop with it.
+Port of FreeToken launch.py. Divergences: /v1/models alone describes the model; proxies are
+ignored when asking the server, and the agent is told to skip them for it; the process execs the
+agent, since on macOS nothing needs a parent left around it, unless the agent needs a helper
+process that must stop with it.
 """
 
 from __future__ import annotations
@@ -18,8 +18,9 @@ import subprocess
 import sys
 from http.client import HTTPException
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import urlsplit, urlunsplit
-from urllib.request import ProxyHandler, build_opener
+from urllib.request import ProxyHandler, Request, build_opener
 
 from pydantic import ValidationError
 
@@ -27,6 +28,7 @@ from ftmetal.env import read_env
 from ftmetal.launch.agents import PREPARERS
 from ftmetal.launch.codex import restore_codex
 from ftmetal.launch.context import (
+    API_KEY_ENV,
     CommandSpec,
     LaunchContext,
     ServedModel,
@@ -85,13 +87,21 @@ def resolve_server_url(server: str, default_port: int) -> ServerURL:
         return ServerURL(origin=origin, openai_base_url=f"{origin}/v1")
 
 
-def discover_served_model(server: ServerURL) -> ServedModel:
+def discover_served_model(server: ServerURL, api_key: str | None) -> ServedModel:
     url = f"{server.openai_base_url}/models"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key is not None else {}
     # A proxy in the environment cannot reach the loopback address the server is usually on.
     opener = build_opener(ProxyHandler({}))
     try:
-        with opener.open(url, timeout=SERVER_TIMEOUT_SECONDS) as response:
+        with opener.open(Request(url, headers=headers), timeout=SERVER_TIMEOUT_SECONDS) as response:
             models = ModelList.model_validate_json(response.read())
+    except HTTPError as exc:
+        if exc.code == 401:
+            raise RuntimeError(
+                f"the ftmetal server at {server.origin} needs a valid API key: pass --api-key "
+                f"or set {API_KEY_ENV}"
+            ) from exc
+        raise RuntimeError(f"the ftmetal server at {server.origin} answered {exc}") from exc
     except (HTTPException, OSError) as exc:
         raise RuntimeError(
             f"cannot reach the ftmetal server at {server.origin}: {exc}\n"
@@ -197,6 +207,11 @@ def run_launch(argv: list[str], default_server_url: str) -> int:
         help=f"server origin or /v1 URL (default: $FTMETAL_HOST, else {default_server_url})",
     )
     parser.add_argument(
+        "--api-key",
+        default=read_env("API_KEY"),
+        help=f"API key of a server started with --api-key (default: ${API_KEY_ENV})",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="print the planned command and change nothing"
     )
     parser.add_argument("-y", "--yes", action="store_true", help="approve every prompt")
@@ -246,7 +261,8 @@ def run_launch(argv: list[str], default_server_url: str) -> int:
             return 0
         else:
             server = resolve_server_url(args.server, default_port)
-            model = discover_served_model(server)
+            api_key = args.api_key or None
+            model = discover_served_model(server, api_key)
             if args.dry_run:
                 binary = resolve_agent_binary(args.agent)
                 command = AgentCommand(binary=binary) if binary is not None else None
@@ -259,6 +275,8 @@ def run_launch(argv: list[str], default_server_url: str) -> int:
                 dry_run=args.dry_run,
                 assume_yes=args.yes,
                 agent_binary=command.binary if command is not None else None,
+                # The plan a dry run prints never holds the key itself.
+                api_key="<api-key>" if args.dry_run and api_key is not None else api_key,
             )
             spec = PREPARERS[args.agent](context)
             environment = agent_environment(spec, server, context.agent_binary)

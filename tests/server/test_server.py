@@ -613,6 +613,31 @@ def test_invalid_requests_are_refused(
     assert response.status_code == status_code and error in response.text
 
 
+# (headers, route, status): a server started with --api-key secret
+API_KEY_CASES: list[tuple[dict[str, str], str, int]] = [
+    ({}, "/health", 200),
+    ({}, "/v1/models", 401),
+    ({"Authorization": "Bearer secret"}, "/v1/models", 200),
+    ({"Authorization": "bearer secret"}, "/v1/models", 200),
+    ({"x-api-key": "secret"}, "/v1/models", 200),
+    ({"Authorization": "Bearer secrets"}, "/v1/models", 401),
+    ({"x-api-key": "wrong"}, "/v1/stats", 401),
+]
+
+
+@pytest.mark.parametrize(("headers", "route", "status_code"), API_KEY_CASES)
+def test_api_key_guards_every_route_but_health(
+    tiny_model_dir: Path,
+    scripted: type[ScriptedScheduler],
+    headers: dict[str, str],
+    route: str,
+    status_code: int,
+) -> None:
+    args = dataclasses.replace(tiny_server_args(tiny_model_dir), api_key="secret")
+    with TestClient(create_app(args)) as client:
+        assert client.get(route, headers=headers).status_code == status_code
+
+
 # (route, request body, the reply's completion tokens)
 TIMINGS_CASES: list[tuple[str, dict[str, JsonValue], int]] = [
     ("/v1/chat/completions", chat_body(), SCRIPT_TOKENS),

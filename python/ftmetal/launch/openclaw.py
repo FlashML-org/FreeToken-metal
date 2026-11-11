@@ -28,11 +28,11 @@ from ftmetal.launch.config_files import (
 )
 from ftmetal.launch.context import (
     CLOUD_PROVIDER_API_KEY_ENV,
-    PLACEHOLDER_API_KEY,
     PROVIDER_ID,
     CommandSpec,
     LaunchContext,
     PreLaunch,
+    agent_api_key,
     confirm,
     context_window,
     input_modalities,
@@ -112,7 +112,7 @@ def patch_openclaw_config(context: LaunchContext, config: dict[str, JsonValue]) 
             for key, value in existing.items():
                 model_entry.setdefault(key, value)
     provider["baseUrl"] = context.server.openai_base_url
-    provider["apiKey"] = PLACEHOLDER_API_KEY
+    provider["apiKey"] = agent_api_key(context)
     provider["api"] = "openai-completions"
     provider["models"] = [model_entry]
     model_config = dict_child(dict_child(dict_child(config, "agents"), "defaults"), "model")
@@ -174,7 +174,7 @@ def onboard_openclaw(context: LaunchContext, binary: str, root_options: list[str
         "--custom-model-id",
         context.model.model_id,
         "--custom-api-key",
-        PLACEHOLDER_API_KEY,
+        agent_api_key(context),
         "--custom-provider-id",
         PROVIDER_ID,
         "--custom-compatibility",
@@ -239,7 +239,7 @@ def prepare_openclaw(context: LaunchContext) -> CommandSpec:
             onboard_openclaw(context, binary, root_options)
             config = load_json_object(config_path)
         patch_openclaw_config(context, config)
-        write_json_with_backup(config_path, config)
+        write_json_with_backup(config_path, config, private=context.api_key is not None)
 
     # The main agent is keyed under agents.entries, or listed by id in agents.list.
     entries = nested_value(config, "agents", "entries")
