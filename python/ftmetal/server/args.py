@@ -51,8 +51,10 @@ TOOL_CALL_PARSER_CHOICES = (
     "qwen",
     "qwen25",
     "qwen3_coder",
+    "ricursive",
     "mistral",
     "deepseekv32",
+    "deepseekv41",
     "gemma4",
     "glm47",
     "minimax",
@@ -79,6 +81,7 @@ REASONING_PARSER_CHOICES = (
     "muse_glimmer",
     "gemma4",
     "flint",
+    "ricursive",
 )
 
 
@@ -98,6 +101,13 @@ class ServerArgs(EngineConfig):
     # prompt_tokens_details.cached_tokens, Anthropic cache_read_input_tokens, Responses
     # input_tokens_details.cached_tokens).
     enable_cache_report: bool = False
+    # Attach a per-request timings object (prefill and decode spans and rates, queue time)
+    # to OpenAI and Responses replies.
+    enable_timings_report: bool = False
+    # How /v1/messages renders a system message after the first turn: auto probes the chat
+    # template, preserve keeps it a system turn in place, fold merges it into the user or
+    # tool turn next to it.
+    anthropic_inline_system: str = "auto"
     # Comma-separated hostname allowlist for client-supplied image URLs; empty admits any
     # domain.
     allowed_media_domains: str = ""
@@ -211,7 +221,10 @@ def model_family_marker(model_path: str) -> str:
 
 def infer_tool_call_parser(model_path: str) -> str:
     # note (jason-fxz): by config, not path: "flint" is a common word in a directory's name.
-    if "flint" in model_type_marker(model_path):
+    type_marker = model_type_marker(model_path)
+    if "ricursive" in type_marker:
+        return "ricursive"
+    if "flint" in type_marker:
         return "glm47"
     marker = model_family_marker(model_path)
     if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
@@ -232,6 +245,8 @@ def infer_tool_call_parser(model_path: str) -> str:
         return "qwen3_coder"
     if "qwen" in marker:
         return "qwen25"
+    if "deepseek_v41" in marker or "deepseekv41" in marker:
+        return "deepseekv41"
     if "deepseek" in marker and ("v4" in marker or "deepseek_v4" in marker):
         return "deepseekv32"
     if "deepseek" in marker and ("v3.2" in marker or "v32" in marker):
@@ -244,7 +259,10 @@ def infer_tool_call_parser(model_path: str) -> str:
 
 
 def infer_reasoning_parser(model_path: str) -> str | None:
-    if "flint" in model_type_marker(model_path):
+    type_marker = model_type_marker(model_path)
+    if "ricursive" in type_marker:
+        return "ricursive"
+    if "flint" in type_marker:
         return "flint"
     marker = model_family_marker(model_path)
     if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
@@ -508,6 +526,22 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         "(on /v1/messages input_tokens then excludes them, as Anthropic bills)",
     )
     parser.add_argument(
+        "--enable-timings-report",
+        action="store_true",
+        help="attach a per-request timings object (prefill and decode spans and rates, queue "
+        "time) to every chat completion, completion and Responses reply, and to the final "
+        "stream chunk; a request's timings_per_token puts it on every chunk",
+    )
+    parser.add_argument(
+        "--anthropic-inline-system",
+        choices=("auto", "preserve", "fold"),
+        default=ServerArgs.anthropic_inline_system,
+        help="how /v1/messages renders a system message after the first turn: preserve keeps "
+        "it a system turn in place, fold merges it into the user or tool turn next to it, auto "
+        "(default) preserves it when the chat template renders it apart without changing the "
+        "tokens around it; either way the prompt prefix before it stays as cached",
+    )
+    parser.add_argument(
         "--tool-call-parser",
         choices=TOOL_CALL_PARSER_CHOICES,
         default="auto",
@@ -626,6 +660,8 @@ def parse_args(argv: list[str], prog: str) -> ServerArgs:
         tool_call_parser=tool_call_parser,
         reasoning_parser=reasoning_parser,
         enable_cache_report=namespace.enable_cache_report,
+        enable_timings_report=namespace.enable_timings_report,
+        anthropic_inline_system=namespace.anthropic_inline_system,
         cors_origins=namespace.cors_origins,
         server_host=namespace.server_host,
         server_port=namespace.server_port,

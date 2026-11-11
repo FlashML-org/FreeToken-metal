@@ -65,6 +65,8 @@ class ScriptedScheduler(Scheduler):
         self.admitted: dict[int, tuple[list[int], SamplingParams]] = {}
         self.reuse_lens: dict[int, int | None] = {}
         self.aborted: list[int] = []
+        # uid -> tokens sampled so far
+        self.generated: dict[int, int] = {}
         ScriptedScheduler.instances.append(self)
 
     @property
@@ -126,12 +128,32 @@ class ScriptedScheduler(Scheduler):
             if not tokens:
                 finish_reason = "stop" if ends_with_eos else "length"
                 self.running.pop(uid)
-            self.results.append(TokenEvent(uid, token, not tokens, finish_reason))
+            prompt, params = self.admitted[uid]
+            self.generated[uid] = self.generated.get(uid, 0) + 1
+            if not tokens or params.timings_per_token or params.stop_strs:
+                timings = scripted_timings(len(prompt), self.cached_tokens, self.generated[uid])
+            else:
+                timings = None
+            self.results.append(TokenEvent(uid, token, not tokens, finish_reason, timings))
         return None
 
     def prompt_text(self, uid: int) -> str:
         """The prompt uid was admitted with, decoded."""
         return self.tokenizer.decode(self.admitted[uid][0], skip_special_tokens=False)
+
+
+def scripted_timings(
+    prompt_tokens: int, cached_tokens: int, completion_tokens: int
+) -> dict[str, float | int]:
+    """What ReqStats.finish reports: 1 ms queued, 2 ms per prompt token, 10 ms per token."""
+    return {
+        "queue_ms": 1.0,
+        "cache_n": cached_tokens,
+        "prompt_n": prompt_tokens - cached_tokens,
+        "prompt_ms": 2.0 * (prompt_tokens - cached_tokens),
+        "predicted_n": completion_tokens,
+        "predicted_ms": 10.0 * completion_tokens,
+    }
 
 
 def wait_for_abort(scheduler: ScriptedScheduler, uid: int) -> None:

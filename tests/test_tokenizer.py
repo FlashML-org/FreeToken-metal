@@ -22,6 +22,7 @@ from tokenizers import AddedToken, Tokenizer, processors
 from transformers import AutoTokenizer
 
 from ftmetal.core import SamplingParams
+from ftmetal.inline_system import InlineSystemError, normalize_inline_system
 from ftmetal.message.frontend import UserReply
 from ftmetal.message.tokenizer import DetokenizeMsg, FinishReason, JsonValue, TokenizeMsg
 from ftmetal.mm.config import MultimodalConfig
@@ -143,6 +144,7 @@ def tokenize_msg(
     messages: list[dict[str, JsonValue]],
     enable_thinking: bool | None = None,
     tools: list[dict[str, JsonValue]] | None = None,
+    inline_system_policy: str | None = None,
 ) -> TokenizeMsg:
     kwargs: dict[str, JsonValue] = {}
     if enable_thinking is not None:
@@ -153,7 +155,62 @@ def tokenize_msg(
         sampling_params=SamplingParams(),
         chat_template_kwargs=kwargs,
         tools=tools,
+        inline_system_policy=inline_system_policy,
     )
+
+
+# A template that renders a system turn wherever it is.
+PLAIN_CHATML_TEMPLATE = (
+    "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}"
+    "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+)
+FOLDED = "<|im_start|>user\nWeather?\n\nUse metric units.<|im_end|>"
+PRESERVED = "<|im_start|>user\nWeather?<|im_end|>\n<|im_start|>system\nUse metric units.<|im_end|>"
+# (policy, whether the template renders a late system turn, its rendering): the tiny template
+# refuses one.
+INLINE_SYSTEM_CASES: list[tuple[str, bool, str]] = [
+    ("auto", False, FOLDED),
+    ("auto", True, PRESERVED),
+    ("fold", True, FOLDED),
+    ("preserve", True, PRESERVED),
+]
+
+
+@pytest.mark.parametrize(("policy", "renders_late_system", "rendered"), INLINE_SYSTEM_CASES)
+def test_late_system_message_stays_after_the_cached_prefix(
+    tiny_model_dir: Path, policy: str, renders_late_system: bool, rendered: str
+) -> None:
+    if renders_late_system:
+        (tiny_model_dir / "chat_template.jinja").write_text(PLAIN_CHATML_TEMPLATE)
+    manager = TokenizeManager(str(tiny_model_dir))
+    messages: list[dict[str, JsonValue]] = [
+        {"role": "system", "content": "Be brief."},
+        {"role": "user", "content": "Hi"},
+        {"role": "assistant", "content": "Hello."},
+        {"role": "user", "content": "Weather?"},
+        {"role": "system", "content": "Use metric units."},
+    ]
+    prompt = manager.render_prompt(tokenize_msg(messages, inline_system_policy=policy))
+    head = "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n"
+    assert prompt.startswith(head) and rendered in prompt
+
+
+def test_late_system_message_waits_for_the_tool_results() -> None:
+    call: dict[str, JsonValue] = {"role": "assistant", "content": "", "tool_calls": []}
+    call["tool_calls"] = [{"id": "a"}, {"id": "b"}]
+    messages: list[dict[str, JsonValue]] = [
+        {"role": "user", "content": "Weather?"},
+        call,
+        {"role": "tool", "tool_call_id": "a", "content": "Sunny"},
+        {"role": "system", "content": "Use metric units."},
+        {"role": "tool", "tool_call_id": "b", "content": "20 C"},
+    ]
+    assert normalize_inline_system(messages, "fold")[3:] == [
+        {"role": "tool", "tool_call_id": "b", "content": "20 C\n\nUse metric units."}
+    ]
+    interrupted = [*messages[:2], messages[3], {"role": "user", "content": "Go on."}]
+    with pytest.raises(InlineSystemError, match="interrupts incomplete tool results"):
+        normalize_inline_system(interrupted, "fold")
 
 
 def test_chat_template_opens_or_closes_the_think_block(tiny_model_dir: Path) -> None:

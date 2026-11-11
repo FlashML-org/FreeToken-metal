@@ -457,8 +457,6 @@ COMPLETION_CASES: list[tuple[dict[str, JsonValue], list[str], list[FinishReason]
         2,
         SCRIPT_TOKENS + 2,
     ),
-    # n is ignored: one choice per prompt.
-    ({"prompt": "hi", "n": 2}, [SCRIPT], ["stop"], 2, SCRIPT_TOKENS),
 ]
 
 
@@ -587,6 +585,15 @@ REFUSED_CASES: list[tuple[str, dict[str, JsonValue], int, str]] = [
         "only support a single text prompt",
     ),
     ("/v1/completions", {"model": "tiny", "prompt": "hi", "max_tokens": 0}, 400, "max_tokens"),
+    ("/v1/completions", {"model": "tiny", "prompt": "hi", "n": 2}, 400, '"param":"n"'),
+    ("/v1/completions", {"model": "tiny", "prompt": []}, 400, "prompt must not be empty"),
+    ("/v1/chat/completions", {**chat_body(), "presence_penalty": 2.5}, 422, "presence_penalty"),
+    (
+        "/v1/completions",
+        {"model": "tiny", "prompt": "hi", "frequency_penalty": -3},
+        422,
+        "frequency",
+    ),
     ("/generate", {"prompt": "hi", "max_tokens": 0}, 400, "max_tokens must be at least 1, got 0"),
     ("/generate", {"prompt": [1, 2, 3], "max_tokens": 4}, 422, "prompt"),
 ]
@@ -598,6 +605,80 @@ def test_invalid_requests_are_refused(
 ) -> None:
     response = client.post(route, json=body)
     assert response.status_code == status_code and error in response.text
+
+
+# (route, request body, the reply's completion tokens)
+TIMINGS_CASES: list[tuple[str, dict[str, JsonValue], int]] = [
+    ("/v1/chat/completions", chat_body(), SCRIPT_TOKENS),
+    ("/v1/completions", {"model": "tiny", "prompt": "hi", "max_tokens": 3}, 3),
+    ("/v1/responses", {"model": "tiny", "input": "hi"}, SCRIPT_TOKENS),
+]
+
+
+@pytest.mark.parametrize("enable_timings_report", [False, True])
+@pytest.mark.parametrize(("route", "body", "completion_tokens"), TIMINGS_CASES)
+def test_timings_report_the_scheduler_spans_when_enabled(
+    tiny_model_dir: Path,
+    scripted: type[ScriptedScheduler],
+    route: str,
+    body: dict[str, JsonValue],
+    completion_tokens: int,
+    enable_timings_report: bool,
+) -> None:
+    args = dataclasses.replace(
+        tiny_server_args(tiny_model_dir), enable_timings_report=enable_timings_report
+    )
+    with TestClient(create_app(args)) as client:
+        reply = client.post(route, json=body).json()
+    if not enable_timings_report:
+        assert "timings" not in reply
+    else:
+        timings = reply["timings"]
+        steps = completion_tokens - 1
+        assert timings["predicted_n"] == completion_tokens and timings["queue_ms"] == 1.0
+        assert timings["predicted_per_token_ms"] == pytest.approx(10.0 * completion_tokens / steps)
+        assert timings["prompt_per_token_ms"] == pytest.approx(2.0) and timings["cache_n"] == 0
+
+
+# (stream_options, timings_per_token, whether every content chunk carries usage, timings)
+STREAM_REPORT_CASES: list[tuple[dict[str, bool], bool, bool, bool]] = [
+    ({}, False, False, False),
+    ({"include_usage": True, "continuous_usage_stats": True}, False, True, False),
+    ({}, True, False, True),
+]
+
+
+@pytest.mark.parametrize(
+    ("stream_options", "timings_per_token", "has_usage", "has_timings"), STREAM_REPORT_CASES
+)
+def test_stream_reports_ride_every_chunk_when_asked(
+    tiny_model_dir: Path,
+    scripted: type[ScriptedScheduler],
+    stream_options: dict[str, bool],
+    timings_per_token: bool,
+    has_usage: bool,
+    has_timings: bool,
+) -> None:
+    args = dataclasses.replace(tiny_server_args(tiny_model_dir), enable_timings_report=True)
+    body = {
+        **chat_body(),
+        "stream": True,
+        "stream_options": stream_options,
+        "timings_per_token": timings_per_token,
+    }
+    with TestClient(create_app(args)) as client:
+        events = sse_events(client.post("/v1/chat/completions", json=body).text)
+    chunks = [json.loads(event) for event in events[:-1]]
+    content_chunks = [
+        chunk for chunk in chunks if chunk["choices"] and chunk["choices"][0]["delta"]
+    ]
+    assert all(("usage" in chunk) == has_usage for chunk in content_chunks[1:])
+    assert all(("timings" in chunk) == has_timings for chunk in content_chunks[1:])
+    # Without per-token timings the block rides the stream's last chunk only.
+    assert "timings" in chunks[-1]
+    if has_usage:
+        usages = [chunk["usage"]["completion_tokens"] for chunk in content_chunks[1:]]
+        assert usages == sorted(usages) and usages[-1] <= SCRIPT_TOKENS
 
 
 def test_image_reaches_the_scheduler_as_its_expanded_span(

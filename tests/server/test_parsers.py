@@ -26,6 +26,24 @@ REASONING_CASES: list[tuple[str, bool, list[str], str, str, str]] = [
     ("qwen3", False, ["<thi", "nk>abc</think>", "def"], "abc", "def", "def"),
     ("qwen3", False, ["no ", "block <", "th"], "", "no block <th", "no block <th"),
     ("qwen3", True, ["still ", "thinking </thi"], "still thinking </thi", "", ""),
+    # A tool call right after an unclosed think goes to the tool parser.
+    (
+        "qwen3",
+        True,
+        ["I need a shell.<tool_", "call><function=run></function></tool_call>"],
+        "I need a shell.",
+        "<tool_call><function=run></function></tool_call>",
+        "<tool_call><function=run></function></tool_call>",
+    ),
+    # Once the think is closed, a tool marker inside it is only text.
+    (
+        "qwen3",
+        True,
+        ["Mention <tool_call> only.</th", "ink>Visible"],
+        "Mention <tool_call> only.",
+        "Visible",
+        "Visible",
+    ),
     (
         "gemma4",
         False,

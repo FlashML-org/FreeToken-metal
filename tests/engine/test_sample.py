@@ -70,3 +70,39 @@ def test_env_selects_the_mlx_ops(monkeypatch: pytest.MonkeyPatch) -> None:
     assert Sampler(vocab_size=6).use_kernel
     monkeypatch.setenv("FTMETAL_SAMPLE_KERNEL", "0")
     assert not Sampler(vocab_size=6).use_kernel
+
+
+# (presence and frequency penalties, greedy or nucleus, tokens over four steps of the same
+# logits [4, 3, 0, 0, 0, 0])
+PENALTY_CASES: list[tuple[float, float, bool, list[int]]] = [
+    (0.0, 0.0, True, [0, 0, 0, 0]),
+    # Every repeat costs 1.5 more, so the two leaders alternate.
+    (0.0, 1.5, True, [0, 1, 0, 1]),
+    # One flat cost per token seen: once both leaders paid it, the first leads again.
+    (3.0, 0.0, True, [0, 1, 0, 0]),
+    # A negative penalty rewards repeats.
+    (0.0, -2.0, True, [0, 0, 0, 0]),
+    (0.0, 1.5, False, [0, 1, 0, 1]),
+]
+
+
+@pytest.mark.parametrize("use_kernel", [True, False])
+@pytest.mark.parametrize(("presence", "frequency", "greedy", "expected"), PENALTY_CASES)
+def test_penalties_count_the_tokens_sampled_so_far(
+    use_kernel: bool, presence: float, frequency: float, greedy: bool, expected: list[int]
+) -> None:
+    params = SamplingParams(
+        temperature=0.0 if greedy else 1.0,
+        top_p=1.0 if greedy else 0.01,
+        presence_penalty=presence,
+        frequency_penalty=frequency,
+    )
+    batch = batch_of([params])
+    sampler = Sampler(vocab_size=6, use_kernel=use_kernel)
+    logits = mx.array([[4.0, 3.0, 0.0, 0.0, 0.0, 0.0]])
+    tokens = [sampler.sample(logits, sampler.prepare(batch)).item() for _ in expected]
+    assert tokens == expected
+    counts = batch.reqs[0].output_token_counts
+    assert (counts is None) == (presence == frequency == 0.0)
+    if counts is not None:
+        assert counts.tolist() == np.bincount(expected, minlength=6).tolist()

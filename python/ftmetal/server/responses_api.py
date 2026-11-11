@@ -63,6 +63,7 @@ from .generation import (
     GenerationError,
     GenResult,
     GenSpec,
+    GenUsage,
     ReasoningDelta,
     ToolCallArgsDelta,
     ToolCallsDelta,
@@ -73,6 +74,7 @@ from .generation import (
     resolve_sampling,
     split_tool_lists,
     submit_generation,
+    timings_block,
     with_keepalive,
 )
 from .request_logger import log_request
@@ -96,6 +98,9 @@ class ResponsesRequest(BaseModel):
     top_p: float | None = None
     top_k: int | None = None
     stream: bool = False
+    # llama.cpp's field: every delta event carries the timings block (effective only with
+    # --enable-timings-report; extra="allow" used to swallow it).
+    timings_per_token: bool = False
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any | None = None
     reasoning: dict[str, Any] | None = None
@@ -158,6 +163,13 @@ async def handle_responses(
             model_sampling,
             default_max_tokens=default_max,
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
+            # stamp per-token only when the server opted into timings too; llama.cpp
+            # publishes partial timings on streams, so non-stream requests never pay
+            timings_per_token=bool(
+                req.stream
+                and req.timings_per_token
+                and getattr(state.config, "enable_timings_report", False)
+            ),
         )
         uid = await submit_generation(spec, state)
     except GenerationError as exc:
@@ -167,12 +179,17 @@ async def handle_responses(
 
     cache_report = getattr(state.config, "enable_cache_report", False)
     if req.stream:
+        # shared with generate_events: its ack loop stamps usage.timings before yielding
+        # each event, so a delta reads the snapshot of the ack behind it
+        usage = GenUsage()
         events = responses_stream_generator(
-            generate_events(uid, spec, state, source="/v1/responses"),
+            generate_events(uid, spec, state, source="/v1/responses", usage=usage),
             req,
             response_id,
             created,
             cache_report=cache_report,
+            state=state,
+            usage=usage,
         )
         if request is not None:
             events = state.stream_with_cancellation(events, request, uid)
@@ -183,7 +200,7 @@ async def handle_responses(
     except GenerationError as exc:
         return _error_response(400, str(exc), exc.code)
     response = build_responses_response(
-        result, req, response_id, created, cache_report=cache_report
+        result, req, response_id, created, cache_report=cache_report, state=state
     )
     return JSONResponse(content=response.model_dump(mode="json"))
 
@@ -198,6 +215,7 @@ def convert_responses_to_genspec(
     model_sampling: dict[str, Any],
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     reasoning_parser: str | None = None,
+    timings_per_token: bool = False,
 ) -> GenSpec:
     # Collect every system/developer text — the top-level `instructions` PLUS any
     # system/developer-role input items (codex sends both: a system prompt as `instructions`
@@ -255,6 +273,7 @@ def convert_responses_to_genspec(
             max_tokens=req.max_output_tokens or default_max_tokens,
             ignore_eos=False,
             model_sampling=model_sampling,
+            timings_per_token=timings_per_token,
         ),
         chat_template_kwargs=ctk,
         template_tools=template_tools,
@@ -420,6 +439,7 @@ def build_responses_response(
     response_id: str,
     created: int,
     cache_report: bool = False,
+    state: Any = None,
 ) -> Response:
     truncated = result.finish_reason == "length"
     item_status = "incomplete" if truncated else "completed"
@@ -470,6 +490,7 @@ def build_responses_response(
             result.cached_tokens if cache_report else 0,
         ),
         incomplete_reason="max_output_tokens" if truncated else None,
+        timings=timings_block(state, result.timings),
     )
 
 
@@ -483,7 +504,10 @@ def _response_obj(
     usage: ResponseUsage | None,
     error: ResponseError | None = None,
     incomplete_reason: str | None = None,
+    timings: dict[str, Any] | None = None,
 ) -> Response:
+    # Response allows extra fields, so timings rides along without forking the schema.
+    extra: dict[str, Any] = {"timings": timings} if timings is not None else {}
     return Response(
         id=response_id,
         created_at=created,
@@ -499,6 +523,7 @@ def _response_obj(
         parallel_tool_calls=True,
         tool_choice="auto",
         tools=[],
+        **extra,
     )
 
 
@@ -523,8 +548,18 @@ async def responses_stream_generator(
     response_id: str,
     created: int,
     cache_report: bool = False,
+    state: Any = None,
+    usage: GenUsage | None = None,
 ) -> AsyncIterator[str]:
     seq = _Seq()
+
+    def timings_extra() -> dict[str, Any]:
+        # per-token: every delta carries the ack's snapshot. Request-side gate: the
+        # terminal snapshot rides every request, so post-terminal residue must stay clean.
+        if not req.timings_per_token or usage is None:
+            return {}
+        t = timings_block(state, usage.timings)
+        return {"timings": t} if t is not None else {}
 
     def snapshot(status, output, usage=None, incomplete_reason=None):
         return _response_obj(
@@ -699,6 +734,7 @@ async def responses_stream_generator(
                 item_id=current["id"],
                 output_index=output_index,
                 delta=fragment,
+                **timings_extra(),
             )
         )
 
@@ -748,6 +784,7 @@ async def responses_stream_generator(
                         output_index=output_index,
                         content_index=0,
                         delta=ev.text,
+                        **timings_extra(),
                     )
                 )
 
@@ -793,6 +830,7 @@ async def responses_stream_generator(
                         content_index=0,
                         delta=ev.text,
                         logprobs=[],
+                        **timings_extra(),
                     )
                 )
 
@@ -839,6 +877,7 @@ async def responses_stream_generator(
                 finish_reason = ev.finish_reason
                 usage_pt, usage_ct = ev.prompt_tokens, ev.completion_tokens
                 usage_cached = ev.cached_tokens if cache_report else 0
+                final_timings = timings_block(state, ev.timings)
                 for f in close_current():
                     yield f
                 if finish_reason == "length":
@@ -852,6 +891,7 @@ async def responses_stream_generator(
                                 usage=_usage(usage_pt, usage_ct, usage_cached),
                                 incomplete_reason="max_output_tokens",
                             ),
+                            **({"timings": final_timings} if final_timings is not None else {}),
                         )
                     )
                 else:
@@ -864,6 +904,7 @@ async def responses_stream_generator(
                                 output_items,
                                 usage=_usage(usage_pt, usage_ct, usage_cached),
                             ),
+                            **({"timings": final_timings} if final_timings is not None else {}),
                         )
                     )
     except GenerationError as exc:

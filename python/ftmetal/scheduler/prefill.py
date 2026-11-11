@@ -22,11 +22,12 @@ than a chunk is still cut, with one warning per manager.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
 
-from ftmetal.core import Batch, CacheHandle, Req, SamplingParams
+from ftmetal.core import Batch, CacheHandle, Req, ReqStats, SamplingParams
 from ftmetal.kvcache.linear_state_pool import LIVE_SLOTS, TRACK_SLOTS
 from ftmetal.kvcache.radix_cache import align_down
 from ftmetal.mm.encoder_cache import EncoderCache
@@ -54,6 +55,8 @@ class PendingReq:
     mm_items: list[MMItem] | None = None
     mrope_positions_full: np.ndarray | None = None
     mrope_delta: int = 0
+    # Every chunk's Req.stats; add_one_req stamps its enqueued_at.
+    stats: ReqStats = field(default_factory=ReqStats)
 
     @property
     def input_len(self) -> int:
@@ -224,6 +227,7 @@ class PrefillAdder:
             mm_items=pending.mm_items,
             mrope_positions_full=pending.mrope_positions_full,
             mrope_delta=pending.mrope_delta,
+            stats=pending.stats,
         )
         req.linear_slot_idx = resources.linear_slot_idx
         req.mamba_ping_pong = resources.ping_pong
@@ -319,6 +323,7 @@ class PrefillManager:
                 mm_items=mm_items,
                 mrope_positions_full=mrope_positions,
                 mrope_delta=mrope_delta,
+                stats=ReqStats(enqueued_at=time.perf_counter()),
             )
         )
 
@@ -373,6 +378,9 @@ class PrefillManager:
             reqs.append(req)
             if not is_continuation:
                 prompt_admissions.append((req.uid, pending.input_len, req.cached_len))
+                pending.stats.first_chunk_at = time.perf_counter()
+                pending.stats.cache_n = req.cached_len
+                pending.stats.prompt_n = pending.input_len - req.cached_len
                 if pending.mm_items and self.encoder_cache is not None:
                     # Claim the rows every chunk of this request gathers: the entry outlives
                     # the chunks.

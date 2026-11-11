@@ -11,7 +11,9 @@ UTF-8 character is held back whole, and flushed as is when the request finishes;
 conversation's reusable prefix ends where its rendering without the generation prompt
 does, when that encoding is a prefix of the prompt's (FreeToken has no such boundary),
 moved past the expansion of the image placeholders it holds, so each image is processed
-once; resolve_thinking_mode is FreeToken's, for the reasoning parser's force_reasoning.
+once; resolve_thinking_mode is FreeToken's, for the reasoning parser's force_reasoning;
+a conversation's later system messages are preserved or folded per its inline system policy,
+the auto mode probed from the template once per (tools, kwargs), as FreeToken does.
 
 A raw prompt gets the special tokens tokenizer.json's post-processor adds, which is what
 transformers 5 adds for FreeToken: none for Qwen3.6, and none for Gemma4 either (its
@@ -24,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, NoReturn
@@ -43,6 +46,11 @@ from ftmetal.effort import (
     probe_thinking_profile,
     quantize_effort,
 )
+from ftmetal.inline_system import (
+    has_inline_system,
+    normalize_inline_system,
+    probe_inline_system,
+)
 from ftmetal.message.backend import UserMsg
 from ftmetal.message.frontend import UserReply
 from ftmetal.message.tokenizer import DetokenizeMsg, TokenizeMsg
@@ -59,6 +67,8 @@ GENERATION_CONFIG_FILE = "generation_config.json"
 TEMPLATE_SPECIAL_TOKENS = ("bos_token", "eos_token", "pad_token", "unk_token")
 # What a byte-level decode yields for a UTF-8 sequence the last token left incomplete.
 REPLACEMENT_CHARACTER = "�"
+# The (tools, kwargs) combinations whose probed inline system mode is kept.
+MAX_INLINE_SYSTEM_MODES = 128
 # The conversation the reasoning-effort and thinking probes render.
 EFFORT_PROBE_MESSAGES: list[dict[str, JsonValue]] = [{"role": "user", "content": "ping"}]
 
@@ -167,19 +177,44 @@ class TokenizeManager:
         self.effort_lock = threading.Lock()
         # (requested effort, the gear it was served as) pairs already logged.
         self.logged_effort_maps: set[tuple[str, str | None]] = set()
+        # The probed inline system mode per JSON (tools, kwargs), oldest first.
+        self.inline_system_lock = threading.Lock()
+        self.inline_system_modes: dict[str, str] = {}
 
     def render_prompt(self, msg: TokenizeMsg, add_generation_prompt: bool = True) -> str:
         """The prompt text. A conversation's reasoning_effort is quantized first: every render
         path (worker, frontend check, count_tokens) must agree."""
         if isinstance(msg.text, str):
             return msg.text
-        else:
-            return self.render_template(
-                msg.text,
-                msg.tools,
-                self.sanitize_effort(msg.chat_template_kwargs),
-                add_generation_prompt,
-            )
+        kwargs = self.sanitize_effort(msg.chat_template_kwargs)
+        messages = msg.text
+        policy = msg.inline_system_policy
+        if policy is not None and policy not in ("auto", "preserve", "fold"):
+            raise ValueError(f"invalid inline system policy: {policy}")
+        elif policy is not None and has_inline_system(messages):
+            mode = self.inline_system_mode(msg.tools, kwargs) if policy == "auto" else policy
+            messages = normalize_inline_system(messages, mode)
+        return self.render_template(messages, msg.tools, kwargs, add_generation_prompt)
+
+    def inline_system_mode(
+        self, tools: list[dict[str, JsonValue]] | None, kwargs: dict[str, JsonValue]
+    ) -> str:
+        """Whether the template keeps a late system message as its own turn without changing
+        the tokens around it (preserve) or not (fold), probed once per (tools, kwargs)."""
+        key = json.dumps([tools, kwargs], sort_keys=True)
+        with self.inline_system_lock:
+            if key not in self.inline_system_modes:
+                mode, reason = probe_inline_system(
+                    lambda messages: self.render_template(
+                        messages, deepcopy(tools), deepcopy(kwargs)
+                    ),
+                    self.tokenizer,
+                )
+                if len(self.inline_system_modes) >= MAX_INLINE_SYSTEM_MODES:
+                    self.inline_system_modes.pop(next(iter(self.inline_system_modes)))
+                self.inline_system_modes[key] = mode
+                logger.info(f"Anthropic inline system policy: {mode} ({reason})")
+            return self.inline_system_modes[key]
 
     def render_template(
         self,
@@ -393,6 +428,7 @@ class DetokenizeManager:
             mamba_total_slots=msg.mamba_total_slots,
             swa_used_tokens=msg.swa_used_tokens,
             swa_total_tokens=msg.swa_total_tokens,
+            timings=msg.timings,
         )
 
 

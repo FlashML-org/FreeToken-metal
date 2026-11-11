@@ -3,8 +3,9 @@ admissions, aborts and scheduler errors.
 
 Port of FreeToken message/tokenizer.py. Divergences: plain dataclasses passed over
 queue.Queue (no ZMQ encoder/decoder); stop strings are matched by the detokenizer, so
-DetokenizeMsg carries neither matched_stop nor stop_strs; no GPU-memory figure or
-cache-rebuild messages.
+DetokenizeMsg carries neither matched_stop nor stop_strs, and carries the timings snapshot
+whenever the request has stop strings (the detokenizer can end it on any token); no GPU-memory
+figure or cache-rebuild messages.
 """
 
 from __future__ import annotations
@@ -43,6 +44,9 @@ class DetokenizeMsg(BaseTokenizerMsg):
     mamba_total_slots: int = 0
     swa_used_tokens: int = 0
     swa_total_tokens: int = 0
+    # The scheduler's ReqStats.finish snapshot: on the terminal reply, and on every reply of
+    # a timings_per_token request or one with stop strings; None otherwise.
+    timings: dict[str, float | int] | None = None
 
 
 @dataclass(kw_only=True)
@@ -65,6 +69,9 @@ class TokenizeMsg(BaseTokenizerMsg):
     tools: list[dict[str, JsonValue]] | None = None
     # The raw bytes of the request's images, in prompt order.
     images: list[bytes] | None = None
+    # How system messages after the conversation's first turn are rendered (auto, preserve
+    # or fold); None leaves them to the chat template.
+    inline_system_policy: str | None = None
 
 
 @dataclass(kw_only=True)

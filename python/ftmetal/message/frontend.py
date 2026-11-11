@@ -45,6 +45,8 @@ class UserReply(BaseFrontendMsg):
     finish_reason: FinishReason | None = None
     # The stop string that ended generation; it and everything after it are not emitted.
     matched_stop: str | None = None
+    # DetokenizeMsg.timings passed through.
+    timings: dict[str, float | int] | None = None
 
 
 __all__ = ["BaseFrontendMsg", "BatchFrontendMsg", "UserReply"]

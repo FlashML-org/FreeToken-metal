@@ -71,6 +71,8 @@ def streamed_blocks(body: str) -> tuple[list[Block], str, JsonValue]:
         if name == "content_block_start":
             block = payload["content_block"]
             assert isinstance(block, dict) and payload["index"] == len(blocks)
+            if block["type"] == "thinking":
+                assert block == {"type": "thinking", "thinking": "", "signature": ""}, block
             tool_name = block.get("name")
             blocks.append(
                 (str(block["type"]), [], tool_name if isinstance(tool_name, str) else None)
@@ -300,12 +302,13 @@ def test_conversation_turns_reach_the_chat_template(
                 "role": "user",
                 "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "Sunny"}],
             },
-            # A system turn inside the array joins the top-level system prompt at the front.
+            # A system turn inside the array stays where it is, after the cached prefix; this
+            # template renders none there, so it joins the tool result before it.
             {"role": "system", "content": "Use metric units."},
         ],
     }
     assert client.post("/v1/messages", json=body).status_code == 200
     prompt = scripted.instances[0].prompt_text(0)
-    assert prompt.startswith("<|im_start|>system\nBe brief.\n\nUse metric units.<|im_end|>\n")
-    turns = ["user\nWeather in Paris?", "assistant\nChecking.", "tool\nSunny"]
+    assert prompt.startswith("<|im_start|>system\nBe brief.<|im_end|>\n")
+    turns = ["user\nWeather in Paris?", "assistant\nChecking.", "tool\nSunny\n\nUse metric units."]
     assert all(f"<|im_start|>{turn}<|im_end|>" in prompt for turn in turns)

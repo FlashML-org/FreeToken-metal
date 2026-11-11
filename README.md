@@ -67,7 +67,9 @@ turns thinking off, and so does `reasoning_effort: "none"`; any other effort tur
 reaches a chat template that grades effort as the nearest level it accepts, which `/v1/models`
 lists along with `thinking_toggleable` and `default_thinking`), `POST /v1/completions` and
 `GET /v1/models`; the Anthropic
-`POST /v1/messages` (thinking, text and tool_use blocks) and `/v1/messages/count_tokens`;
+`POST /v1/messages` (thinking, text and tool_use blocks; a system message after the first
+turn stays in place, as its own turn when the chat template renders one there and folded into
+the turn next to it otherwise, `--anthropic-inline-system`) and `/v1/messages/count_tokens`;
 the OpenAI Responses `POST /v1/responses` (stateless: `GET /v1/responses/{id}` and its
 `/cancel` answer 404); and `POST /generate` (a raw text prompt, no chat template, streamed
 as `{"text": ...}` events and sampled greedily). The control plane is FreeToken's too:
@@ -75,9 +77,12 @@ as `{"text": ...}` events and sampled greedily). The control plane is FreeToken'
 `GET /v1/requests?since=<cursor>` (recent requests), `GET /v1/cache/status` and, from
 loopback only, `POST /v1/admin/prepare-stop` (close admission, drain, abort the rest, seal
 the token totals); `FTMETAL_API_LOG_DIR` logs every request body as JSON lines, and
-`--cors-origins` sets the CORS allow-list. Any API key is accepted. The reasoning
-and tool-call parsers follow the model family (`--reasoning-parser`, `--tool-call-parser`
-override them); `--enable-cache-report` adds the prefix-cache hit to each `usage`. `ftm shell` is a client of the chat endpoint: `/think` toggles
+`--cors-origins` sets the CORS allow-list. Any API key is accepted. `presence_penalty` and
+`frequency_penalty` apply. The reasoning and tool-call parsers follow the model family
+(`--reasoning-parser`, `--tool-call-parser` override them); `--enable-cache-report` adds the
+prefix-cache hit to each `usage`, and `--enable-timings-report` a per-request `timings` object
+(prefill and decode spans and rates; on every streamed chunk with `timings_per_token`).
+`ftm shell` is a client of the chat endpoint: `/think` toggles
 thinking, `/reset` clears the conversation, `/exit` or Ctrl-D quits, Ctrl-C cancels a
 reply. Environment knobs are read as `FTMETAL_<NAME>`, falling back to
 `FREETOKEN_<NAME>`.

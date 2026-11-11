@@ -10,13 +10,15 @@ rows read the token pool's scratch row; only real requests allocate pages and wr
 sampled tokens. The multimodal gather plan, the image block ends and the mrope positions
 are built in numpy by scheduler/mm.py. A drained step's tokens are used only once the
 engine's offload cache passes its health check (a failed expert read leaves stand-in
-experts behind).
+experts behind). A request with stop strings carries its timings on every event, as the
+detokenizer may end it on any token.
 """
 
 from __future__ import annotations
 
 import logging
 import queue
+import time
 from dataclasses import dataclass
 from typing import Literal, NamedTuple
 
@@ -72,6 +74,7 @@ class TokenEvent:
     token: int
     finished: bool
     finish_reason: Literal["stop", "length"] | None = None
+    timings: dict[str, float | int] | None = None
 
 
 class Scheduler:
@@ -334,6 +337,7 @@ class Scheduler:
                         mamba_total_slots=mamba_total_slots,
                         swa_used_tokens=swa_used_tokens,
                         swa_total_tokens=swa_total_tokens,
+                        timings=event.timings,
                     )
                 )
                 if event.finished:
@@ -465,6 +469,8 @@ class Scheduler:
             return
         batch = last_data.forward_input.batch
         next_tokens = host_ints(last_data.forward_output.next_tokens)
+        # The tokens are on the host from here: the timings' token stamp.
+        now = time.perf_counter()
         self.engine.check_healthy()
         events: list[TokenEvent] = []
         new_finished: set[Req] = set()
@@ -495,7 +501,14 @@ class Scheduler:
                 reason = None
                 if finished:
                     reason = "stop" if hit_eos else "length"
-                events.append(TokenEvent(req.uid, next_token, finished, reason))
+                req.stats.stamp_token(now)
+                params = req.sampling_params
+                timings = (
+                    req.stats.finish(req.generated_len)
+                    if finished or params.timings_per_token or params.stop_strs
+                    else None
+                )
+                events.append(TokenEvent(req.uid, next_token, finished, reason, timings))
                 if finished:
                     self.decode_manager.remove_req(req)
                     self.free_req_resources(req)

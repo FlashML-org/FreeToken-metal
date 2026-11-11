@@ -6,7 +6,8 @@ Context, its attention metadata is a dict keyed by AttnType (fla_metadata is the
 LINEAR entry); padded_reqs starts as reqs and only the graph runner pads it; a Req's
 cache_handle is None while it locks no cached prefix; a Req carries reuse_len, where its
 prompt's reusable prefix ends (FreeToken has none); SamplingParams is greedy at
-temperature 0 or top-k 1 whatever top_p is (FreeToken also requires top_p == 1); a
+temperature 0 or top-k 1 whatever top_p is (FreeToken also requires top_p == 1); ReqStats
+has no draft counters (no speculative decoding); a
 gather plan row is an MMGatherRow (mm/item.py), not a tuple; mm_block_ends is a host
 array, clamped to each request's keys, that the attention backends translate.
 """
@@ -37,10 +38,51 @@ class SamplingParams:
     ignore_eos: bool = False
     max_tokens: int = 1024
     stop_strs: list[str] = field(default_factory=list)
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    # The ReqStats snapshot rides every reply, not only the terminal one; the API layer has
+    # already ANDed the request's timings_per_token with --enable-timings-report.
+    timings_per_token: bool = False
 
     @property
     def is_greedy(self) -> bool:
         return self.temperature <= 0.0 or self.top_k == 1
+
+
+@dataclass
+class ReqStats:
+    """A request's timings, stamped by the scheduler with time.perf_counter(): queue is the
+    waiting queue to the first prefill chunk's launch, prompt that launch to the first sampled
+    token on the host, predicted the first to the last committed token. One instance is shared
+    by every chunk Req of a request."""
+
+    enqueued_at: float | None = None
+    first_chunk_at: float | None = None
+    first_token_at: float | None = None
+    last_token_at: float | None = None
+    # Prompt tokens served from the prefix cache at admission, and the ones computed.
+    cache_n: int = 0
+    prompt_n: int = 0
+
+    def stamp_token(self, now: float) -> None:
+        if self.first_token_at is None:
+            self.first_token_at = now
+        self.last_token_at = now
+
+    def finish(self, completion_tokens: int) -> dict[str, float | int] | None:
+        """The spans and counts a reply carries; None before the first chunk or token."""
+        if self.first_chunk_at is None or self.first_token_at is None:
+            return None
+        assert self.enqueued_at is not None and self.last_token_at is not None
+        return {
+            "queue_ms": (self.first_chunk_at - self.enqueued_at) * 1000.0,
+            "cache_n": self.cache_n,
+            "prompt_n": self.prompt_n,
+            "prompt_ms": (self.first_token_at - self.first_chunk_at) * 1000.0,
+            "predicted_n": completion_tokens,
+            # 1 us floor: the first token can land in the same instant.
+            "predicted_ms": max((self.last_token_at - self.first_token_at) * 1000.0, 0.001),
+        }
 
 
 @dataclass(eq=False)
@@ -75,6 +117,12 @@ class Req:
     mm_items: list[MMItem] | None = None
     mrope_positions_full: np.ndarray | None = None
     mrope_delta: int = 0
+    # Shared with every other chunk Req of the request (the PrefillAdder hands the
+    # PendingReq's on).
+    stats: ReqStats = field(default_factory=ReqStats)
+    # int32 [vocab] counts of the sampled tokens, made by the sampler on the request's first
+    # penalized step; None while it has no presence or frequency penalty.
+    output_token_counts: mx.array | None = None
 
     def __post_init__(self) -> None:
         self.input_ids = np.asarray(self.input_ids, dtype=np.int32)
@@ -202,6 +250,7 @@ __all__ = [
     "Batch",
     "CacheHandle",
     "Req",
+    "ReqStats",
     "SamplingParams",
     "host_floats",
     "host_ints",

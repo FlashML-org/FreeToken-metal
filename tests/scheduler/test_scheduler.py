@@ -11,6 +11,7 @@ from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
+import pytest
 
 from ftmetal.core import SamplingParams
 from ftmetal.engine.config import EngineConfig
@@ -204,3 +205,41 @@ def test_abort_mid_chunked_prefill_frees_once_and_the_prompt_still_runs(tmp_path
     events = scheduler.run_until_idle()
     assert tokens_by_uid(events, [1]) == [expected]
     assert_all_freed(scheduler)
+
+
+# (timings_per_token, stop strings, whether every event carries the timings or only the last)
+TIMINGS_CASES: list[tuple[bool, list[str], bool]] = [
+    (False, [], False),
+    (True, [], True),
+    # The detokenizer may end it on any token.
+    (False, ["never"], True),
+]
+
+
+@pytest.mark.parametrize(("timings_per_token", "stop_strs", "every_event"), TIMINGS_CASES)
+def test_timings_count_the_prompt_and_every_committed_token(
+    tmp_path: Path, timings_per_token: bool, stop_strs: list[str], every_event: bool
+) -> None:
+    save_checkpoint(build_reference(seed=10), tmp_path, quantization=None)
+    scheduler = make_scheduler(tmp_path, max_running_req=1, num_pages=64)
+    prompt = np.random.default_rng(10).integers(1, 120, size=130).astype(np.int32)
+    cached_lens = [0, 132]
+    for uid, cached_len in enumerate(cached_lens):
+        # The first turn finishes at 132 cached tokens, a page boundary, so the tree keeps them
+        # for the next turn, which goes on past them.
+        params = SamplingParams(
+            max_tokens=3,
+            ignore_eos=True,
+            stop_strs=stop_strs,
+            timings_per_token=timings_per_token,
+        )
+        scheduler.add_request(uid, prompt, params)
+        events = scheduler.run_until_idle()
+        assert [event.timings is not None for event in events] == [every_event] * 2 + [True]
+        timings = [event.timings for event in events if event.timings is not None]
+        assert [t["predicted_n"] for t in timings] == ([1, 2, 3] if every_event else [3])
+        last = timings[-1]
+        assert (last["cache_n"], last["prompt_n"]) == (cached_len, len(prompt) - cached_len)
+        assert min(last["queue_ms"], last["prompt_ms"], last["predicted_ms"]) >= 0
+        generated = np.array([event.token for event in events], dtype=np.int32)
+        prompt = np.concatenate([prompt, generated, prompt[:5]])

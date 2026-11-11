@@ -114,8 +114,8 @@ def prepare_claude(context: LaunchContext) -> CommandSpec:
             "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
             # Provider and auth keys from ~/.claude/settings.json then no longer apply.
             "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST": "1",
-            # Reminders then stay inline instead of system turns, which the server merges into
-            # the front of the prompt, costing the prefix cache on every turn.
+            # Reminders then stay inside user turns, not system turns mid-conversation, which
+            # most chat templates cannot render in place.
             "CLAUDE_CODE_MODEL_CAPABILITIES": ";".join(
                 filter(None, ["-mid_conv_system", user_capabilities])
             ),
