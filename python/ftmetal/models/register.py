@@ -51,18 +51,19 @@ class EncoderSpec:
     fixed_bytes: int = 0
 
 
-# Qwen3.6's tower, measured in bf16: 12.2 widths per patch plus 43 MiB above the weights.
+# Qwen3.6's tower, measured in bf16: 12.2 widths per patch plus 43 MiB above the weights;
+# model.visual. in the Hugging Face layout, vision_tower. in the MLX conversion's.
 QWEN_VISION = EncoderSpec(
     "vision",
     "vision_config",
     ("image",),
-    ("model.visual.",),
+    ("model.visual.", "vision_tower."),
     activation_widths=13,
     mlp_rows=4096,
     mlp_widths=2,
 )
 # Qwen3.8-Flash-Next's tower: Qwen3.6's geometry (its merger 2560 wide, not 2048), so its
-# measured widths, loaded from the MLX conversion's vision_tower. prefix.
+# measured widths; the family loads MLX conversions only.
 QWEN4_EXP_VISION = replace(QWEN_VISION, weight_prefixes=("vision_tower.",))
 # Gemma4's tower (its projection loads from embed_vision.), measured on the 26B-A4B in bf16.
 GEMMA4_VISION = EncoderSpec(

@@ -227,16 +227,22 @@ class Engine:
                 for encoder in MODEL_REGISTRY[config.architecture].encoders
                 if config.raw_config.get(encoder.config_key) is not None
             ]
+            unloaded = [
+                encoder for encoder in configured if encoder.kind not in config.mm.disabled_encoders
+            ]
             if not configured:
-                reason = "no encoder registered for this architecture"
-            elif all(encoder.kind in config.mm.disabled_encoders for encoder in configured):
+                logger.info("Multimodal disabled: no encoder registered for this architecture")
+            elif not unloaded:
                 reason = "--text-model-only" if config.mm.text_model_only else "--mm-disable"
+                logger.info(f"Multimodal disabled: {reason}")
             else:
-                prefixes = ", ".join(
-                    prefix for encoder in configured for prefix in encoder.weight_prefixes
-                )
-                reason = f"the checkpoint has no tower weights under {prefixes}"
-            logger.info(f"Multimodal disabled: {reason}")
+                for encoder in unloaded:
+                    prefixes = ", ".join(encoder.weight_prefixes)
+                    logger.warning(
+                        f"Multimodal disabled: config.json has {encoder.config_key} but the "
+                        f"checkpoint has no {encoder.kind} encoder weights under {prefixes}; "
+                        f"serving text only"
+                    )
 
         can_capture = attention_backend_info(config.attention_backend).can_capture
         if config.command_graph and not can_capture:

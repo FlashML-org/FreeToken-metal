@@ -261,11 +261,14 @@ def test_processor_lookup_needs_a_served_encoder(
         assert get_mm_processor(str(gemma_dir), MultimodalConfig()) is None
     # A checkpoint without config.json, or without its vision section, serves no images.
     assert get_mm_processor(str(tmp_path), MultimodalConfig()) is None
-    # Nor one whose weights hold no tower under the prefix the loader reads.
+    # Nor one whose weights hold no tower under a prefix the loader reads.
     weights = tiny_model_dir / "model.safetensors"
-    mx.save_safetensors(str(weights), {"vision_tower.proj.weight": mx.zeros((1,))})
+    mx.save_safetensors(str(weights), {"model.vision_model.proj.weight": mx.zeros((1,))})
     assert get_mm_processor(str(tiny_model_dir), MultimodalConfig()) is None
-    mx.save_safetensors(str(weights), {"model.visual.proj.weight": mx.zeros((1,))})
-    assert isinstance(get_mm_processor(str(tiny_model_dir), MultimodalConfig()), QwenVLMMProcessor)
+    # The tower loads from the Hugging Face layout and from the MLX conversion's.
+    for prefix in ("model.visual.", "vision_tower."):
+        mx.save_safetensors(str(weights), {f"{prefix}proj.weight": mx.zeros((1,))})
+        processor = get_mm_processor(str(tiny_model_dir), MultimodalConfig())
+        assert isinstance(processor, QwenVLMMProcessor), prefix
     write_qwen_vl_model(tiny_model_dir, has_vision=False)
     assert get_mm_processor(str(tiny_model_dir), MultimodalConfig()) is None
