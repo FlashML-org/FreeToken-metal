@@ -20,7 +20,8 @@ it after any change.
 uv sync                                  # creates .venv with the dev group, builds the C++ extensions
 uv sync --reinstall-package ftmetal      # after editing a .cpp or .h (not for .metal)
 uv run pytest tests/ -q
-uv run ruff check python tests tools && uv run ruff format --check python tests tools
+uv run pre-commit install                # once: run the checks below on every commit
+uv run pre-commit run --all-files        # what CI runs: ruff, clang-format (C++, headers), whitespace
 uvx pyright python tests tools                                 # 0 errors expected
 FTMETAL_TEST_MODEL_PATH=/path/to/Qwen3.6-35B-A3B-MLX uv run pytest tests/models/test_real_checkpoint.py -q
 uv run python tools/aime0_check.py /path/to/Qwen3.6-35B-A3B-MLX   # AIME25 #0 must answer 70

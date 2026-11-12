@@ -255,9 +255,9 @@ speculative generality.
 
 ## TOOLING
 
-- Lint and format with ruff (configured in `pyproject.toml`). Run
-  `ruff check python tests` and `ruff format --check python tests`
-  plus `pytest tests/ -q` before completing a change, and report results as they are.
+- Lint and format Python with ruff (configured in `pyproject.toml`) and C++ with clang-format
+  (`.clang-format`). Run `uv run pre-commit run --all-files` (what CI runs) plus `pytest tests/ -q`
+  before completing a change, and report results as they are.
 - Test the public contract (inputs → outputs), not internal layout.
   Do not snapshot helper tuples, page tables, prefix sums, or other
   encodings that can change without changing behavior. A representation

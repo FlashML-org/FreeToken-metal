@@ -41,7 +41,9 @@ ftm = "ftmetal.cli:main"
 [dependency-groups]
 dev = [
     "pytest>=8",
-    "ruff>=0.12",
+    # The version .pre-commit-config.yaml pins, so the editor and CI agree.
+    "ruff==0.17.5",
+    "pre-commit>=4",
     # The parity reference of tests/models, and the Hugging Face packages it brings in.
     "mlx-lm==0.31.3",
     "transformers==5.17.0",
