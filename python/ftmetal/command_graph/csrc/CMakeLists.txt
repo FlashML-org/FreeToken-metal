@@ -9,7 +9,7 @@ set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(
-  Python 3.13
+  Python 3.11
   COMPONENTS Interpreter Development.Module
   REQUIRED)
 execute_process(
