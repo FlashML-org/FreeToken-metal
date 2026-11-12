@@ -1,151 +1,173 @@
-# kernel/ 目录规范
+# kernel/ layout
 
-适用于 `python/ftmetal/kernel/` 下的自定义 kernel，以及它们的测试和 bench。新增、移动、改名
-kernel 都按本文做；要改规则，先改本文。
+Applies to the custom kernels under `python/ftmetal/kernel/`, and to their tests and benches. Adding,
+moving or renaming a kernel follows this document; to change a rule, change this document first.
 
-## 1. 目录树
+## 1. Directory tree
 
 ```
 python/ftmetal/kernel/
   _ext.py  custom.py  ref.py  bindings.cpp  CMakeLists.txt
-  common/              跨领域共用的头文件
+  common/              headers shared across domains
   attention/
-    mha/               MHA、GQA、MQA
-    qsa/               QSA 稀疏注意力
+    mha/               MHA, GQA, MQA
+    qsa/               QSA sparse attention
     gdn/               Gated DeltaNet
-  moe/                 MoE：路由、排序、槽位查找、专家 GEMM
+  moe/                 MoE: routing, sorting, slot lookup, expert GEMMs
     affine/  fp/  unquantized/
-  gemm/                稠密层的矩阵乘
+  gemm/                matrix multiplies of dense layers
     affine/
-  norm/                RMS norm 的各种变体
+  norm/                RMS norm variants
   hc/                  hyper-connection
-  rope/                位置编码
-  sample/              采样
-  kvcache/             KV 池和状态池的行读写
-  embedding/           embedding 查表
-  service/             CPU 端运行时服务，不是 kernel
-    expert/              ExpertService、expert_lru、expert_mailbox、victim_cache
-    ple/                 PleService、ple_row_store
-tests/kernel/          与 kernel/ 相同的目录结构
-tools/bench_<名>.py
+  rope/                position encoding
+  sample/              sampling
+  kvcache/             row reads and writes of the KV and state pools
+  embedding/           embedding lookup
+  service/             CPU-side runtime services, not kernels
+    expert/              ExpertService, expert_lru, expert_mailbox, victim_cache
+    ple/                 PleService, ple_row_store
+tests/kernel/          the same tree as kernel/
+tools/bench_<name>.py
 ```
 
-有 `.py` 的子目录是 Python 包；只放 `.metal` 的格式目录不是。目录里有文件才建。
+A subdirectory with a `.py` file is a Python package; a format directory that holds only `.metal` files
+is not. Create a directory only once it has files.
 
-## 2. 一个 kernel 的文件
+## 2. The files of one kernel
 
-`<名>` 是一个 Python 包装对外提供的那组 kernel 的名字。它的文件都放在同一个目录，用同一个名字：
+`<name>` is the name of the set of kernels one Python wrapper exposes. Its files all live in one
+directory and share that name:
 
-| 文件 | 内容 |
+| file | contents |
 |---|---|
-| `<名>.py` | Python 包装：形状检查、grid、模板参数、调用 |
-| `<名>.metal` | 只有一个 `metal_kernel` 时的函数体；或 C++ primitive 的整个 Metal 库 |
-| `<名>_<kernel>.metal` | 包装有多个 `metal_kernel` 时，每个函数体一个文件 |
-| `<名>.h`（没有同名 `.cpp`） | 只给这个包装的 `metal_kernel` 用的头文件，作为 `header=` 传入 |
-| `<名>.h`、`<名>.cpp` | C++ primitive，只在需要时才有（见 §6） |
-| `<名>_shared.h` | primitive 的 C++ 和 Metal 共用的常量、结构体（见 §6.3） |
-| `tests/kernel/<目录>/test_<名>.py` | 测试 |
-| `tools/bench_<名>.py` | bench |
+| `<name>.py` | Python wrapper: shape checks, grid, template parameters, the call |
+| `<name>.metal` | the function body when there is one `metal_kernel`, or the whole Metal library of a C++ primitive |
+| `<name>_<kernel>.metal` | one function body per file when the wrapper has several `metal_kernel`s |
+| `<name>.h` (no `.cpp` of the same name) | a header used only by this wrapper's `metal_kernel`s, passed as `header=` |
+| `<name>.h`, `<name>.cpp` | a C++ primitive, only when one is needed (see §6) |
+| `<name>_shared.h` | constants and structs shared by a primitive's C++ and Metal (see §6.3) |
+| `tests/kernel/<directory>/test_<name>.py` | the test |
+| `tools/bench_<name>.py` | the bench |
 
-C++ primitive 的 Metal 库由 `_ext.py` 交给 `_C.init_<名>_library` 加载。测试对照纯 MLX 的参考实现，
-命名为 `<函数>_ref`：多个测试共用的放在 `kernel/ref.py`，只有一个测试用的写在那个测试文件里。
-`service/` 的测试同样按目录放，比如 `tests/kernel/service/expert/test_expert_lru.py`。
+`_ext.py` hands a C++ primitive's Metal library to `_C.init_<name>_library` to load. Tests compare
+against a pure-MLX reference named `<function>_ref`: one shared by several tests lives in
+`kernel/ref.py`, one used by a single test lives in that test file. Tests of `service/` follow the
+same tree, e.g. `tests/kernel/service/expert/test_expert_lru.py`.
 
-## 3. 放在哪个目录
+## 3. Which directory
 
-1. 按 kernel 类型选领域目录；没有合适的领域时再开新目录。
-2. 领域内默认平铺。按变体开子目录的只有两处：
-   - `attention/` 按注意力类型分：`mha/`、`qsa/`、`gdn/`。新的注意力类型开新目录，比如 `attention/dsa/`。
-   - `moe/` 和 `gemm/` 按量化格式分，见 §4。
-3. MoE 用的 kernel 都放 `moe/`，包括专家 GEMM（比如 `gather_sorted`）。`gemm/` 只放稠密层的矩阵乘。
-4. 融合 kernel 跟着它服务的模块走。`hc_up_mix` 内含 affine GEMV，但它是为 hyper-connection 写的，
-   放在 `hc/`。
-5. 通用 kernel 为某种类型加的变体，留在通用 kernel 里。QSA 用的 `flash_prefill_qsa` 在
-   `attention/mha/mha_prefill`，`qsa/` 只放 QSA 独有的 kernel；hyper-connection 注入分支的
-   `hc_norm` 是分组 (1 + w) RMS norm 的一个变体，在 `norm/offset_rms_norm`，`hc/` 放 `hc_mix`
-   和 `hc_up_mix`。
-6. 同一族的新变体用文件名前缀区分，放进同一个目录。比如 DeepSeek 的 mHC 放 `hc/`，文件用 `mhc_` 前缀。
+1. Pick the domain directory by kernel type; open a new one only when no domain fits.
+2. A domain is flat by default. Only two places have subdirectories per variant:
+   - `attention/` splits by attention type: `mha/`, `qsa/`, `gdn/`. A new attention type gets a new
+     directory, e.g. `attention/dsa/`.
+   - `moe/` and `gemm/` split by quantization format, see §4.
+3. Every kernel MoE uses goes in `moe/`, including the expert GEMMs (e.g. `gather_sorted`). `gemm/`
+   holds only the matrix multiplies of dense layers.
+4. A fused kernel goes with the module it serves. `hc_up_mix` contains an affine GEMV, but it was
+   written for hyper-connection, so it lives in `hc/`.
+5. A variant a general kernel adds for one type stays in the general kernel. QSA's
+   `flash_prefill_qsa` lives in `attention/mha/mha_prefill`, and `qsa/` holds only kernels unique to
+   QSA. The `hc_norm` of the hyper-connection injection branch is a variant of the grouped (1 + w) RMS
+   norm, so it lives in `norm/offset_rms_norm`, while `hc/` holds `hc_mix` and `hc_up_mix`.
+6. A new variant of the same family goes in the same directory, told apart by a file-name prefix.
+   For example, DeepSeek's mHC goes in `hc/` with files prefixed `mhc_`.
 
-## 4. 量化格式目录
+## 4. Quantization format directories
 
-- 按反量化方式分：`affine/`（MLX affine，2–8 bit）、`fp/`（mxfp4、nvfp4、mxfp8）、`unquantized/`
-  （权重与输入同 dtype），以后加 `lut/`（LUT 量化）。位宽和 dtype 是模板参数，不分目录。
-- 格式目录只放该格式的代码。跨格式分派的包装和 primitive 放在上一层：`moe/gather_sorted.{py,h,cpp}`
-  按格式选用 `moe/affine/`、`moe/fp/`、`moe/unquantized/` 里的 Metal 库。只支持一种格式的 kernel
-  整个放进格式目录，比如 `gemm/affine/affine_qmv_rows.py`。
-- 量化 kernel 的文件名以格式开头（`affine_`、`fp_`、`lut_`），不量化的不加（`gather_mm_sorted`），
-  与 MLX 的 kernel 名一致（`affine_gather_qmm_rhs`、`fp_gather_qmm_rhs`、`gather_mm_rhs`）。格式目录里
-  的文件按这条命名，不受 §2 的 `<名>` 约束。
-- `moe/` 和 `gemm/` 都要用的格式代码放 `common/quant/<格式>.h`。
-- 测试和 bench 跟着包装走，不跟着格式走：`test_gather_sorted` 覆盖三种格式。
+- Split by how weights are dequantized: `affine/` (MLX affine, 2–8 bit), `fp/` (mxfp4, nvfp4, mxfp8),
+  `unquantized/` (weights in the input's dtype), and later `lut/` (LUT quantization). Bit width and
+  dtype are template parameters, not directories.
+- A format directory holds only that format's code. Wrappers and primitives that dispatch across
+  formats sit one level up: `moe/gather_sorted.{py,h,cpp}` picks the Metal library in `moe/affine/`,
+  `moe/fp/` or `moe/unquantized/` by format. A kernel that supports one format only goes wholly into
+  that format's directory, e.g. `gemm/affine/affine_qmv_rows.py`.
+- File names of quantized kernels start with the format (`affine_`, `fp_`, `lut_`); unquantized ones
+  carry no prefix (`gather_mm_sorted`), matching MLX's kernel names (`affine_gather_qmm_rhs`,
+  `fp_gather_qmm_rhs`, `gather_mm_rhs`). Files in a format directory are named by this rule, not by
+  the `<name>` of §2.
+- Format code that both `moe/` and `gemm/` use goes in `common/quant/<format>.h`.
+- Tests and benches follow the wrapper, not the format: `test_gather_sorted` covers all three formats.
 
-## 5. 命名
+## 5. Naming
 
-- 文件名全局唯一，离开目录也看得出是什么：`attention/mha/mha_decode.py`，不写成
-  `attention/mha/decode.py`；`kvcache/pool_rows.py`，不写成 `kvcache/rows.py`。目录只负责分组。原因：
-  - `tests/` 没有 `__init__.py`，pytest 默认的导入模式要求整个 `tests/` 里的测试文件名唯一。
-    名字太泛就会和别处的测试撞名：采样 kernel 因此叫 `sample_tokens`，不叫 `sample`，否则
-    `test_sample.py` 会和 `tests/engine/test_sample.py` 冲突；
-  - Metal 库名和 `_C.init_<名>_library` 必须唯一；
-  - 文件换目录时，测试、bench、库名都不用改。
-- 名字说明算的是什么，不用代号：`mha_decode`，不是 `fdecode`。
-- 领域和类型名与 vLLM、SGLang 一致：`mha`、`gdn`、`moe_topk`、`moe_align`、`indexer`、`mrope`、
-  `kvcache`、`embedding`。hyper-connection 用 Qwen3.8（`hc_count`）和 DeepSeek V4（`hc_mult`）
-  config 共同的缩写 `hc`。
-- 从 MLX 改来的 kernel 保留 MLX 的名字（`gather_qmm`、`gather_mm`），升级 MLX 时方便对照上游。
+- File names are unique across the tree and say what they are outside their directory:
+  `attention/mha/mha_decode.py`, not `attention/mha/decode.py`; `kvcache/pool_rows.py`, not
+  `kvcache/rows.py`. Directories only group. Because:
+  - `tests/` has no `__init__.py`, and pytest's default import mode needs test file names to be unique
+    across all of `tests/`. A generic name collides with a test elsewhere: the sampling kernel is
+    therefore `sample_tokens`, not `sample`, or `test_sample.py` would clash with
+    `tests/engine/test_sample.py`;
+  - Metal library names and `_C.init_<name>_library` must be unique;
+  - a file that changes directory keeps its test, bench and library names.
+- A name says what is computed, not a code name: `mha_decode`, not `fdecode`.
+- Domain and type names match vLLM and SGLang: `mha`, `gdn`, `moe_topk`, `moe_align`, `indexer`,
+  `mrope`, `kvcache`, `embedding`. Hyper-connection uses `hc`, the abbreviation the Qwen3.8
+  (`hc_count`) and DeepSeek V4 (`hc_mult`) configs share.
+- A kernel adapted from MLX keeps MLX's name (`gather_qmm`, `gather_mm`), so it stays easy to compare
+  with upstream when MLX is upgraded.
 
-## 6. 源码
+## 6. Sources
 
-1. Metal 代码都写在 `.metal` 文件里，不写在 Python 字符串里。
-   - 一个 `metal_kernel` 函数体一个文件，文件里只有函数体；`metal_kernel` 的 `name` 与文件名
-     （去掉扩展名）相同。同一个函数体替换 `{{...}}` 记号生成的变体，在名字后加后缀区分，比如
-     `gdn_prefill_recurrence_mask`。辅助函数通过 `header=` 传入。
-   - 包装用 `_ext.py` 的 `metal_source()` 读函数体和 Metal 库，用 `metal_kernel_header()` 读
-     `header=` 的头文件（它跳过 `metal_kernel` 前导部分已有的 `utils.h`）。
-   - 随配置变化的代码片段用 `{{NAME}}` 记号，由包装在编译前替换；类型和整数常量用
-     `metal_kernel` 的 `template` 参数。
-2. 头文件：
-   - C++ primitive 的 `<名>.h` 与 `<名>.cpp` 成对出现。kernel 目录里没有同名 `.cpp` 的 `.h`，
-     是 Metal 头文件（`<名>.h`）或 C++ 和 Metal 共用的头文件（`<名>_shared.h`）。
-   - 跨领域共用的头文件放 `common/`：Metal 的（`norm.h`）、两种语言共用的（`mailbox.h`），以及
-     各个 primitive 共用的 C++ 头文件（`metal_primitive.h`）。
-   - `#include` 一律写相对 `kernel/` 的路径，比如 `#include "common/mailbox.h"`。运行时编译 Metal
-     没有 include 路径，`_ext.py` 在编译前内联头文件：`mlx/...` 取自 mlx wheel，其余取自 `kernel/`。
-   - 注释里提到别的目录的文件时写相对 `kernel/` 的路径（`kvcache/pool_rows.h`），同目录的可以只写文件名。
-3. 共用定义只写一份：C++ 和 Metal 都用到的结构体、常量和状态码只在一个头文件里定义，两边都
-   include。只属于一个 kernel 的放它目录里的 `<名>_shared.h`（`sample/sample_tokens_shared.h`），
-   kernel 和服务之间的协议放 `common/`（`common/mailbox.h`）。头文件用 `#ifdef __METAL_VERSION__`
-   区分两种语言：Metal 的程序级常量要写 `constant constexpr`，C++ 的放进 `namespace ftmetal`；
-   为此定义的宏在文件末尾 `#undef`。
-4. 只有 `metal_kernel` 做不到时才写 C++ primitive：
-   - 输出要原地写进已有的 buffer；
-   - 多次 dispatch 共享临时 buffer；
-   - 要和 CPU 端服务通信（mailbox）。
+1. All Metal code lives in `.metal` files, never in Python strings.
+   - One `metal_kernel` function body per file, and the file holds only the body; the `metal_kernel`'s
+     `name` equals the file name without its extension. Variants generated from one body by
+     substituting `{{...}}` markers get a suffix after the name, e.g. `gdn_prefill_recurrence_mask`.
+     Helper functions come in through `header=`.
+   - Wrappers read bodies and Metal libraries with `_ext.py`'s `metal_source()`, and `header=` headers
+     with `metal_kernel_header()` (which skips the `utils.h` the `metal_kernel` preamble already has).
+   - Code fragments that change with the configuration use `{{NAME}}` markers, which the wrapper
+     substitutes before compiling; types and integer constants use the `metal_kernel`'s `template`
+     parameter.
+2. Headers:
+   - A C++ primitive's `<name>.h` and `<name>.cpp` come in pairs. A `.h` in a kernel directory without a
+     `.cpp` of the same name is a Metal header (`<name>.h`) or a header C++ and Metal share
+     (`<name>_shared.h`).
+   - Headers shared across domains live in `common/`: Metal ones (`norm.h`), ones both languages share
+     (`mailbox.h`), and the C++ headers several primitives share (`metal_primitive.h`).
+   - Every `#include` is written relative to `kernel/`, e.g. `#include "common/mailbox.h"`. Metal
+     compiled at run time has no include path, so `_ext.py` inlines headers before compiling: `mlx/...`
+     comes from the mlx wheel, everything else from `kernel/`.
+   - A comment that mentions a file in another directory writes its path relative to `kernel/`
+     (`kvcache/pool_rows.h`); a file in the same directory may be named alone.
+3. Shared definitions are written once: structs, constants and status codes that both C++ and Metal
+   use are defined in one header that both include. One that belongs to a single kernel goes in
+   `<name>_shared.h` in its directory (`sample/sample_tokens_shared.h`); the protocol between kernels
+   and a service goes in `common/` (`common/mailbox.h`). The header tells the two languages apart with
+   `#ifdef __METAL_VERSION__`: Metal program-scope constants are `constant constexpr`, and the C++ ones
+   go in `namespace ftmetal`; macros defined for this are `#undef`ed at the end of the file.
+4. Write a C++ primitive only when a `metal_kernel` cannot do the job:
+   - the output must be written in place into an existing buffer;
+   - several dispatches share a scratch buffer;
+   - the kernel talks to a CPU-side service (mailbox).
 
-   primitive 在 `bindings.cpp` 注册并写进 `_C.pyi`，`.cpp` 加进 `CMakeLists.txt`，Metal 库由 `_ext.py`
-   加载。
-5. 移植或改编来的 kernel，模块 docstring 写明来源文件和改动。从 MLX 或 mlx-lm 改来的 `.metal`、`.h`
-   文件（包括 `metal_kernel` 的函数体文件）开头写明来源的版本、文件和行号，以及版权和许可声明。
-6. `service/` 不是 kernel：CPU 端运行时服务按服务分子目录，编进同一个 `_C`。服务和 kernel 之间的
-   协议定义放在 `common/`。
+   A primitive is registered in `bindings.cpp` and declared in `_C.pyi`, its `.cpp` is added to
+   `CMakeLists.txt`, and `_ext.py` loads its Metal library.
+5. A ported or adapted kernel's module docstring names the source file and the changes. A `.metal` or
+   `.h` file adapted from MLX or mlx-lm (including the function-body files of a `metal_kernel`) starts
+   with the source's version, file and line numbers, and its copyright and license notice.
+6. `service/` is not kernels: the CPU-side runtime services get one subdirectory per service and are
+   built into the same `_C`. The protocol definitions between a service and its kernels live in
+   `common/`.
 
-## 7. 新增 kernel 的步骤
+## 7. Adding a kernel
 
-1. 按 §3、§4 选目录，按 §5 起名。
-2. 写 `<名>.metal` 和 `<名>.py`。需要 primitive 时再写 `<名>.h`、`<名>.cpp`，并在 `bindings.cpp`、
-   `_C.pyi`、`CMakeLists.txt`、`_ext.py` 各加一处。
-3. 写参考实现（多个测试共用的放 `ref.py`）和 `tests/kernel/<目录>/test_<名>.py`。
-4. 有性能要求的 kernel 写 `tools/bench_<名>.py`。
+1. Pick the directory by §3 and §4, and the name by §5.
+2. Write `<name>.metal` and `<name>.py`. When a primitive is needed, also write `<name>.h` and
+   `<name>.cpp`, and add one entry each to `bindings.cpp`, `_C.pyi`, `CMakeLists.txt` and `_ext.py`.
+3. Write the reference (in `ref.py` when several tests share it) and
+   `tests/kernel/<directory>/test_<name>.py`.
+4. A kernel with a performance target gets `tools/bench_<name>.py`.
 
-## 8. 依据
+## 8. Rationale
 
-- 按类型分目录：vLLM `csrc/{attention,moe,quantization}/`，SGLang `kernels/ops/<领域>/`。MLX 和
-  vllm-metal 先按语言分，是因为它们预编译 metallib，或同一个 op 有多个后端；我们只有 Metal 一个
-  后端、运行时编译，一个 kernel 的几个文件总是一起改。
-- 量化格式目录：TensorRT-LLM `cutlass_kernels/{fp4_gemm,fp8_rowwise_gemm,int8_gemm}/`，vLLM
-  `csrc/quantization/<方法>/`。
-- 稀疏注意力每种一个目录：SGLang `layers/attention/{nsa,dsa}/`。
-- 共用定义只写一份：llama.cpp `ggml-metal-impl.h`，PyTorch MPS `kernels/<Op>.h`。
-- 每个 `metal_kernel` 函数体一个 `.metal` 文件：vllm-metal `kernels_v2/`，比如
-  `gdn_recurrent_decode.metal`。
-- 目录里的文件名仍带前缀：MLX `steel/gemm/kernels/steel_gemm_fused.metal`。
+- Directories by type: vLLM `csrc/{attention,moe,quantization}/`, SGLang `kernels/ops/<domain>/`. MLX
+  and vllm-metal split by language first because they precompile a metallib, or have several backends
+  for one op; we have one backend, Metal, compiled at run time, and a kernel's files always change
+  together.
+- Quantization format directories: TensorRT-LLM `cutlass_kernels/{fp4_gemm,fp8_rowwise_gemm,int8_gemm}/`,
+  vLLM `csrc/quantization/<method>/`.
+- One directory per sparse attention: SGLang `layers/attention/{nsa,dsa}/`.
+- Shared definitions written once: llama.cpp `ggml-metal-impl.h`, PyTorch MPS `kernels/<Op>.h`.
+- One `.metal` file per `metal_kernel` body: vllm-metal `kernels_v2/`, e.g.
+  `gdn_recurrent_decode.metal`.
+- File names inside a directory still carry a prefix: MLX `steel/gemm/kernels/steel_gemm_fused.metal`.
