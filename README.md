@@ -112,4 +112,4 @@ FTMETAL_TEST_MODEL_PATH=/path/to/Qwen3.6-35B-A3B-MLX uv run pytest tests/server 
 ## License
 
 Apache-2.0, see [LICENSE](LICENSE). The kernels adapted from MLX and mlx-lm keep their MIT license,
-see [LICENSE-MLX](LICENSE-MLX).
+see [python/ftmetal/kernel/LICENSE-MLX](python/ftmetal/kernel/LICENSE-MLX).

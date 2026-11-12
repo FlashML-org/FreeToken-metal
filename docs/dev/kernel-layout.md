@@ -7,7 +7,7 @@ moving or renaming a kernel follows this document; to change a rule, change this
 
 ```
 python/ftmetal/kernel/
-  _ext.py  custom.py  ref.py  bindings.cpp  CMakeLists.txt
+  _ext.py  custom.py  ref.py  bindings.cpp  CMakeLists.txt  LICENSE-MLX
   common/              headers shared across domains
   attention/
     mha/               MHA, GQA, MQA
@@ -144,7 +144,8 @@ same tree, e.g. `tests/kernel/service/expert/test_expert_lru.py`.
    `CMakeLists.txt`, and `_ext.py` loads its Metal library.
 5. A ported or adapted kernel's module docstring names the source file and the changes. A `.metal` or
    `.h` file adapted from MLX or mlx-lm (including the function-body files of a `metal_kernel`) starts
-   with the source's version, file and line numbers, and its copyright and license notice.
+   with the source's version, file and line numbers, and its copyright and license notice. The MIT
+   license text they refer to is `kernel/LICENSE-MLX`.
 6. `service/` is not kernels: the CPU-side runtime services get one subdirectory per service and are
    built into the same `_C`. The protocol definitions between a service and its kernels live in
    `common/`.

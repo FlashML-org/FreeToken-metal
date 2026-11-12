@@ -9,7 +9,7 @@ dynamic = ["version"]
 description = "LLM serving engine for Apple Silicon on MLX and Metal"
 readme = "README.md"
 license = "Apache-2.0"
-license-files = ["LICENSE", "LICENSE-MLX"]
+license-files = ["LICENSE"]
 authors = [{ name = "FlashML Team" }]
 requires-python = ">=3.13,<3.14"
 dependencies = [
@@ -58,7 +58,7 @@ version = { attr = "ftmetal.version.__version__" }
 where = ["python"]
 
 [tool.setuptools.package-data]
-"ftmetal.kernel" = ["**/*.metal", "**/*.h"]
+"ftmetal.kernel" = ["**/*.metal", "**/*.h", "LICENSE-MLX"]
 "ftmetal.moe" = ["hot_experts/*.json"]
 
 [tool.ruff]
