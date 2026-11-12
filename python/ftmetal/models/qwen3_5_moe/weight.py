@@ -4,8 +4,8 @@ Port of FreeToken models/qwen3_5_moe/weight.py, with the vision rename of
 models/qwen3_vl/weight.py. Divergences: the rules read the MLX layout, which stores the norm
 weights shifted, the conv weight as [conv_dim, kernel, 1] and the experts stacked per layer,
 so they are renames and fusions only; mlx_layout rewrites a Hugging Face layout checkpoint
-into it first; the tower is read under the HF model.visual. prefix only (an mlx-vlm
-vision_tower. checkpoint is served text only).
+into it first, the tower included (under vision_tower., its patch conv kernel channels last),
+whatever layout the text model is stored in.
 """
 
 from __future__ import annotations
@@ -44,6 +44,7 @@ SHIFTED_NORMS = (
     ".k_norm.weight",
     "language_model.model.norm.weight",
 )
+HF_TOWER = "model.visual."
 
 
 def mlx_layout(
@@ -51,17 +52,27 @@ def mlx_layout(
 ) -> tuple[dict[str, mx.array], dict[str, ExpertBytes]]:
     """A Hugging Face layout checkpoint in the MLX layout: language_model.* names, each layer's
     experts as switch_mlp banks (one tensor per expert stacked, or a gate_up bank split),
-    [conv_dim, kernel, 1] convs and shifted norms; and where each expert of every bank lies in
-    the checkpoint. An MLX checkpoint, the one with language_model.* names, passes unchanged."""
-    if any(key.startswith("language_model.") for key in state):
-        return state, {}
-    out: dict[str, mx.array] = {}
+    [conv_dim, kernel, 1] convs, shifted norms and the tower under vision_tower. with its
+    patch conv kernel [hidden, temporal, patch, patch, channels]; and where each expert of
+    every bank lies in the checkpoint. An MLX text model, the one with language_model.* names,
+    passes unchanged."""
+    tower = {
+        "vision_tower." + hf_key.removeprefix(HF_TOWER): (
+            tensor.moveaxis(1, 4) if hf_key.endswith("patch_embed.proj.weight") else tensor
+        )
+        for hf_key, tensor in state.items()
+        if hf_key.startswith(HF_TOWER)
+    }
+    text = {key: tensor for key, tensor in state.items() if not key.startswith(HF_TOWER)}
+    if any(key.startswith("language_model.") for key in text):
+        return text | tower, {}
+    out: dict[str, mx.array] = tower
     expert_bytes: dict[str, ExpertBytes] = {}
     experts: dict[str, dict[int, tuple[str, mx.array]]] = {}
-    for hf_key, tensor in state.items():
+    for hf_key, tensor in text.items():
         if hf_key.startswith("model.language_model."):
             key = "language_model.model." + hf_key.removeprefix("model.language_model.")
-        elif hf_key.startswith(("model.", "lm_head.")) and not hf_key.startswith("model.visual."):
+        elif hf_key.startswith(("model.", "lm_head.")):
             key = "language_model." + hf_key
         else:
             key = hf_key
@@ -99,12 +110,11 @@ def weight_rules(model_config: ModelConfig) -> WeightRules:
     renames = (
         ("language_model.model.", "model."),
         ("language_model.lm_head.", "lm_head."),
-        ("model.visual.", "visual."),
+        ("vision_tower.", "visual."),
     )
     # A tower this process does not build leaves its weights unread.
-    drops = ("mtp.", "language_model.mtp.", "vision_tower.")
-    if model_config.vision_config is None:
-        drops += ("model.visual.",)
+    tower = ("vision_tower.",) if model_config.vision_config is None else ()
+    drops = ("mtp.", "language_model.mtp.", *tower)
     return WeightRules(
         renames=renames,
         segments=(("switch_mlp", "experts"),),

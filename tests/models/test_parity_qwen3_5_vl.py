@@ -4,8 +4,9 @@ reference forward of the same text model and tower (tiny_vl_model.reference_vl_g
 Greedy decode must agree token for token whether the prefill is one chunk or cut inside an
 image span, whether the image prefix comes from the radix cache or is encoded again, and
 whether decode replays CommandGraphs; a text-only prompt on a vision-serving model decodes as
-the same model without vision. The tower is whatever models/qwen3_vl/vision.py builds, so
-nothing here depends on its numerics.
+the same model without vision; the tower loads from the Hugging Face layout and from the MLX
+conversion's. The tower is whatever models/qwen3_vl/vision.py builds, so nothing here depends
+on its numerics.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
+from mlx.utils import tree_flatten
 
 from ftmetal.command_graph import _C, check_same_graph
 from ftmetal.core import Batch, SamplingParams
@@ -246,25 +248,52 @@ def test_text_prompt_decodes_as_the_model_without_vision(
             scheduler = make_scheduler(tmp_path, mm=mm)
         assert scheduler.engine.model_config.is_mrope is has_tower
         assert (scheduler.engine.encoder_cache is not None) is has_tower
-        disabled_lines = [line for line in caplog.messages if "Multimodal disabled" in line]
-        assert disabled_lines == ([] if log_line is None else [log_line])
+        disabled_records = [
+            record for record in caplog.records if "Multimodal disabled" in record.getMessage()
+        ]
+        assert [record.getMessage() for record in disabled_records] == (
+            [] if log_line is None else [log_line]
+        )
+        # A tower left unbuilt on purpose is no warning.
+        assert all(record.levelno == logging.INFO for record in disabled_records)
         tokens = scheduler.generate(np.array(prompt, dtype=np.int32), params)
         assert tokens == expected, disabled_encoders
 
 
-def test_tower_under_another_prefix_serves_text_only(
+def test_tower_in_the_mlx_layout_matches_the_reference(tmp_path: Path) -> None:
+    """A tower stored as the MLX conversion does (vision_tower., the patch conv kernel channels
+    last) encodes and decodes as the reference, which runs it channels first."""
+    model, tower = build_vl_checkpoint(7, tmp_path)
+    # A random patch kernel: the zero-initialized one reads the same in either layout.
+    kernel = tower.patch_embed.proj.weight
+    tower.patch_embed.proj.update({"weight": 0.1 * mx.random.normal(kernel.shape)})
+    tensors = {
+        f"vision_tower.{key}": value
+        for key, value in tree_flatten(tower.parameters())
+        if isinstance(value, mx.array)
+    }
+    patch = "vision_tower.patch_embed.proj.weight"
+    tensors[patch] = tensors[patch].moveaxis(1, 4)
+    mx.save_safetensors(str(tmp_path / "visual.safetensors"), tensors)
+    texts = random_texts(7, TEXT_LENGTHS)
+    images = [
+        noise_png(width, height, 40 + seed) for seed, (width, height) in enumerate(IMAGE_SIZES)
+    ]
+    expected = reference_vl_greedy(model, tower, image_prompt(tmp_path, texts, images), STEPS)
+
+    scheduler = make_scheduler(tmp_path)
+    for item in image_prompt(tmp_path, texts, images).mm_items:
+        assert mx.array_equal(scheduler.engine.model.encode(item), tower.encode(item))
+    add_prompt(scheduler, 0, image_prompt(tmp_path, texts, images))
+    assert tokens_of(scheduler, 1) == [expected]
+
+
+def test_checkpoint_without_tower_weights_warns_and_serves_text_only(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A checkpoint whose tower is stored where the loader does not read it, with no processor
-    config, loads as its text model."""
+    """A checkpoint whose config has a vision section but whose weights hold no tower, with no
+    processor config, loads as its text model, with a warning naming the prefixes read."""
     model, _ = build_vl_checkpoint(6, tmp_path)
-    tower_weights = mx.load(str(tmp_path / "visual.safetensors"))
-    assert isinstance(tower_weights, dict)
-    renamed = {
-        key.replace("model.visual.", "vision_tower.", 1): value
-        for key, value in tower_weights.items()
-    }
-    mx.save_safetensors(str(tmp_path / "vision_tower.safetensors"), renamed)
     (tmp_path / "visual.safetensors").unlink()
     (tmp_path / "preprocessor_config.json").unlink()
     prompt = random_texts(5, (37,))[0]
@@ -272,8 +301,16 @@ def test_tower_under_another_prefix_serves_text_only(
     with caplog.at_level(logging.INFO, logger="ftmetal.engine.engine"):
         scheduler = make_scheduler(tmp_path)
     assert scheduler.engine.encoder_cache is None and not scheduler.engine.model_config.is_mrope
-    reason = "Multimodal disabled: the checkpoint has no tower weights under model.visual."
-    assert [line for line in caplog.messages if "Multimodal disabled" in line] == [reason]
+    warning = (
+        "Multimodal disabled: config.json has vision_config but the checkpoint has no vision "
+        "encoder weights under model.visual., vision_tower.; serving text only"
+    )
+    disabled_records = [
+        (record.levelno, record.getMessage())
+        for record in caplog.records
+        if "Multimodal disabled" in record.getMessage()
+    ]
+    assert disabled_records == [(logging.WARNING, warning)]
     params = SamplingParams(temperature=0.0, max_tokens=STEPS, ignore_eos=True)
     assert scheduler.generate(np.array(prompt, dtype=np.int32), params) == expected
 

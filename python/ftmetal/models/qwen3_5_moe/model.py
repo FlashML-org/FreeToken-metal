@@ -136,7 +136,7 @@ class Qwen3_5MoeForCausalLM(BaseLLMModel):
                 dtype=dtype,
             )
         if config.vision_config is not None:
-            self.visual = Qwen3VLVisionModel(config.vision_config, channels_last=False)
+            self.visual = Qwen3VLVisionModel(config.vision_config, channels_last=True)
             self.visual.set_dtype(dtype)
 
     def finish_loading(self, model_path: str) -> int:
