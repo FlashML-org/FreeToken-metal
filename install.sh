@@ -29,8 +29,8 @@ case "$FT_HOME:$BIN_DIR" in
   *) die "FTMETAL_HOME and FTMETAL_BIN_DIR must be absolute paths." ;;
 esac
 [ "$(uname -sm)" = "Darwin arm64" ] || die "needs macOS on Apple Silicon, this is $(uname -sm)."
-[ "$(sw_vers -productVersion | cut -d. -f1)" -ge 14 ] \
-  || die "needs macOS 14 or later, this is $(sw_vers -productVersion)."
+[ "$(sw_vers -productVersion | cut -d. -f1)" -ge 15 ] \
+  || die "needs macOS 15 or later, this is $(sw_vers -productVersion)."
 xcode-select -p >/dev/null 2>&1 || die "no C++ compiler: run xcode-select --install, then re-run."
 
 # Private, so that a uv the user already has stays as it is. Unmanaged: no shell rc edits. The two
