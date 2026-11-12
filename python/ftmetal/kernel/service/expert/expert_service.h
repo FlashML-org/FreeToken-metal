@@ -211,10 +211,8 @@ class ExpertService {
   void fill_initial(const std::vector<int32_t>& flat_ids);
 
   // SlotLru::resolve, then read the misses; returns each expert's slot.
-  std::vector<int32_t> ensure_experts(
-      int layer_id,
-      const std::vector<int32_t>& expert_ids,
-      uint32_t step);
+  std::vector<int32_t>
+  ensure_experts(int layer_id, const std::vector<int32_t>& expert_ids, uint32_t step);
 
   // Drain the prefill buffers' reads, forget the layers they hold and drop the experts their
   // slots hold, into the victim cache.
@@ -281,11 +279,8 @@ class ExpertService {
       std::vector<ReadTask> copies = {});
   void finish_buffer(PrefillBuffer& buffer, int64_t wait_ns);
   // Reset the batch for loads (expert, slot or row) of the layer into buffer (-1: slots).
-  void begin_batch(
-      ReadBatch& batch,
-      int layer_id,
-      const std::vector<ExpertLoad>& loads,
-      int buffer);
+  void
+  begin_batch(ReadBatch& batch, int layer_id, const std::vector<ExpertLoad>& loads, int buffer);
   // Fill the rows of the batch's experts' segments the checkpoint does not store.
   void fill_rows(const ReadBatch& batch);
   void enqueue(ReadBatch& batch, std::vector<ReadTask> tasks);

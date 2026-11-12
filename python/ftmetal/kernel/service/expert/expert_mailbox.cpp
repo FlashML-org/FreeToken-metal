@@ -59,9 +59,9 @@ void ExpertService::check_healthy() const {
 }
 
 void ExpertService::arm() {
-  armed_at_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                         Clock::now().time_since_epoch())
-                         .count());
+  armed_at_ns_.store(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch())
+          .count());
   if (is_dozing_.load()) {
     {
       std::lock_guard<std::mutex> lock(wake_mutex_);
@@ -73,8 +73,8 @@ void ExpertService::arm() {
 void ExpertService::coordinate() {
   pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
   auto is_armed = [this](Clock::time_point now) {
-    auto armed_at = Clock::time_point(std::chrono::duration_cast<Clock::duration>(
-        std::chrono::nanoseconds(armed_at_ns_.load())));
+    auto armed_at = Clock::time_point(
+        std::chrono::duration_cast<Clock::duration>(std::chrono::nanoseconds(armed_at_ns_.load())));
     return now - armed_at < HOT_WINDOW;
   };
   auto last_answered = Clock::now();
@@ -114,8 +114,7 @@ void ExpertService::coordinate() {
     {
       std::unique_lock<std::mutex> lock(wake_mutex_);
       coordinator_wake_.wait_for(lock, doze, [&] {
-        return is_stopping_coordination_.load(std::memory_order_acquire) ||
-            is_armed(Clock::now());
+        return is_stopping_coordination_.load(std::memory_order_acquire) || is_armed(Clock::now());
       });
     }
     is_dozing_.store(false);
@@ -211,8 +210,7 @@ void ExpertService::answer() {
         .store(static_cast<uint32_t>(num_loaded), std::memory_order_relaxed);
     mailbox_word(MailboxWord::NumEvicted)
         .store(static_cast<uint32_t>(num_evicted), std::memory_order_relaxed);
-    mailbox_word(MailboxWord::Error)
-        .store(static_cast<uint32_t>(error), std::memory_order_relaxed);
+    mailbox_word(MailboxWord::Error).store(static_cast<uint32_t>(error), std::memory_order_relaxed);
     auto stamp = [this](MailboxWord word, uint64_t time) {
       std::atomic_ref<uint64_t>(
           *reinterpret_cast<uint64_t*>(mailbox_data_ + static_cast<int>(word)))
@@ -251,8 +249,7 @@ void ExpertService::watch() {
     // progresses between samples is alive.
     if (!is_pending(observed)) {
       suspect.reset();
-    } else if (
-        !suspect || suspect->sequence != sequence || suspect->num_answered != num_answered) {
+    } else if (!suspect || suspect->sequence != sequence || suspect->num_answered != num_answered) {
       suspect = Suspect{sequence, num_answered, now};
     } else if (now - suspect->first_seen >= stall_timeout_) {
       auto age_ms =

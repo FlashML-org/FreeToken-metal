@@ -142,10 +142,8 @@ std::vector<int32_t> SlotLru::fill(const std::vector<int32_t>& flat_ids) {
   return slots;
 }
 
-SlotAssignment SlotLru::resolve(
-    int layer_id,
-    const std::vector<int32_t>& expert_ids,
-    uint32_t step) {
+SlotAssignment
+SlotLru::resolve(int layer_id, const std::vector<int32_t>& expert_ids, uint32_t step) {
   check_layer(layer_id, "resolve");
   if (step == 0) {
     throw std::invalid_argument("SlotLru.resolve: steps count from 1; 0 marks a slot never used");
@@ -199,7 +197,9 @@ SlotAssignment SlotLru::resolve(
   }
   auto victims_end = candidates_.begin() + static_cast<std::ptrdiff_t>(misses_.size());
   std::partial_sort(
-      candidates_.begin(), victims_end, candidates_.end(),
+      candidates_.begin(),
+      victims_end,
+      candidates_.end(),
       [this](const Candidate& a, const Candidate& b) { return is_victim_before(a, b); });
   // The cache splits a forward into steps whose experts fit every pool at once, so the
   // victims were all last used before this step.
@@ -359,8 +359,8 @@ SlotAssignment SlotLru::prefill_slot_map(int layer_id) const {
   if (absent > buffer_size_) {
     throw std::logic_error(
         "SlotLru.prefill_slot_map: prefill buffers of " + std::to_string(buffer_size_) +
-        " experts cannot hold layer " + std::to_string(layer_id) + "'s " +
-        std::to_string(absent) + " absent experts");
+        " experts cannot hold layer " + std::to_string(layer_id) + "'s " + std::to_string(absent) +
+        " absent experts");
   }
   SlotAssignment assignment;
   assignment.slots.resize(num_experts_);

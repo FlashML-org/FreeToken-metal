@@ -59,8 +59,8 @@ VictimCache::VictimCache(
   for (size_t pool = 0; pool < pools_.size(); ++pool) {
     pools_[pool].entry_bytes = entry_bytes[pool];
     if (slot_bytes > 0 && entry_bytes[pool] > 0) {
-      __int128 share = static_cast<__int128>(budget_bytes) * pool_slots[pool] *
-          entry_bytes[pool] / slot_bytes;
+      __int128 share =
+          static_cast<__int128>(budget_bytes) * pool_slots[pool] * entry_bytes[pool] / slot_bytes;
       // Never more entries than the pool's experts outside its slots.
       pools_[pool].capacity = std::min(
           static_cast<int64_t>(share / entry_bytes[pool]),

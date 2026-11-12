@@ -81,7 +81,8 @@ mx::array flash_decode(
   if (partition_tokens < 1 || min_partition_tokens < 1 || max_partitions < 1) {
     throw std::invalid_argument("ftmetal mha_decode: partition rule values must be >= 1");
   }
-  if (sinks && (sinks->ndim() != 1 || sinks->shape(0) != num_heads || sinks->dtype() != q.dtype())) {
+  if (sinks &&
+      (sinks->ndim() != 1 || sinks->shape(0) != num_heads || sinks->dtype() != q.dtype())) {
     throw std::invalid_argument("ftmetal mha_decode: sinks must be [Hq] in q's dtype");
   }
   auto stream = mx::to_stream(s);
@@ -137,9 +138,9 @@ void FlashDecode::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx:
       std::to_string(c.head_dim) + "_" + std::to_string(c.group) + "_" +
       std::to_string(c.num_kv_heads) + "_" + std::to_string(c.page_size) + "_" +
       std::to_string(c.num_head_groups) + "_" + std::to_string(c.num_simdgroups) + "_" +
-      std::to_string(c.rule.partition_tokens) + "_" +
-      std::to_string(c.rule.min_partition_tokens) + "_" + std::to_string(c.rule.max_partitions) +
-      "_" + std::to_string(c.rule.min_threadgroups) + (c.has_sinks ? "_sinks" : "");
+      std::to_string(c.rule.partition_tokens) + "_" + std::to_string(c.rule.min_partition_tokens) +
+      "_" + std::to_string(c.rule.max_partitions) + "_" + std::to_string(c.rule.min_threadgroups) +
+      (c.has_sinks ? "_sinks" : "");
 
   auto s = stream();
   auto& d = mx::metal::device(s.device);

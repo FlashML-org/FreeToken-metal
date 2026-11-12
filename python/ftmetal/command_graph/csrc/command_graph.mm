@@ -211,9 +211,7 @@ void record_dispatch(Session& session, GridSize grid, GridSize group, bool is_th
   dispatch.bytes_end = static_cast<uint32_t>(graph.bytes_arguments.size());
   dispatch.memory_begin = static_cast<uint32_t>(graph.threadgroup_memory.size());
   graph.threadgroup_memory.insert(
-      graph.threadgroup_memory.end(),
-      session.pending_memory.begin(),
-      session.pending_memory.end());
+      graph.threadgroup_memory.end(), session.pending_memory.begin(), session.pending_memory.end());
   dispatch.memory_end = static_cast<uint32_t>(graph.threadgroup_memory.size());
   graph.dispatches.push_back(dispatch);
   session.pending_bindings.clear();
@@ -484,8 +482,8 @@ void install_hooks() {
     original_set_buffer =
         install_required(e, @selector(setBuffer:offset:atIndex:), &hook_set_buffer);
     original_set_bytes = install_required(e, @selector(setBytes:length:atIndex:), &hook_set_bytes);
-    original_set_memory = install_required(
-        e, @selector(setThreadgroupMemoryLength:atIndex:), &hook_set_memory);
+    original_set_memory =
+        install_required(e, @selector(setThreadgroupMemoryLength:atIndex:), &hook_set_memory);
     original_dispatch_threadgroups = install_required(
         e, @selector(dispatchThreadgroups:threadsPerThreadgroup:), &hook_dispatch_threadgroups);
     original_dispatch_threads = install_required(
@@ -513,7 +511,9 @@ void install_hooks() {
     install_forbidden<10, void, id, id, NS::UInteger>(
         e, @selector(executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:));
     install_forbidden<11, void, id, NS::UInteger, GridSize>(
-        e, @selector(dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup:));
+        e,
+        @selector(
+            dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup:));
     install_forbidden<12, void, id, NS::UInteger>(e, @selector(setTexture:atIndex:));
     install_forbidden<13, void, id, NS::UInteger>(e, @selector(setSamplerState:atIndex:));
 
@@ -701,8 +701,7 @@ void classify(Session& session) {
   for (size_t i = 0; i < session.intermediates.size(); ++i) {
     const auto& array = session.intermediates[i];
     if (has_data(array)) {
-      producer_labels[array.buffer().ptr()] =
-          array_label(session.intermediate_names[i], array);
+      producer_labels[array.buffer().ptr()] = array_label(session.intermediate_names[i], array);
     }
   }
 
@@ -827,8 +826,7 @@ void classify(Session& session) {
     auto it = classes.find(buffer);
     bool owned = it != classes.end() &&
         (it->second.role == BufferRole::Logits || it->second.role == BufferRole::Constant ||
-         it->second.role == BufferRole::Intermediate ||
-         it->second.role == BufferRole::Temporary);
+         it->second.role == BufferRole::Intermediate || it->second.role == BufferRole::Temporary);
     if (owned && pinned.insert(buffer).second) {
       stats.pinned_bytes += static_cast<int64_t>(static_cast<const MTL::Buffer*>(buffer)->length());
     }
@@ -948,8 +946,7 @@ void begin_capture(
       session->leaves.push_back(std::move(array));
       continue;
     }
-    if (array.primitive().device() != mx::Device::gpu ||
-        array.primitive().stream() != stream) {
+    if (array.primitive().device() != mx::Device::gpu || array.primitive().stream() != stream) {
       throw std::invalid_argument(
           std::string("begin_capture: ") + array.primitive().name() +
           " runs off the capture's GPU stream");
@@ -1198,9 +1195,8 @@ std::vector<std::string> compare_graphs(const Graph& first, const Graph& second)
             (x.role == BufferRole::External && x.buffer != y.buffer)) {
           report(
               slot + ": " + role_name(x.role) + " #" + std::to_string(x.id) + " +" +
-              std::to_string(x.offset) + " vs " + role_name(y.role) + " #" +
-              std::to_string(y.id) + " +" + std::to_string(y.offset) + " at slot " +
-              std::to_string(y.index));
+              std::to_string(x.offset) + " vs " + role_name(y.role) + " #" + std::to_string(y.id) +
+              " +" + std::to_string(y.offset) + " at slot " + std::to_string(y.index));
         } else if (x.role == BufferRole::Constant && constant_sites[x.id].empty()) {
           constant_sites[x.id] = slot;
         }
@@ -1279,8 +1275,7 @@ void poison_blocks(Graph& graph, const std::vector<int32_t>& blocks) {
     }
     auto* buffer = graph.blocks[block].buffer;
     auto* contents = static_cast<uint8_t*>(buffer->contents());
-    graph.poisoned.emplace_back(
-        block, std::vector<uint8_t>(contents, contents + buffer->length()));
+    graph.poisoned.emplace_back(block, std::vector<uint8_t>(contents, contents + buffer->length()));
     std::memset(contents, 0xFF, buffer->length());
   }
 }

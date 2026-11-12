@@ -49,8 +49,9 @@ inline void replace_all(std::string& text, const std::string& token, const std::
   }
 }
 
-// {q, k_cache, v_cache, page_table, lengths}: the k/v pools stay as they are (see kvcache/pool_rows.h),
-// the rest is made contiguous; eval_gpu checks the pools with check_pools_row_contiguous.
+// {q, k_cache, v_cache, page_table, lengths}: the k/v pools stay as they are (see
+// kvcache/pool_rows.h), the rest is made contiguous; eval_gpu checks the pools with
+// check_pools_row_contiguous.
 inline std::vector<mx::array> paged_attention_inputs(
     const mx::array& q,
     const mx::array& k_cache,
@@ -67,7 +68,8 @@ inline std::vector<mx::array> paged_attention_inputs(
 }
 
 inline void check_pools_row_contiguous(
-    const std::vector<mx::array>& inputs, const std::string& kernel) {
+    const std::vector<mx::array>& inputs,
+    const std::string& kernel) {
   if (!inputs[1].flags().row_contiguous || !inputs[2].flags().row_contiguous) {
     throw std::runtime_error("ftmetal " + kernel + ": k/v cache must be row contiguous");
   }
@@ -80,8 +82,8 @@ struct SplitPartials {
   mx::array ml;
 };
 
-inline SplitPartials split_partials(
-    const mx::Shape& rows, int head_dim, mx::metal::CommandEncoder& encoder) {
+inline SplitPartials
+split_partials(const mx::Shape& rows, int head_dim, mx::metal::CommandEncoder& encoder) {
   mx::Shape acc_shape = rows;
   acc_shape.push_back(head_dim);
   mx::Shape ml_shape = rows;

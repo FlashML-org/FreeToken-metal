@@ -90,8 +90,9 @@ ExpertService::ExpertService(
       mailbox_data_(static_cast<uint32_t*>(shared_data(mailbox_, "mailbox"))),
       hit_stats_(std::move(hit_stats)),
       hit_stats_data_(static_cast<uint32_t*>(shared_data(hit_stats_, "hit_stats"))),
-      stall_timeout_(std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::duration<double>(stall_timeout_s))) {
+      stall_timeout_(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::duration<double>(stall_timeout_s))) {
   if (io_threads < 1) {
     throw std::invalid_argument("ExpertService: io_threads must be positive");
   }
@@ -148,8 +149,8 @@ ExpertService::ExpertService(
     for (int s = 0; s < segments_per_layer_; ++s) {
       int64_t segment_index = layer_id * segments_per_layer_ + s;
       const ExpertSegment& segment = segments_[segment_index];
-      bool is_valid = segment.bank_index >= 0 && segment.bank_index < num_banks &&
-          segment.expert_bytes >= 1;
+      bool is_valid =
+          segment.bank_index >= 0 && segment.bank_index < num_banks && segment.expert_bytes >= 1;
       for (int e = 0; e < num_experts; ++e) {
         const ExpertLocation& location = locations_[segment_index * num_experts + e];
         is_valid = is_valid &&
@@ -194,8 +195,8 @@ ExpertService::ExpertService(
     for (int s = 0; s < segments_per_layer_; ++s) {
       bool is_fill = layer_locations[s * num_experts].file_index == FILL_FILE;
       for (int e = 0; e < num_experts; ++e) {
-        is_record = is_record &&
-            (layer_locations[s * num_experts + e].file_index == FILL_FILE) == is_fill;
+        is_record =
+            is_record && (layer_locations[s * num_experts + e].file_index == FILL_FILE) == is_fill;
       }
       if (!is_fill) {
         stored.push_back(s);
@@ -377,8 +378,7 @@ void ExpertService::keep_ssd_awake(int64_t interval_us) {
     }
     state = state * 6364136223846793005ull + 1442695040888963407ull;
     const auto& [descriptor, blocks] = files[(state >> 33) % files.size()];
-    off_t offset =
-        static_cast<off_t>((state >> 11) % static_cast<uint64_t>(blocks)) * read_bytes;
+    off_t offset = static_cast<off_t>((state >> 11) % static_cast<uint64_t>(blocks)) * read_bytes;
     (void)!pread(descriptor, memory, read_bytes, offset);
     std::unique_lock<std::mutex> lock(keepalive_mutex_);
     keepalive_wake_.wait_for(lock, std::chrono::microseconds(interval_us), [this] {
@@ -638,8 +638,8 @@ void ExpertService::read(const ReadTask& task, uint8_t* staging) {
   // The widened end may pass the end of the file; only the wanted bytes must arrive.
   int64_t done = 0;
   while (done < task.end - aligned_begin) {
-    ssize_t count = pread(
-        descriptor, staging + done, aligned_end - aligned_begin - done, aligned_begin + done);
+    ssize_t count =
+        pread(descriptor, staging + done, aligned_end - aligned_begin - done, aligned_begin + done);
     if (count < 0 && errno == EINTR) {
       continue;
     }
@@ -703,8 +703,7 @@ uint8_t* ExpertService::expert_row(
     const ReadBatch& batch,
     const ExpertSegment& segment,
     int64_t expert) const {
-  return bank_row(
-             batch.layer_id, segment.bank_index, batch.buffer, batch.index_of_expert[expert]) +
+  return bank_row(batch.layer_id, segment.bank_index, batch.buffer, batch.index_of_expert[expert]) +
       segment.row_offset;
 }
 
@@ -862,19 +861,15 @@ void ExpertService::fill_initial(const std::vector<int32_t>& flat_ids) {
   }
 }
 
-std::vector<int32_t> ExpertService::ensure_experts(
-    int layer_id,
-    const std::vector<int32_t>& expert_ids,
-    uint32_t step) {
+std::vector<int32_t>
+ExpertService::ensure_experts(int layer_id, const std::vector<int32_t>& expert_ids, uint32_t step) {
   std::lock_guard<std::mutex> lock(call_mutex_);
   check_healthy();
   return std::move(serve(layer_id, expert_ids, step).slots);
 }
 
-SlotAssignment ExpertService::serve(
-    int layer_id,
-    const std::vector<int32_t>& expert_ids,
-    uint32_t step) {
+SlotAssignment
+ExpertService::serve(int layer_id, const std::vector<int32_t>& expert_ids, uint32_t step) {
   for (const PrefillBuffer& buffer : buffers_) {
     if (!buffer.is_waited) {
       throw std::logic_error(
@@ -925,9 +920,8 @@ SlotAssignment ExpertService::serve(
       submit(ensure_batch_, layer_id, reads);
       std::vector<int32_t>& spares = spares_[lru_.pool_of_layer(layer_id)];
       for (const auto& [flat_id, slot] : assignment.evicted) {
-        auto hit = std::find_if(hits.begin(), hits.end(), [slot](const auto& h) {
-          return h.second == slot;
-        });
+        auto hit = std::find_if(
+            hits.begin(), hits.end(), [slot](const auto& h) { return h.second == slot; });
         if (hit != hits.end() && !spares.empty()) {
           // A victim hit evicting a resident: the hit goes to a spare slot now, and the
           // evicted expert is copied out of its slot (the next spare) once answered.
@@ -1128,8 +1122,7 @@ std::vector<int32_t> ExpertService::prefetch_prefill_layer(
       std::vector<ReadTask> copies;
       for (size_t j = 0; j < hits.size(); ++j) {
         const auto& [entry, row] = hits[j];
-        copies.push_back(
-            {.entry = victims_->data(entry), .index = row, .expert = hit_experts[j]});
+        copies.push_back({.entry = victims_->data(entry), .index = row, .expert = hit_experts[j]});
       }
       submit(*buffer.batch, layer_id, reads, layer_id % 2, std::move(copies));
       return buffer.slot_map;
@@ -1139,8 +1132,8 @@ std::vector<int32_t> ExpertService::prefetch_prefill_layer(
     begin_batch(batch, layer_id, assignment.loads, layer_id % 2);
     batch.experts_read = static_cast<int64_t>(reads.size());
     fill_rows(batch);
-    size_t head = reads_ahead < 0 ? order.size()
-                                  : std::min(order.size(), static_cast<size_t>(reads_ahead));
+    size_t head =
+        reads_ahead < 0 ? order.size() : std::min(order.size(), static_cast<size_t>(reads_ahead));
     std::vector<int32_t> ahead;
     for (size_t j = 0; j < order.size(); ++j) {
       if (buffer.slot_map[order[j]] < 0) {
@@ -1258,8 +1251,9 @@ ExpertServiceStats ExpertService::stats() {
     // The GPU's counts, read without synchronizing: an older value is fine.
     stats.lookups.push_back(
         std::atomic_ref<uint32_t>(hit_stats_data_[2 * layer_id]).load(std::memory_order_relaxed));
-    stats.lookup_hits.push_back(std::atomic_ref<uint32_t>(hit_stats_data_[2 * layer_id + 1])
-                                    .load(std::memory_order_relaxed));
+    stats.lookup_hits.push_back(
+        std::atomic_ref<uint32_t>(hit_stats_data_[2 * layer_id + 1])
+            .load(std::memory_order_relaxed));
   }
   return stats;
 }

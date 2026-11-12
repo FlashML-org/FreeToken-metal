@@ -87,9 +87,8 @@ MTL::ComputePipelineState* round_pipeline(
     return std::to_string(round.kind) + "_" + std::to_string(round.shift) + "_" +
         std::to_string(round.root) + std::to_string(round.final);
   };
-  std::string hash_name = library_name + "_" + kernel + "_" + std::to_string(dispatch_index) +
-      "_" + spec(prev) + "_" + spec(cur) + "_" + std::to_string(has_top_k) +
-      std::to_string(has_top_p);
+  std::string hash_name = library_name + "_" + kernel + "_" + std::to_string(dispatch_index) + "_" +
+      spec(prev) + "_" + spec(cur) + "_" + std::to_string(has_top_k) + std::to_string(has_top_p);
   return device.get_kernel(kernel, library, hash_name, constants);
 }
 

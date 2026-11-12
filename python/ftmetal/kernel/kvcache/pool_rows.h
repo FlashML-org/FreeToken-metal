@@ -35,10 +35,7 @@ mx::array copy_rows(
     mx::StreamOrDevice s = {});
 
 // pool[ids[i]] = 0
-mx::array zero_rows(
-    const mx::array& pool,
-    const mx::array& ids,
-    mx::StreamOrDevice s = {});
+mx::array zero_rows(const mx::array& pool, const mx::array& ids, mx::StreamOrDevice s = {});
 
 // k_cache[out_loc[i]] = k[i]; v_cache[out_loc[i]] = v[i]; returns (k_cache, v_cache)
 std::vector<mx::array> kv_write(
@@ -53,15 +50,10 @@ enum class RowsKind { Scatter, Copy, Zero, KVWrite };
 
 class PoolRows : public mx::Primitive {
  public:
-  PoolRows(mx::Stream stream, RowsKind kind)
-      : mx::Primitive(stream), kind_(kind) {}
+  PoolRows(mx::Stream stream, RowsKind kind) : mx::Primitive(stream), kind_(kind) {}
 
-  void eval_cpu(
-      const std::vector<mx::array>& inputs,
-      std::vector<mx::array>& outputs) override;
-  void eval_gpu(
-      const std::vector<mx::array>& inputs,
-      std::vector<mx::array>& outputs) override;
+  void eval_cpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) override;
+  void eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) override;
 
   const char* name() const override;
 

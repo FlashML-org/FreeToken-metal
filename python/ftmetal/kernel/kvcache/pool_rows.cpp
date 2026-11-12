@@ -76,9 +76,7 @@ mx::array scatter_rows(
       pool.shape(),
       pool.dtype(),
       std::make_shared<PoolRows>(stream, RowsKind::Scatter),
-      {pool,
-       mx::contiguous(rows, false, stream),
-       mx::contiguous(dst_ids, false, stream)});
+      {pool, mx::contiguous(rows, false, stream), mx::contiguous(dst_ids, false, stream)});
 }
 
 mx::array copy_rows(
@@ -99,9 +97,7 @@ mx::array copy_rows(
       pool.shape(),
       pool.dtype(),
       std::make_shared<PoolRows>(stream, RowsKind::Copy),
-      {pool,
-       mx::contiguous(src_ids, false, stream),
-       mx::contiguous(dst_ids, false, stream)});
+      {pool, mx::contiguous(src_ids, false, stream), mx::contiguous(dst_ids, false, stream)});
 }
 
 mx::array zero_rows(const mx::array& pool, const mx::array& ids, mx::StreamOrDevice s) {
@@ -158,15 +154,11 @@ bool PoolRows::is_equivalent(const mx::Primitive& other) const {
   return rows != nullptr && rows->kind_ == kind_;
 }
 
-void PoolRows::eval_cpu(
-    const std::vector<mx::array>&,
-    std::vector<mx::array>&) {
+void PoolRows::eval_cpu(const std::vector<mx::array>&, std::vector<mx::array>&) {
   throw std::runtime_error("ftmetal pool_rows: GPU only");
 }
 
-void PoolRows::eval_gpu(
-    const std::vector<mx::array>& inputs,
-    std::vector<mx::array>& outputs) {
+void PoolRows::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) {
   switch (kind_) {
     case RowsKind::Scatter:
       outputs[0].copy_shared_buffer(inputs[0]);
@@ -205,8 +197,10 @@ void PoolRows::encode(
   bool vectorized = row_elems % POOL_ROWS_VECTOR_WIDTH == 0;
   int lanes = vectorized ? row_elems / POOL_ROWS_VECTOR_WIDTH : row_elems;
 
-  const char* base = rows != nullptr ? "scatter_rows" : (src_ids != nullptr ? "copy_rows" : "zero_rows");
-  std::string kernel_name = std::string(base) + (vectorized ? "_vec_" : "_") + metal_type(pool_out.dtype());
+  const char* base =
+      rows != nullptr ? "scatter_rows" : (src_ids != nullptr ? "copy_rows" : "zero_rows");
+  std::string kernel_name =
+      std::string(base) + (vectorized ? "_vec_" : "_") + metal_type(pool_out.dtype());
 
   auto s = stream();
   auto& d = mx::metal::device(s.device);

@@ -41,10 +41,8 @@ class GDNDecode : public mx::Primitive {
  public:
   GDNDecode(mx::Stream stream, GDNDecodeShape shape) : mx::Primitive(stream), shape_(shape) {}
 
-  void eval_cpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs)
-      override;
-  void eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs)
-      override;
+  void eval_cpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) override;
+  void eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) override;
 
   const char* name() const override {
     return "GDNDecode";

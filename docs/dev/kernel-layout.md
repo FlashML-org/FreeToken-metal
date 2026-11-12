@@ -118,6 +118,9 @@ same tree, e.g. `tests/kernel/service/expert/test_expert_lru.py`.
    - Code fragments that change with the configuration use `{{NAME}}` markers, which the wrapper
      substitutes before compiling; types and integer constants use the `metal_kernel`'s `template`
      parameter.
+   - clang-format (`.clang-format`) formats `.h`, `.cpp` and `.mm` files, not `.metal` ones: a
+     `metal_kernel` body is not a translation unit, and `{{NAME}}` markers do not survive it.
+     Write `.metal` files in the same style by hand.
 2. Headers:
    - A C++ primitive's `<name>.h` and `<name>.cpp` come in pairs. A `.h` in a kernel directory without a
      `.cpp` of the same name is a Metal header (`<name>.h`) or a header C++ and Metal share

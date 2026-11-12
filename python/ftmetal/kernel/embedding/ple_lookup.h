@@ -57,10 +57,8 @@ class PleLookup : public mx::Primitive {
   PleLookup(mx::Stream stream, PleKernel kernel, int num_rows)
       : mx::Primitive(stream), kernel_(kernel), num_rows_(num_rows) {}
 
-  void eval_cpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs)
-      override;
-  void eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs)
-      override;
+  void eval_cpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) override;
+  void eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) override;
 
   const char* name() const override {
     return kernel_ == PleKernel::Post ? "PlePost" : "PleWait";

@@ -195,9 +195,7 @@ METAL_FUNC void qmv_rows(
     }
   } else {
     const int remaining = clamp(
-        static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
-        0,
-        values_per_thread);
+        static_cast<int>(in_vec_size - k - simd_lid * values_per_thread), 0, values_per_thread);
     if (remaining > 0) {
       U sum = load_vector_safe<T, U, values_per_thread, bits>(x, x_thread, remaining);
 
@@ -225,11 +223,8 @@ constant constexpr int QMV_TILE_ROWS = 8;
 // under one tile the rows past N repeat the last, else the non-fast impl's last tile moves back to
 // end at N. False when the simdgroup has none.
 template <bool FAST>
-METAL_FUNC bool gather_qmv_rows(
-    uint tile,
-    uint simdgroup,
-    int N,
-    thread int (&rows)[QMV_ROWS_PER_SIMDGROUP]) {
+METAL_FUNC bool
+gather_qmv_rows(uint tile, uint simdgroup, int N, thread int (&rows)[QMV_ROWS_PER_SIMDGROUP]) {
   const int out_row = int(tile) * QMV_TILE_ROWS + int(simdgroup) * QMV_ROWS_PER_SIMDGROUP;
   if (out_row >= N) {
     return false;

@@ -50,8 +50,8 @@ std::vector<mx::array> ple_post(
   check_mailbox(mailbox, "ple_post");
   auto stream = mx::to_stream(s);
   int num_rows = static_cast<int>(input_ids.size());
-  // The context pool and the mailbox stay as they are (see kvcache/pool_rows.h); eval_gpu checks they
-  // are row contiguous.
+  // The context pool and the mailbox stay as they are (see kvcache/pool_rows.h); eval_gpu checks
+  // they are row contiguous.
   return mx::array::make_arrays(
       {context.shape(), input_ids.shape(), {1}},
       {mx::int32, mx::int32, mx::uint32},

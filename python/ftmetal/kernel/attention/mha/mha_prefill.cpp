@@ -92,7 +92,8 @@ mx::array make_flash_prefill(
         "ftmetal mha_prefill: head_split must cut D into 8-column slices (16 with mpp)");
   }
   if (block_k < granule || block_k % granule != 0) {
-    throw std::invalid_argument("ftmetal mha_prefill: block_k must be a multiple of 8 (16 with mpp)");
+    throw std::invalid_argument(
+        "ftmetal mha_prefill: block_k must be a multiple of 8 (16 with mpp)");
   }
   if (num_passes < 1 || head_split % num_passes != 0 || (num_passes > 1 && !kv_shared)) {
     throw std::invalid_argument(
@@ -104,11 +105,13 @@ mx::array make_flash_prefill(
   if (sliding_window < 0) {
     throw std::invalid_argument("ftmetal mha_prefill: sliding_window must be >= 0 (0: none)");
   }
-  if (block_ends && (block_ends->ndim() != 1 || block_ends->shape(0) != q.shape(0) ||
-                     block_ends->dtype() != mx::int32)) {
+  if (block_ends &&
+      (block_ends->ndim() != 1 || block_ends->shape(0) != q.shape(0) ||
+       block_ends->dtype() != mx::int32)) {
     throw std::invalid_argument("ftmetal mha_prefill: block_ends must be int32 [num_tokens]");
   }
-  if (sinks && (sinks->ndim() != 1 || sinks->shape(0) != num_heads || sinks->dtype() != q.dtype())) {
+  if (sinks &&
+      (sinks->ndim() != 1 || sinks->shape(0) != num_heads || sinks->dtype() != q.dtype())) {
     throw std::invalid_argument("ftmetal mha_prefill: sinks must be [Hq] in q's dtype");
   }
   auto stream = mx::to_stream(s);
@@ -165,8 +168,25 @@ mx::array flash_prefill(
     const std::optional<mx::array>& sinks,
     mx::StreamOrDevice s) {
   return make_flash_prefill(
-      q, k_cache, v_cache, page_table, tiles, page_size, num_row_groups, head_split, block_k,
-      kv_shared, num_passes, num_partitions, sliding_window, mpp, scale, block_ends, 0, {}, sinks,
+      q,
+      k_cache,
+      v_cache,
+      page_table,
+      tiles,
+      page_size,
+      num_row_groups,
+      head_split,
+      block_k,
+      kv_shared,
+      num_passes,
+      num_partitions,
+      sliding_window,
+      mpp,
+      scale,
+      block_ends,
+      0,
+      {},
+      sinks,
       s);
 }
 
@@ -199,9 +219,26 @@ mx::array flash_prefill_qsa(
         "[num_tokens, B] uint32, block size >= 1");
   }
   return make_flash_prefill(
-      q, k_cache, v_cache, page_table, tiles, page_size, num_row_groups, head_split, block_k,
-      kv_shared, num_passes, num_partitions, 0, mpp, scale, std::nullopt, qsa_block_size,
-      {qsa_blocks, qsa_counts, qsa_bits}, std::nullopt, s);
+      q,
+      k_cache,
+      v_cache,
+      page_table,
+      tiles,
+      page_size,
+      num_row_groups,
+      head_split,
+      block_k,
+      kv_shared,
+      num_passes,
+      num_partitions,
+      0,
+      mpp,
+      scale,
+      std::nullopt,
+      qsa_block_size,
+      {qsa_blocks, qsa_counts, qsa_bits},
+      std::nullopt,
+      s);
 }
 
 bool FlashPrefill::is_equivalent(const mx::Primitive& other) const {
@@ -306,8 +343,7 @@ void FlashPrefill::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx
   encoder.set_bytes(max_pages, 7);
   encoder.set_bytes(scale_log2e, 8);
   set_mask_inputs();
-  encoder.dispatch_threadgroups(
-      MTL::Size(num_tiles, c.num_kv_heads, c.num_partitions), tile_group);
+  encoder.dispatch_threadgroups(MTL::Size(num_tiles, c.num_kv_heads, c.num_partitions), tile_group);
 
   encoder.set_compute_pipeline_state(d.get_kernel("mha_prefill_merge", library));
   encoder.set_input_array(part_acc, 0);

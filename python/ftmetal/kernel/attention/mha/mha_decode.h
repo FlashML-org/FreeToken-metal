@@ -70,10 +70,8 @@ class FlashDecode : public mx::Primitive {
   FlashDecode(mx::Stream stream, FlashDecodeConfig config)
       : mx::Primitive(stream), config_(config) {}
 
-  void eval_cpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs)
-      override;
-  void eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs)
-      override;
+  void eval_cpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) override;
+  void eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) override;
 
   const char* name() const override {
     return "FlashDecode";

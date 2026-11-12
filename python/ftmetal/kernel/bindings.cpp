@@ -359,7 +359,9 @@ NB_MODULE(_C, m) {
           "Empty the cache and place each of flat_ids in its layer's pool; returns their slots.")
       .def(
           "resolve",
-          [](ftmetal::SlotLru& lru, int layer_id, const std::vector<int32_t>& expert_ids,
+          [](ftmetal::SlotLru& lru,
+             int layer_id,
+             const std::vector<int32_t>& expert_ids,
              uint32_t step) {
             ftmetal::SlotAssignment assignment = lru.resolve(layer_id, expert_ids, step);
             return std::make_pair(std::move(assignment.slots), std::move(assignment.loads));
@@ -434,9 +436,11 @@ NB_MODULE(_C, m) {
              double lrfu_half_life,
              int64_t ssd_keepalive_us) {
             if (segments.shape(0) != static_cast<size_t>(num_layers) || segments.shape(2) != 3) {
-              throw std::invalid_argument("ExpertService: segments must be int64 [num_layers, n, 3]");
+              throw std::invalid_argument(
+                  "ExpertService: segments must be int64 [num_layers, n, 3]");
             }
-            if (locations.shape(0) != segments.shape(0) || locations.shape(1) != segments.shape(1) ||
+            if (locations.shape(0) != segments.shape(0) ||
+                locations.shape(1) != segments.shape(1) ||
                 locations.shape(2) != static_cast<size_t>(num_experts) || locations.shape(3) != 2) {
               throw std::invalid_argument(
                   "ExpertService: locations must be int64 [num_layers, n, num_experts, 2]");
@@ -473,7 +477,8 @@ NB_MODULE(_C, m) {
                 files,
                 std::move(table),
                 std::move(places),
-                std::vector<int64_t>(destinations.data(), destinations.data() + destinations.size()),
+                std::vector<int64_t>(
+                    destinations.data(), destinations.data() + destinations.size()),
                 buffer_bytes,
                 victim_cache_bytes,
                 io_threads,
@@ -714,9 +719,8 @@ NB_MODULE(_C, m) {
             size_t num_triples = triples.shape(0);
             size_t heads = static_cast<size_t>(service.num_heads());
             auto* ids = new int64_t[num_triples * heads];
-            nb::capsule owner(ids, [](void* pointer) noexcept {
-              delete[] static_cast<int64_t*>(pointer);
-            });
+            nb::capsule owner(
+                ids, [](void* pointer) noexcept { delete[] static_cast<int64_t*>(pointer); });
             service.ngram_ids(triples.data(), static_cast<int64_t>(num_triples), ids);
             return nb::ndarray<nb::numpy, int64_t, nb::ndim<2>>(ids, {num_triples, heads}, owner);
           },

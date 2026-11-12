@@ -52,8 +52,9 @@ PleService::PleService(
       head_sizes_(std::move(head_sizes)),
       head_offsets_(std::move(head_offsets)),
       eos_token_id_(eos_token_id),
-      stall_timeout_(std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::duration<double>(stall_timeout_s))) {
+      stall_timeout_(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::duration<double>(stall_timeout_s))) {
   if (mailbox_.dtype() != mx::uint32 || mailbox_.shape() != mx::Shape{PLE_MAILBOX_WORDS}) {
     throw std::invalid_argument(
         "PleService: mailbox must be uint32 [" + std::to_string(PLE_MAILBOX_WORDS) + "]");
@@ -205,8 +206,8 @@ void PleService::shutdown() {
 void PleService::coordinate() {
   pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
   auto is_armed = [this](Clock::time_point now) {
-    auto armed_at = Clock::time_point(std::chrono::duration_cast<Clock::duration>(
-        std::chrono::nanoseconds(armed_at_ns_.load())));
+    auto armed_at = Clock::time_point(
+        std::chrono::duration_cast<Clock::duration>(std::chrono::nanoseconds(armed_at_ns_.load())));
     return now - armed_at < HOT_WINDOW;
   };
   auto last_answered = Clock::now();
@@ -283,8 +284,8 @@ void PleService::answer() {
     std::vector<int64_t> triples(3 * num_rows);
     for (uint32_t i = 0; i < 3 * num_rows; ++i) {
       // The GPU wrote int32 tokens.
-      triples[i] = static_cast<int32_t>(
-          std::atomic_ref<uint32_t>(rows[i]).load(std::memory_order_relaxed));
+      triples[i] =
+          static_cast<int32_t>(std::atomic_ref<uint32_t>(rows[i]).load(std::memory_order_relaxed));
     }
     std::vector<int64_t> ids(num_rows * num_heads());
     ngram_ids(triples.data(), num_rows, ids.data());
@@ -333,8 +334,7 @@ void PleService::watch() {
     // A post is stuck only while the coordinator answers nothing.
     if (!is_pending(observed)) {
       suspect.reset();
-    } else if (
-        !suspect || suspect->sequence != sequence || suspect->num_answered != num_answered) {
+    } else if (!suspect || suspect->sequence != sequence || suspect->num_answered != num_answered) {
       suspect = Suspect{sequence, num_answered, now};
     } else if (now - suspect->first_seen >= stall_timeout_) {
       auto age_ms =

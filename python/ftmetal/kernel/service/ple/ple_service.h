@@ -4,8 +4,8 @@
 // (a mapped table faults 16 KiB pages per part of a ~100-byte row and keeps them in the page
 // cache). A gather copies its cached rows on the caller's thread, then reads the rest on the
 // caller and a pool of IO threads. PleService answers ple_post's mailbox posts (see
-// embedding/ple_lookup.h) on a coordinator thread: it hashes each row's n-grams and gathers the table
-// rows into the staging buffers. A watchdog thread fails a post left unanswered.
+// embedding/ple_lookup.h) on a coordinator thread: it hashes each row's n-grams and gathers the
+// table rows into the staging buffers. A watchdog thread fails a post left unanswered.
 #pragma once
 
 #include <array>

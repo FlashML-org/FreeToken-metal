@@ -118,9 +118,10 @@ void GDNDecode::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::a
     return;
   }
   std::string type = metal_type(outputs[0].dtype(), "gdn_decode");
-  std::string library_name = "ftmetal_gdn_decode_" + type + "_" + std::to_string(shape_.num_k_heads) +
-      "_" + std::to_string(shape_.num_v_heads) + "_" + std::to_string(shape_.key_dim) + "_" +
-      std::to_string(shape_.value_dim) + "_" + std::to_string(shape_.conv_kernel);
+  std::string library_name = "ftmetal_gdn_decode_" + type + "_" +
+      std::to_string(shape_.num_k_heads) + "_" + std::to_string(shape_.num_v_heads) + "_" +
+      std::to_string(shape_.key_dim) + "_" + std::to_string(shape_.value_dim) + "_" +
+      std::to_string(shape_.conv_kernel);
 
   auto s = stream();
   auto& d = mx::metal::device(s.device);

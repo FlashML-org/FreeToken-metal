@@ -111,9 +111,8 @@ PleRowStore::PleRowStore(
       int64_t end = offset + (shard_rows - 1) * stride + row_bytes_[i % 3];
       if (end > status.st_size) {
         throw std::runtime_error(
-            "PleRowStore: " + files_[file_index] + " ends before shard " +
-            std::to_string(i / 3) + " part " + std::to_string(i % 3) + "'s last row at " +
-            std::to_string(end));
+            "PleRowStore: " + files_[file_index] + " ends before shard " + std::to_string(i / 3) +
+            " part " + std::to_string(i % 3) + "'s last row at " + std::to_string(end));
       }
     }
     cached_rows_ = std::make_unique<int64_t[]>(cache_rows);
@@ -169,8 +168,8 @@ bool PleRowStore::copy_cached_row(int64_t row, uint8_t* const destinations[3]) c
 }
 
 void PleRowStore::read_row(int64_t row, uint8_t* const destinations[3]) const {
-  int64_t shard = std::upper_bound(shard_starts_.begin(), shard_starts_.end(), row) -
-      shard_starts_.begin() - 1;
+  int64_t shard =
+      std::upper_bound(shard_starts_.begin(), shard_starts_.end(), row) - shard_starts_.begin() - 1;
   int64_t local_row = row - shard_starts_[shard];
   alignas(READ_ALIGNMENT) uint8_t blocks[2 * READ_ALIGNMENT];
   for (int p = 0; p < 3; ++p) {

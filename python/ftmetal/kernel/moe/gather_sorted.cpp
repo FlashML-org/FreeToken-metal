@@ -69,8 +69,8 @@ void check_sorted_inputs(
     throw std::invalid_argument("ftmetal " + op_name + ": n must be positive");
   }
   if (expert_offsets.dtype() != mx::int32 || expert_offsets.ndim() != 1 ||
-      expert_bytes.dtype() != mx::int64 || expert_bytes.ndim() != 2 ||
-      expert_bytes.shape(0) < 1 || expert_bytes.shape(1) != num_buffers ||
+      expert_bytes.dtype() != mx::int64 || expert_bytes.ndim() != 2 || expert_bytes.shape(0) < 1 ||
+      expert_bytes.shape(1) != num_buffers ||
       expert_offsets.shape(0) != expert_bytes.shape(0) + 1) {
     throw std::invalid_argument(
         "ftmetal " + op_name + ": expert_offsets must be [E + 1] int32 and expert_bytes [E, " +
@@ -137,8 +137,8 @@ mx::array gather_qmm_sorted(
     if (bits != mode_bits || group_size != mode_group_size) {
       throw std::invalid_argument(
           "ftmetal gather_qmm_sorted: " + mode + " takes bits " + std::to_string(mode_bits) +
-          " and group size " + std::to_string(mode_group_size) + ", not (" +
-          std::to_string(bits) + ", " + std::to_string(group_size) + ")");
+          " and group size " + std::to_string(mode_group_size) + ", not (" + std::to_string(bits) +
+          ", " + std::to_string(group_size) + ")");
     }
     if (biases) {
       throw std::invalid_argument("ftmetal gather_qmm_sorted: " + mode + " takes no biases");
@@ -221,9 +221,7 @@ void GatherSorted::eval_cpu(const std::vector<mx::array>&, std::vector<mx::array
   throw std::runtime_error("ftmetal gather_sorted: GPU only");
 }
 
-void GatherSorted::eval_gpu(
-    const std::vector<mx::array>& inputs,
-    std::vector<mx::array>& outputs) {
+void GatherSorted::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) {
   // inputs: x, the weight buffers (weight, then scales and biases when quantized, or codes and
   // the pair table over pair-code rows), expert_offsets, expert_bytes.
   int num_buffers = static_cast<int>(inputs.size()) - 3;
@@ -275,8 +273,8 @@ void GatherSorted::eval_gpu(
   }
   bool align_N = (N % tiles.bn) == 0;
   bool align_K = (K % tiles.bk) == 0;
-  std::string hash_name = library_name + "_align_N_" + (align_N ? "t" : "n") + "_align_K_" +
-      (align_K ? "t" : "n");
+  std::string hash_name =
+      library_name + "_align_N_" + (align_N ? "t" : "n") + "_align_K_" + (align_K ? "t" : "n");
   mx::metal::MTLFCList constants = {
       {&align_N, MTL::DataType::DataTypeBool, 201},
       {&align_K, MTL::DataType::DataTypeBool, 202},

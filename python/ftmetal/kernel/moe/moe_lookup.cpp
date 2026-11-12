@@ -20,7 +20,8 @@ void check_array(
     const char* what,
     const char* expected) {
   if (array.dtype() != dtype || array.shape() != shape) {
-    throw std::invalid_argument(std::string("ftmetal moe_lookup: ") + what + " must be " + expected);
+    throw std::invalid_argument(
+        std::string("ftmetal moe_lookup: ") + what + " must be " + expected);
   }
 }
 
@@ -71,7 +72,8 @@ std::vector<mx::array> make_lookup(
   }
   auto stream = mx::to_stream(s);
   mx::Shape slot_map_or_issued_shape = is_issue ? mx::Shape{ISSUED_WORDS} : mx::Shape{num_experts};
-  // The shared tables stay as they are (see kvcache/pool_rows.h); eval_gpu checks they are row contiguous.
+  // The shared tables stay as they are (see kvcache/pool_rows.h); eval_gpu checks they are row
+  // contiguous.
   return mx::array::make_arrays(
       {topk_ids.shape(),
        slot_map_or_issued_shape,
@@ -107,7 +109,16 @@ std::vector<mx::array> moe_lookup(
     MoeLookupKind kind,
     mx::StreamOrDevice s) {
   return make_lookup(
-      topk_ids, moe_step, slot_of, mailbox, last_use, hit_stats, layer_id, slot_base, kind, false,
+      topk_ids,
+      moe_step,
+      slot_of,
+      mailbox,
+      last_use,
+      hit_stats,
+      layer_id,
+      slot_base,
+      kind,
+      false,
       s);
 }
 
