@@ -17,13 +17,14 @@
 # pyright: reportOptionalMemberAccess=false, reportAssignmentType=false
 """Tool-call parsing: one detector per model family's tool-call format, one-shot and streamed.
 
-Port of FreeToken server/function_call_parser.py, verbatim apart from formatting.
+Port of FreeToken server/function_call_parser.py, verbatim apart from formatting and one
+divergence: forwarding unknown tool names is switched by FTMETAL_FORWARD_UNKNOWN_TOOLS (or
+FREETOKEN_FORWARD_UNKNOWN_TOOLS) alone, not by LightLLM's or SGLang's variables.
 """
 
 import ast
 import json
 import logging
-import os
 import re
 from abc import ABC, abstractmethod
 from json import JSONDecodeError, JSONDecoder
@@ -34,6 +35,8 @@ import partial_json_parser
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 from pydantic import BaseModel
+
+from ftmetal.env import read_env
 
 from .api_models import Function, Tool
 from .reasoning_parser import (
@@ -60,16 +63,7 @@ except ModuleNotFoundError:  # FreeToken does not require orjson.
 
 logger = logging.getLogger(__name__)
 _TRUE_ENV_VALUES = {"ON", "TRUE", "1", "YES"}
-_LIGHTLLM_ENABLE_TOOL_NAME_CHECK = os.getenv("LIGHTLLM_ENABLE_TOOL_NAME_CHECK")
-if _LIGHTLLM_ENABLE_TOOL_NAME_CHECK is not None:
-    FORWARD_UNKNOWN_TOOLS = _LIGHTLLM_ENABLE_TOOL_NAME_CHECK.upper() not in _TRUE_ENV_VALUES
-else:
-    FORWARD_UNKNOWN_TOOLS = (
-        os.getenv(
-            "FREETOKEN_FORWARD_UNKNOWN_TOOLS", os.getenv("SGLANG_FORWARD_UNKNOWN_TOOLS", "True")
-        ).upper()
-        in _TRUE_ENV_VALUES
-    )
+FORWARD_UNKNOWN_TOOLS = (read_env("FORWARD_UNKNOWN_TOOLS") or "True").upper() in _TRUE_ENV_VALUES
 
 
 def _should_forward_unknown_tool(name: Any) -> bool:
