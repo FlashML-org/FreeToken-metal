@@ -60,7 +60,8 @@ version = { attr = "ftmetal.version.__version__" }
 where = ["python"]
 
 [tool.setuptools.package-data]
-"ftmetal.kernel" = ["**/*.metal", "**/*.h", "LICENSE-MLX"]
+"ftmetal.kernel" = ["**/*.metal", "**/*.h", "**/*.cpp", "CMakeLists.txt", "LICENSE-MLX"]
+"ftmetal.command_graph" = ["csrc/*"]
 "ftmetal.moe" = ["hot_experts/*.json"]
 
 [tool.ruff]

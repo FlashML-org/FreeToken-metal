@@ -18,7 +18,7 @@ it after any change.
 
 ```bash
 uv sync                                  # creates .venv with the dev group, builds the C++ extensions
-uv sync --reinstall-package ftmetal      # after editing a .cpp or .h (not for .metal)
+uv sync --reinstall-package ftmetal      # after editing a .cpp, .h or .mm (not for .metal)
 uv run pytest tests/ -q
 uv run pre-commit install                # once: run the checks below on every commit
 uv run pre-commit run --all-files        # what CI runs: ruff, clang-format (C++, headers), whitespace
