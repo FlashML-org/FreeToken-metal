@@ -25,6 +25,8 @@ uv run pre-commit run --all-files        # what CI runs: ruff, clang-format (C++
 uvx pyright python tests tools                                 # 0 errors expected
 FTMETAL_TEST_MODEL_PATH=/path/to/Qwen3.6-35B-A3B-MLX uv run pytest tests/models/test_real_checkpoint.py -q
 uv run python tools/aime0_check.py /path/to/Qwen3.6-35B-A3B-MLX   # AIME25 #0 must answer 70
+uv run python -m benchmarks.bench_serving --dataset sharegpt --tokenizer /path/to/model
+                                         # prefill and decode tok/s of a running server
 ```
 
 The extensions `ftmetal.kernel._C` and `ftmetal.command_graph._C` are built by CMake
