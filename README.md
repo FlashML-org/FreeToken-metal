@@ -95,8 +95,7 @@ prefix-cache hit to each `usage`, and `--enable-timings-report` a per-request `t
 (prefill and decode spans and rates; on every streamed chunk with `timings_per_token`).
 `ftm shell` is a client of the chat endpoint: `/think` toggles
 thinking, `/reset` clears the conversation, `/exit` or Ctrl-D quits, Ctrl-C cancels a
-reply. Environment knobs are read as `FTMETAL_<NAME>`, falling back to
-`FREETOKEN_<NAME>`.
+reply. Environment knobs are read as `FTMETAL_<NAME>`.
 
 A MoE checkpoint whose experts do not fit the memory budget, in any format its family loads
 (bf16, MLX affine or float modes, the Hugging Face layout, an NVFP4 or FP8 export), serves

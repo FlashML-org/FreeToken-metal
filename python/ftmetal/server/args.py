@@ -15,7 +15,7 @@ no --moe-cpu-threads, --moe-cpu-layers, --moe-hybrid-max-fetch or --moe-prefill-
 --moe-victim-cache-gib is this engine's own; no --kv-reserve-tokens and no --moe-cache-auto:
 an offload without a cache size and auto's resident check keep the context, --num-token
 (FreeToken's --num-tokens, also --context-length), --max-seq-len or 64K tokens, before the
-experts. --api-key defaults to FTMETAL_API_KEY (FREETOKEN_API_KEY as the fallback).
+experts. --api-key defaults to FTMETAL_API_KEY.
 """
 
 from __future__ import annotations

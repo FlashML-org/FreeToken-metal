@@ -27,7 +27,7 @@ from pydantic import JsonValue
 from tokenizers import Tokenizer
 
 from ftmetal.core import SamplingParams
-from ftmetal.env import ENV_PREFIXES
+from ftmetal.env import ENV_PREFIX
 from ftmetal.message.frontend import BatchFrontendMsg, UserReply
 from ftmetal.message.tokenizer import (
     AbortMsg,
@@ -931,8 +931,7 @@ def test_disable_command_graph_flag_overrides_the_environment(
     env_value: str | None,
     command_graph: bool,
 ) -> None:
-    for prefix in ENV_PREFIXES:
-        monkeypatch.delenv(f"{prefix}COMMAND_GRAPH", raising=False)
+    monkeypatch.delenv(f"{ENV_PREFIX}COMMAND_GRAPH", raising=False)
     if env_value is not None:
         monkeypatch.setenv("FTMETAL_COMMAND_GRAPH", env_value)
     args = parse_args(["--model", str(tiny_model_dir), *flags], prog="ftm serve")

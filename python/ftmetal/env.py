@@ -1,23 +1,18 @@
-"""Environment knobs, read as FTMETAL_<NAME> with a FREETOKEN_<NAME> fallback.
+"""Environment knobs, read as FTMETAL_<NAME>.
 
-Port of FreeToken env.py, reduced to a lookup: the fallback lets both engines share
-one shell environment.
+Port of FreeToken env.py (FREETOKEN_<NAME> there), reduced to a lookup.
 """
 
 from __future__ import annotations
 
 import os
 
-ENV_PREFIXES = ("FTMETAL_", "FREETOKEN_")
+ENV_PREFIX = "FTMETAL_"
 
 
 def read_env(name: str) -> str | None:
-    """The first non-empty FTMETAL_<name> or FREETOKEN_<name>, else None."""
-    for prefix in ENV_PREFIXES:
-        value = os.environ.get(prefix + name)
-        if value:
-            return value
-    return None
+    """FTMETAL_<name>, or None when it is unset or empty."""
+    return os.environ.get(ENV_PREFIX + name) or None
 
 
-__all__ = ["ENV_PREFIXES", "read_env"]
+__all__ = ["ENV_PREFIX", "read_env"]

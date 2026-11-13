@@ -74,8 +74,7 @@ def test_top_k_past_the_vocabulary_keeps_every_token(use_kernel: bool) -> None:
 
 
 def test_env_selects_the_mlx_ops(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in ("FTMETAL_SAMPLE_KERNEL", "FREETOKEN_SAMPLE_KERNEL"):
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("FTMETAL_SAMPLE_KERNEL", raising=False)
     assert Sampler(vocab_size=6).use_kernel
     monkeypatch.setenv("FTMETAL_SAMPLE_KERNEL", "0")
     assert not Sampler(vocab_size=6).use_kernel

@@ -18,8 +18,8 @@
 """Tool-call parsing: one detector per model family's tool-call format, one-shot and streamed.
 
 Port of FreeToken server/function_call_parser.py, verbatim apart from formatting and one
-divergence: forwarding unknown tool names is switched by FTMETAL_FORWARD_UNKNOWN_TOOLS (or
-FREETOKEN_FORWARD_UNKNOWN_TOOLS) alone, not by LightLLM's or SGLang's variables.
+divergence: forwarding unknown tool names is switched by FTMETAL_FORWARD_UNKNOWN_TOOLS alone,
+not by LightLLM's or SGLang's variables.
 """
 
 import ast

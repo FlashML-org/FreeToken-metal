@@ -22,7 +22,7 @@ from fastapi import FastAPI
 from pydantic import JsonValue
 
 from ftmetal.cli import main as ftm_main
-from ftmetal.env import ENV_PREFIXES
+from ftmetal.env import ENV_PREFIX
 from ftmetal.launch import config_files, hermes, openclaw
 from ftmetal.launch import context as launch_context
 from ftmetal.launch import install as launch_install
@@ -122,7 +122,7 @@ def sandbox(
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("PATH", str(bin_dir))
     for name in (
-        *(prefix + variable for prefix in ENV_PREFIXES for variable in ("HOST", "API_KEY")),
+        *(ENV_PREFIX + variable for variable in ("HOST", "API_KEY")),
         *AGENT_ENV,
     ):
         monkeypatch.delenv(name, raising=False)

@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient
 from pydantic import JsonValue
 
 from ftmetal.cli import main as ftm_main
-from ftmetal.env import ENV_PREFIXES
+from ftmetal.env import ENV_PREFIX
 from ftmetal.mm.config import ENCODER_KINDS, EncoderKind, MultimodalConfig
 from ftmetal.server.access_log_filter import PollingAccessLogFilter
 from ftmetal.server.api_server import FrontendManager, create_app
@@ -345,8 +345,8 @@ def test_prepare_stop_answers_loopback_clients_only(
     assert (response.status_code, response.json()) == (403, {"error": "loopback access required"})
 
 
-# (environment variable naming the log directory, None for neither)
-REQUEST_LOG_CASES: list[str | None] = ["FTMETAL_API_LOG_DIR", "FREETOKEN_API_LOG_DIR", None]
+# (environment variable naming the log directory, None to leave it unset)
+REQUEST_LOG_CASES: list[str | None] = ["FTMETAL_API_LOG_DIR", None]
 
 
 @pytest.mark.parametrize("variable", REQUEST_LOG_CASES)
@@ -357,8 +357,7 @@ def test_request_log_writes_one_line_per_dispatched_request(
     tmp_path: Path,
     variable: str | None,
 ) -> None:
-    for prefix in ENV_PREFIXES:
-        monkeypatch.delenv(f"{prefix}API_LOG_DIR", raising=False)
+    monkeypatch.delenv(f"{ENV_PREFIX}API_LOG_DIR", raising=False)
     log_dir = tmp_path / "requests"
     if variable is not None:
         monkeypatch.setenv(variable, str(log_dir))

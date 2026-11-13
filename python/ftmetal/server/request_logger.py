@@ -1,6 +1,6 @@
 """Optional inbound-request logging.
 
-With FTMETAL_API_LOG_DIR (FREETOKEN_API_LOG_DIR as the fallback) set, every request
+With FTMETAL_API_LOG_DIR set, every request
 dispatched to an API handler (/v1/chat/completions, /v1/completions, /v1/messages,
 /v1/messages/count_tokens, /v1/responses, /generate) is appended as one JSON line to a
 per-process requests-<start>-<pid>.jsonl under that directory. Requests that fail body

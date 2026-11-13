@@ -183,7 +183,7 @@ read-before-write that shows only in pool contents is not caught.
 ## 5. How the engine uses it
 
 - **Switch.** On by default. `--disable-command-graph` or `FTMETAL_COMMAND_GRAPH=0`
-  (`FREETOKEN_COMMAND_GRAPH` as the fallback) turns it off; any other value than `0` or `1` raises.
+  turns it off; any other value than `0` or `1` raises.
   The attention backend must declare `BackendInfo(can_capture=True)`. Only `metal` does; with `mlx`,
   decode runs eagerly and the engine logs a warning.
 - **Buckets.** `determine_graph_bs(max_running_req)` gives 1, 2, 4, the multiples of 8 below
