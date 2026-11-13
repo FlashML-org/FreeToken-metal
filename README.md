@@ -1,6 +1,7 @@
 # ftmetal
 
-LLM serving engine for one Apple Silicon Mac: Python + MLX + Metal.
+LLM serving engine for one Apple Silicon Mac, built on [MLX](https://github.com/ml-explore/mlx)
+and Metal, ported from [FreeToken](https://github.com/FlashML-org/FreeToken).
 
 ## Install
 
@@ -116,7 +117,11 @@ changed under is passed over with a warning; `FTMETAL_MOE_PACK=0` ignores it.
 FTMETAL_TEST_MODEL_PATH=/path/to/Qwen3.6-35B-A3B-MLX uv run pytest tests/server tests/test_tokenizer.py -q
 ```
 
+## Acknowledgment
+
+ftmetal is the Apple Silicon port of [FreeToken](https://github.com/FlashML-org/FreeToken) and is
+built on [MLX](https://github.com/ml-explore/mlx).
+
 ## License
 
-Apache-2.0, see [LICENSE](LICENSE). The kernels adapted from MLX and mlx-lm keep their MIT license,
-see [python/ftmetal/kernel/LICENSE-MLX](python/ftmetal/kernel/LICENSE-MLX).
+[Apache License 2.0](LICENSE).
