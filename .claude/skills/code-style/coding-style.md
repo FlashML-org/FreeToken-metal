@@ -218,6 +218,10 @@ speculative generality.
   argparse+yaml / dataclass / env). If none exists, pick the lightest that fits.
   Do not stack config dataclasses,
   YAML loaders, validators, and CLI overrides when argparse + dict would do.
+- Read ftmetal's environment knobs only through `ftmetal.env.read_env("NAME")`, which adds the
+  `FTMETAL_` prefix; never read a `FTMETAL_` variable with `os.environ` or `os.getenv`. Direct
+  `os.environ` is for other programs' variables (agent settings in `launch/`, proxies, a child
+  process's environment) and the test suite's `FTMETAL_TEST_*` paths.
 - Do not ship a YAML file that is "documentation only" and never loaded.
 - Define a constant used by only one module in that module; do not create a
   cross-file import solely for it.
