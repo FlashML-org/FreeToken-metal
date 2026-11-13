@@ -1,7 +1,7 @@
 """Decode tok/s at batch size 1 after prompts of several context depths.
 
-    uv run python tools/bench_decode_depth.py /path/to/Qwen3.6-35B-A3B-MLX \\
-        [--attention-backend metal] [--depths 1024,8192,32768] [--decode-steps 64]
+    uv run python -m benchmarks.e2e.bench_decode_depth /path/to/Qwen3.6-35B-A3B-MLX \\
+        [--attention-backend metal] [--depths 2048,8192,32768] [--decode-steps 64]
 
 The model loads once; each depth then runs one greedy request on a random prompt of
 that many tokens and reports the decode rate over its steps after the warm-up, with

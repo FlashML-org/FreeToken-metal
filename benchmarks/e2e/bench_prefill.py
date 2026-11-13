@@ -1,6 +1,6 @@
 """Prefill tok/s of one request at several prompt depths.
 
-    uv run python tools/bench_prefill.py /path/to/Qwen3.6-35B-A3B-MLX \\
+    uv run python -m benchmarks.e2e.bench_prefill /path/to/Qwen3.6-35B-A3B-MLX \\
         [--depths 2048,8192] [--repeats 3]
 
 The model loads once and a warm-up prompt compiles the kernels; each depth then runs

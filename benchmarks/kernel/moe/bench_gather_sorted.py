@@ -1,8 +1,9 @@
 """MoE prefill's sorted expert gather on a large shared expert bank, three ways, per call.
 
-    uv run python tools/bench_gather_sorted.py [--rows 1024,8192,16384,32768]
+    uv run python -m benchmarks.kernel.moe.bench_gather_sorted [--rows 1024,8192,16384,32768]
         [--banks 5120,10240] [--projections gate_up,down] [--repeats 25]
-    uv run python tools/bench_gather_sorted.py --pair-codes [--models qwen3.6,qwen3.8]
+    uv run python -m benchmarks.kernel.moe.bench_gather_sorted --pair-codes
+        [--models qwen3.6,qwen3.8]
         [--tokens 512,2048,4096] [--projections gate_up,down] [--repeats 25]
 
 Qwen3.6-35B-A3B's expert projections in affine 4-bit, group 64, bf16: gate_up (2048 -> 1024)

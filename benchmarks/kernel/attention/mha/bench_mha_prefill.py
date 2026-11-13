@@ -1,6 +1,7 @@
 """Per-call time of paged flash-attention prefill at the Qwen3.6 (default) or a given shape.
 
-    uv run python tools/bench_mha_prefill.py [--shapes 0:2048,30720:64] [--repeats 5]
+    uv run python -m benchmarks.kernel.attention.mha.bench_mha_prefill [--shapes 0:2048,30720:64]
+        [--repeats 5]
         [--num-heads 16 --num-kv-heads 2 --head-dim 256] [--sliding-window 1024]
         [--mma simdgroup|mpp]
 
@@ -22,12 +23,12 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 from dataclasses import dataclass
 
 import mlx.core as mx
 import numpy as np
 
+from benchmarks.timing import best_seconds_per_call
 from ftmetal.kernel.attention.mha.mha_prefill import (
     MhaPrefillMma,
     default_mma,
@@ -112,16 +113,7 @@ class PrefillCall:
 def time_per_call(call: PrefillCall, use_kernel: bool, q: mx.array, repeats: int) -> float:
     """Best mean seconds per call over repeats of CALLS_PER_RUN calls chained through q."""
     attend = call.kernel if use_kernel else call.sdpa
-    mx.eval(attend(q))
-    best = float("inf")
-    for _ in range(repeats):
-        out = q
-        started = time.perf_counter()
-        for _ in range(CALLS_PER_RUN):
-            out = attend(out)
-        mx.eval(out)
-        best = min(best, (time.perf_counter() - started) / CALLS_PER_RUN)
-    return best
+    return best_seconds_per_call(attend, q, CALLS_PER_RUN, repeats)
 
 
 def main() -> int:

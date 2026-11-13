@@ -1,6 +1,6 @@
 """HTTP serving benchmark: TTFT and decode tok/s against an OpenAI-compatible server.
 
-    uv run python tools/bench_serving.py --base-url http://127.0.0.1:1919 \\
+    uv run python -m benchmarks.bench_serving --base-url http://127.0.0.1:1919 \\
         [--prompt-tokens 2048] [--max-tokens 256] [--concurrency 1] [--rounds 3] [--repeat 1]
 
 Each round sends `concurrency` streaming chat completions at once and reports the

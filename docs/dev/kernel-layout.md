@@ -27,7 +27,7 @@ python/ftmetal/kernel/
     expert/              ExpertService, expert_lru, expert_mailbox, victim_cache
     ple/                 PleService, ple_row_store
 tests/kernel/          the same tree as kernel/
-tools/bench_<name>.py
+benchmarks/kernel/     the same tree as kernel/
 ```
 
 A subdirectory with a `.py` file is a Python package; a format directory that holds only `.metal` files
@@ -47,7 +47,7 @@ directory and share that name:
 | `<name>.h`, `<name>.cpp` | a C++ primitive, only when one is needed (see §6) |
 | `<name>_shared.h` | constants and structs shared by a primitive's C++ and Metal (see §6.3) |
 | `tests/kernel/<directory>/test_<name>.py` | the test |
-| `tools/bench_<name>.py` | the bench |
+| `benchmarks/kernel/<directory>/bench_<name>.py` | the bench |
 
 `_ext.py` hands a C++ primitive's Metal library to `_C.init_<name>_library` to load. Tests compare
 against a pure-MLX reference named `<function>_ref`: one shared by several tests lives in
@@ -160,7 +160,7 @@ same tree, e.g. `tests/kernel/service/expert/test_expert_lru.py`.
    `<name>.cpp`, and add one entry each to `bindings.cpp`, `_C.pyi`, `CMakeLists.txt` and `_ext.py`.
 3. Write the reference (in `ref.py` when several tests share it) and
    `tests/kernel/<directory>/test_<name>.py`.
-4. A kernel with a performance target gets `tools/bench_<name>.py`.
+4. A kernel with a performance target gets `benchmarks/kernel/<directory>/bench_<name>.py`.
 
 ## 8. Rationale
 

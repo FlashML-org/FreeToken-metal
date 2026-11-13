@@ -1,7 +1,8 @@
 """Per-call time of the offload decode's expert gather: affine_gather_qmv_pair_codes on pair-code
 rows against mx.gather_qmm on the scales and biases they stand for.
 
-    uv run python tools/bench_affine_gather_qmv_pair_codes.py [--models qwen3.6,qwen3.8]
+    uv run python -m benchmarks.kernel.moe.affine.bench_affine_gather_qmv_pair_codes
+        [--models qwen3.6,qwen3.8]
         [--projections gate_up,down] [--tokens 1,8,22] [--slots 128] [--bits 4] [--code-bits 13]
 
 The routed expert projections of Qwen3.6-35B-A3B (group 64, top 8) and Qwen3.8-Flash-Next

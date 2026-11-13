@@ -1,8 +1,8 @@
 """GPU time of one offload decode MoE layer's routed experts: the waiting lookup's kernels against
 the split lookup's four.
 
-uv run python tools/bench_affine_glu_pending.py [--models qwen3.6,qwen3.8] [--tokens 1,8,22]
-[--pending 0,2] [--scales plain,pair_codes] [--slots 128]
+uv run python -m benchmarks.kernel.moe.affine.bench_affine_glu_pending [--models qwen3.6,qwen3.8]
+    [--tokens 1,8,22] [--pending 0,2] [--scales plain,pair_codes] [--slots 128]
 
 waiting: moe_lookup, the gate_up gather (mx.gather_qmm, or affine_gather_qmv_pair_codes on pair-code
 rows), the activation, the down gather, (y * weights).sum(-2) and sigmoid_gated_add with the shared

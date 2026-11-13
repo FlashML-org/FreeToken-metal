@@ -24,8 +24,8 @@ from ftmetal.kernel._ext import _C
 # Threadgroups across the batch, four per GPU core on the M4 Pro (20 cores), and no chunk
 # under MIN_CHUNK logits, below which a threadgroup's fixed cost (re-selecting the previous
 # round's bin) outweighs its share of the row. Measured on the M4 Pro
-# (tools/bench_sample_tokens.py): G = 15-25 at bs 1 and 10 at bs 8 are fastest for 152k and
-# 248k vocabularies.
+# (benchmarks/kernel/sample/bench_sample_tokens.py): G = 15-25 at bs 1 and 10 at bs 8 are
+# fastest for 152k and 248k vocabularies.
 TARGET_THREADGROUPS = 80
 MIN_CHUNK = 10240
 # The draw scans the per-chunk masses in one threadgroup (sample_tokens.metal MAX_GROUPS).

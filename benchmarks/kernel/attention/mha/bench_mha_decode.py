@@ -1,6 +1,7 @@
 """Per-call time of paged flash-decode at the Qwen3.6 (default) or a given attention shape.
 
-    uv run python tools/bench_mha_decode.py [--lengths 1024,2048,8192,32768] [--batch-size 1]
+    uv run python -m benchmarks.kernel.attention.mha.bench_mha_decode
+        [--lengths 1024,2048,8192,32768] [--batch-size 1]
         [--num-heads 16 --num-kv-heads 2 --head-dim 256]
 
 One call is one full-attention layer of a decode batch: bf16 q [B, Hq, D] over a
@@ -18,11 +19,11 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 
 import mlx.core as mx
 import numpy as np
 
+from benchmarks.timing import best_seconds_per_call
 from ftmetal.kernel.attention.mha.mha_decode import flash_decode
 
 PAGE_SIZE = 1
@@ -40,18 +41,13 @@ def time_per_call(
 ) -> float:
     """Best mean seconds per call over repeats of CALLS_PER_RUN calls chained through q."""
     scale = q.shape[2] ** -0.5
-    mx.eval(flash_decode(q, k_cache, v_cache, page_table, seq_lens, max_seqlen_k, PAGE_SIZE, scale))
-    best = float("inf")
-    for _ in range(repeats):
-        out = q
-        started = time.perf_counter()
-        for _ in range(CALLS_PER_RUN):
-            out = flash_decode(
-                out, k_cache, v_cache, page_table, seq_lens, max_seqlen_k, PAGE_SIZE, scale
-            )
-        mx.eval(out)
-        best = min(best, (time.perf_counter() - started) / CALLS_PER_RUN)
-    return best
+
+    def decode(previous: mx.array) -> mx.array:
+        return flash_decode(
+            previous, k_cache, v_cache, page_table, seq_lens, max_seqlen_k, PAGE_SIZE, scale
+        )
+
+    return best_seconds_per_call(decode, q, CALLS_PER_RUN, repeats)
 
 
 def main() -> int:

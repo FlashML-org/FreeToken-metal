@@ -1,6 +1,7 @@
 """Per-layer-call time of the chunked gated delta rule at the Qwen3.6 GDN shapes.
 
-    uv run python tools/bench_gdn_chunk.py [--lengths 64,512,2048,8192] [--repeats 5]
+    uv run python -m benchmarks.kernel.attention.gdn.bench_gdn_chunk [--lengths 64,512,2048,8192]
+        [--repeats 5]
 
 One call is one GDN layer of one request: bf16 q, k [1, T, 16, 128], v [1, T, 32, 128],
 fp32 state [1, 32, 128, 128]. Each call waits for the previous one (its gates depend on
