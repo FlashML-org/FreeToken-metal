@@ -30,8 +30,9 @@ uv run python -m benchmarks.bench_serving --dataset sharegpt --tokenizer /path/t
 ```
 
 The extensions `ftmetal.kernel._C` and `ftmetal.command_graph._C` are built by CMake
-against the pinned `mlx` wheel; the Metal kernels under `python/ftmetal/kernel/` (layout in
-`docs/dev/kernel-layout.md`) are compiled at first use.
+against the pinned `mlx` wheel (what they rely on in MLX: `docs/dev/mlx-internals.md`); the
+Metal kernels under `python/ftmetal/kernel/` (layout in `docs/dev/kernel-layout.md`) are
+compiled at first use.
 
 ## Serve and chat
 

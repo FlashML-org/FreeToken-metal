@@ -13,8 +13,8 @@ replay's logits; graphs outgrowing the memory budget's graph reserve fail the st
 a failed capture. Under MoE offload (FreeToken passes the cache to the runner too) the
 banks and slot_of are externals, the lookups' tables are pools and moe_step is the last
 step input (a model's own step lookups bind their buffers as externals too); captures run
-on dummy rows only, so their lookups post nothing; a decode whose experts may not fit the
-cache in one step runs eagerly.
+on dummy rows only, so their lookups post nothing; the scheduler admits no more requests
+than the cache holds in one decode step, so every offload decode replays.
 """
 
 from __future__ import annotations
