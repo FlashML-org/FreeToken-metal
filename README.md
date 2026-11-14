@@ -57,9 +57,7 @@ If you use FreeToken-metal for your research, please cite the FreeToken
 ## Acknowledgment
 
 FreeToken-metal is the Apple Silicon port of [FreeToken](https://github.com/FlashML-org/FreeToken)
-and is built on [MLX](https://github.com/ml-explore/mlx); it reuses code from
-[mlx-lm](https://github.com/ml-explore/mlx-lm), [vLLM](https://github.com/vllm-project/vllm) and
-[LightLLM](https://github.com/ModelTC/lightllm).
+and is built on [MLX](https://github.com/ml-explore/mlx).
 
 ## License
 
