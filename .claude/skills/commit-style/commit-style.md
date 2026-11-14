@@ -46,3 +46,10 @@ build(kernel): pin mlx 0.32.1 and nanobind for the _C extension
   an unrelated lint fix or rename into a feature commit.
 - Never `git push`, open or comment on PRs, or create issues on the user's behalf.
 - Report test results as they are in the conversation, never in the commit message.
+
+## Releases
+
+A release is one commit that only changes `python/ftmetal/version.py`, subject
+`build: release X.Y.Z`, tagged `vX.Y.Z` (the first release tags the commit that already says
+0.0.1). The wheels that go to PyPI are built from a clean checkout of that tag with
+`scripts/build-wheels.sh --release`, which refuses anything else; no sdist is published.
