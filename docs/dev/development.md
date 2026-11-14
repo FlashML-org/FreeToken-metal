@@ -32,7 +32,7 @@ Python and `.metal` changes take effect on the next run. After changing a `.cpp`
 file, rebuild the extensions:
 
 ```bash
-uv sync --reinstall-package ftmetal
+uv sync --reinstall-package freetoken-metal
 ```
 
 Add dependencies with `uv add`, never with `pip`.

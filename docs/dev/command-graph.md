@@ -326,7 +326,7 @@ uv run pytest tests/ -q -k "replay or captur or graph"                 # every r
 FTMETAL_TEST_MODEL_PATH=/path/to/model uv run pytest tests/models/test_real_checkpoint.py -q
 uv run python tools/command_graph_m1.py /path/to/Qwen3.6-35B-A3B \
     [--context 2048] [--steps 18] [--timing-steps 64] [--attention-backend metal] [--page-size 1]
-uv sync --reinstall-package ftmetal                                    # after editing csrc/
+uv sync --reinstall-package freetoken-metal                            # after editing csrc/
 ```
 
 | test | covers |

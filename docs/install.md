@@ -23,4 +23,4 @@ uv sync
 uv run ftm --version
 ```
 
-After editing a `.cpp`, `.h` or `.mm` file, rebuild with `uv sync --reinstall-package ftmetal`.
+After editing a `.cpp`, `.h` or `.mm` file, rebuild with `uv sync --reinstall-package freetoken-metal`.

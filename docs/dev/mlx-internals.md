@@ -27,7 +27,7 @@ after a build: `strings` on mlx's `core` module and on both `_C` extensions show
 1. Read the release notes and the diff of `mlx/backend/metal/device.{h,cpp}`, of the inlined
    kernel headers, of `steel/gemm/params.h` (`command_graph.mm` hardcodes the 72 and 68 bytes of
    `GEMMParams`), and of the files the adapted kernels cite.
-2. Move the three pins (and `nanobind` with mlx's), then `uv sync --reinstall-package ftmetal`.
+2. Move the three pins (and `nanobind` with mlx's), then `uv sync --reinstall-package freetoken-metal`.
 3. A compile error in `command_graph.mm` means a private member changed: re-read how it is used
    before renaming anything.
 4. Update the version and line numbers in the adapted kernels' headers and the version named in

@@ -66,7 +66,7 @@ def test_version_is_the_installed_package_version(
 ) -> None:
     assert ftm_main([flag]) == 0
     assert capsys.readouterr().out == f"ftmetal version {__version__}\n"
-    assert version("ftmetal") == __version__
+    assert version("freetoken-metal") == __version__
 
 
 def test_health_follows_the_engine_lifecycle(

@@ -51,7 +51,7 @@ env -u DEBUG "$UV" build --wheel --python "$PY_VERSION" --out-dir "$WHEEL_DIR"
 # Only now: a build that fails above leaves the previous install working.
 say "installing into $VENV ..."
 "$UV" venv "$VENV" --python "$PY_VERSION" --clear
-"$UV" pip install --python "$VENV" "$WHEEL_DIR"/ftmetal-*.whl
+"$UV" pip install --python "$VENV" "$WHEEL_DIR"/freetoken_metal-*.whl
 
 mkdir -p "$BIN_DIR"
 ln -sf "$VENV/bin/ftm" "$BIN_DIR/ftm"
