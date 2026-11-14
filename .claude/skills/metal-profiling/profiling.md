@@ -152,10 +152,10 @@ bad and the cause is unknown.
    line: ALU, memory, control flow, synchronization), Shader Cost Graph. A trace replays only on
    the same GPU and OS version.
 6. Compiler view. A C++ primitive's `.metal` is a whole library, usually with `{{KEY}}` markers its
-   `.cpp` fills; a `metal_kernel`'s holds only the function body (`docs/dev/kernel-layout.md` §2)
-   and compiles only through MLX: call the kernel with `verbose=True` to print the source MLX
-   compiles. Substitute every key first (`grep -o '{{[A-Z_]*}}' k.metal | sort -u`; MSL spells
-   bf16 `bfloat`) and pass the include roots:
+   `.cpp` fills; a `metal_kernel`'s holds only the function body (`docs/dev/kernel-layout.md`, "The
+   files of one kernel") and compiles only through MLX: call the kernel with `verbose=True` to print
+   the source MLX compiles. Substitute every key first (`grep -o '{{[A-Z_]*}}' k.metal | sort -u`;
+   MSL spells bf16 `bfloat`) and pass the include roots:
 
    ```bash
    I="-I python/ftmetal/kernel -I $(echo .venv/lib/python3.*/site-packages/mlx/include)"
