@@ -65,8 +65,9 @@ FTMETAL_TEST_MODEL_PATH=/path/to/Qwen3.6-35B-A3B-MLX uv run pytest tests/ -q  # 
 uv run python tools/aime0_check.py /path/to/Qwen3.6-35B-A3B-MLX   # AIME25 #0 must answer 70
 ```
 
-[AGENTS.md](AGENTS.md) holds the repository's rules: the environment, coding style, kernel
-layout, model packages and parallel work. Before changing the areas below, read:
+The [development guide](docs/dev/development.md) and
+[coding style](.claude/skills/code-style/coding-style.md) apply to every change. Before changing
+the areas below, read:
 
 - `python/ftmetal/kernel/`: [docs/dev/kernel-layout.md](docs/dev/kernel-layout.md).
 - A kernel, C++ primitive, model layer or attention backend that runs in a decode step:
