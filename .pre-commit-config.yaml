@@ -15,4 +15,4 @@ repos:
       - id: clang-format
         # Not .metal: most are metal_kernel bodies, which are not translation units, and the
         # {{NAME}} markers of the rest do not survive formatting. MLX formats only .h and .cpp too.
-        files: \.(h|cpp|mm)$
+        files: \.(h|cpp|mm|m)$
