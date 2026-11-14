@@ -1,5 +1,5 @@
 // BLOCKS_PER_SIMDGROUP consecutive blocks of one request per simdgroup and step, the grid capped
-// at SCORE_THREADGROUPS per request (PR #3's qsa_block_scores_multi): a wide page table (a
+// at SCORE_THREADGROUPS per request: a wide page table (a
 // replayed step's) loops instead of launching a threadgroup per 32 blocks, most of them past the
 // request's complete blocks. Each block's score: the sum over the index heads of relu(q . k) /
 // sqrt(D) in fp32, -inf past the complete blocks.

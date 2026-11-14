@@ -25,7 +25,7 @@ SCORE_SIMDGROUPS = 8
 # Each simdgroup scores this many consecutive blocks: their page-table and key loads issue
 # together and the queries are read once.
 BLOCKS_PER_SIMDGROUP = 4
-# Score threadgroups per request at most (eight per M4 Pro GPU core; PR #3's SCORE_THREADGROUPS):
+# Score threadgroups per request at most (eight per M4 Pro GPU core):
 # wider rows loop.
 SCORE_THREADGROUPS = 160
 # One threadgroup per request, the largest Metal allows.

@@ -356,7 +356,7 @@ ExpertService::~ExpertService() {
 void ExpertService::keep_ssd_awake(int64_t interval_us) {
   // While the coordinator is hot, a 16 KiB read of an expert file, then interval_us asleep:
   // after >= 0.5 ms idle the SSD answers a read ~0.05 ms slower, and decode's misses come one
-  // layer at a time with idle gaps between them (PR #3's 9981c36).
+  // layer at a time with idle gaps between them.
   const int64_t read_bytes = 16384;
   std::vector<std::pair<int, int64_t>> files;
   for (int descriptor : file_descriptors_) {

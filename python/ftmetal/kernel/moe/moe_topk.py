@@ -3,7 +3,7 @@ renormalization.
 
 One simdgroup per token row on mx.fast.metal_kernel; replaces the softmax or sigmoid,
 argpartition, take_along_axis, sum and divide dispatches of the ops path (kernel/ref.py). The
-selection runs on per-lane registers (PR #3's kernel/router.py router_topk_registers): no
+selection runs on per-lane registers: no
 threadgroup memory or barrier on its serial path.
 """
 

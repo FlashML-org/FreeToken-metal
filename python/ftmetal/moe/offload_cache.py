@@ -18,7 +18,7 @@ like an attention backend's metadata: a decode, or a prefill below prefill_overl
 looks its experts up (a copy-miss prefill: its misses join the LRU, where FreeToken's prefill
 streams whole layers); a longer prefill reads each layer's absent experts into a prefill buffer
 ahead of its routing, the most often routed first, drops the reads its routing does not need
-once that is on the host, and starts the next layer's then (PR #3's route-drop). No slot a step
+once that is on the host, and starts the next layer's then. No slot a step
 reads may be rewritten within the step, since the GPU caches may keep its old row: a decode's
 rows are capped so that each pool holds its layers' experts of the whole decode at once
 (FreeToken caps per layer), one step as a graph replay must, and a copy-miss prefill whose
@@ -58,12 +58,12 @@ STAGING_BYTES = IO_THREADS * _C.EXPERT_STAGING_BYTES
 MAX_STEP = 2**31 - 1
 # A pool's spare slots for deferred victim stores (ExpertService): a decode lookup's victim hit
 # that evicts a resident takes a spare, and the evicted expert is stored once the lookup is
-# answered, so the GPU waits for one copy instead of two (PR #3's 4). Only in pools far larger
+# answered, so the GPU waits for one copy instead of two. Only in pools far larger
 # than one step's experts: the scheduler's cap on a step's rows counts every slot of a pool. 1024:
 # four steps of Gemma4 26B's 240 experts, whose whole model is 3840.
 DEFERRED_STORE_SPARES = 4
 DEFERRED_STORE_MIN_POOL_SLOTS = 1024
-# --moe-cache-policy lrfu's half-life in steps (PR #3's): an expert a conversation keeps coming
+# --moe-cache-policy lrfu's half-life in steps: an expert a conversation keeps coming
 # back to outlasts one-off ones; longer ones lost long replies there, whose new working set they
 # evicted while earlier turns' frequent experts held their slots.
 LRFU_HALF_LIFE = 20.0
@@ -72,16 +72,16 @@ VICTIM_MEMORY = {
     "reserved": _C.VictimMemory.ANONYMOUS,
 }
 # An overlap prefill reads each layer's absent experts ahead of its routing, the most often
-# routed first: each layer's routed rate, decayed by this at each of its prefill routings (PR #3's
-# 0.75), orders them, so that the reads its routing then drops (route_prefill_layer) are the
+# routed first: each layer's routed rate, decayed by this at each of its prefill routings,
+# orders them, so that the reads its routing then drops (route_prefill_layer) are the
 # queue's tail.
 PREFILL_ROUTED_DECAY = 0.75
 # With a prediction of its routing (the next layer's router on this layer's MoE input:
 # set_routers), a layer reads ahead only its absent predicted experts, the predicted at least this
-# many (PR #3's 48); the rest wait for its routing, so that the reads it drops never begin.
+# many; the rest wait for its routing, so that the reads it drops never begin.
 PREFILL_READS_AHEAD = 48
 # An overlap prefill of fewer tokens computes each layer's routed experts that lie in slots while
-# its absent ones are read (FTMETAL_MOE_RESIDENT_FIRST_TOKENS, 0: never; PR #3's 3072): less GPU
+# its absent ones are read (FTMETAL_MOE_RESIDENT_FIRST_TOKENS, 0: never): less GPU
 # work is left after the reads, so the next layer's routing lands sooner and drops more of its
 # reads. A longer one's MoE outlasts its reads anyway. Only when each pair runs changes.
 RESIDENT_FIRST_TOKENS = 3072

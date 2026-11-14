@@ -1,4 +1,4 @@
-// One threadgroup of THREADS per request (PR #3's qsa_topk_bisect): the topk-th largest of the
+// One threadgroup of THREADS per request: the topk-th largest of the
 // complete blocks' order-preserving uint keys from a 4096-bin histogram of their high 12 bits,
 // then a bisection of the low 20 bits over the threshold bin's keys (gathered in threadgroup
 // memory, or re-read when more than 4096 share the bin): three passes over the row. The blocks

@@ -15,8 +15,8 @@
 // on any MLX upgrade, the bit-exact tests against mx.gather_qmm are the guard.
 //
 // qmv_rows' last part-block on half the lanes or less (Qwen3.8's down, K 640: 128 values on lanes
-// 0-15) leaves the other half idle; with QMV_HALF_REM (kernel/_ext.py's switch, PR #3's
-// down_combine_gated half_rem) lane l + 16 computes the upper half of the rows on lane l's values
+// 0-15) leaves the other half idle; with QMV_HALF_REM (kernel/_ext.py's switch)
+// lane l + 16 computes the upper half of the rows on lane l's values
 // and hands them down: every lane adds the same products in the same order.
 #pragma once
 

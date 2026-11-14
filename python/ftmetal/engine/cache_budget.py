@@ -52,7 +52,7 @@ GRAPH_FIXED_BYTES = 4 << 20
 GRAPH_BYTES_PER_ROW = 5 << 18
 # Host memory beyond Metal's working set that an auto victim cache leaves the system. On the
 # 48 GB M4 Pro (10.56 GiB beyond it) the 4.56 GiB this leaves the cache ran the 2026-11-02
-# victim cache A/B (single-turn cells, agentic replay) without swap and nearly no purges; PR #3's
+# victim cache A/B (single-turn cells, agentic replay) without swap and nearly no purges; an
 # unpinned victim sweep on that box reached free ~0.1 GiB at 6 GiB and swap at 7.
 VICTIM_CACHE_HOST_RESERVE_BYTES = 6 * GIB
 # Each pool's budget line; the only LINEAR pool so far holds GDN state.
