@@ -44,6 +44,11 @@ decode step, read [docs/dev/command-graph.md](docs/dev/command-graph.md).
 Before measuring performance or reporting numbers, read and follow
 [.claude/skills/benchmark/benchmark.md](.claude/skills/benchmark/benchmark.md).
 
+## Profiling
+
+Before profiling GPU work (per-kernel time, timelines, counters, GPU traces), read and follow
+[.claude/skills/metal-profiling/profiling.md](.claude/skills/metal-profiling/profiling.md).
+
 ## Commit style guidelines
 
 Before writing a commit message, read and follow

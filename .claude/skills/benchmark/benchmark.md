@@ -64,8 +64,8 @@ uv run python -m benchmarks.kernel.sample.bench_sample_tokens
   fraction of the measured ceiling (DRAM bandwidth for decode kernels, matrix throughput for
   prefill GEMMs, each measured once per machine with a large streaming copy and a large bf16
   matmul); and the worst relative error against the reference (`kernel/ref.py`).
-- To see why a kernel is slow (per-kernel GPU time, occupancy, counters), profile it with Xcode
-  Instruments (Metal System Trace, GPU counters) or a Metal GPU capture.
+- To see why a kernel is slow (per-kernel GPU time, occupancy, counters), profile it with the
+  tools in `tools/profiling/`, as `.claude/skills/metal-profiling/profiling.md` describes.
 
 ## 4. End-to-end benches
 

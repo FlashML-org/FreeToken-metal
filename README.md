@@ -32,6 +32,8 @@ uv run python -m benchmarks.bench_serving --dataset sharegpt --tokenizer /path/t
 
 Benchmarks live in `benchmarks/` (kernel micro benches, in-process end-to-end benches and the
 serving bench); how to run them and report results is in `.claude/skills/benchmark/benchmark.md`.
+Profiling tools (per-kernel GPU time, timelines, hardware counters) live in `tools/profiling/`;
+how to use them is in `.claude/skills/metal-profiling/profiling.md`.
 
 The extensions `ftmetal.kernel._C` and `ftmetal.command_graph._C` are built by CMake
 against the pinned `mlx` wheel (what they rely on in MLX: `docs/dev/mlx-internals.md`); the
