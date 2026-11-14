@@ -2,7 +2,7 @@
 #
 # ftmetal installer (macOS on Apple Silicon), from this source checkout: the pinned uv, a venv with
 # ftmetal built from the current sources and without the dev group, and `ftm` linked onto PATH.
-# Rerun after any source change. Development uses `uv sync` instead, see README.md.
+# Rerun after any source change. Development uses `uv sync` instead, see CONTRIBUTING.md.
 #
 # Configurable via environment, absolute paths only:
 #   FTMETAL_HOME      install root (default: ~/.ftmetal); uv at bin/uv, wheel at wheel/, venv at venv/
