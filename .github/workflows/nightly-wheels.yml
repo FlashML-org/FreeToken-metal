@@ -1,0 +1,89 @@
+name: Nightly wheels
+
+# Builds main's development wheel for Python 3.13 (scripts/build-wheels.sh) and publishes it to
+# this repository's rolling `nightly` prerelease (scripts/publish-nightly.sh). Skips a day when
+# main has not moved since the last publish.
+on:
+  schedule:
+    - cron: "0 11 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build even if this commit is already published"
+        type: boolean
+        default: false
+
+concurrency:
+  group: nightly-wheels
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check
+    # Only main of this repository is published; a manual run from another branch or a fork stops
+    # here.
+    if: github.repository == 'FlashML-org/FreeToken-metal' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      build: ${{ steps.compare.outputs.build }}
+    steps:
+      - id: compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          published=""
+          if sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/nightly" --jq .object.sha)"; then
+            published="$sha"
+          fi
+          if [ "$FORCE" = true ] || [ "$published" != "$GITHUB_SHA" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "nightly is already at $GITHUB_SHA"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.13.7"
+      - run: scripts/build-wheels.sh --python 3.13 --out-dir dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nightly-wheels
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nightly-wheels
+          path: dist
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          NIGHTLY_COMMIT: ${{ github.sha }}
+        run: scripts/publish-nightly.sh dist
