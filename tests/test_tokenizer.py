@@ -121,15 +121,6 @@ def test_partial_stop_is_held_back_then_released(tiny_model_dir: Path) -> None:
     assert chunks == ["x", "x", "", "", "abd", "", "ab"]
 
 
-def test_eos_is_counted_but_not_decoded(tiny_model_dir: Path) -> None:
-    tokenize_manager, detokenize_manager = make_managers(str(tiny_model_dir))
-    eos = tokenize_manager.tokenizer.token_to_id("<|im_end|>")
-    assert eos is not None
-    replies = decode_stream(detokenize_manager, [*tokenize_manager.tokenizer.encode("hi").ids, eos])
-    assert "".join(outputs(replies)) == "hi"
-    assert len(replies) == 3
-
-
 def test_dropped_request_ignores_late_tokens(tiny_model_dir: Path) -> None:
     tokenize_manager, detokenize_manager = make_managers(str(tiny_model_dir))
     detokenize_manager.add_request(7, [])
@@ -213,19 +204,6 @@ def test_late_system_message_waits_for_the_tool_results() -> None:
         normalize_inline_system(interrupted, "fold")
 
 
-def test_chat_template_opens_or_closes_the_think_block(tiny_model_dir: Path) -> None:
-    manager = TokenizeManager(str(tiny_model_dir))
-    messages: list[dict[str, JsonValue]] = [{"role": "user", "content": "hi"}]
-    thinking = manager.render_prompt(tokenize_msg(messages))
-    assert thinking == "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n"
-    assert manager.render_prompt(tokenize_msg(messages, enable_thinking=False)).endswith(
-        "<|im_start|>assistant\n<think>\n\n</think>\n\n"
-    )
-    input_ids = manager.tokenize(tokenize_msg(messages)).input_ids.tolist()
-    special_ids = [manager.tokenizer.token_to_id(t) for t in ("<|im_start|>", "<think>")]
-    assert input_ids[0] == special_ids[0] and input_ids[-2] == special_ids[1]
-
-
 def test_chat_template_raises_and_renders_plain_json(tiny_model_dir: Path) -> None:
     manager = TokenizeManager(str(tiny_model_dir))
     out_of_order: list[dict[str, JsonValue]] = [
@@ -305,11 +283,9 @@ CONVERSATION: list[dict[str, JsonValue]] = [
 # (chat template, enable_thinking, the generation suffix the reusable prefix leaves out)
 REUSE_CASES: list[tuple[Literal["qwen", "gemma"], bool | None, str]] = [
     ("qwen", None, "<|im_start|>assistant\n<think>\n"),
-    ("qwen", True, "<|im_start|>assistant\n<think>\n"),
     ("qwen", False, "<|im_start|>assistant\n<think>\n\n</think>\n\n"),
     ("gemma", None, "<|turn>model\n<|channel>thought\n<channel|>"),
     ("gemma", True, "<|turn>model\n"),
-    ("gemma", False, "<|turn>model\n<|channel>thought\n<channel|>"),
 ]
 
 

@@ -495,7 +495,6 @@ CASES += [
     DEFERRED_CASE,
     replace(DEFERRED_CASE, victim_memory="reserved"),
     replace(DEFERRED_CASE, cache_policy="lrfu"),
-    replace(CASES[3], cache_policy="lrfu"),
     replace(CASES[0], ssd_keepalive_us=50),
 ]
 

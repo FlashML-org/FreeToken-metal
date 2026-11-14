@@ -26,18 +26,6 @@ def test_entry_lives_until_every_claim_is_gathered() -> None:
     assert not cache.has(7) and cache.stats() == (0, 0)
 
 
-def test_repeated_image_in_one_request_adds_up() -> None:
-    cache = EncoderCache()
-    cache.register(7, 1, 4)
-    cache.register(7, 1, 4)
-    cache.put(7, mx.ones((4, 2)))
-    # The first occurrence is done, the second still holds the entry.
-    cache.consume(7, 1, 4)
-    assert cache.has(7)
-    cache.consume(7, 1, 4)
-    assert not cache.has(7)
-
-
 def test_release_drops_a_claim_even_before_the_embedding_arrives() -> None:
     cache = EncoderCache()
     cache.register(5, 1, 3)

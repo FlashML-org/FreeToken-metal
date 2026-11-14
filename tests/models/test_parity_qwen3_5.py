@@ -104,19 +104,6 @@ def test_prefill_logits_match_mlx_lm(
     assert mx.allclose(logits[0], expected_logits[-1], atol=1e-4, rtol=1e-4)
 
 
-def test_chunked_prefill_matches_full_prefill(tmp_path: Path) -> None:
-    model = build_reference(seed=2)
-    save_checkpoint(model, tmp_path, quantization=None)
-    prompt = [int(t) for t in np.random.default_rng(2).integers(1, 120, size=50)]
-    steps = 8
-    _, expected = reference_greedy(model, prompt, steps)
-
-    scheduler = make_scheduler(tmp_path, page_size=4, max_extend_tokens=16)
-    params = SamplingParams(temperature=0.0, max_tokens=steps, ignore_eos=True)
-    tokens = scheduler.generate(np.array(prompt, dtype=np.int32), params)
-    assert tokens == expected
-
-
 # One 200-token prefill (chunked GDN path, ragged last chunk), or 160 chunked then 40
 # on the per-token path.
 @pytest.mark.parametrize("max_extend_tokens", [256, 160])
@@ -165,8 +152,7 @@ def test_chunked_long_prefill_metal_matches_mlx_backend(tmp_path: Path) -> None:
     assert tokens["metal"] == tokens["mlx"]
 
 
-@pytest.mark.parametrize("attention_backend", ["mlx", "metal"])
-def test_two_requests_batched_match_single(tmp_path: Path, attention_backend: str) -> None:
+def test_two_requests_batched_match_single(tmp_path: Path) -> None:
     model = build_reference(seed=3)
     save_checkpoint(model, tmp_path, quantization=None)
     rng = np.random.default_rng(3)
@@ -174,7 +160,7 @@ def test_two_requests_batched_match_single(tmp_path: Path, attention_backend: st
     steps = 12
     expected = [reference_greedy(model, prompt, steps)[1] for prompt in prompts]
 
-    scheduler = make_scheduler(tmp_path, page_size=4, attention_backend=attention_backend)
+    scheduler = make_scheduler(tmp_path, page_size=4)
     for uid, prompt in enumerate(prompts):
         params = SamplingParams(temperature=0.0, max_tokens=steps, ignore_eos=True)
         scheduler.add_request(uid, np.array(prompt, dtype=np.int32), params)

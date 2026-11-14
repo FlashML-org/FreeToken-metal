@@ -6,7 +6,7 @@ and values, so reading one shows up in the output. Decode runs flash-decode, who
 numeric test this is: the decode cases cover each decode plan (head groups and
 simdgroups per head dim and dtype) and partition regime once. Prefill runs flash-prefill
 (its numeric cases are in kernel/attention/mha/test_mha_prefill.py) on the backend's metadata,
-one batch of unequal requests or one long prompt chunk by chunk. Replay metadata (a page table
+unequal requests and a long prompt's chunks. Replay metadata (a page table
 as wide as the longest context, so flash-decode's grid holds the most partitions) must give the
 per-length metadata's results. Sliding-window attention runs on a window pool whose slots
 back only the keys a step's windows reach; every other full slot maps to the sentinel,
@@ -46,9 +46,6 @@ TOLERANCE = {mx.bfloat16: 2**-7, mx.float32: 1e-5}
 # probabilities to bf16, which alone costs up to ~2 ulps (1.7e-2 measured against the fp32
 # reference, where flash-prefill stays within one ulp).
 PREFILL_MLX_TOLERANCE = {mx.bfloat16: 2**-5, mx.float32: 2e-5}
-# One prompt prefilled in chunks of at most PREFILL_CHUNK tokens.
-CHUNKED_PROMPT_LEN = 5000
-PREFILL_CHUNK = 2048
 # A replayed graph's page-table width (the engine's default context), and its batches:
 # keys per request and the dummy rows that pad the batch to its graph's size.
 REPLAY_MAX_SEQ_LEN = 262144
@@ -123,11 +120,15 @@ FULL_CASES = [
     Case(*SHORT_MIX, 512),
     Case(*ONE_LONG, 512, dtype=mx.float32),
     Case(*EIGHT, 512, num_heads=8, num_kv_heads=1),
-    # Prefill: one prompt, a short turn, unequal requests, a long chunk beside a long prefix.
+    # Prefill: one prompt, a short turn, unequal requests, a long chunk beside a long prefix,
+    # and a 5000-token prompt's 2048-token chunks.
     Case((0,), (37,), 128),
     Case((300,), (2,), 256, dtype=mx.float32),
     Case((0, 2049, 7), (100, 33, 1), 256),
     Case((5000, 0), (64, 2048), 512),
+    Case((0,), (2048,), 256),
+    Case((2048,), (2048,), 256),
+    Case((4096,), (904,), 256),
     # Learned sinks at Flint's shape (Hq 32, Hkv 4, D 128): one key, long rows, a long prompt.
     Case(*decode_lens((1,)), 128, num_heads=32, num_kv_heads=4, has_sinks=True),
     Case(*EIGHT, 128, num_heads=32, num_kv_heads=4, has_sinks=True),
@@ -349,48 +350,6 @@ def test_replay_metadata_matches_reference_and_eager(seq_lens: list[int], num_du
     if num_dummies == 0:
         # Same batch size, so each request gets the same partitions under either grid.
         assert mx.array_equal(replayed, eager)
-
-
-def test_chunked_prefill_matches_reference_and_mlx_backend() -> None:
-    num_heads, num_kv_heads, head_dim = 16, 2, 256
-    config = attention_config(num_heads, num_kv_heads, head_dim)
-    mx.random.seed(CHUNKED_PROMPT_LEN)
-    kv_cache, page_table, _ = filled_pool(
-        [CHUNKED_PROMPT_LEN], num_kv_heads, head_dim, mx.bfloat16, CHUNKED_PROMPT_LEN + PAGE_SIZE
-    )
-    (spec,) = config.kv_cache_group_specs()
-    metal_backend = FullAttnMetalBackend(config, spec, kv_cache, page_table, PAGE_SIZE)
-    mlx_backend = FullAttnMLXBackend(config, spec, kv_cache, page_table, PAGE_SIZE)
-    for start in range(0, CHUNKED_PROMPT_LEN, PREFILL_CHUNK):
-        stop = min(CHUNKED_PROMPT_LEN, start + PREFILL_CHUNK)
-        # Each chunk attends over the keys the chunks before it stored.
-        req = Req(
-            input_ids=np.zeros(stop, dtype=np.int32),
-            table_idx=0,
-            cached_len=start,
-            output_len=1,
-            uid=0,
-            sampling_params=SamplingParams(),
-        )
-        batch = Batch(reqs=[req], phase="prefill")
-        metal_backend.prepare_metadata(batch)
-        metadata = batch.attn_metadata[AttnType.FULL]
-        assert isinstance(metadata, MetalAttnMetadata)
-        q, k, v = new_tokens(stop - start, num_heads, num_kv_heads, head_dim, mx.bfloat16)
-        out = metal_backend.forward(q, k, v, 0, batch)
-        expected = mlx_backend.forward(q, k, v, 0, batch)
-        reference = flash_prefill_ref(
-            q,
-            kv_cache.k_cache(0),
-            kv_cache.v_cache(0),
-            metadata.page_table,
-            [stop - start],
-            [start],
-            PAGE_SIZE,
-            config.head_dim**-0.5,
-        )
-        assert max_row_error(out, reference) < TOLERANCE[mx.bfloat16]
-        assert max_row_error(out, expected) < PREFILL_MLX_TOLERANCE[mx.bfloat16]
 
 
 def window_pool(

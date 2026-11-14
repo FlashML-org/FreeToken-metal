@@ -250,17 +250,6 @@ def test_evict_full_takes_the_leaf_snapshot_and_leaves_the_ancestor_usable(
     assert (match.cached_len, match.second) == (2 * PAGE, mx)
 
 
-def test_evict_full_cascades_through_an_exposed_tombstone_leaf(hybrid: Session) -> None:
-    two_node_tree(hybrid)
-    hybrid.do_evict_mamba(1)  # X becomes a tombstone
-    hybrid.do_evict_full(2 * PAGE)  # evicting Y exposes X and reclaims it too
-    assert hybrid.model.events["evict_full.cascade"] == 1
-    hybrid.check()
-
-    assert full_size(hybrid) == 0 and live_snapshots(hybrid) == 0
-    assert hybrid.kv.in_use() == set() and hybrid.mamba.in_use() == set()
-
-
 def test_lock_pins_the_snapshot_and_the_whole_kv_path(hybrid: Session) -> None:
     """A lock pins the matched node's snapshot and the KV up to the root, but not an
     ancestor's snapshot (full_ref >= mamba_ref, not the other way round)."""

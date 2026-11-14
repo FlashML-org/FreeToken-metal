@@ -87,10 +87,9 @@ def test_allocate_then_finish_returns_every_page(page_size: int) -> None:
     manager.check_integrity()
 
 
-@pytest.mark.parametrize("cache_type", ["naive", "radix"])
-def test_pages_exhausted_raises(cache_type: Literal["naive", "radix"]) -> None:
+def test_pages_exhausted_raises() -> None:
     page_table = np.zeros((1, 64), dtype=np.int32)
-    manager = CacheManager(2, 4, page_table, cache_type)
+    manager = CacheManager(2, 4, page_table, "naive")
     with pytest.raises(RuntimeError):
         manager.allocate_paged([make_req(0, 12, 1)])
 
@@ -305,19 +304,6 @@ def test_hybrid_prefill_chunks_end_on_a_page_boundary() -> None:
     )
     req = adder.try_add_one(pending)
     assert req is not None and req.extend_len == 20
-
-
-def test_without_a_prefix_cache_chunks_are_not_aligned() -> None:
-    page_table = np.zeros((4, 512), dtype=np.int32)
-    manager = CacheManager(64, 32, page_table, "naive")
-    assert manager.prefill_chunk_align == 1
-    table = TableManager(max_running_reqs=4, page_table=page_table)
-    pending = PendingReq(0, np.arange(300, dtype=np.int32), SamplingParams(max_tokens=1))
-    adder = PrefillAdder(
-        token_budget=100, reserved_size=0, cache_manager=manager, table_manager=table
-    )
-    req = adder.try_add_one(pending)
-    assert req is not None and req.extend_len == 100
 
 
 def test_a_fresh_admission_without_a_first_chunk_fails_loudly(

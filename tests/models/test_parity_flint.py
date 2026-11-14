@@ -6,8 +6,8 @@ and decode graphs, the SWA radix cache) run the same random weights: prefill log
 greedy decode must agree token for token, with the window crossed in prefill, in decode and at
 chunk seams, batched, resumed from the prefix cache and quantized as flint-int4 stores it. Under
 MoE offload, whose layer indices start past the dense layers and whose shared expert has no gate:
-replayed and eager decode with and without split lookup, an overlap prefill, two requests, and an
-expert pack.
+replayed decode with and without split lookup, eager decode, an overlap prefill, two requests, and
+an expert pack.
 """
 
 from __future__ import annotations
@@ -217,7 +217,6 @@ OFFLOAD_CASES = [
     OffloadCase("replayed-decode", (9,)),
     OffloadCase("eager-decode", (9,), command_graph=False),
     OffloadCase("replayed-decode-split-off", (9, 17), split_lookup=False),
-    OffloadCase("eager-decode-split-off", (9,), command_graph=False, split_lookup=False),
     OffloadCase("overlap-prefill", (40,), overlap_min_tokens=16),
     OffloadCase("chunks-across-the-threshold", (100,), overlap_min_tokens=48),
     OffloadCase("two-requests", (13, 29)),

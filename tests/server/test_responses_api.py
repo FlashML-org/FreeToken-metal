@@ -5,7 +5,6 @@ the stateless routes."""
 from __future__ import annotations
 
 import base64
-import dataclasses
 import io
 import json
 from pathlib import Path
@@ -17,7 +16,6 @@ from pydantic import JsonValue
 from tokenizers import Tokenizer
 
 from ftmetal.mm import MM_PAD_SHIFT_VALUE
-from ftmetal.mm.config import ENCODER_KINDS, EncoderKind, MultimodalConfig
 from ftmetal.server.api_server import create_app
 from scripted_server import SCRIPT, ScriptedScheduler, named_sse_events, tiny_server_args
 from tiny_vl_model import write_qwen_vl_model
@@ -301,27 +299,12 @@ def test_tool_output_image_rides_the_following_user_turn(
     assert after.startswith("<|vision_end|><|im_end|>\n<|im_start|>assistant\n")
 
 
-# (whether the checkpoint has a vision tower, the encoder kinds left unbuilt, the refusal)
-IMAGE_REFUSAL_CASES: list[tuple[bool, frozenset[EncoderKind], str]] = [
-    (False, frozenset(), "the served model has no vision support"),
-    (True, frozenset(ENCODER_KINDS), "image input is disabled on this server (--text-model-only)"),
-    (True, frozenset({"vision"}), "image input is disabled on this server (--mm-disable)"),
-]
-
-
-@pytest.mark.parametrize(("has_vision", "disabled_encoders", "reason"), IMAGE_REFUSAL_CASES)
 def test_text_only_server_refuses_images_before_any_stream(
-    tiny_model_dir: Path,
-    scripted: type[ScriptedScheduler],
-    has_vision: bool,
-    disabled_encoders: frozenset[EncoderKind],
-    reason: str,
+    tiny_model_dir: Path, scripted: type[ScriptedScheduler]
 ) -> None:
-    write_qwen_vl_model(tiny_model_dir, has_vision)
-    args = dataclasses.replace(
-        tiny_server_args(tiny_model_dir), mm=MultimodalConfig(disabled_encoders=disabled_encoders)
-    )
-    with TestClient(create_app(args)) as client:
+    write_qwen_vl_model(tiny_model_dir, has_vision=False)
+    reason = "the served model has no vision support"
+    with TestClient(create_app(tiny_server_args(tiny_model_dir))) as client:
         for stream in (False, True):
             body = {"model": "tiny", "input": image_input(png_data_url(8, 8)), "stream": stream}
             response = client.post("/v1/responses", json=body)

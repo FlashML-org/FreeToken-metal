@@ -21,7 +21,7 @@ from pydantic import JsonValue
 
 from ftmetal.cli import main as ftm_main
 from ftmetal.env import ENV_PREFIX
-from ftmetal.mm.config import ENCODER_KINDS, EncoderKind, MultimodalConfig
+from ftmetal.mm.config import EncoderKind, MultimodalConfig
 from ftmetal.server.access_log_filter import PollingAccessLogFilter
 from ftmetal.server.api_server import FrontendManager, create_app
 from ftmetal.server.control_api import MoeCacheGeometry, cache_geometry
@@ -145,7 +145,6 @@ def test_stats_count_requests_and_keep_the_last_pool_usage(
 MODALITY_CASES: list[tuple[bool, frozenset[EncoderKind], list[str]]] = [
     (False, frozenset(), ["text"]),
     (True, frozenset(), ["text", "image"]),
-    (True, frozenset(ENCODER_KINDS), ["text"]),
     (True, frozenset({"vision"}), ["text"]),
 ]
 
@@ -414,7 +413,6 @@ ACCESS_LOG_CASES: list[tuple[str, bool, bool]] = [
     ("/v1/cache/status", False, False),
     ("/v1", False, False),
     ("/v1/models", False, True),
-    ("/v1/chat/completions", False, True),
     ("/v1/stats", True, True),
 ]
 

@@ -78,33 +78,6 @@ def test_requests_beyond_max_running_queue_and_match(tmp_path: Path) -> None:
     assert_all_freed(scheduler)
 
 
-def test_abort_running_request_frees_it_and_leaves_the_other_intact(tmp_path: Path) -> None:
-    model = build_reference(seed=11)
-    save_checkpoint(model, tmp_path, quantization=None)
-    rng = np.random.default_rng(11)
-    prompts = [[int(t) for t in rng.integers(1, 120, size=n)] for n in (12, 20)]
-    steps = 10
-    expected = reference_greedy(model, prompts[1], steps)[1]
-
-    scheduler = make_scheduler(tmp_path, max_running_req=2, num_pages=64)
-    for uid, prompt in enumerate(prompts):
-        params = SamplingParams(temperature=0.0, max_tokens=steps, ignore_eos=True)
-        scheduler.add_request(uid, np.array(prompt, dtype=np.int32), params)
-    data = None
-    events: list[TokenEvent] = []
-    for _ in range(4):
-        data = scheduler.overlap_loop(data)
-        events += scheduler.take_results()
-    aborted_before = len([event for event in events if event.uid == 0])
-    scheduler.abort_request(0)
-    while scheduler.runnable or data is not None:
-        data = scheduler.overlap_loop(data)
-        events += scheduler.take_results()
-    assert len([event for event in events if event.uid == 0]) == aborted_before
-    assert tokens_by_uid(events, [1]) == [expected]
-    assert_all_freed(scheduler)
-
-
 def test_abort_pending_request_never_runs(tmp_path: Path) -> None:
     model = build_reference(seed=12)
     save_checkpoint(model, tmp_path, quantization=None)

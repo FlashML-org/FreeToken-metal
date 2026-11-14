@@ -298,19 +298,20 @@ def test_text_only_block_ends_change_nothing(mma: MhaPrefillMma) -> None:
     assert mx.array_equal(flash_prefill(q, *args), flash_prefill(q, *args, zeros))
 
 
-def test_window_partitions_follow_the_window_not_the_context() -> None:
-    """A short turn far into a long context splits by the keys its window reaches."""
-    full = prefill_tiles([64], [30720], num_heads=16, num_kv_heads=2)
-    windowed = prefill_tiles([64], [30720], num_heads=16, num_kv_heads=2, sliding_window=1024)
-    assert (full.num_partitions, windowed.num_partitions) == (8, 2)
-
-
 @pytest.mark.parametrize(
-    ("cached_len", "extend_len", "num_partitions"), [(30720, 2048, 1), (30720, 64, 8)]
+    ("cached_len", "extend_len", "sliding_window", "num_partitions"),
+    [(30720, 2048, None, 1), (30720, 64, None, 8), (30720, 64, 1024, 2)],
 )
-def test_partition_rule_at_the_qwen3_6_shape(
-    cached_len: int, extend_len: int, num_partitions: int
+def test_partition_rule(
+    cached_len: int, extend_len: int, sliding_window: int | None, num_partitions: int
 ) -> None:
-    """A long chunk fills the GPU with its tiles; a short turn over a long prefix splits."""
-    tiles = prefill_tiles([extend_len], [cached_len], num_heads=16, num_kv_heads=2)
+    """A long chunk fills the GPU with its tiles; a short turn over a long prefix splits, and
+    under a window by the keys its window reaches."""
+    tiles = prefill_tiles(
+        [extend_len],
+        [cached_len],
+        num_heads=16,
+        num_kv_heads=2,
+        sliding_window=sliding_window,
+    )
     assert tiles.num_partitions == num_partitions

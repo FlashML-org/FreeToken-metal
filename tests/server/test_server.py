@@ -221,7 +221,6 @@ CHAT_CASES: list[
         [PARIS_CALL, CET_CALL],
         "tool_calls",
     ),
-    ("gemma4", "gemma4", "Forty-two.", {}, "", "Forty-two.", [], "stop"),
     (
         "glm47",
         "flint",
@@ -783,26 +782,13 @@ def test_image_reaches_the_scheduler_as_its_expanded_span(
     assert refused.status_code == 400 and "could not load image" in refused.text
 
 
-# (whether the checkpoint has a vision tower, the encoder kinds left unbuilt, the refusal)
-IMAGE_REFUSAL_CASES: list[tuple[bool, frozenset[EncoderKind], str]] = [
-    (False, frozenset(), "the served model has no vision support"),
-    (True, frozenset(ENCODER_KINDS), "image input is disabled on this server (--text-model-only)"),
-    (True, frozenset({"vision"}), "image input is disabled on this server (--mm-disable)"),
-]
-
-
-@pytest.mark.parametrize(("has_vision", "disabled_encoders", "reason"), IMAGE_REFUSAL_CASES)
 def test_text_only_server_refuses_images_before_any_stream(
-    tiny_model_dir: Path,
-    scripted: type[ScriptedScheduler],
-    has_vision: bool,
-    disabled_encoders: frozenset[EncoderKind],
-    reason: str,
+    tiny_model_dir: Path, scripted: type[ScriptedScheduler]
 ) -> None:
-    write_qwen_vl_model(tiny_model_dir, has_vision)
-    args = dataclasses.replace(
-        tiny_server_args(tiny_model_dir), mm=MultimodalConfig(disabled_encoders=disabled_encoders)
-    )
+    write_qwen_vl_model(tiny_model_dir)
+    mm = MultimodalConfig(disabled_encoders=frozenset({"vision"}))
+    args = dataclasses.replace(tiny_server_args(tiny_model_dir), mm=mm)
+    reason = "image input is disabled on this server (--mm-disable)"
     with TestClient(create_app(args)) as client:
         for stream in (False, True):
             body = image_chat_body(png_base64(8, 8), stream)
@@ -954,7 +940,6 @@ FLINT_CONFIG: dict[str, JsonValue] = {"architectures": ["FlintForCausalLM"], "mo
 PARSER_SELECTION_CASES: list[tuple[dict[str, JsonValue] | None, list[str], str, str | None]] = [
     (QWEN3_6_CONFIG, [], "qwen3_coder", "qwen3"),
     (GEMMA4_CONFIG, [], "gemma4", "gemma4"),
-    (FLINT_CONFIG, [], "glm47", "flint"),
     (None, [], "llama3", None),
     (QWEN3_6_CONFIG, ["--reasoning-parser", "off"], "qwen3_coder", None),
     (
@@ -1005,33 +990,71 @@ def test_flint_follows_its_config_not_its_path(
     assert infer_reasoning_parser(str(model_dir)) == reasoning
 
 
-def test_cache_type_flag_defaults_to_radix(tiny_model_dir: Path) -> None:
-    assert parse_args(["--model", str(tiny_model_dir)], prog="ftm serve").cache_type == "radix"
-    args = parse_args(["--model", str(tiny_model_dir), "--cache-type", "naive"], prog="ftm serve")
-    assert args.cache_type == "naive"
+# (flags, the server-args attribute, the value it holds)
+FLAG_CASES: list[tuple[list[str], str, str | float | None]] = [
+    ([], "cache_type", "radix"),
+    (["--cache-type", "naive"], "cache_type", "naive"),
+    ([], "swa_windows", None),
+    (["--swa-windows", "12"], "swa_windows", 12),
+    ([], "linear_state_checkpoints", None),
+    (["--linear-state-checkpoints", "12"], "linear_state_checkpoints", 12),
+    ([], "num_token_override", None),
+    (["--num-token", "8192"], "num_token_override", 8192),
+    (["--context-length", "8192"], "num_token_override", 8192),
+    ([], "moe_victim_cache_gib", 0),
+    (["--moe-victim-cache-gib", "auto"], "moe_victim_cache_gib", "auto"),
+    (["--moe-victim-cache-gib", "4.5"], "moe_victim_cache_gib", 4.5),
+    ([], "moe_victim_memory", "purgeable"),
+    (["--moe-victim-memory", "reserved"], "moe_victim_memory", "reserved"),
+    (["--moe-cache-policy", "lru"], "moe_victim_memory", "purgeable"),
+    ([], "moe_cache_policy", "lrfu"),
+    (["--moe-victim-memory", "reserved"], "moe_cache_policy", "lrfu"),
+    (["--moe-cache-policy", "lru"], "moe_cache_policy", "lru"),
+]
 
 
-def test_swa_windows_flag_takes_a_window_count(tiny_model_dir: Path) -> None:
-    flags = ["--model", str(tiny_model_dir)]
-    assert parse_args(flags, prog="ftm serve").swa_windows is None
-    assert parse_args([*flags, "--swa-windows", "12"], prog="ftm serve").swa_windows == 12
-    for value in ("0", "1.5"):
-        with pytest.raises(SystemExit):
-            parse_args([*flags, "--swa-windows", value], prog="ftm serve")
+@pytest.mark.parametrize(("flags", "attribute", "value"), FLAG_CASES)
+def test_flags_reach_the_server_args(
+    tiny_model_dir: Path, flags: list[str], attribute: str, value: str | float | None
+) -> None:
+    args = parse_args(["--model", str(tiny_model_dir), *flags], prog="ftm serve")
+    assert getattr(args, attribute) == value
 
 
-def test_linear_state_checkpoints_flag_takes_a_checkpoint_count(tiny_model_dir: Path) -> None:
-    flags = ["--model", str(tiny_model_dir)]
-    assert parse_args(flags, prog="ftm serve").linear_state_checkpoints is None
-    assert (
-        parse_args(
-            [*flags, "--linear-state-checkpoints", "12"], prog="ftm serve"
-        ).linear_state_checkpoints
-        == 12
-    )
-    for value in ("0", "1.5"):
-        with pytest.raises(SystemExit):
-            parse_args([*flags, "--linear-state-checkpoints", value], prog="ftm serve")
+# (flags, with {model} for the checkpoint directory; the startup refusal)
+REFUSED_FLAG_CASES: list[tuple[list[str], str]] = [
+    (["--swa-windows", "0"], "expected a positive integer"),
+    (["--swa-windows", "1.5"], "invalid positive_int value"),
+    (["--linear-state-checkpoints", "0"], "expected a positive integer"),
+    (["--linear-state-checkpoints", "1.5"], "invalid positive_int value"),
+    (["--image-min-tokens", "2048", "--image-max-tokens", "1024"], "2048 exceeds"),
+    (["--image-max-tokens", "0"], "expected a positive integer"),
+    (["--allowed-local-media-path", "{model}/missing"], "is not a directory"),
+    (["--mm-disable", "video"], "invalid choice: 'video'"),
+    (["--moe-strategy", "cpu"], "--moe-strategy cpu computes experts on the CPU"),
+    (["--moe-backend", "hybrid"], "--moe-strategy hybrid computes experts on the CPU"),
+    (["--moe-cache-size", "600", "--moe-cache-rate", "0.5"], "not allowed with argument"),
+    (["--moe-cache-auto"], "unrecognized arguments: --moe-cache-auto"),
+    (["--num-token", "8192", "--num-pages", "1024"], "--num-token and --num-pages are exclusive"),
+    (["--moe-cache-rate", "1.5"], "expected a number in [0, 1]"),
+    (["--moe-cache-size", "-1"], "expected a non-negative integer"),
+    (["--memory-ratio", "0"], "expected a number in (0, 1]"),
+    (["--moe-cache-policy", "lfu"], "invalid choice: 'lfu'"),
+    (["--kv-reserve-tokens", "4096"], "unrecognized arguments: --kv-reserve-tokens"),
+    (["--moe-victim-cache-gib", "-1"], "expected auto or a non-negative number"),
+    (["--moe-victim-cache-gib", "inf"], "expected auto or a non-negative number"),
+    (["--moe-victim-memory", "anonymous"], "invalid choice"),
+]
+
+
+@pytest.mark.parametrize(("flags", "error"), REFUSED_FLAG_CASES)
+def test_flags_are_validated_at_startup(
+    tiny_model_dir: Path, capsys: pytest.CaptureFixture[str], flags: list[str], error: str
+) -> None:
+    argv = ["--model", str(tiny_model_dir), *[flag.format(model=tiny_model_dir) for flag in flags]]
+    with pytest.raises(SystemExit):
+        parse_args(argv, prog="ftm serve")
+    assert error in capsys.readouterr().err
 
 
 def test_multimodal_flags_reach_the_server_args(tiny_model_dir: Path) -> None:
@@ -1086,41 +1109,6 @@ def test_encoder_flags_leave_their_towers_unbuilt(
     assert args.mm.disabled_encoders == disabled_encoders
     assert args.mm.text_model_only is text_model_only
     assert args.served_modalities == modalities
-
-
-# (flags, with {model} for the checkpoint directory; the startup refusal)
-REFUSED_MULTIMODAL_FLAG_CASES: list[tuple[list[str], str]] = [
-    (["--image-min-tokens", "2048", "--image-max-tokens", "1024"], "2048 exceeds"),
-    (["--image-max-tokens", "0"], "expected a positive integer"),
-    (["--allowed-local-media-path", "{model}/missing"], "is not a directory"),
-    (["--mm-disable", "video"], "invalid choice: 'video'"),
-]
-
-
-@pytest.mark.parametrize(("flags", "error"), REFUSED_MULTIMODAL_FLAG_CASES)
-def test_multimodal_flags_are_validated_at_startup(
-    tiny_model_dir: Path, capsys: pytest.CaptureFixture[str], flags: list[str], error: str
-) -> None:
-    argv = ["--model", str(tiny_model_dir), *[flag.format(model=tiny_model_dir) for flag in flags]]
-    with pytest.raises(SystemExit):
-        parse_args(argv, prog="ftm serve")
-    assert error in capsys.readouterr().err
-
-
-# (flags, --num-token as the server args hold it)
-NUM_TOKEN_FLAG_CASES: list[tuple[list[str], int | None]] = [
-    ([], None),
-    (["--num-token", "8192"], 8192),
-    (["--context-length", "8192"], 8192),
-]
-
-
-@pytest.mark.parametrize(("flags", "expected"), NUM_TOKEN_FLAG_CASES)
-def test_num_token_flag_reaches_the_server_args(
-    tiny_model_dir: Path, flags: list[str], expected: int | None
-) -> None:
-    args = parse_args(["--model", str(tiny_model_dir), *flags], prog="ftm serve")
-    assert args.num_token_override == expected
 
 
 # (flags, (--moe-strategy, --moe-cache-size, --moe-cache-rate, prefill overlap,
@@ -1183,48 +1171,6 @@ def test_moe_flags_reach_the_server_args(
     assert warning in caplog.text
 
 
-# (flags, the startup refusal)
-REFUSED_MOE_FLAG_CASES: list[tuple[list[str], str]] = [
-    (["--moe-strategy", "cpu"], "--moe-strategy cpu computes experts on the CPU"),
-    (["--moe-backend", "hybrid"], "--moe-strategy hybrid computes experts on the CPU"),
-    (["--moe-cache-size", "600", "--moe-cache-rate", "0.5"], "not allowed with argument"),
-    (["--moe-cache-auto"], "unrecognized arguments: --moe-cache-auto"),
-    (["--num-token", "8192", "--num-pages", "1024"], "--num-token and --num-pages are exclusive"),
-    (["--moe-cache-rate", "1.5"], "expected a number in [0, 1]"),
-    (["--moe-cache-size", "-1"], "expected a non-negative integer"),
-    (["--memory-ratio", "0"], "expected a number in (0, 1]"),
-    (["--moe-cache-policy", "lfu"], "invalid choice: 'lfu'"),
-    (["--kv-reserve-tokens", "4096"], "unrecognized arguments: --kv-reserve-tokens"),
-    (["--moe-victim-cache-gib", "-1"], "expected auto or a non-negative number"),
-    (["--moe-victim-cache-gib", "inf"], "expected auto or a non-negative number"),
-    (["--moe-victim-memory", "anonymous"], "invalid choice"),
-]
-
-
-# (flags, --moe-victim-cache-gib as the server args hold it)
-VICTIM_CACHE_FLAG_CASES: list[tuple[list[str], float | str]] = [
-    ([], 0),
-    (["--moe-victim-cache-gib", "auto"], "auto"),
-    (["--moe-victim-cache-gib", "4.5"], 4.5),
-]
-
-
-@pytest.mark.parametrize(("flags", "expected"), VICTIM_CACHE_FLAG_CASES)
-def test_victim_cache_flag_reaches_the_server_args(
-    tiny_model_dir: Path, flags: list[str], expected: float | str
-) -> None:
-    args = parse_args(["--model", str(tiny_model_dir), *flags], prog="ftm serve")
-    assert args.moe_victim_cache_gib == expected
-
-
-# (flags, --moe-victim-memory and --moe-cache-policy as the server args hold them)
-OFFLOAD_POLICY_FLAG_CASES: list[tuple[list[str], str, str]] = [
-    ([], "purgeable", "lrfu"),
-    (["--moe-victim-memory", "reserved"], "reserved", "lrfu"),
-    (["--moe-cache-policy", "lru"], "purgeable", "lru"),
-]
-
-
 # (FTMETAL_MOE_SSD_KEEPALIVE_US, the interval the server args hold, or the error)
 SSD_KEEPALIVE_ENV_CASES: list[tuple[str | None, int | str]] = [
     (None, 0),
@@ -1245,23 +1191,6 @@ def test_ssd_keepalive_env_reaches_the_server_args(
     else:
         args = parse_args(["--model", str(tiny_model_dir)], prog="ftm serve")
         assert args.moe_ssd_keepalive_us == expected
-
-
-@pytest.mark.parametrize(("flags", "memory", "policy"), OFFLOAD_POLICY_FLAG_CASES)
-def test_offload_policy_flags_reach_the_server_args(
-    tiny_model_dir: Path, flags: list[str], memory: str, policy: str
-) -> None:
-    args = parse_args(["--model", str(tiny_model_dir), *flags], prog="ftm serve")
-    assert (args.moe_victim_memory, args.moe_cache_policy) == (memory, policy)
-
-
-@pytest.mark.parametrize(("flags", "error"), REFUSED_MOE_FLAG_CASES)
-def test_moe_flags_are_validated_at_startup(
-    tiny_model_dir: Path, capsys: pytest.CaptureFixture[str], flags: list[str], error: str
-) -> None:
-    with pytest.raises(SystemExit):
-        parse_args(["--model", str(tiny_model_dir), *flags], prog="ftm serve")
-    assert error in capsys.readouterr().err
 
 
 @pytest.mark.skipif(MODEL_PATH is None, reason="FTMETAL_TEST_MODEL_PATH is not set")

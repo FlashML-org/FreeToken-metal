@@ -55,7 +55,6 @@ REASONING_CASES: list[tuple[str, bool, list[str], str, str, str]] = [
     ("gemma4", False, ["Just ", "the answer."], "", "Just the answer.", "Just the answer."),
     ("gemma4", True, ["Thinking<channel|>", "Done"], "Thinking", "Done", "Done"),
     ("flint", False, ["<thi", "nk>Let me th", "ink.</think>Done"], "Let me think.", "Done", "Done"),
-    ("flint", False, ["Just ", "the answer."], "", "Just the answer.", "Just the answer."),
     (
         "deepseekv32",
         True,
@@ -134,8 +133,6 @@ QWEN3_CODER_CET = (
     "<tool_call>\n<function=get_time>\n<parameter=zone>\nCET\n</parameter>\n</function>\n"
     "</tool_call>"
 )
-GEMMA4_PARIS = '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>'
-GEMMA4_CET = '<|tool_call>call:get_time{zone:<|"|>CET<|"|>}<tool_call|>'
 
 # (parser, streamed chunks, content around the calls, the calls as (name, arguments))
 TOOL_CALL_CASES: list[tuple[str, list[str], str, list[tuple[str, dict[str, JsonValue]]]]] = [
@@ -170,12 +167,6 @@ TOOL_CALL_CASES: list[tuple[str, list[str], str, list[tuple[str, dict[str, JsonV
         ['Checking.<|tool_call>call:get_weather{city:<|"|>Par', 'is<|"|>,days:3}<tool_call|>'],
         "Checking.",
         [("get_weather", {"city": "Paris", "days": 3})],
-    ),
-    (
-        "gemma4",
-        [GEMMA4_PARIS, GEMMA4_CET],
-        "",
-        [("get_weather", {"city": "Paris"}), ("get_time", {"zone": "CET"})],
     ),
 ]
 

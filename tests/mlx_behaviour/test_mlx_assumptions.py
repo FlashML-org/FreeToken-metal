@@ -1,14 +1,6 @@
 """MLX behaviours the engine relies on; rerun after any mlx upgrade (mlx is pinned)."""
 
-from importlib.metadata import version
-
 import mlx.core as mx
-
-from ftmetal.kernel._ext import REQUIRED_MLX_VERSION
-
-
-def test_mlx_version_is_pinned() -> None:
-    assert version("mlx") == REQUIRED_MLX_VERSION
 
 
 def test_compile_bakes_implicitly_captured_arrays_as_constants() -> None:

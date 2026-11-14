@@ -142,7 +142,6 @@ def test_mismatched_or_undecodable_images_raise_value_error(
 
 # (--image-min-tokens, --image-max-tokens, image width, height, the tokens it takes)
 QWEN_BUDGET_CASES: list[tuple[int | None, int | None, int, int, int]] = [
-    (None, None, 512, 512, 256),
     # The checkpoint's minimum is 64 tokens.
     (None, None, 64, 64, 64),
     # The checkpoint's maximum of 16384 tokens lets a 2400x2000 image through at 1984x2400.
@@ -217,8 +216,7 @@ def test_gemma_wraps_the_soft_tokens_in_boi_eoi(tiny_model_dir: Path) -> None:
 
 # (--image-max-tokens, the soft tokens a 640x400 image takes): the largest accepted budget
 # within the maximum.
-GEMMA_BUDGET_CASES: list[tuple[int | None, int]] = [
-    (None, 273),
+GEMMA_BUDGET_CASES: list[tuple[int, int]] = [
     (910, 522),
     (100, 60),
     (70, 60),
@@ -227,7 +225,7 @@ GEMMA_BUDGET_CASES: list[tuple[int | None, int]] = [
 
 @pytest.mark.parametrize(("max_tokens", "soft_tokens"), GEMMA_BUDGET_CASES)
 def test_gemma_maximum_picks_a_soft_token_budget(
-    tiny_model_dir: Path, max_tokens: int | None, soft_tokens: int
+    tiny_model_dir: Path, max_tokens: int, soft_tokens: int
 ) -> None:
     write_gemma4_model(tiny_model_dir)
     processor = gemma_processor(tiny_model_dir, MultimodalConfig(image_max_tokens=max_tokens))

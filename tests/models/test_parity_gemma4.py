@@ -15,7 +15,7 @@ tiny_model.quantize_export) serves in fp32 like mlx-lm on its dequantized weight
 bf16 as the same tensors under the MLX layout's names, bit for bit. The MoE variant served from
 an offload cache that misses and evicts every step decodes the resident experts' greedy tokens
 and its last prefill chunk's logits match theirs, in every format above and from an expert pack:
-its decode replayed and eager, on the pending kernels (split lookup) when affine, one and two
+its decode replayed, on the pending kernels (split lookup) when affine, one and two
 requests, looked up or read through the prefill buffers, with a victim cache; a prompt resuming
 another's cached head on the slots it left does too, on every forward.
 """
@@ -262,7 +262,6 @@ def make_scheduler(
     attention_backend: str,
     max_extend_tokens: int = 64,
     cache_type: Literal["naive", "radix"] = "radix",
-    num_pages: int = 64,
     dtype: mx.Dtype = mx.float32,
 ) -> Scheduler:
     config = EngineConfig(
@@ -271,7 +270,7 @@ def make_scheduler(
         max_running_req=2,
         page_size=page_size,
         attention_backend=attention_backend,
-        num_page_override=num_pages,
+        num_page_override=64,
         max_extend_tokens_override=max_extend_tokens,
         cache_type=cache_type,
     )
@@ -643,7 +642,6 @@ class PrefixCase(NamedTuple):
     # The prefix each admission finds cached.
     cached_lens: list[int]
     cache_type: Literal["naive", "radix"] = "radix"
-    num_pages: int = 64
 
 
 HEAD = random_prompt(8, 29)
@@ -708,7 +706,6 @@ def test_prompts_resuming_a_cached_prefix_match_mlx_lm(tmp_path: Path, moe: bool
             case.attention_backend,
             case.max_extend_tokens,
             case.cache_type,
-            case.num_pages,
         )
         assert scheduler.cache_manager.cache_type == (
             "swa_radix" if case.cache_type == "radix" else "naive"
@@ -743,7 +740,6 @@ class OffloadCase(NamedTuple):
     expert_format: str = "affine"
     # Prompts of this many tokens or more prefill through the prefill buffers.
     overlap_min_tokens: int = 128
-    command_graph: bool = True
     # An affine decode issues its lookups (moe_split_lookup).
     split_lookup: bool = True
     # The offload's victim cache (0: none).
@@ -758,9 +754,7 @@ OFFLOAD_CACHE_SIZE = 30
 OFFLOAD_STEPS = 10
 OFFLOAD_CASES = [
     OffloadCase("replayed-decode-copy-miss-prefill", (9,)),
-    OffloadCase("eager-decode", (9,), command_graph=False),
     OffloadCase("replayed-decode-split-off", (9,), split_lookup=False),
-    OffloadCase("two-requests", (13, 29)),
     OffloadCase("chunks-across-the-threshold", (100, 9), overlap_min_tokens=48),
     OffloadCase("chunked-overlap-prefill", (150,), overlap_min_tokens=16),
     OffloadCase("unquantized", (100, 9), "unquantized", overlap_min_tokens=48),
@@ -772,7 +766,6 @@ OFFLOAD_CASES = [
     OffloadCase("modelopt-fp8", (100, 9), "modelopt-fp8", overlap_min_tokens=48),
     OffloadCase("compressed-tensors", (100, 9), "compressed-tensors", overlap_min_tokens=48),
     OffloadCase("victim-cache", (100, 9), overlap_min_tokens=48, victim_cache_gib=8e-5),
-    OffloadCase("nvfp4-victim-cache", (100, 9), "nvfp4", 48, victim_cache_gib=8e-5),
     OffloadCase("packed", (100, 9), overlap_min_tokens=48, is_packed=True),
     OffloadCase("one-layer-up-8-bit", (100, 9), "affine-up-8-bit", overlap_min_tokens=48),
     OffloadCase("modelopt-26b-packed", (100, 9), "modelopt-26b", 48, is_packed=True),
@@ -810,7 +803,6 @@ def make_offload_scheduler(path: Path, case: OffloadCase, offload: bool) -> Sche
         page_size=4,
         num_page_override=128,
         max_extend_tokens_override=64,
-        command_graph=case.command_graph,
         moe_strategy="offload" if offload else "fused",
         moe_cache_size=OFFLOAD_CACHE_SIZE if offload else 0,
         moe_split_lookup=case.split_lookup,

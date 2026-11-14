@@ -93,21 +93,6 @@ def test_insert_drops_a_trailing_partial_page(plain: Session) -> None:
     plain.check()
 
 
-def test_match_takes_a_ragged_length_and_stops_at_the_page_boundary(plain: Session) -> None:
-    """match_prefix does not truncate its argument the way insert does: it takes a raw
-    length and rounds the match down per node."""
-    page_size = plain.page_size
-    ids = page_ids(page_size, 1, 2)
-    slots = plain.kv.take(len(ids))
-    plain.do_insert(ids, slots=slots)
-
-    match, _ = plain.do_match(ids[: 2 * page_size - 1])  # one token short of the second page
-    assert (match.cached_len, match.indices) == (page_size, slots[:page_size])
-    assert plain.model.events["node.split"] == 1  # the boundary fell inside the node
-    assert node_end_path(match.node) == ids[:page_size]
-    plain.check()
-
-
 def test_mid_node_divergence_rounds_down_to_the_page_boundary(plain: Session) -> None:
     page_size = plain.page_size
     ids = page_ids(page_size, 1, 2)

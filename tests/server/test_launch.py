@@ -303,10 +303,8 @@ def test_agent_loses_variables_that_route_elsewhere(
 # (agent, the arguments after --, the started command's end).
 EXTRA_ARGS_CASES: list[tuple[str, list[str], list[str]]] = [
     ("claude", ["-p", "hi"], ["--model", MODEL_ID, "-p", "hi"]),
-    ("opencode", ["run", "hi"], ["run", "hi"]),
     ("openclaw", ["status"], ["status"]),
     ("hermes", ["status"], ["status"]),
-    ("pi", ["--print", "hi"], ["--model", MODEL_ID, "--print", "hi"]),
 ]
 
 

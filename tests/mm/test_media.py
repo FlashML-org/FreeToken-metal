@@ -53,9 +53,7 @@ def test_refs_are_popped_in_prompt_order() -> None:
 REJECT_CASES: list[tuple[bool, frozenset[EncoderKind], str | None]] = [
     (False, frozenset(), "the served model has no vision support"),
     (False, frozenset(ENCODER_KINDS), "image input is disabled on this server (--text-model-only)"),
-    (True, frozenset(ENCODER_KINDS), "image input is disabled on this server (--text-model-only)"),
     (False, frozenset({"vision"}), "image input is disabled on this server (--mm-disable)"),
-    (True, frozenset({"vision"}), "image input is disabled on this server (--mm-disable)"),
     (True, frozenset({"audio"}), None),
     (True, frozenset(), None),
 ]

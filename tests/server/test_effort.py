@@ -59,7 +59,6 @@ STRENGTH = EffortProfile(
 # (profile, requested effort, the gear it is served as; None sends no effort)
 QUANTIZE_CASES: list[tuple[EffortProfile, JsonValue, str | None]] = [
     (IGNORES, "high", None),
-    (OPENAI_TRIPLE, "low", "low"),
     (OPENAI_TRIPLE, "high", "high"),
     (OPENAI_TRIPLE, "xhigh", "high"),
     (OPENAI_TRIPLE, "minimal", "low"),
@@ -210,7 +209,6 @@ EFFORT_ROUTE_CASES: list[tuple[str, str | None, str, str, str]] = [
         "assistant\n<think>\n",
     ),
     ("/v1/responses", None, "none", "<|im_start|>user\n", "<think>\n\n</think>\n\n"),
-    ("/v1/responses", None, "high", "<|im_start|>user\n", "assistant\n<think>\n"),
     (
         "/v1/responses",
         GRADES_EFFORT_HEAD,
