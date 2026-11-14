@@ -1,10 +1,9 @@
-name: CI
+name: Lint
 
 on:
   pull_request:
   push:
-    # test/** runs CI on a branch without opening a pull request.
-    branches: [main, "test/**"]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
