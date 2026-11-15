@@ -6,7 +6,8 @@ sink per query head, two leading dense MLP layers, then sigmoid-routed experts b
 shared expert. Sinks and norms are perturbed, since an initial zero sink would hide a kernel that
 drops it. save_checkpoint writes the MLX layout; quantized, as flint-int4 stores it: group-64
 affine 4-bit, the embedding in 8 bits only its export section declares, the router unquantized and
-the packed weights as bytes.
+the packed weights as bytes. save_conversion writes it as the conversions that nest the text model
+under language_model. do.
 """
 
 from __future__ import annotations
@@ -28,6 +29,9 @@ WINDOW = 8
 GROUP_SIZE = 64
 BITS = 4
 EMBEDDING_BITS = 8
+# The conversions quantize the router, in 8 bits, and nest the text model under this prefix.
+ROUTER_BITS = 8
+CONVERSION_PREFIX = "language_model."
 SINK_SCALE = 2.0
 NORM_NOISE = 0.1
 LAYER_TYPES = [
@@ -215,14 +219,19 @@ def build_reference(seed: int, config: dict[str, object] | None = None) -> Model
     return model
 
 
-def quantize(model: Model) -> None:
-    """The flint-int4 recipe: 4-bit in groups of 64, the embedding in 8, the router unquantized."""
+def quantize(model: Model, router_bits: int | None = None) -> None:
+    """The flint-int4 recipe: 4-bit in groups of 64, the embedding in 8, the router unquantized,
+    or in router_bits."""
 
     def predicate(path: str, module: nn.Module) -> bool | dict[str, object]:
-        if not hasattr(module, "to_quantized") or path.endswith("mlp.gate"):
+        if not hasattr(module, "to_quantized") or (
+            path.endswith("mlp.gate") and router_bits is None
+        ):
             return False
         if path.endswith("embed_tokens"):
             return {"group_size": GROUP_SIZE, "bits": EMBEDDING_BITS}
+        if path.endswith("mlp.gate"):
+            return {"group_size": GROUP_SIZE, "bits": router_bits}
         return True
 
     nn.quantize(model, GROUP_SIZE, BITS, class_predicate=predicate)
@@ -244,6 +253,34 @@ def save_checkpoint(
         }
         saved_config["quantization"] = {"group_size": GROUP_SIZE, "bits": BITS}
         saved_config["mlx_export"] = {"bits": BITS, "embedding_bits": EMBEDDING_BITS}
+    mx.save_safetensors(str(path / "model.safetensors"), state, metadata={"format": "mlx"})
+    (path / "config.json").write_text(json.dumps(saved_config))
+
+
+def save_conversion(model: Model, path: Path, config: dict[str, object] | None = None) -> None:
+    """The MLX layout as conversions store it: every name under language_model., a zero router
+    bias per MoE layer, packed weights as words and, quantized, the modules not in the default
+    scheme named under the prefix in the quantization section, with no export section."""
+    saved_config = dict(TINY_FLINT_CONFIG if config is None else config)
+    state = {CONVERSION_PREFIX + key: value for key, value in tree_flatten(model.parameters())}
+    dense_ids = saved_config["mlp_only_layers"]
+    assert isinstance(dense_ids, list)
+    for layer_id in range(config_int(saved_config, "num_hidden_layers")):
+        if layer_id not in dense_ids:
+            bias = mx.zeros((config_int(saved_config, "num_experts"),))
+            state[f"{CONVERSION_PREFIX}model.layers.{layer_id}.mlp.expert_bias"] = bias
+    quantized = [
+        (module_path, module)
+        for module_path, module in model.named_modules()
+        if isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding))
+    ]
+    if quantized:
+        quantization: dict[str, object] = {"group_size": GROUP_SIZE, "bits": BITS}
+        for module_path, module in quantized:
+            if module.bits != BITS:
+                entry = {"group_size": module.group_size, "bits": module.bits}
+                quantization[CONVERSION_PREFIX + module_path] = entry
+        saved_config["quantization"] = quantization
     mx.save_safetensors(str(path / "model.safetensors"), state, metadata={"format": "mlx"})
     (path / "config.json").write_text(json.dumps(saved_config))
 

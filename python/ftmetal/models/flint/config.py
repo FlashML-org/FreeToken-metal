@@ -2,7 +2,8 @@
 
 Port of FreeToken models/flint/config.py. Divergences: reads the checkpoint dictionary and its MLX
 scheme map, in which the release's export section also declares the embedding's bits (its
-quantization section names only the default); no GGUF metadata shim.
+quantization section names only the default) and a conversion that nests the text model under
+language_model. names its modules with that prefix; no GGUF metadata shim.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from ftmetal.models.config import (
     RotaryConfig,
     SWAAttentionGroupConfig,
 )
+from ftmetal.models.flint.weight import bare_name
 from ftmetal.models.loader import (
     config_bool,
     config_dict,
@@ -102,6 +104,15 @@ def parse_config(config: dict[str, object], quant: QuantConfig | None = None) ->
         base=config_float(config, "rope_theta", 10000.0) if rope_theta is None else rope_theta,
     )
     architectures = config_str_list(config, "architectures") or ["FlintForCausalLM"]
+    # The section names modules as the checkpoint does; mlx_layout gave them bare names.
+    bare_quant = (
+        None
+        if quant is None
+        else replace(
+            quant,
+            overrides={bare_name(module): scheme for module, scheme in quant.overrides.items()},
+        )
+    )
     return ModelConfig(
         num_layers=num_layers,
         num_qo_heads=config_int(config, "num_attention_heads"),
@@ -137,7 +148,7 @@ def parse_config(config: dict[str, object], quant: QuantConfig | None = None) ->
                 rotary_config=replace(swa_rotary, rotary_dim=0),
             ),
         ),
-        quant=with_embedding_bits(config, quant),
+        quant=with_embedding_bits(config, bare_quant),
         moe_enabled=True,
         shared_expert_intermediate_size=config_int(config, "shared_expert_intermediate_size"),
         first_k_dense_replace=len(dense_ids),
