@@ -3,9 +3,10 @@
 Port of FreeToken models/qwen3_5_moe/weight.py, with the vision rename of
 models/qwen3_vl/weight.py. Divergences: the rules read the MLX layout, which stores the norm
 weights shifted, the conv weight as [conv_dim, kernel, 1] and the experts stacked per layer,
-so they are renames and fusions only; mlx_layout rewrites a Hugging Face layout checkpoint
-into it first, the tower included (under vision_tower., its patch conv kernel channels last),
-whatever layout the text model is stored in.
+so they are renames and fusions only, and A_log and the gated norm's weight load in the
+model's dtype (FreeToken keeps A_log float32); mlx_layout rewrites a Hugging Face layout
+checkpoint into it first, the tower included (under vision_tower., its patch conv kernel
+channels last), whatever layout the text model is stored in.
 """
 
 from __future__ import annotations
@@ -120,6 +121,9 @@ def weight_rules(model_config: ModelConfig) -> WeightRules:
         segments=(("switch_mlp", "experts"),),
         drops=drops,
         fuses=tuple(fuses),
+        # The Qwen3.5 release stores these in float32 (A_log's values bf16-exact), its MLX
+        # conversions A_log; the GDN kernels read them in the model's dtype.
+        casts=(".linear_attn.A_log", ".linear_attn.norm.weight"),
         expert_segment="experts",
     )
 
