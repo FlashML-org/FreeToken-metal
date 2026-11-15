@@ -8,7 +8,8 @@ chunk seams, batched, resumed from the prefix cache, quantized as flint-int4 sto
 as the conversions that nest the text model under language_model. do. Under MoE offload, whose
 layer indices start past the dense layers and whose shared expert has no gate: replayed decode with
 and without split lookup, eager decode, an overlap prefill, two requests, an expert pack and a
-conversion's experts read from their stored names.
+conversion's experts read from their stored names. The nvfp4 conversion, each linear under a
+global scale, must serve like the reference on its dequantized weights, fused and offloaded.
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ from ftmetal.layers.quantization.moe_pending import PendingOutputs
 from ftmetal.models.config import MoeStrategy
 from ftmetal.models.flint.config import parse_config
 from ftmetal.models.flint.weight import mlx_layout
-from ftmetal.models.register import read_checkpoint
+from ftmetal.models.register import create_model, read_checkpoint
 from ftmetal.moe.offload_cache import IssuedLookup
 from ftmetal.scheduler.scheduler import Scheduler
 from tiny_flint_model import (
@@ -45,6 +46,7 @@ from tiny_flint_model import (
     WINDOW,
     build_reference,
     quantize,
+    quantize_nvfp4,
     reference_greedy,
     save_checkpoint,
     save_conversion,
@@ -284,6 +286,41 @@ def test_offload_matches_reference(
     assert set(pending_layers) == (set(range(NUM_MOE_LAYERS)) if case.split_lookup else set())
     assert sum(cache.stats().misses) > 0
     cache.check_healthy()
+
+
+@pytest.mark.parametrize("strategy", ["fused", "offload"])
+def test_nvfp4_conversion_matches_its_dequantized_weights(
+    tmp_path: Path, strategy: MoeStrategy
+) -> None:
+    model = build_reference(seed=19, config=OFFLOAD_CONFIG)
+    nvfp4_tensors = quantize_nvfp4(model)
+    save_conversion(model, tmp_path, config=OFFLOAD_CONFIG, nvfp4_tensors=nvfp4_tensors)
+    prompt = random_prompt(10, 19)
+    _, expected = reference_greedy(model, prompt, OFFLOAD_STEPS)
+    scheduler = make_scheduler(tmp_path, page_size=4, strategy=strategy)
+    assert generate(scheduler, [prompt], OFFLOAD_STEPS) == [expected]
+
+
+# A module the nvfp4 conversion stores with a global scale, declared otherwise under its own name.
+SCALED_MODULE = "model.layers.2.self_attn.q_proj"
+NOT_NVFP4_ENTRIES: list[dict[str, object]] = [
+    {"group_size": 64, "bits": 4, "mode": "affine"},
+    {"group_size": 32, "bits": 8, "mode": "mxfp8"},
+]
+
+
+@pytest.mark.parametrize("entry", NOT_NVFP4_ENTRIES, ids=lambda entry: str(entry["mode"]))
+def test_a_global_scale_on_a_module_not_declared_nvfp4_is_refused(
+    tmp_path: Path, entry: dict[str, object]
+) -> None:
+    model = build_reference(seed=20)
+    save_conversion(model, tmp_path, nvfp4_tensors=quantize_nvfp4(model))
+    config = json.loads((tmp_path / "config.json").read_text())
+    config["quantization"][f"language_model.{SCALED_MODULE}"] = entry
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    engine_config = EngineConfig(model_path=str(tmp_path), dtype=mx.float32)
+    with pytest.raises(ValueError, match=f"{SCALED_MODULE}: a global scale"):
+        create_model(engine_config.architecture, engine_config.model_config, mx.float32)
 
 
 MTP_NORM = "language_model.mtp.layers.0.input_layernorm.weight"

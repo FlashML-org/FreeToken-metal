@@ -5,7 +5,8 @@ engine serves: bf16 and MLX's quantization modes, affine (AffineScheme) and the 
 modes mxfp4, nvfp4 and mxfp8 (FpBlockScheme). A module is quantized when the checkpoint holds
 its scales tensor; the per-module entries of the quantization section override the default
 and are affine unless they name a mode. A ModelOpt or compressed-tensors export, rewritten by
-models/quant_export.py, brings the scheme of each module it rewrote instead (from_export). A
+models/quant_export.py, brings the scheme of each module it rewrote instead (from_export); an
+MLX nvfp4 module that stores a global scale as such an export does is output-scaled. A
 scheme is one dataclass per kind (the kind is its type) and QuantScheme names any of them. A
 scheme's layout is the arrays it stores an [output, input] weight in, which the methods of
 layers/quantization/{linear,embedding,moe}.py allocate and read; FreeToken's methods and
@@ -17,7 +18,7 @@ weight's scheme added, and describes any layout's array, not only an expert bank
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import mlx.core as mx
@@ -119,6 +120,9 @@ class QuantConfig:
     default: QuantScheme | None
     overrides: dict[str, QuantScheme]
     quantized_modules: frozenset[str]
+    # Modules whose global scale became their output_scale (rewrite_global_scales); each must be
+    # declared nvfp4.
+    output_scaled_modules: frozenset[str] = frozenset()
 
     @classmethod
     def from_checkpoint(
@@ -145,11 +149,21 @@ class QuantConfig:
     def scheme_for(self, checkpoint_name: str) -> QuantScheme | None:
         """Scheme of one module by its checkpoint name; None means bf16."""
         if checkpoint_name in self.overrides:
-            return self.overrides[checkpoint_name]
-        if checkpoint_name in self.quantized_modules:
+            declared = self.overrides[checkpoint_name]
+        elif checkpoint_name in self.quantized_modules:
             assert self.default is not None, f"{checkpoint_name} has scales but no default scheme"
-            return self.default
-        return None
+            declared = self.default
+        else:
+            declared = None
+        if checkpoint_name not in self.output_scaled_modules:
+            return declared
+        elif declared == FpBlockScheme("nvfp4"):
+            return replace(declared, has_output_scale=True)
+        else:
+            raise ValueError(
+                f"{checkpoint_name}: a global scale (weight_scale_2) scales nvfp4 weights only, "
+                f"not {declared}"
+            )
 
     def schemes_for(self, checkpoint_names: list[str]) -> list[QuantScheme | None]:
         """The scheme of each part of a fused module; the parts fuse only when all agree."""

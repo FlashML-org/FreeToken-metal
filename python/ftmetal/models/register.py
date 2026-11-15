@@ -28,7 +28,7 @@ from ftmetal.models.loader import (
     mixed_fuses,
     read_model_config,
 )
-from ftmetal.models.quant_export import rewrite_export
+from ftmetal.models.quant_export import rewrite_export, rewrite_global_scales
 
 
 @dataclass(frozen=True)
@@ -176,7 +176,8 @@ class Checkpoint:
 
 def read_checkpoint(architecture: str, model_path: str) -> Checkpoint:
     """The checkpoint as an MLX one: a Hugging Face layout rewritten by the family's
-    mlx_layout, then a ModelOpt or compressed-tensors export's tensors by rewrite_export."""
+    mlx_layout, then a ModelOpt or compressed-tensors export's tensors by rewrite_export, or an
+    MLX checkpoint's nvfp4 global scales by rewrite_global_scales."""
     spec = get_model_spec(architecture)
     config = read_model_config(model_path)
     state = load_checkpoint(model_path)
@@ -187,7 +188,9 @@ def read_checkpoint(architecture: str, model_path: str) -> Checkpoint:
     quantization = config_dict(config, "quantization")
     export_config = config_dict(config, "quantization_config")
     if quantization is not None or export_config is None:
+        state, scaled = rewrite_global_scales(state)
         quant = QuantConfig.from_checkpoint(quantization, list(state))
+        quant = replace(quant, output_scaled_modules=scaled)
         return Checkpoint(state=state, quant=quant, expert_bytes=expert_bytes)
     elif spec.mlx_layout is None:
         method = config_str(export_config, "quant_method", "")
