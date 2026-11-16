@@ -96,7 +96,7 @@ cleanup() {
   if [ "$STAMPED" = 1 ]; then
     cp "$SCRATCH/version.py" "$ROOT/$VERSION_FILE"
   fi
-  rm -rf "$SCRATCH" "$ROOT/build" "$ROOT/python/ftmetal.egg-info"
+  rm -rf "$SCRATCH" "$ROOT/build" "$ROOT/python/freetoken_metal.egg-info"
 }
 trap cleanup EXIT
 
