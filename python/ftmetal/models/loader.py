@@ -3,10 +3,11 @@
 Port of FreeToken models/loader.py and models/weight.py. Divergences: the source is a
 checkpoint in the MLX layout (safetensors read lazily by mx.load, a family's mlx_layout
 rewriting another layout first), experts arrive pre-stacked, the fused state is applied with
-nn.Module.update after a strict key and shape check, and a fused module whose parts the
-checkpoint quantizes differently loads its parts apart. A rewrite that stacks, splits or
-renames an expert tensor records where each expert's bytes lie in the checkpoint
-(ExpertBytes), which an offload cache reads them from.
+nn.Module.update after a strict key, shape and dtype check (only the parameters a family's
+rules name are cast to the model's dtype), and a fused module whose parts the checkpoint
+quantizes differently loads its parts apart. A rewrite that stacks, splits or renames an
+expert tensor records where each expert's bytes lie in the checkpoint (ExpertBytes), which
+an offload cache reads them from.
 """
 
 from __future__ import annotations
@@ -109,6 +110,9 @@ class WeightRules:
     # Checkpoint key prefixes to drop entirely.
     drops: tuple[str, ...] = ()
     fuses: tuple[FuseRule, ...] = ()
+    # Model-key suffixes of parameters that load in the model's dtype whatever float dtype the
+    # checkpoint stores them in; a tensor of any other dtype must still match.
+    casts: tuple[str, ...] = ()
     # The model-key segment whose leaves are routed-expert banks ("experts" matches
     # model.layers.3.mlp.experts.gate_up_proj.weight); None: the model has none.
     expert_segment: str | None = None
@@ -362,21 +366,26 @@ def load_state(model: BaseOP, state: dict[str, mx.array]) -> None:
 def load_weights(
     model: BaseOP, state: dict[str, mx.array], rules: WeightRules, *, skip_experts: bool = False
 ) -> None:
-    """Fill model from a lazily mapped checkpoint state in the MLX layout; skip_experts leaves
-    the routed-expert banks the model does not hold unread (an offload cache reads them).
+    """Fill model from a lazily mapped checkpoint state in the MLX layout, the parameters
+    rules.casts names in the model's dtype; skip_experts leaves the routed-expert banks the
+    model does not hold unread (an offload cache reads them).
 
     Empties state: a source tensor the rules stack or fuse is then freed once its result is
     built, not kept beside it.
     """
     renamed = apply_rules(state, rules)
     state.clear()
+    held = dict(tree_flatten(model.parameters()))
     if skip_experts:
-        held = dict(tree_flatten(model.parameters()))
         renamed = {
             key: tensor
             for key, tensor in renamed.items()
             if not rules.is_expert(key) or key in held
         }
+    for key in renamed.keys() & held.keys():
+        tensor = renamed[key]
+        if key.endswith(rules.casts) and mx.issubdtype(tensor.dtype, mx.floating):
+            renamed[key] = tensor.astype(held[key].dtype)
     load_state(model, renamed)
     mx.eval(model.parameters())
 

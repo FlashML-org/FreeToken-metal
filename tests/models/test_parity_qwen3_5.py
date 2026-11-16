@@ -3,11 +3,13 @@
 The reference (mlx-lm, contiguous caches) and ftmetal (paged KV, GDN state pool,
 scheduler, overlap) run the same random weights: prefill logits must match and
 greedy decode must agree token for token, also for a chat turn resumed from the
-snapshot the previous turn left below its generation suffix.
+snapshot the previous turn left below its generation suffix. A bf16 checkpoint that stores
+GDN tensors in float32, as Qwen3.5 does, must serve exactly as one that stores them in bf16.
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import mlx.core as mx
@@ -15,6 +17,7 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 from mlx.utils import tree_flatten
+from mlx_lm.models import qwen3_5 as reference
 from pydantic import JsonValue
 
 from ftmetal.core import SamplingParams
@@ -42,10 +45,11 @@ def make_scheduler(
     num_pages: int = 64,
     max_seq_len: int | None = None,
     cache_type: CacheTypeChoice = "radix",
+    dtype: mx.Dtype = mx.float32,
 ) -> Scheduler:
     config = EngineConfig(
         model_path=str(path),
-        dtype=mx.float32,
+        dtype=dtype,
         max_running_req=2,
         page_size=page_size,
         attention_backend=attention_backend,
@@ -227,6 +231,65 @@ def test_hugging_face_layout_matches_mlx_lm(tmp_path: Path, layout: str) -> None
     scheduler = make_scheduler(tmp_path, page_size=4)
     params = SamplingParams(temperature=0.0, max_tokens=steps, ignore_eos=True)
     assert scheduler.generate(np.array(prompt, dtype=np.int32), params) == expected
+
+
+# The tensors Qwen3.5 stores in float32 among bf16 weights, per layout: the release keeps the
+# GDN gated norm's weight in float32 too, its MLX conversions only A_log.
+FLOAT32_TENSORS = {
+    "hugging-face": (".linear_attn.A_log", ".linear_attn.norm.weight"),
+    "mlx": (".linear_attn.A_log",),
+}
+
+
+def save_bf16_checkpoint(
+    model: reference.Model, path: Path, layout: str, stored_dtypes: dict[str, mx.Dtype]
+) -> None:
+    """The model's weights in bf16 but those ending in a suffix of stored_dtypes, in its
+    dtype, in layout."""
+    weights: dict[str, mx.array] = {}
+    for key, value in tree_flatten(model.parameters()):
+        suffix = next((suffix for suffix in stored_dtypes if key.endswith(suffix)), None)
+        weights[key] = value.astype(mx.bfloat16 if suffix is None else stored_dtypes[suffix])
+    if layout == "hugging-face":
+        weights = hf_layout_weights(weights, "model.language_model.")
+    path.mkdir()
+    save_hf_checkpoint(weights, model, path, "Qwen3_5MoeForConditionalGeneration")
+
+
+@pytest.mark.parametrize("layout", list(FLOAT32_TENSORS))
+def test_float32_gdn_tensors_serve_as_bf16(tmp_path: Path, layout: str) -> None:
+    model = build_reference(seed=9)
+    prompt = [int(t) for t in np.random.default_rng(9).integers(1, 120, size=37)]
+    params = SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=True)
+    logits: dict[str, mx.array] = {}
+    tokens: dict[str, list[int]] = {}
+    float32_tensors = dict.fromkeys(FLOAT32_TENSORS[layout], mx.float32)
+    for stored, stored_dtypes in (("bf16", {}), ("float32", float32_tensors)):
+        path = tmp_path / stored
+        save_bf16_checkpoint(model, path, layout, stored_dtypes)
+        scheduler = make_scheduler(path, page_size=4, attention_backend="metal", dtype=mx.bfloat16)
+        logits[stored] = last_chunk_logits(scheduler, prompt)
+        scheduler = make_scheduler(path, page_size=4, attention_backend="metal", dtype=mx.bfloat16)
+        tokens[stored] = scheduler.generate(np.array(prompt, dtype=np.int32), params)
+    assert mx.array_equal(logits["float32"], logits["bf16"])
+    assert tokens["float32"] == tokens["bf16"]
+
+
+# Tensors no cast applies to, each refused: a float one the family's rules do not name, and an
+# integer one under a name they do (casts take float tensors only).
+UNCAST_TENSORS: dict[str, tuple[str, mx.Dtype]] = {
+    "float32-dt-bias": (".linear_attn.dt_bias", mx.float32),
+    "int32-gated-norm": (".linear_attn.norm.weight", mx.int32),
+}
+
+
+@pytest.mark.parametrize("case", list(UNCAST_TENSORS))
+def test_uncast_tensors_are_refused(tmp_path: Path, case: str) -> None:
+    suffix, dtype = UNCAST_TENSORS[case]
+    save_bf16_checkpoint(build_reference(seed=9), tmp_path / "ckpt", "mlx", {suffix: dtype})
+    mismatch = rf"{re.escape(suffix)}: checkpoint .*{re.escape(str(dtype))} vs model"
+    with pytest.raises(ValueError, match=mismatch):
+        make_scheduler(tmp_path / "ckpt", page_size=4, dtype=mx.bfloat16)
 
 
 # The mlx-community recipes, (mode, group size, bits, the routers' entry): every other linear
