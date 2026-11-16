@@ -1,0 +1,113 @@
+name: Release wheels
+
+# Release wheels: built by scripts/build-wheels.sh --release, published to PyPI, then attached to
+# a draft GitHub release. A manual run only builds and import-checks development wheels.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Never cancelled: a release must not stop half-way through an upload.
+concurrency:
+  group: release-wheels-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build
+    if: github.repository == 'FlashML-org/FreeToken-metal'
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.13.7"
+          # The action's own checksum table stops before this version.
+          checksum: "81b811b57e4624df7ed3aac148e0359100d9962f3d9dce00aec533dc2e086731"
+          # A cache another ref's run saved must not reach a release.
+          enable-cache: false
+      # The event picks the mode, not the ref: a manual run started on a tag stays a rehearsal.
+      - run: |
+          # Nothing uploaded to PyPI after the commit can reach the wheels or the checks.
+          UV_EXCLUDE_NEWER="$(git log -1 --format=%cI)"
+          export UV_EXCLUDE_NEWER
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            version="$(sed -nE 's/^__version__ = "([^"]+)"$/\1/p' python/ftmetal/version.py)"
+            if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not name version $version"
+              exit 1
+            fi
+            scripts/build-wheels.sh --release --out-dir dist
+          else
+            scripts/build-wheels.sh --out-dir dist
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-wheels
+          path: dist/*.whl
+          if-no-files-found: error
+          # Long enough to rerun the publish jobs days later.
+          retention-days: 30
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: pypi
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-wheels
+          path: dist
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.13.7"
+          checksum: "c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83"
+          enable-cache: false
+      # PyPI accepts an identical file again but refuses other bytes under a name it holds.
+      - env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: uv publish --trusted-publishing never dist/*.whl
+
+  github-release:
+    name: Draft GitHub release
+    # After PyPI, so the release carries the wheels PyPI holds.
+    needs: publish-pypi
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-wheels
+          path: dist
+      # gh release create adds a second draft for a tag, so an earlier attempt's draft is replaced.
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          releases="$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq '.[] | select(.tag_name == env.GITHUB_REF_NAME) | "\(.id) \(.draft)"')"
+          case "$releases" in
+            "") ;;
+            *$'\n'*)
+              echo "::error::more than one release is tagged $GITHUB_REF_NAME"
+              exit 1
+              ;;
+            *" true") gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/${releases% true}" ;;
+            *)
+              echo "::error::release $GITHUB_REF_NAME is already published; its assets stay as they are"
+              exit 1
+              ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            --title "$GITHUB_REF_NAME" --notes "Draft: write the notes, then publish." dist/*.whl
