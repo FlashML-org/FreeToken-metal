@@ -4,10 +4,12 @@ The reference (tiny_flint_model.Model: contiguous caches for the full layers, ro
 the sliding layers) and ftmetal (both pools, both attention backends, the scheduler with overlap
 and decode graphs, the SWA radix cache) run the same random weights: prefill logits must match and
 greedy decode must agree token for token, with the window crossed in prefill, in decode and at
-chunk seams, batched, resumed from the prefix cache and quantized as flint-int4 stores it. Under
-MoE offload, whose layer indices start past the dense layers and whose shared expert has no gate:
-replayed decode with and without split lookup, eager decode, an overlap prefill, two requests, and
-an expert pack.
+chunk seams, batched, resumed from the prefix cache, quantized as flint-int4 stores it and stored
+as the conversions that nest the text model under language_model. do. Under MoE offload, whose
+layer indices start past the dense layers and whose shared expert has no gate: replayed decode with
+and without split lookup, eager decode, an overlap prefill, two requests, an expert pack and a
+conversion's experts read from their stored names. The nvfp4 conversion, each linear under a
+global scale, must serve like the reference on its dequantized weights, fused and offloaded.
 """
 
 from __future__ import annotations
@@ -33,17 +35,21 @@ from ftmetal.layers.quantization.moe import AffineMoEMethod, SharedExpertForward
 from ftmetal.layers.quantization.moe_pending import PendingOutputs
 from ftmetal.models.config import MoeStrategy
 from ftmetal.models.flint.config import parse_config
-from ftmetal.models.register import read_checkpoint
+from ftmetal.models.flint.weight import mlx_layout
+from ftmetal.models.register import create_model, read_checkpoint
 from ftmetal.moe.offload_cache import IssuedLookup
 from ftmetal.scheduler.scheduler import Scheduler
 from tiny_flint_model import (
     EOS_TOKEN_ID,
+    ROUTER_BITS,
     TINY_FLINT_CONFIG,
     WINDOW,
     build_reference,
     quantize,
+    quantize_nvfp4,
     reference_greedy,
     save_checkpoint,
+    save_conversion,
 )
 
 LOGITS_TOLERANCE = 1e-4
@@ -104,6 +110,8 @@ class GreedyCase:
     max_extend_tokens: int = 64
     is_quantized: bool = False
     command_graph: bool = True
+    # Stored as a conversion under language_model. (save_conversion); quantized, its router too.
+    is_conversion: bool = False
 
 
 GREEDY_CASES = [
@@ -117,6 +125,9 @@ GREEDY_CASES = [
     GreedyCase("metal-chunk-seams", "metal", 4, 29, 6, max_extend_tokens=12),
     GreedyCase("mlx-flint-int4", "mlx", 1, 19, 16, is_quantized=True),
     GreedyCase("metal-flint-int4", "metal", 1, 19, 16, is_quantized=True),
+    GreedyCase("mlx-conversion", "mlx", 1, 19, 16, is_quantized=True, is_conversion=True),
+    GreedyCase("metal-conversion", "metal", 1, 19, 16, is_quantized=True, is_conversion=True),
+    GreedyCase("metal-bf16-conversion", "metal", 1, 19, 16, is_conversion=True),
 ]
 
 
@@ -124,8 +135,11 @@ GREEDY_CASES = [
 def test_greedy_decode_matches_reference(tmp_path: Path, case: GreedyCase) -> None:
     model = build_reference(seed=11)
     if case.is_quantized:
-        quantize(model)
-    save_checkpoint(model, tmp_path, case.is_quantized)
+        quantize(model, router_bits=ROUTER_BITS if case.is_conversion else None)
+    if case.is_conversion:
+        save_conversion(model, tmp_path)
+    else:
+        save_checkpoint(model, tmp_path, case.is_quantized)
     prompt = random_prompt(case.prompt_len, case.prompt_len)
     _, expected = reference_greedy(model, prompt, case.steps)
     assert len(set(expected)) > 1 or case.steps < 6, "a token stream too flat to tell paths apart"
@@ -211,6 +225,7 @@ class OffloadCase:
     command_graph: bool = True
     split_lookup: bool = True
     is_packed: bool = False
+    is_conversion: bool = False
 
 
 OFFLOAD_CASES = [
@@ -221,6 +236,7 @@ OFFLOAD_CASES = [
     OffloadCase("chunks-across-the-threshold", (100,), overlap_min_tokens=48),
     OffloadCase("two-requests", (13, 29)),
     OffloadCase("expert-pack", (9,), is_packed=True),
+    OffloadCase("conversion", (9,), is_conversion=True),
 ]
 
 
@@ -230,8 +246,12 @@ def test_offload_matches_reference(
 ) -> None:
     monkeypatch.setenv("FTMETAL_MOE_PREFILL_OVERLAP_MIN_TOKENS", str(case.overlap_min_tokens))
     model = build_reference(seed=18, config=OFFLOAD_CONFIG)
-    quantize(model)
-    save_checkpoint(model, tmp_path, is_quantized=True, config=OFFLOAD_CONFIG)
+    if case.is_conversion:
+        quantize(model, router_bits=ROUTER_BITS)
+        save_conversion(model, tmp_path, config=OFFLOAD_CONFIG)
+    else:
+        quantize(model)
+        save_checkpoint(model, tmp_path, is_quantized=True, config=OFFLOAD_CONFIG)
     if case.is_packed:
         assert run_pack(["--model", str(tmp_path)]) == 0
     prompts = [random_prompt(n, n) for n in case.prompt_lens]
@@ -266,6 +286,79 @@ def test_offload_matches_reference(
     assert set(pending_layers) == (set(range(NUM_MOE_LAYERS)) if case.split_lookup else set())
     assert sum(cache.stats().misses) > 0
     cache.check_healthy()
+
+
+@pytest.mark.parametrize("strategy", ["fused", "offload"])
+def test_nvfp4_conversion_matches_its_dequantized_weights(
+    tmp_path: Path, strategy: MoeStrategy
+) -> None:
+    model = build_reference(seed=19, config=OFFLOAD_CONFIG)
+    nvfp4_tensors = quantize_nvfp4(model)
+    save_conversion(model, tmp_path, config=OFFLOAD_CONFIG, nvfp4_tensors=nvfp4_tensors)
+    prompt = random_prompt(10, 19)
+    _, expected = reference_greedy(model, prompt, OFFLOAD_STEPS)
+    scheduler = make_scheduler(tmp_path, page_size=4, strategy=strategy)
+    assert generate(scheduler, [prompt], OFFLOAD_STEPS) == [expected]
+
+
+# A module the nvfp4 conversion stores with a global scale, declared otherwise under its own name.
+SCALED_MODULE = "model.layers.2.self_attn.q_proj"
+NOT_NVFP4_ENTRIES: list[dict[str, object]] = [
+    {"group_size": 64, "bits": 4, "mode": "affine"},
+    {"group_size": 32, "bits": 8, "mode": "mxfp8"},
+]
+
+
+@pytest.mark.parametrize("entry", NOT_NVFP4_ENTRIES, ids=lambda entry: str(entry["mode"]))
+def test_a_global_scale_on_a_module_not_declared_nvfp4_is_refused(
+    tmp_path: Path, entry: dict[str, object]
+) -> None:
+    model = build_reference(seed=20)
+    save_conversion(model, tmp_path, nvfp4_tensors=quantize_nvfp4(model))
+    config = json.loads((tmp_path / "config.json").read_text())
+    config["quantization"][f"language_model.{SCALED_MODULE}"] = entry
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    engine_config = EngineConfig(model_path=str(tmp_path), dtype=mx.float32)
+    with pytest.raises(ValueError, match=f"{SCALED_MODULE}: a global scale"):
+        create_model(engine_config.architecture, engine_config.model_config, mx.float32)
+
+
+MTP_NORM = "language_model.mtp.layers.0.input_layernorm.weight"
+NESTED_TOWER_NORM = "language_model.vision_tower.blocks.0.norm1.weight"
+TOWER_NORM = "vision_tower.blocks.0.norm1.weight"
+# (a checkpoint tensor name, its name in the MLX layout; None: left out)
+LAYOUT_NAME_CASES: list[tuple[str, str | None]] = [
+    ("model.layers.0.mlp.down_proj.weight", "model.layers.0.mlp.down_proj.weight"),
+    ("language_model.model.layers.2.mlp.gate.scales", "model.layers.2.mlp.gate.scales"),
+    ("language_model.lm_head.weight", "lm_head.weight"),
+    ("language_model.model.layers.2.mlp.expert_bias", None),
+    (MTP_NORM, MTP_NORM),
+    (NESTED_TOWER_NORM, NESTED_TOWER_NORM),
+    (TOWER_NORM, TOWER_NORM),
+]
+
+
+@pytest.mark.parametrize(("name", "expected"), LAYOUT_NAME_CASES)
+def test_layout_takes_only_the_text_model_out_from_under_language_model(
+    name: str, expected: str | None
+) -> None:
+    """An MTP head or a tower beside the text model keeps its name, so it fails the strict load
+    instead of passing for a module of the text model."""
+    state, _ = mlx_layout({name: mx.zeros((2, 2))})
+    assert list(state) == ([] if expected is None else [expected])
+
+
+def test_layout_refuses_a_nonzero_router_bias() -> None:
+    bias = "language_model.model.layers.2.mlp.expert_bias"
+    with pytest.raises(ValueError, match=f"{bias}: a nonzero router expert bias"):
+        mlx_layout({bias: mx.array([0.0, 0.5])})
+
+
+def test_layout_refuses_a_tensor_stored_under_both_names() -> None:
+    """Either copy would otherwise replace the other unseen."""
+    state = {"model.norm.weight": mx.zeros((2,)), "language_model.model.norm.weight": mx.ones((2,))}
+    with pytest.raises(ValueError, match="model.norm.weight: the checkpoint stores it both"):
+        mlx_layout(state)
 
 
 def test_the_hugging_face_layout_is_refused(tmp_path: Path) -> None:

@@ -1,4 +1,5 @@
-"""ModelOpt and compressed-tensors exports rewritten into MLX quantized tensors.
+"""ModelOpt and compressed-tensors exports rewritten into MLX quantized tensors, and the global
+scales an MLX nvfp4 checkpoint keeps as ModelOpt does rewritten into output scales.
 
 Port of the weight-only part of FreeToken layers/quantization/configs/modelopt.py and
 compressed_tensors.py. Divergences: the export's NVFP4 and per-tensor FP8 modules are rewritten
@@ -54,6 +55,25 @@ def output_scale(module: str, scale: mx.array, weight: mx.array) -> mx.array:
         return scale.astype(mx.float32).reshape(*experts, 1, 1)
     else:
         return mx.full((weight.shape[0], 1), scale.astype(mx.float32).reshape(()))
+
+
+def rewrite_global_scales(
+    state: dict[str, mx.array],
+) -> tuple[dict[str, mx.array], frozenset[str]]:
+    """An MLX checkpoint whose nvfp4 modules each store the dequantization-side global scale
+    ModelOpt NVFP4 does (weight_scale_2: one per tensor, or per expert of a bank), with each such
+    scale as its module's output_scale; and the modules rewritten, for QuantConfig to check that
+    each is declared nvfp4."""
+    out: dict[str, mx.array] = {}
+    modules: set[str] = set()
+    for key, tensor in state.items():
+        if key.endswith(".weight_scale_2"):
+            module = key.removesuffix(".weight_scale_2")
+            out[f"{module}.output_scale"] = output_scale(module, tensor, state[f"{module}.weight"])
+            modules.add(module)
+        else:
+            out[key] = tensor
+    return out, frozenset(modules)
 
 
 def rewrite_export(
@@ -160,4 +180,4 @@ def rewrite_export(
     return out, schemes, out_expert_bytes
 
 
-__all__ = ["rewrite_export"]
+__all__ = ["rewrite_export", "rewrite_global_scales"]

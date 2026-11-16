@@ -6,7 +6,8 @@ sink per query head, two leading dense MLP layers, then sigmoid-routed experts b
 shared expert. Sinks and norms are perturbed, since an initial zero sink would hide a kernel that
 drops it. save_checkpoint writes the MLX layout; quantized, as flint-int4 stores it: group-64
 affine 4-bit, the embedding in 8 bits only its export section declares, the router unquantized and
-the packed weights as bytes.
+the packed weights as bytes. save_conversion writes it as the conversions that nest the text model
+under language_model. do, the nvfp4 one (quantize_nvfp4) included.
 """
 
 from __future__ import annotations
@@ -28,6 +29,14 @@ WINDOW = 8
 GROUP_SIZE = 64
 BITS = 4
 EMBEDDING_BITS = 8
+# The conversions quantize the router, in 8 bits, and nest the text model under this prefix.
+ROUTER_BITS = 8
+CONVERSION_PREFIX = "language_model."
+# The nvfp4 conversion's linears: e2m1 in groups of 16 with an e4m3 scale each, under a global
+# scale per tensor (per expert in a bank) of absmax / 2688, e2m1's largest value times e4m3's.
+NVFP4_ENTRY: dict[str, object] = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+NVFP4_SCALE_DIVISOR = 6.0 * 448.0
+AFFINE_ENTRY: dict[str, object] = {"group_size": GROUP_SIZE, "bits": BITS, "mode": "affine"}
 SINK_SCALE = 2.0
 NORM_NOISE = 0.1
 LAYER_TYPES = [
@@ -215,18 +224,55 @@ def build_reference(seed: int, config: dict[str, object] | None = None) -> Model
     return model
 
 
-def quantize(model: Model) -> None:
-    """The flint-int4 recipe: 4-bit in groups of 64, the embedding in 8, the router unquantized."""
+def quantize(model: Model, router_bits: int | None = None) -> None:
+    """The flint-int4 recipe: 4-bit in groups of 64, the embedding in 8, the router unquantized,
+    or in router_bits."""
 
     def predicate(path: str, module: nn.Module) -> bool | dict[str, object]:
-        if not hasattr(module, "to_quantized") or path.endswith("mlp.gate"):
+        if not hasattr(module, "to_quantized") or (
+            path.endswith("mlp.gate") and router_bits is None
+        ):
             return False
         if path.endswith("embed_tokens"):
             return {"group_size": GROUP_SIZE, "bits": EMBEDDING_BITS}
+        if path.endswith("mlp.gate"):
+            return {"group_size": GROUP_SIZE, "bits": router_bits}
         return True
 
     nn.quantize(model, GROUP_SIZE, BITS, class_predicate=predicate)
     mx.eval(model.parameters())
+
+
+def quantize_nvfp4(model: Model) -> dict[str, mx.array]:
+    """Quantize model as the nvfp4 conversion does: the router and the embedding in 8-bit affine,
+    every other linear to its nvfp4 dequantization under its global scales. Returns those
+    linears' stored tensors by name: the packed weight, its scales and weight_scale_2."""
+    stored: dict[str, mx.array] = {}
+    dequantized: list[tuple[str, mx.array]] = []
+    for key, weight in tree_flatten(model.parameters()):
+        assert isinstance(weight, mx.array)
+        module = key.removesuffix(".weight")
+        if weight.ndim < 2 or module.endswith(("mlp.gate", "embed_tokens")):
+            continue
+        global_scale = mx.max(mx.abs(weight), axis=(-2, -1), keepdims=True) / NVFP4_SCALE_DIVISOR
+        packed, scales = mx.quantize(weight / global_scale, **NVFP4_ENTRY)
+        stored[key] = packed
+        stored[f"{module}.scales"] = scales
+        stored[f"{module}.weight_scale_2"] = global_scale.reshape(weight.shape[:-2])
+        values = mx.dequantize(packed, scales, **NVFP4_ENTRY, dtype=mx.float32)
+        dequantized.append((key, values * global_scale))
+    model.load_weights(dequantized, strict=False)
+
+    def predicate(path: str, module: nn.Module) -> bool | dict[str, object]:
+        if path.endswith("embed_tokens"):
+            return {"group_size": GROUP_SIZE, "bits": EMBEDDING_BITS}
+        if path.endswith("mlp.gate"):
+            return {"group_size": GROUP_SIZE, "bits": ROUTER_BITS}
+        return False
+
+    nn.quantize(model, class_predicate=predicate)
+    mx.eval(model.parameters(), stored)
+    return stored
 
 
 def save_checkpoint(
@@ -244,6 +290,42 @@ def save_checkpoint(
         }
         saved_config["quantization"] = {"group_size": GROUP_SIZE, "bits": BITS}
         saved_config["mlx_export"] = {"bits": BITS, "embedding_bits": EMBEDDING_BITS}
+    mx.save_safetensors(str(path / "model.safetensors"), state, metadata={"format": "mlx"})
+    (path / "config.json").write_text(json.dumps(saved_config))
+
+
+def save_conversion(
+    model: Model,
+    path: Path,
+    config: dict[str, object] | None = None,
+    nvfp4_tensors: dict[str, mx.array] | None = None,
+) -> None:
+    """The MLX layout as conversions store it: every name under language_model., a zero router
+    bias per MoE layer, packed weights as words and, quantized, the modules not in the default
+    scheme named under the prefix in the quantization section, with no export section.
+    nvfp4_tensors (quantize_nvfp4's) replace their linears' weights, nvfp4 then the default."""
+    saved_config = dict(TINY_FLINT_CONFIG if config is None else config)
+    params = dict(tree_flatten(model.parameters())) | (nvfp4_tensors or {})
+    state = {CONVERSION_PREFIX + key: value for key, value in params.items()}
+    dense_ids = saved_config["mlp_only_layers"]
+    assert isinstance(dense_ids, list)
+    for layer_id in range(config_int(saved_config, "num_hidden_layers")):
+        if layer_id not in dense_ids:
+            bias = mx.zeros((config_int(saved_config, "num_experts"),))
+            state[f"{CONVERSION_PREFIX}model.layers.{layer_id}.mlp.expert_bias"] = bias
+    quantized = [
+        (module_path, module)
+        for module_path, module in model.named_modules()
+        if isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding))
+    ]
+    if quantized:
+        default = AFFINE_ENTRY if nvfp4_tensors is None else NVFP4_ENTRY
+        quantization: dict[str, object] = dict(default)
+        for module_path, module in quantized:
+            entry = {"group_size": module.group_size, "bits": module.bits, "mode": module.mode}
+            if entry != default:
+                quantization[CONVERSION_PREFIX + module_path] = entry
+        saved_config["quantization"] = quantization
     mx.save_safetensors(str(path / "model.safetensors"), state, metadata={"format": "mlx"})
     (path / "config.json").write_text(json.dumps(saved_config))
 
