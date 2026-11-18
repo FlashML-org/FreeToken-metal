@@ -46,7 +46,7 @@ struct AffineScales {
 template <typename T, int CODE_BITS, typename PairTable>
 struct PairCodeScales {
   const device uint32_t* codes;
-  PairTable pairs;
+  metal::remove_addrspace_t<PairTable> pairs;
 
   METAL_FUNC void group(int i, thread float& scale, thread float& bias) const {
     const uint pair = pair_code<CODE_BITS>(codes, i);
